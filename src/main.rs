@@ -20,6 +20,7 @@ mod menubar;
 mod model_fetch;
 mod paste;
 mod performance;
+mod permissions;
 mod qos;
 mod settings;
 mod settings_ui;
@@ -39,6 +40,12 @@ use crate::settings::SettingsStore;
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    // Hard-fail with a clear actionable error if Microphone, Accessibility,
+    // or Input Monitoring isn't granted. Until we have an onboarding UI,
+    // refusing to start beats coming up half-broken (e.g. tray icon
+    // present but hotkey silently inert because Input Monitoring is off).
+    permissions::ensure_all()?;
 
     // AppKit requires its first contact to be on the main thread. Rust's
     // entry point already is.

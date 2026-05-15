@@ -20,6 +20,21 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
 
+// Public CoreGraphics APIs (macOS 10.15+) for checking and requesting
+// the Input Monitoring permission. Not exposed by the `core-graphics`
+// crate, so we declare them directly.
+unsafe extern "C" {
+    /// Returns true if the calling process is allowed to listen to events
+    /// via `CGEventTap`. Equivalent to checking the Input Monitoring TCC
+    /// permission.
+    fn CGPreflightListenEventAccess() -> bool;
+    /// Triggers the Input Monitoring permission dialog if not already
+    /// granted. Returns the current state. The user's decision is
+    /// asynchronous — they grant it in System Settings, then must restart
+    /// the app for the tap to actually start delivering events.
+    fn CGRequestListenEventAccess() -> bool;
+}
+
 use anyhow::{Context, Result, anyhow};
 use block2::RcBlock;
 use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
@@ -94,6 +109,28 @@ pub fn register(
     let initial = parse(spec).with_context(|| format!("parsing hotkey: {spec}"))?;
     let binding = Arc::new(Mutex::new(initial));
 
+    // ---------- 0. Input Monitoring preflight ----------
+    // CGEventTapCreate returns a "valid" mach port even without Input
+    // Monitoring permission, but the tap never delivers events. Check up
+    // front so we can surface a clear log line and trigger the system
+    // prompt instead of failing silently.
+    let granted = unsafe { CGPreflightListenEventAccess() };
+    if !granted {
+        log::warn!(
+            "Input Monitoring permission not yet granted. Requesting it now — \
+             macOS will open System Settings → Privacy & Security → Input \
+             Monitoring. Enable Parakeet there and relaunch the app for the \
+             hotkey to start working."
+        );
+        let _ = unsafe { CGRequestListenEventAccess() };
+        // The request returns immediately; the user has to grant it in
+        // System Settings and then relaunch. We continue starting the
+        // detectors anyway — they'll be inert until permission lands and
+        // the app restarts.
+    } else {
+        log::info!("Input Monitoring permission granted");
+    }
+
     // ---------- 1. CGEventTap thread ----------
     if TAP_STARTED.set(()).is_ok() {
         let binding_for_tap = binding.clone();
@@ -133,10 +170,14 @@ fn run_tap(binding: Arc<Mutex<Binding>>, on_press: EventFn, on_release: EventFn)
     let tap = CGEventTap::new(
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
-        // `Default` mode lets us return `None` from the callback to swallow
-        // events — required to suppress Caps Lock's normal AlphaShift toggle
-        // when CapsLockToggle is the active binding.
-        CGEventTapOptions::Default,
+        // `ListenOnly` so the tap never modifies or swallows events.
+        // `Default` mode (which would let us suppress Caps Lock's
+        // AlphaShift toggle) trips a stricter TCC pathway on macOS that
+        // silently drops the tap into "permission pending" even when
+        // Input Monitoring is allowed — observed empirically: no events
+        // delivered at all. We accept the Caps Lock state toggling for
+        // now in exchange for the tap actually working.
+        CGEventTapOptions::ListenOnly,
         vec![
             CGEventType::KeyDown,
             CGEventType::KeyUp,
@@ -147,6 +188,17 @@ fn run_tap(binding: Arc<Mutex<Binding>>, on_press: EventFn, on_release: EventFn)
             let flags = event.get_flags();
             let keycode =
                 event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as CGKeyCode;
+
+            // Trace every keyboard event the tap sees. Useful for
+            // diagnosing "I pressed X but nothing happened" — e.g. F-keys
+            // being intercepted as media keys by the system. Turn on with
+            // RUST_LOG=parakeet_rs::hotkey=trace.
+            log::trace!(
+                "tap event: type={:?} keycode={} flags={:#010x}",
+                event_type,
+                keycode,
+                flags.bits()
+            );
 
             match bind {
                 Binding::Chord {
@@ -181,10 +233,12 @@ fn run_tap(binding: Arc<Mutex<Binding>>, on_press: EventFn, on_release: EventFn)
                             caps_held.set(true);
                             on_press();
                         }
-                        // Swallow the event so the OS-level AlphaShift state
-                        // doesn't toggle. Caps Lock effectively becomes our
-                        // private dictation key.
-                        None
+                        // In `ListenOnly` mode the return value is ignored
+                        // and the AlphaShift state still toggles. Documented
+                        // limitation; revisit when we figure out how to
+                        // ask for the stricter TCC capability needed for
+                        // `Default` mode tap-modify.
+                        Some(event.clone())
                     } else {
                         Some(event.clone())
                     }
@@ -217,7 +271,18 @@ fn run_tap(binding: Arc<Mutex<Binding>>, on_press: EventFn, on_release: EventFn)
     let current = CFRunLoop::get_current();
     unsafe { current.add_source(&loop_source, kCFRunLoopCommonModes) };
     tap.enable();
-    log::info!("hotkey tap active (CGEventTap at HID level)");
+    // Re-check Input Monitoring here so the line we log reflects whether the
+    // tap will ACTUALLY deliver events, not just whether create() succeeded
+    // (which it does even without permission).
+    if unsafe { CGPreflightListenEventAccess() } {
+        log::info!("hotkey tap active (CGEventTap at HID level, Input Monitoring granted)");
+    } else {
+        log::warn!(
+            "hotkey tap created but Input Monitoring is not yet granted — events \
+             will NOT be delivered. Grant permission in System Settings → Privacy \
+             & Security → Input Monitoring and relaunch."
+        );
+    }
     CFRunLoop::run_current(); // blocks forever
 }
 
