@@ -1,8 +1,5 @@
-//! Build script.
-//!
-//! Runs `tauri_build::build()` for the Tauri 2 glue, then inspects the
-//! sherpa-onnx prebuilt library for the CoreML execution provider symbol
-//! (ADR-0015 layer 1).
+//! Build script. Inspects the sherpa-onnx prebuilt library for the CoreML
+//! execution-provider symbol (ADR-0015 layer 1).
 //!
 //! We use the SHARED variant of sherpa-onnx (per the `shared` feature on
 //! `sherpa-onnx-sys`), which links against Microsoft's official
@@ -19,7 +16,27 @@ use std::process::Command;
 fn main() {
     // Tell rustc this cfg is one we set ourselves; silences --check-cfg lint.
     println!("cargo:rustc-check-cfg=cfg(parakeet_coreml_ep_present)");
-    tauri_build::build();
+
+    // `sherpa-onnx-sys` emits `cargo:rustc-link-arg=-Wl,-rpath,@loader_path`
+    // from its own build script — but Cargo does NOT propagate
+    // `rustc-link-arg` directives from transitive build scripts into the
+    // final binary's link command. Re-emit them here, from the binary's
+    // own build script, so the resulting executable can actually find
+    // `libonnxruntime.dylib` next to itself at runtime.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
+        // Also add the sherpa-onnx-prebuilt cache dir as an rpath so a
+        // bare `cargo run` works without first copying dylibs alongside
+        // the binary. Used as a fallback only — production .app bundles
+        // ship the dylibs in Contents/Frameworks.
+        if let Some(dir) = locate_libonnxruntime().and_then(|p| {
+            p.parent()
+                .map(|p| p.to_path_buf())
+        }) {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+        }
+    }
+
     let _ = check_coreml_ep();
 }
 

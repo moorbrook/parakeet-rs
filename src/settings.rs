@@ -1,13 +1,23 @@
+//! Persisted user preferences + model paths.
+//!
+//! Drops the Tauri `AppHandle` previously used to find the per-bundle data
+//! directory. On macOS, that path is now hand-derived from `dirs::data_dir()`
+//! ( `~/Library/Application Support` ) plus our `com.parakeet.rs` bundle
+//! identifier — so a `cargo run`-built binary points at the same directory
+//! that the previous Tauri-bundled build used. No re-download needed.
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
 
-/// Persisted user preferences. No API key, no provider — all transcription is
-/// local via Omnilingual ASR.
+/// Bundle-id-style namespace for our on-disk state. Matches what the previous
+/// Tauri build wrote (`tauri.conf.json` `identifier`), so the model files
+/// downloaded under that name still resolve.
+const BUNDLE_NAMESPACE: &str = "com.parakeet.rs";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub hotkey: String,
@@ -28,18 +38,22 @@ impl Default for Settings {
 
 #[derive(Clone)]
 pub struct SettingsStore {
+    #[allow(dead_code)] // Reserved for the future settings-save UI.
     settings_path: PathBuf,
     data_dir: PathBuf,
     cache: Arc<Mutex<Settings>>,
 }
 
 impl SettingsStore {
-    pub fn new(app: AppHandle) -> Result<Self> {
-        let config_dir = app.path().app_config_dir().context("app config dir")?;
-        let data_dir = app.path().app_data_dir().context("app data dir")?;
-        std::fs::create_dir_all(&config_dir).context("create config dir")?;
+    pub fn new() -> Result<Self> {
+        let data_root = dirs::data_dir().context("locating Application Support dir")?;
+        let data_dir = data_root.join(BUNDLE_NAMESPACE);
+        // On macOS the conventional split is config under `~/Library/Preferences`
+        // and data under `~/Library/Application Support`. We collapse both into
+        // a single per-bundle directory so a fresh checkout finds its settings
+        // next to its models.
         std::fs::create_dir_all(&data_dir).context("create data dir")?;
-        let settings_path = config_dir.join("settings.json");
+        let settings_path = data_dir.join("settings.json");
         let cache = if settings_path.exists() {
             let raw = std::fs::read_to_string(&settings_path)?;
             serde_json::from_str::<Settings>(&raw).unwrap_or_default()
@@ -57,6 +71,7 @@ impl SettingsStore {
         self.cache.lock().clone()
     }
 
+    #[allow(dead_code)] // Reserved for the future settings-save UI.
     pub fn save(&self, s: &Settings) -> Result<()> {
         *self.cache.lock() = s.clone();
         let raw = serde_json::to_string_pretty(s)?;
@@ -64,6 +79,7 @@ impl SettingsStore {
         Ok(())
     }
 
+    #[allow(dead_code)] // Useful in tests / future debugging code.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }

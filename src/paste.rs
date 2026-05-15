@@ -1,31 +1,32 @@
-use anyhow::{Context, Result};
-use enigo::{Direction, Enigo, Key, Keyboard, Settings};
-use tauri::AppHandle;
-use tauri_plugin_clipboard_manager::ClipboardExt;
+//! Deliver a finalised transcript to the focused window.
+//!
+//! Default mode is "paste": write the text to the system clipboard via
+//! `NSPasteboard` (through `arboard`), then synthesise a ⌘V keypress via
+//! `enigo` so the focused app pastes it. Two other modes available for
+//! debugging: `"type"` types the string keystroke-by-keystroke (slow), and
+//! `"clipboard"` only writes to the pasteboard without pressing ⌘V.
 
-/// Deliver transcribed `text` to the user according to `mode`.
-///
-/// Modes:
-/// - "paste":     write to clipboard then synthesize Cmd/Ctrl+V
-/// - "type":      type each character via enigo (slow, but no clipboard touch)
-/// - "clipboard": write to clipboard only
-pub fn deliver(app: &AppHandle, text: &str, mode: &str) -> Result<()> {
+use anyhow::{Context, Result};
+use arboard::Clipboard;
+use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+
+pub fn deliver(text: &str, mode: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
     match mode {
         "type" => type_text(text),
-        "clipboard" => copy_to_clipboard(app, text),
+        "clipboard" => copy_to_clipboard(text),
         _ => {
-            copy_to_clipboard(app, text)?;
+            copy_to_clipboard(text)?;
             send_paste_chord()
         }
     }
 }
 
-fn copy_to_clipboard(app: &AppHandle, text: &str) -> Result<()> {
-    app.clipboard()
-        .write_text(text.to_string())
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    let mut cb = Clipboard::new().context("creating NSPasteboard handle")?;
+    cb.set_text(text.to_string())
         .context("writing to clipboard")?;
     Ok(())
 }
