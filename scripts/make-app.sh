@@ -133,10 +133,24 @@ sign_one "$APP"
 
 echo "6. verify signature"
 codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -3
-spctl --assess --type execute --verbose=2 "$APP" 2>&1 | tail -2 || {
-  echo "  note: spctl rejected the ad-hoc signature — that's expected; it'd"
-  echo "        accept a Developer-ID-signed + notarised build."
-}
+# spctl --assess is Gatekeeper's view of the bundle. For an ad-hoc build
+# (`SIGN_ID=-`, the default), rejection is EXPECTED — Gatekeeper won't
+# trust an unnotarised signature regardless of how clean it is. For a
+# real Developer-ID-signed build, rejection means the bundle is not
+# distributable, which is a release blocker — fail the script so CI /
+# release scripts see a non-zero exit.
+if ! spctl --assess --type execute --verbose=2 "$APP" 2>&1 | tail -2; then
+  if [ "$SIGN_ID" = "-" ]; then
+    echo "  note: spctl rejected the ad-hoc signature — that's expected; it'd"
+    echo "        accept a Developer-ID-signed + notarised build."
+  else
+    echo "ERROR: spctl rejected the bundle signed with '$SIGN_ID'. This build" >&2
+    echo "       is not distributable. Common causes: identity missing from" >&2
+    echo "       login keychain, intermediate cert expired, notarisation not" >&2
+    echo "       yet stapled. Check 'codesign -dvv \"$APP\"' for details." >&2
+    exit 1
+  fi
+fi
 
 # --- Distribution notes (NOT run by default) -----------------------------
 # To produce a build a user can download from the internet without

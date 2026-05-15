@@ -33,3 +33,6 @@ target/
 # ---------- Logs & temp ----------
 *.log
 .cache/
+
+# Local agent-runtime metadata
+.claude/

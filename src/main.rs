@@ -15,9 +15,13 @@
 mod app;
 mod asr;
 mod audio;
+mod cleanup;
 mod hotkey;
+mod hud;
+mod keychain;
 mod menubar;
 mod model_fetch;
+mod objc_util;
 mod paste;
 mod performance;
 mod permissions;
@@ -41,15 +45,35 @@ use crate::settings::SettingsStore;
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Hard-fail with a clear actionable error if Microphone, Accessibility,
-    // or Input Monitoring isn't granted. Until we have an onboarding UI,
-    // refusing to start beats coming up half-broken (e.g. tray icon
-    // present but hotkey silently inert because Input Monitoring is off).
-    permissions::ensure_all()?;
+    // Log panics before the (release-mode) abort handler eats them. This
+    // is the only feedback channel for a Finder-launched LSUIElement app
+    // that aborts on panic — stderr from a double-clicked .app is
+    // visible only in Console.app.
+    objc_util::install_panic_hook();
 
     // AppKit requires its first contact to be on the main thread. Rust's
     // entry point already is.
     let mtm = MainThreadMarker::new().context("main() must run on the main thread")?;
+
+    // Pre-flight TCC permissions: Microphone, Accessibility, Input
+    // Monitoring. Missing permissions show a native NSAlert (the previous
+    // stderr-then-exit path was invisible for an LSUIElement app launched
+    // from Finder). The alert lets the user open each System Settings
+    // pane directly, then Quit — and we relaunch on the next attempt.
+    let missing = permissions::check_all();
+    if !missing.is_empty() {
+        permissions::present_missing_alert_blocking(mtm, &missing);
+        // Surface the same info on stderr for the curious / for CI.
+        eprintln!(
+            "Parakeet exiting: missing permission(s): {}",
+            missing
+                .iter()
+                .map(|p| p.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        std::process::exit(1);
+    }
 
     // Build the app state up-front so the menu-action handlers can reach it
     // via the AppHandle singleton.
@@ -59,6 +83,8 @@ fn main() -> Result<()> {
 
     // Status-bar menu (uses sf_symbol::load internally).
     menubar::install(mtm).context("install menu bar")?;
+    // Recording-state HUD overlay. Hidden until the first state change.
+    hud::install(mtm);
 
     // Hotkey: press/release edges call App::on_hotkey_press / on_hotkey_release.
     // In Tap mode only press matters; in Hold mode release is the commit edge.
@@ -77,12 +103,16 @@ fn main() -> Result<()> {
     // when the user picks a new combo.
     *app.hotkey.lock() = Some(hotkey_handle);
 
-    // Tokio runtime drives the model download + spawn_blocking ASR work.
+    // Tokio runtime drives the model download + spawn_blocking ASR work
+    // + the cleanup-pass HTTP call. Stash the handle on `App` so the
+    // synchronous transcribe thread can `block_on` the cleanup call
+    // without spinning up a second runtime per dictation.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("parakeet-tokio")
         .build()
         .context("build tokio runtime")?;
+    *app.tokio_handle.lock() = Some(runtime.handle().clone());
     {
         let app = app.clone();
         runtime.spawn(async move {

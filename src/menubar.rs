@@ -41,28 +41,35 @@ define_class!(
             // Menu clicks always behave like a Tap press — they can't
             // express a hold/release pair. In Hold mode this means a menu
             // click starts the session and a second click stops it.
-            if let Some(app) = AppHandle::get() {
-                app.on_hotkey_press();
-                // For Hold mode + active session, simulate the release
-                // edge so the menu-click toggle stays sane.
-                if app.session.lock().is_some()
-                    && app.settings.load().trigger_mode == TriggerMode::Hold
-                {
-                    app.on_hotkey_release();
+            crate::objc_util::selector_guard("toggleDictation:", || {
+                if let Some(app) = AppHandle::get() {
+                    app.on_hotkey_press();
+                    // For Hold mode + active session, simulate the release
+                    // edge so the menu-click toggle stays sane.
+                    if app.session.lock().is_some()
+                        && app.settings.load().trigger_mode == TriggerMode::Hold
+                    {
+                        app.on_hotkey_release();
+                    }
                 }
-            }
+            });
         }
 
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: *mut NSObject) {
-            settings_ui::open(self.mtm());
+            let mtm = self.mtm();
+            crate::objc_util::selector_guard("openSettings:", || {
+                settings_ui::open(mtm);
+            });
         }
 
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: *mut NSObject) {
             let mtm = self.mtm();
-            let ns_app = NSApplication::sharedApplication(mtm);
-            unsafe { ns_app.terminate(None) };
+            crate::objc_util::selector_guard("quit:", || {
+                let ns_app = NSApplication::sharedApplication(mtm);
+                unsafe { ns_app.terminate(None) };
+            });
         }
     }
 );
@@ -264,6 +271,12 @@ fn refresh_on_main(
             DictationState::Transcribing => (
                 "mic.fill",
                 "Transcribing…".to_string(),
+                "Working…".to_string(),
+                false,
+            ),
+            DictationState::Polishing => (
+                "wand.and.stars",
+                "Polishing…".to_string(),
                 "Working…".to_string(),
                 false,
             ),

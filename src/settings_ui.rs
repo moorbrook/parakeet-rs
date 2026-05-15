@@ -17,6 +17,7 @@
 
 use std::cell::RefCell;
 
+use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
@@ -30,13 +31,21 @@ use objc2_foundation::{
 };
 
 use crate::app::{glyphs_for_shortcut, is_capslock_token, AppHandle};
-use crate::settings::TriggerMode;
+use crate::settings::{CleanupMode, TriggerMode};
 
-const WINDOW_W: f64 = 460.0;
-const WINDOW_H: f64 = 260.0;
+const WINDOW_W: f64 = 480.0;
+const WINDOW_H: f64 = 440.0;
 const ROW_H: f64 = 26.0;
 const LABEL_W: f64 = 130.0;
 const PAD: f64 = 20.0;
+
+/// Models offered in the cleanup-model popup. Index matches the popup
+/// menu item position; we keep both the user-visible label and the API
+/// model id paired so the order is the only source of truth.
+const CLEANUP_MODELS: &[(&str, &str)] = &[
+    ("Haiku 4.5 (fast, recommended)", "claude-haiku-4-5"),
+    ("Sonnet 4.6 (best quality)", "claude-sonnet-4-6"),
+];
 
 #[derive(Default)]
 struct Ivars {
@@ -45,6 +54,9 @@ struct Ivars {
     recording_token: RefCell<Option<String>>,
     shortcut_button: RefCell<Option<Retained<NSButton>>>,
     mode_popup: RefCell<Option<Retained<NSPopUpButton>>>,
+    cleanup_popup: RefCell<Option<Retained<NSPopUpButton>>>,
+    cleanup_model_popup: RefCell<Option<Retained<NSPopUpButton>>>,
+    api_key_field: RefCell<Option<Retained<NSTextField>>>,
     // No window field. Storing a strong `Retained<NSWindow>` here while
     // the window also held a strong `Retained<SettingsController>` was a
     // textbook retain cycle that prevented either object from ever being
@@ -90,41 +102,41 @@ define_class!(
     unsafe impl NSWindowDelegate for SettingsController {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _note: &NSNotification) {
-            // Drop the live-settings handle so both the controller and the
-            // window (which would otherwise be held alive by the static
-            // slot) can be deallocated.
-            drop_live_settings();
+            crate::objc_util::selector_guard("windowWillClose:", || {
+                // Defer the drop. AppKit is mid-dispatch on `self`
+                // here; if this happens to be the call path that also
+                // drops the only strong ref (e.g. user clicked the red
+                // close button rather than Cancel), releasing
+                // synchronously would dangle the receiver pointer ObjC
+                // is still using. Bouncing through the main GCD queue
+                // postpones the drop until after the selector has
+                // fully returned.
+                DispatchQueue::main().exec_async(drop_live_settings);
+            });
         }
     }
 
     impl SettingsController {
         /// "Save" button action. Read controls, call App::apply_settings.
+        /// Body in `save_inner` so the selector itself is just the
+        /// panic-guard wrapper.
         #[unsafe(method(save:))]
         fn save(&self, _sender: *mut NSObject) {
-            let Some(app) = AppHandle::get() else {
-                return;
-            };
-            let mut new = app.settings.load();
+            crate::objc_util::selector_guard("save:", || self.save_inner());
+        }
 
-            if let Some(token) = self.ivars().recording_token.borrow().clone() {
-                new.hotkey = token;
-            }
-            if let Some(popup) = self.ivars().mode_popup.borrow().as_ref() {
-                new.trigger_mode = match unsafe { popup.indexOfSelectedItem() } {
-                    1 => TriggerMode::Hold,
-                    _ => TriggerMode::Tap,
-                };
-            }
-
-            if let Err(e) = app.apply_settings(new) {
-                log::error!("save settings failed: {e:#}");
-            }
-            self.close_window();
+        /// Cleanup-mode popup changed. Enable / disable the API key + model
+        /// inputs to make it obvious they only matter when cleanup is on.
+        #[unsafe(method(cleanupModeChanged:))]
+        fn cleanup_mode_changed(&self, _sender: *mut NSObject) {
+            crate::objc_util::selector_guard("cleanupModeChanged:", || {
+                self.refresh_cleanup_enabled();
+            });
         }
 
         #[unsafe(method(cancel:))]
         fn cancel(&self, _sender: *mut NSObject) {
-            self.close_window();
+            crate::objc_util::selector_guard("cancel:", || self.close_window());
         }
 
         /// "Record Shortcut" button. Flips the UI into recording state; the
@@ -132,10 +144,12 @@ define_class!(
         /// hotkey token.
         #[unsafe(method(beginRecording:))]
         fn begin_recording(&self, _sender: *mut NSObject) {
-            *self.ivars().recording_token.borrow_mut() = Some(String::new());
-            if let Some(btn) = self.ivars().shortcut_button.borrow().as_ref() {
-                unsafe { btn.setTitle(&NSString::from_str("Press a key combination…")) };
-            }
+            crate::objc_util::selector_guard("beginRecording:", || {
+                *self.ivars().recording_token.borrow_mut() = Some(String::new());
+                if let Some(btn) = self.ivars().shortcut_button.borrow().as_ref() {
+                    unsafe { btn.setTitle(&NSString::from_str("Press a key combination…")) };
+                }
+            });
         }
 
         /// Captured by the custom NSWindow subclass below — see
@@ -143,26 +157,86 @@ define_class!(
         /// like `"CmdOrCtrl+Shift+Space"` and updates the button label.
         #[unsafe(method(captureKey:))]
         fn capture_key(&self, event_obj: *mut NSObject) {
-            if self.ivars().recording_token.borrow().is_none() {
-                return;
-            }
-            // Re-interpret the opaque sender as an NSEvent pointer. The
-            // RecordingWindow forwards events through this selector.
-            let event: &NSEvent = unsafe { &*(event_obj as *const NSEvent) };
-            if let Some(token) = ns_event_to_token(event) {
-                let glyphs = glyphs_for_shortcut(&token);
-                *self.ivars().recording_token.borrow_mut() = Some(token.clone());
-                if let Some(btn) = self.ivars().shortcut_button.borrow().as_ref() {
-                    unsafe { btn.setTitle(&NSString::from_str(&glyphs)) };
+            crate::objc_util::selector_guard("captureKey:", || {
+                if self.ivars().recording_token.borrow().is_none() {
+                    return;
                 }
-                // Recording a Caps Lock binding flips us into the locked-
-                // Hold UI state so the user understands their Tap/Hold
-                // choice no longer applies.
-                self.refresh_mode_popup_for(&token);
-            }
+                // Re-interpret the opaque sender as an NSEvent pointer.
+                // The RecordingWindow forwards events through this
+                // selector.
+                let event: &NSEvent = unsafe { &*(event_obj as *const NSEvent) };
+                if let Some(token) = ns_event_to_token(event) {
+                    let glyphs = glyphs_for_shortcut(&token);
+                    *self.ivars().recording_token.borrow_mut() = Some(token.clone());
+                    if let Some(btn) = self.ivars().shortcut_button.borrow().as_ref() {
+                        unsafe { btn.setTitle(&NSString::from_str(&glyphs)) };
+                    }
+                    // Recording a Caps Lock binding flips us into the
+                    // locked-Hold UI state so the user understands
+                    // their Tap/Hold choice no longer applies.
+                    self.refresh_mode_popup_for(&token);
+                }
+            });
         }
     }
 );
+
+impl SettingsController {
+    /// Inner body of the `save:` selector. Lives outside `define_class!`
+    /// so it isn't ObjC-exposed.
+    fn save_inner(&self) {
+        let Some(app) = AppHandle::get() else {
+            return;
+        };
+        let mut new = app.settings.load();
+
+        if let Some(token) = self.ivars().recording_token.borrow().clone() {
+            // begin_recording seeds recording_token with an empty
+            // string. If the user clicks Record then clicks Save
+            // without pressing anything, the token is "". Validating
+            // here (and also belt-and-braces in App::apply_settings)
+            // stops us persisting an unparseable binding that would
+            // brick the next launch.
+            let trimmed = token.trim();
+            if !trimmed.is_empty() && crate::hotkey::parse(trimmed).is_ok() {
+                new.hotkey = trimmed.to_string();
+            } else if !trimmed.is_empty() {
+                log::warn!("ignoring unparseable hotkey token from recorder: {trimmed:?}");
+            }
+        }
+        if let Some(popup) = self.ivars().mode_popup.borrow().as_ref() {
+            new.trigger_mode = match unsafe { popup.indexOfSelectedItem() } {
+                1 => TriggerMode::Hold,
+                _ => TriggerMode::Tap,
+            };
+        }
+        if let Some(popup) = self.ivars().cleanup_popup.borrow().as_ref() {
+            new.cleanup_mode = match unsafe { popup.indexOfSelectedItem() } {
+                1 => CleanupMode::Anthropic,
+                _ => CleanupMode::Off,
+            };
+        }
+        if let Some(field) = self.ivars().api_key_field.borrow().as_ref() {
+            let s: Retained<NSString> = unsafe { field.stringValue() };
+            new.anthropic_api_key = s.to_string().trim().to_string();
+        }
+        if let Some(popup) = self.ivars().cleanup_model_popup.borrow().as_ref() {
+            let idx = unsafe { popup.indexOfSelectedItem() };
+            if let Some((_, id)) = idx
+                .try_into()
+                .ok()
+                .and_then(|i: usize| CLEANUP_MODELS.get(i))
+            {
+                new.cleanup_model = (*id).to_string();
+            }
+        }
+
+        if let Err(e) = app.apply_settings(new) {
+            log::error!("save settings failed: {e:#}");
+        }
+        self.close_window();
+    }
+}
 
 impl SettingsController {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
@@ -188,16 +262,48 @@ impl SettingsController {
         }
     }
 
-    fn close_window(&self) {
-        // Take the live-settings handle out of the thread-local FIRST so
-        // the windowWillClose callback that fires synchronously from
-        // `NSWindow::close` finds an empty slot and skips its own cleanup
-        // (avoids re-entrancy on the same RefCell).
-        let live = LIVE_SETTINGS.with(|slot| slot.borrow_mut().take());
-        if let Some(live) = live {
-            unsafe { live.window.close() };
-            // `live` drops here; the controller + window both deallocate.
+    /// Grey out the API key + model picker unless cleanup mode is on.
+    /// Removes the "I typed my key but cleanup is off" footgun.
+    fn refresh_cleanup_enabled(&self) {
+        let on = match self.ivars().cleanup_popup.borrow().as_ref() {
+            Some(popup) => {
+                let idx = unsafe { popup.indexOfSelectedItem() };
+                idx == 1
+            }
+            None => false,
+        };
+        if let Some(field) = self.ivars().api_key_field.borrow().as_ref() {
+            unsafe { field.setEnabled(on) };
         }
+        if let Some(popup) = self.ivars().cleanup_model_popup.borrow().as_ref() {
+            unsafe { popup.setEnabled(on) };
+        }
+    }
+
+    fn close_window(&self) {
+        // Defer the close + drop to the next runloop tick.
+        //
+        // Why: callers reach `close_window` from inside an ObjC selector
+        // on `self`. The only strong ref to `self` lives in
+        // LIVE_SETTINGS. Dropping it synchronously here would release
+        // `self` while ObjC is still mid-dispatch on it — a textbook
+        // use-after-free, even though `self` is just a `&` borrow.
+        //
+        // `DispatchQueue::main().exec_async` runs the closure on the
+        // next runloop iteration, after the current selector has
+        // returned. By then ObjC no longer holds the receiver pointer.
+        DispatchQueue::main().exec_async(move || {
+            // Same take-before-close ordering as before, for the same
+            // reason: windowWillClose fires synchronously from `close()`
+            // and re-enters `drop_live_settings`; if the slot is already
+            // empty that re-entry short-circuits.
+            let live = LIVE_SETTINGS.with(|slot| slot.borrow_mut().take());
+            if let Some(live) = live {
+                unsafe { live.window.close() };
+                // `live` drops here; the controller + window both
+                // deallocate at this point.
+            }
+        });
     }
 }
 
@@ -220,7 +326,9 @@ define_class!(
     impl RecordingWindow {
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            forward_to_live_controller(event);
+            crate::objc_util::selector_guard("RecordingWindow.keyDown:", || {
+                forward_to_live_controller(event);
+            });
         }
 
         // Caps Lock arrives via `flagsChanged:`, not `keyDown:`, because
@@ -229,10 +337,12 @@ define_class!(
         // doesn't accidentally commit "Shift" as the binding.
         #[unsafe(method(flagsChanged:))]
         fn flags_changed(&self, event: &NSEvent) {
-            let keycode = unsafe { event.keyCode() };
-            if keycode == 57 {
-                forward_to_live_controller(event);
-            }
+            crate::objc_util::selector_guard("RecordingWindow.flagsChanged:", || {
+                let keycode = unsafe { event.keyCode() };
+                if keycode == 57 {
+                    forward_to_live_controller(event);
+                }
+            });
         }
     }
 );
@@ -339,7 +449,87 @@ pub fn open(mtm: MainThreadMarker) {
         60.0,
     );
 
-    // --- Row 4: Buttons (bottom-right) ------------------------------------
+    // --- Section divider: Cleanup -----------------------------------------
+    let section_y = row3_y - 80.0;
+    add_section_label(mtm, &content, "Post-processing", PAD, section_y);
+
+    // --- Row 4: Cleanup mode popup ----------------------------------------
+    let row4_y = section_y - ROW_H - 10.0;
+    add_label(mtm, &content, "Cleanup", PAD, row4_y);
+    let cleanup_popup = make_popup(
+        mtm,
+        &["Off — paste raw transcript", "Anthropic Claude"],
+        match settings.as_ref().map(|s| s.cleanup_mode) {
+            Some(CleanupMode::Anthropic) => 1,
+            _ => 0,
+        },
+        NSPoint::new(PAD + LABEL_W, row4_y - 4.0),
+        NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
+    );
+    unsafe {
+        cleanup_popup.setTarget(Some(controller.as_ref()));
+        cleanup_popup.setAction(Some(sel!(cleanupModeChanged:)));
+        content.addSubview(&cleanup_popup);
+    }
+    *controller.ivars().cleanup_popup.borrow_mut() = Some(cleanup_popup);
+
+    // --- Row 5: API key (secure text field) -------------------------------
+    let row5_y = row4_y - ROW_H - 10.0;
+    add_label(mtm, &content, "API key", PAD, row5_y);
+    let key_field = make_secure_field(
+        mtm,
+        settings
+            .as_ref()
+            .map(|s| s.anthropic_api_key.as_str())
+            .unwrap_or(""),
+        NSPoint::new(PAD + LABEL_W, row5_y - 4.0),
+        NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
+    );
+    unsafe { content.addSubview(&key_field) };
+    *controller.ivars().api_key_field.borrow_mut() = Some(key_field);
+
+    // --- Row 6: Model picker ----------------------------------------------
+    let row6_y = row5_y - ROW_H - 10.0;
+    add_label(mtm, &content, "Model", PAD, row6_y);
+    let labels: Vec<&str> = CLEANUP_MODELS.iter().map(|(label, _)| *label).collect();
+    let stored_model = settings
+        .as_ref()
+        .map(|s| s.cleanup_model.as_str())
+        .unwrap_or("claude-haiku-4-5");
+    let selected_model_idx = CLEANUP_MODELS
+        .iter()
+        .position(|(_, id)| *id == stored_model)
+        .unwrap_or(0) as isize;
+    let model_popup = make_popup(
+        mtm,
+        &labels,
+        selected_model_idx,
+        NSPoint::new(PAD + LABEL_W, row6_y - 4.0),
+        NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
+    );
+    unsafe { content.addSubview(&model_popup) };
+    *controller.ivars().cleanup_model_popup.borrow_mut() = Some(model_popup);
+
+    // Initial enabled-state sync: API key + model are greyed out when
+    // cleanup is Off, so a fresh-install user doesn't think they need
+    // to fill them in.
+    controller.refresh_cleanup_enabled();
+
+    // --- Row 7: Cleanup hint ----------------------------------------------
+    let row7_y = row6_y - 30.0;
+    add_hint(
+        mtm,
+        &content,
+        "Cleanup removes filler words, fixes punctuation, and honours\n\
+         commands like \"new paragraph\" and \"scratch that\". Your\n\
+         API key is stored in the macOS Keychain, not on disk.",
+        PAD,
+        row7_y - 38.0,
+        WINDOW_W - PAD * 2.0,
+        46.0,
+    );
+
+    // --- Row 8: Buttons (bottom-right) ------------------------------------
     let btn_w = 90.0;
     let btn_h = 28.0;
     let btn_y = PAD;
@@ -411,6 +601,46 @@ fn add_hint(mtm: MainThreadMarker, parent: &NSView, text: &str, x: f64, y: f64, 
         // gives appropriate contrast in light and dark.
         parent.addSubview(&label);
     }
+}
+
+/// Bold section heading, full-width above its rows. Used to break the
+/// window up into Hotkey / Post-processing groups.
+fn add_section_label(mtm: MainThreadMarker, parent: &NSView, text: &str, x: f64, y: f64) {
+    let label = unsafe { NSTextField::labelWithString(&NSString::from_str(text), mtm) };
+    unsafe {
+        label.setFrame(NSRect::new(
+            NSPoint::new(x, y),
+            NSSize::new(WINDOW_W - PAD * 2.0, ROW_H),
+        ));
+        label.setTextColor(Some(&NSColor::labelColor()));
+        // System font, bold, slightly larger than the row labels.
+        let font = objc2_app_kit::NSFont::boldSystemFontOfSize(13.0);
+        label.setFont(Some(&font));
+        parent.addSubview(&label);
+    }
+}
+
+/// NSSecureTextField for the API key. Same metrics as a regular NSTextField
+/// but hides the contents like a password field.
+fn make_secure_field(
+    mtm: MainThreadMarker,
+    initial: &str,
+    origin: NSPoint,
+    size: NSSize,
+) -> Retained<NSTextField> {
+    let frame = NSRect::new(origin, size);
+    let field: Retained<objc2_app_kit::NSSecureTextField> = unsafe {
+        let alloc = objc2_app_kit::NSSecureTextField::alloc(mtm);
+        msg_send![alloc, initWithFrame: frame]
+    };
+    unsafe {
+        field.setStringValue(&NSString::from_str(initial));
+        field.setPlaceholderString(Some(&NSString::from_str("sk-ant-…")));
+    }
+    // Up-cast to NSTextField — the controller's ivars hold the base type so
+    // the same `stringValue` accessor works for both regular and secure.
+    let as_text: Retained<NSTextField> = unsafe { Retained::cast_unchecked(field) };
+    as_text
 }
 
 fn make_button(

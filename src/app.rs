@@ -13,11 +13,13 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::asr::Asr;
+use crate::cleanup;
 use crate::hotkey::HotkeyHandle;
+use crate::hud;
 use crate::menubar;
 use crate::model_fetch::{self, Progress};
-use crate::settings::{Settings, SettingsStore, TriggerMode};
-use crate::streamer::{self, Mode as StreamerMode, Outcome, Session};
+use crate::settings::{CleanupMode, Settings, SettingsStore, TriggerMode};
+use crate::streamer::{self, Mode as StreamerMode, Outcome, OutcomeRx, Session};
 use crate::{paste, performance, warmup};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +32,8 @@ pub enum DictationState {
     Listening,
     /// Capture stopped, ASR running.
     Transcribing,
+    /// ASR done; LLM cleanup pass running.
+    Polishing,
 }
 
 pub struct App {
@@ -41,6 +45,10 @@ pub struct App {
     /// Lives for the program's lifetime; held here so the Settings UI can
     /// rebind it after the user records a new hotkey combo.
     pub hotkey: Mutex<Option<HotkeyHandle>>,
+    /// Shared handle to the process-wide tokio runtime. Used by the
+    /// synchronous transcribe thread to `block_on` async cleanup HTTP
+    /// calls without spinning up a per-request runtime.
+    pub tokio_handle: Mutex<Option<tokio::runtime::Handle>>,
 }
 
 impl App {
@@ -51,6 +59,7 @@ impl App {
             asr: Mutex::new(None),
             current_state: Mutex::new(DictationState::ModelLoading),
             hotkey: Mutex::new(None),
+            tokio_handle: Mutex::new(None),
         }
     }
 
@@ -92,8 +101,8 @@ impl App {
             return;
         }
         let vad_path = self.settings.vad_path();
-        let session = match streamer::start(&vad_path, mode) {
-            Ok(s) => s,
+        let (session, outcome_rx) = match streamer::start(&vad_path, mode) {
+            Ok(pair) => pair,
             Err(e) => {
                 log::error!("start session failed: {e:#}");
                 return;
@@ -101,6 +110,11 @@ impl App {
         };
         self.set_state(DictationState::Listening);
 
+        // Park the command half in app.session for the lifetime of the
+        // recording. on_hotkey_release / on_hotkey_press reach the active
+        // session through here. The watcher owns only the outcome
+        // receiver — it can't accidentally interfere with the command
+        // path.
         {
             let mut slot = self.session.lock();
             let prev = slot.replace(session);
@@ -111,11 +125,13 @@ impl App {
         std::thread::Builder::new()
             .name("session-watcher".into())
             .spawn(move || {
-                let session = app.session.lock().take();
-                let outcome = match session {
-                    Some(s) => s.outcome_rx.recv().ok(),
-                    None => None,
-                };
+                let OutcomeRx(rx) = outcome_rx;
+                let outcome = rx.recv().ok();
+                // Drop the command half NOW that the recording is done.
+                // This both shuts down the capture thread (Drop sends a
+                // Cancel) and clears `app.session` so the next hotkey
+                // press sees an idle slot.
+                drop(app.session.lock().take());
                 match outcome {
                     Some(Outcome::Speech {
                         samples,
@@ -152,7 +168,7 @@ impl App {
                         return;
                     }
                 };
-                let text = match asr.recognize(&samples, sample_rate) {
+                let raw = match asr.recognize(&samples, sample_rate) {
                     Ok(t) => t,
                     Err(e) => {
                         log::error!("recognise failed: {e:#}");
@@ -160,8 +176,36 @@ impl App {
                         return;
                     }
                 };
-                let mode = app.settings.load().inject_mode;
-                if let Err(e) = paste::deliver(&text, &mode) {
+
+                // Run the cleanup pass if enabled. Failure is non-fatal —
+                // the worst case is "user gets the raw transcript", which
+                // is the same as if cleanup were off. Surface the error in
+                // the menu bar but keep going.
+                let settings = app.settings.load();
+                let cleaned = if matches!(settings.cleanup_mode, CleanupMode::Off) {
+                    raw
+                } else {
+                    app.set_state(DictationState::Polishing);
+                    let handle = app.tokio_handle.lock().clone();
+                    match handle {
+                        Some(h) => match h.block_on(cleanup::polish(&raw, &settings)) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                log::error!("cleanup failed: {e:#}");
+                                menubar::set_status_text(&format!(
+                                    "Cleanup failed — using raw transcript ({e})"
+                                ));
+                                raw
+                            }
+                        },
+                        None => {
+                            log::error!("cleanup skipped: tokio handle not installed");
+                            raw
+                        }
+                    }
+                };
+
+                if let Err(e) = paste::deliver(&cleaned, &settings.inject_mode) {
                     log::error!("paste failed: {e:#}");
                 }
                 app.on_session_finished();
@@ -181,6 +225,7 @@ impl App {
     pub fn set_state(&self, new_state: DictationState) {
         *self.current_state.lock() = new_state;
         self.refresh_menu();
+        hud::show_state(new_state);
     }
 
     pub fn refresh_menu(&self) {
@@ -198,6 +243,16 @@ impl App {
     /// Persist new settings AND apply runtime side-effects (rebinding the
     /// global hotkey if it changed).
     pub fn apply_settings(self: &Arc<Self>, new: Settings) -> anyhow::Result<()> {
+        // Refuse to persist an empty / unparseable hotkey. The Settings
+        // UI also validates before calling us, but this is the canonical
+        // chokepoint — any future caller (CLI flag, scripted import)
+        // can't bypass it.
+        if new.hotkey.trim().is_empty() {
+            anyhow::bail!("refusing to save an empty hotkey");
+        }
+        crate::hotkey::parse(&new.hotkey)
+            .map_err(|e| anyhow::anyhow!("hotkey {:?} is not parseable: {e}", new.hotkey))?;
+
         let prev = self.settings.load();
         self.settings.save(&new)?;
         if prev.hotkey != new.hotkey {
@@ -442,6 +497,20 @@ mod tests {
         assert_eq!(effective_trigger_mode(&s), TriggerMode::Hold);
         // Stored mode is untouched (the override is runtime-only).
         assert_eq!(s.trigger_mode, TriggerMode::Tap);
+    }
+
+    #[test]
+    fn parse_rejects_empty_and_whitespace_hotkey() {
+        // The validation that apply_settings runs lives on
+        // `crate::hotkey::parse`. Pin both ends — empty rejected,
+        // whitespace rejected — so a future refactor can't silently
+        // re-open the "next launch bricks" footgun.
+        assert!(crate::hotkey::parse("").is_err());
+        assert!(crate::hotkey::parse("   ").is_err());
+        // And the canonical happy paths still pass.
+        assert!(crate::hotkey::parse("CmdOrCtrl+Shift+Space").is_ok());
+        assert!(crate::hotkey::parse("F5").is_ok());
+        assert!(crate::hotkey::parse("CapsLock").is_ok());
     }
 
     #[test]

@@ -52,11 +52,20 @@ enum Signal {
     Finalize,
 }
 
+/// Command half of a dictation session. Lives in `App::session` for the
+/// whole life of the recording so that hotkey press/release edges can
+/// always reach the active session — the bug this split fixes was the
+/// watcher thread `take()`ing the session out of `App::session` right
+/// after start, leaving Hold-mode release with no way to call `finalize`.
 pub struct Session {
     signal_tx: Sender<Signal>,
-    pub outcome_rx: Receiver<Outcome>,
     join: Option<JoinHandle<()>>,
 }
+
+/// Outcome half — owned by the watcher thread. Cannot be `Send`-cloned
+/// because `Receiver<T>` is single-consumer, so we split it out at
+/// construction time and pass it directly to the watcher.
+pub struct OutcomeRx(pub Receiver<Outcome>);
 
 impl Session {
     /// Discard the in-flight recording. Produces `Outcome::Cancelled`.
@@ -83,7 +92,11 @@ impl Drop for Session {
 
 /// Start a new dictation session in the given mode. `vad_model` is only
 /// loaded for `Mode::VadAutoStop`; in `Mode::Manual` the path is ignored.
-pub fn start(vad_model: &Path, mode: Mode) -> Result<Session> {
+///
+/// Returns the command half (kept by `App` so hotkey edges can reach it)
+/// and the outcome half (passed directly to the watcher thread that
+/// waits for the session to finish).
+pub fn start(vad_model: &Path, mode: Mode) -> Result<(Session, OutcomeRx)> {
     let (tap_tx, tap_rx) = channel::<Vec<f32>>();
     let (signal_tx, signal_rx) = channel::<Signal>();
     let (outcome_tx, outcome_rx) = channel::<Outcome>();
@@ -115,11 +128,13 @@ pub fn start(vad_model: &Path, mode: Mode) -> Result<Session> {
         })
         .context("spawning session watcher")?;
 
-    Ok(Session {
-        signal_tx,
-        outcome_rx,
-        join: Some(join),
-    })
+    Ok((
+        Session {
+            signal_tx,
+            join: Some(join),
+        },
+        OutcomeRx(outcome_rx),
+    ))
 }
 
 fn run_vad(

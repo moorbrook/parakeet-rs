@@ -19,8 +19,10 @@ short_description = "Voice-to-text dictation, fully local, Apple Silicon."
 long_description = """
 Press a global hotkey, speak, and Parakeet pastes the transcript at your
 cursor. Powered by NVIDIA Parakeet TDT 0.6B v3 running locally on the
-Apple Neural Engine via sherpa-onnx + CoreML. No cloud, no API keys,
-no network calls after the first-run model download.
+Apple Neural Engine via sherpa-onnx + CoreML. Optional LLM cleanup pass
+(via your Anthropic API key) removes filler words and fixes punctuation;
+ASR itself is fully local with no network calls after the first-run
+model download.
 """
 osx_minimum_system_version = "11.0"
 # cargo-bundle's `osx_info_plist_exts` concatenates rather than merges, which
@@ -70,6 +72,7 @@ sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "stream",
+    "json",
 ] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
@@ -80,6 +83,11 @@ memmap2 = "0.9"
 
 # Apple-specific: thread QoS, P-core scheduling.
 libc = "0.2"
+
+# Keychain Services (kSecClassGenericPassword) for the Anthropic API
+# key. Never persist secrets to settings.json — `security-framework` is
+# the official Apple framework binding, no extra Rust runtime needed.
+security-framework = "2"
 
 # CGEventTap-based global hotkey detector. `core-graphics` gives us
 # `CGEventTap` (HID-level keyboard listening with right-side modifier
@@ -129,6 +137,8 @@ objc2-app-kit = { version = "0.3", features = [
     "NSView",
     "NSWindow",
     "NSButton",
+    "NSAlert",
+    "NSWorkspace",
     "block2",
     "objc2-core-foundation",
 ] }

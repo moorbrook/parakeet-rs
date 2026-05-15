@@ -29,6 +29,23 @@ pub enum TriggerMode {
     Hold,
 }
 
+/// Optional LLM post-processing pass between ASR output and paste. Used to
+/// strip filler words, fix punctuation, and honour inline editing commands
+/// (e.g. "new paragraph", "scratch that").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CleanupMode {
+    /// No post-processing; paste the raw ASR transcript.
+    #[default]
+    Off,
+    /// Call Anthropic's Messages API with `anthropic_api_key` + `cleanup_model`.
+    Anthropic,
+}
+
+fn default_cleanup_model() -> String {
+    "claude-haiku-4-5".to_string()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub hotkey: String,
@@ -37,6 +54,17 @@ pub struct Settings {
     pub inject_mode: String,
     /// Language hint for the recognizer, e.g. "eng_Latn". Empty = autodetect.
     pub language: String,
+    #[serde(default)]
+    pub cleanup_mode: CleanupMode,
+    /// Anthropic API key. **Runtime only** — never persisted to
+    /// settings.json (the `#[serde(skip)]` keeps it out). The on-disk
+    /// home for this is the macOS Keychain via `crate::keychain`; the
+    /// SettingsStore loads it into this field on construction and
+    /// writes it back on save.
+    #[serde(skip)]
+    pub anthropic_api_key: String,
+    #[serde(default = "default_cleanup_model")]
+    pub cleanup_model: String,
 }
 
 impl Default for Settings {
@@ -46,6 +74,9 @@ impl Default for Settings {
             trigger_mode: TriggerMode::default(),
             inject_mode: "paste".to_string(),
             language: String::new(),
+            cleanup_mode: CleanupMode::default(),
+            anthropic_api_key: String::new(),
+            cleanup_model: default_cleanup_model(),
         }
     }
 }
@@ -68,12 +99,20 @@ impl SettingsStore {
         // next to its models.
         std::fs::create_dir_all(&data_dir).context("create data dir")?;
         let settings_path = data_dir.join("settings.json");
-        let cache = if settings_path.exists() {
+        let mut cache = if settings_path.exists() {
             let raw = std::fs::read_to_string(&settings_path)?;
             serde_json::from_str::<Settings>(&raw).unwrap_or_default()
         } else {
             Settings::default()
         };
+        // Hydrate the API key from the Keychain. `#[serde(skip)]` means
+        // we always read it from disk as empty; the Keychain is the
+        // canonical store. A failure here is non-fatal (the user just
+        // sees "no key" in the cleanup section and can re-enter it).
+        match crate::keychain::read_anthropic_key() {
+            Ok(key) => cache.anthropic_api_key = key,
+            Err(e) => log::warn!("reading Anthropic key from Keychain failed: {e:#}"),
+        }
         Ok(Self {
             settings_path,
             data_dir,
@@ -88,8 +127,14 @@ impl SettingsStore {
     #[allow(dead_code)] // Reserved for the future settings-save UI.
     pub fn save(&self, s: &Settings) -> Result<()> {
         *self.cache.lock() = s.clone();
+        // settings.json (no key — `#[serde(skip)]` strips it). Pretty-
+        // printed so it's grep-friendly when debugging.
         let raw = serde_json::to_string_pretty(s)?;
         std::fs::write(&self.settings_path, raw)?;
+        // Keychain (the only durable home for the key). Empty string
+        // deletes the entry — `crate::keychain` handles that.
+        crate::keychain::write_anthropic_key(&s.anthropic_api_key)
+            .context("persisting Anthropic key to Keychain")?;
         Ok(())
     }
 
@@ -213,6 +258,92 @@ mod tests {
         let s: Settings = serde_json::from_str(raw).expect("should ignore unknown keys");
         assert_eq!(s.hotkey, "F5");
         assert_eq!(s.trigger_mode, TriggerMode::Hold);
+    }
+
+    #[test]
+    fn cleanup_defaults_are_off_with_haiku_model() {
+        // The cleanup pass is opt-in: a fresh install costs nothing on the
+        // network. Pin the default so an accidental flip doesn't silently
+        // start billing anyone who upgrades.
+        let s = Settings::default();
+        assert_eq!(s.cleanup_mode, CleanupMode::Off);
+        assert!(s.anthropic_api_key.is_empty());
+        assert_eq!(s.cleanup_model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn cleanup_fields_round_trip_through_json() {
+        let s = Settings {
+            cleanup_mode: CleanupMode::Anthropic,
+            cleanup_model: "claude-sonnet-4-6".into(),
+            ..Settings::default()
+        };
+        let raw = serde_json::to_string(&s).unwrap();
+        // Lowercase enum form, same as TriggerMode.
+        assert!(
+            raw.contains("\"cleanup_mode\":\"anthropic\""),
+            "expected lowercase cleanup_mode, got: {raw}"
+        );
+        let back: Settings = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.cleanup_mode, CleanupMode::Anthropic);
+        assert_eq!(back.cleanup_model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn api_key_never_lands_in_serialised_json() {
+        // The Anthropic API key is a long-lived credential. It MUST NOT
+        // appear in settings.json — the canonical store is the macOS
+        // Keychain. `#[serde(skip)]` is what enforces this; pin it.
+        // If this test ever fails, someone has removed the skip attr
+        // and is about to leak credentials onto every user's disk.
+        let s = Settings {
+            cleanup_mode: CleanupMode::Anthropic,
+            anthropic_api_key: "sk-ant-SHOULD-NOT-APPEAR".into(),
+            ..Settings::default()
+        };
+        let raw = serde_json::to_string(&s).unwrap();
+        assert!(
+            !raw.contains("sk-ant-SHOULD-NOT-APPEAR"),
+            "API key leaked into serialised settings: {raw}"
+        );
+        assert!(
+            !raw.contains("anthropic_api_key"),
+            "API key field leaked into serialised settings: {raw}"
+        );
+        // And: deserialising a file that DID include the field (e.g.
+        // from a pre-Keychain build) must not blow up. serde with
+        // permissive defaults drops it silently.
+        let leaky = r#"{
+            "hotkey": "F5",
+            "trigger_mode": "tap",
+            "inject_mode": "paste",
+            "language": "",
+            "cleanup_mode": "anthropic",
+            "anthropic_api_key": "sk-ant-old-build",
+            "cleanup_model": "claude-haiku-4-5"
+        }"#;
+        let back: Settings = serde_json::from_str(leaky).expect("legacy file should parse");
+        // The legacy key is dropped — it'll have to be re-entered into
+        // the Keychain via the Settings UI.
+        assert!(back.anthropic_api_key.is_empty());
+    }
+
+    #[test]
+    fn missing_cleanup_fields_take_safe_defaults() {
+        // A settings.json from before the cleanup feature existed must
+        // still parse — and importantly, it must come out with cleanup
+        // OFF so an upgrade doesn't silently start sending dictation to
+        // the cloud.
+        let raw = r#"{
+            "hotkey": "CmdOrCtrl+Shift+Space",
+            "trigger_mode": "tap",
+            "inject_mode": "paste",
+            "language": ""
+        }"#;
+        let s: Settings = serde_json::from_str(raw).expect("pre-cleanup file should parse");
+        assert_eq!(s.cleanup_mode, CleanupMode::Off);
+        assert!(s.anthropic_api_key.is_empty());
+        assert_eq!(s.cleanup_model, "claude-haiku-4-5");
     }
 
     #[test]
