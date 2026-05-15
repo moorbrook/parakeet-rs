@@ -6,6 +6,28 @@ authors = ["parakeet-rs"]
 edition = "2021"
 rust-version = "1.77"
 
+# Metadata read by `cargo-bundle` when assembling Parakeet.app.
+# Run `cargo bundle --release` to produce target/release/bundle/osx/Parakeet.app.
+[package.metadata.bundle]
+name = "Parakeet"
+identifier = "com.parakeet.rs"
+icon = ["assets/icon.icns"]
+version = "0.1.0"
+copyright = "Copyright (c) 2026 parakeet-rs"
+category = "Productivity"
+short_description = "Voice-to-text dictation, fully local, Apple Silicon."
+long_description = """
+Press a global hotkey, speak, and Parakeet pastes the transcript at your
+cursor. Powered by NVIDIA Parakeet TDT 0.6B v3 running locally on the
+Apple Neural Engine via sherpa-onnx + CoreML. No cloud, no API keys,
+no network calls after the first-run model download.
+"""
+osx_minimum_system_version = "11.0"
+# cargo-bundle's `osx_info_plist_exts` concatenates rather than merges, which
+# produces a malformed plist with two `<plist>` roots. Custom Info.plist
+# keys (NSMicrophoneUsageDescription, NSAppleEventsUsageDescription,
+# LSUIElement) are stitched in by `scripts/make-app.sh` after bundling.
+
 # Release profile tuned for shipping:
 # - fat LTO + single codegen unit gives the compiler full cross-crate
 #   inlining and dead-code elimination, important since the audio path

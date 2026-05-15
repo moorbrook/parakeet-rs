@@ -1,25 +1,11 @@
 # ---------- Rust ----------
-# Cargo build artifacts. Match at any depth so a nested workspace stays clean.
-# The sherpa-onnx-prebuilt cache (~600 MB of static libs / dylibs) lives here too.
+# Cargo build artifacts. Includes the sherpa-onnx-prebuilt dylib cache
+# (~600 MB) and the `target/release/bundle/osx/Parakeet.app` produced by
+# `scripts/make-app.sh`.
 target/
 **/*.rs.bk
 *.pdb
 *.profraw
-
-# ---------- Tauri ----------
-# Tauri 2 generates per-platform shims here at build time
-src-tauri/gen/
-
-# ---------- bun / Node / Vite ----------
-node_modules/
-dist/
-.npm/
-.pnp.*
-.yarn/
-
-# Vite cache + transform output
-.vite/
-*.tsbuildinfo
 
 # ---------- macOS ----------
 .DS_Store
