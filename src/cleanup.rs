@@ -1,23 +1,27 @@
 //! Optional LLM post-processing pass.
 //!
 //! Sits between `Asr::recognize()` and `paste::deliver()` in the dictation
-//! pipeline. Takes the raw ASR transcript and (when enabled) sends it to a
-//! cloud LLM to:
+//! pipeline. Takes the raw ASR transcript and (when enabled) cleans it
+//! through Claude to:
 //!
 //! - strip filler words (`um`, `uh`, `you know`, `like`),
 //! - fix punctuation and capitalisation,
 //! - honour inline editing commands (`new paragraph`, `scratch that`).
 //!
-//! Cloud path uses Anthropic's Messages API directly (no SDK). The HTTP
-//! call is async — the caller is expected to drive it via the shared tokio
-//! runtime handle stashed on `App`.
+//! **Transport: `claude -p`**, not the Anthropic Messages API. Per project
+//! directive (see [[no-anthropic-api]] in agent memory): no direct API
+//! calls, no `x-api-key`, no separate API-key provisioning. The user's
+//! existing Claude Code OAuth login is what bills the request, and a key
+//! that we don't hold is a key that can't leak.
+
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
-use serde::Deserialize;
 
 use crate::settings::{CleanupMode, Settings};
 
-const SYSTEM_PROMPT: &str = "You clean up raw speech-to-text transcriptions for direct insertion into the user's document. Output only the cleaned text. No preamble, no commentary, no quotes around the output.\n\
+const SYSTEM_PROMPT: &str = "You clean up raw speech-to-text transcriptions for direct insertion into the user's document. Output only the cleaned text. No preamble, no commentary, no quotes around the output, no Markdown formatting.\n\
 \n\
 Rules:\n\
 1. Remove filler words: um, uh, er, ah, like, you know, sort of, kind of, I mean (when used as filler).\n\
@@ -26,89 +30,116 @@ Rules:\n\
 4. Preserve the speaker's meaning, tone, and vocabulary. Do NOT paraphrase, summarise, expand, or 'improve' the content.\n\
 5. Do NOT add information the speaker did not say.\n\
 6. If the input is empty, single-word, or unintelligible, return it unchanged.\n\
-7. Preserve technical terms, names, and code-like fragments exactly as transcribed.";
+7. Preserve technical terms, names, and code-like fragments exactly as transcribed.\n\
+8. Do not call any tools. Output text only.";
 
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// Hard upper bound to keep the bill bounded. A 30-second dictation at
-/// normal speaking speed is ~80 words ≈ ~120 tokens; 2048 leaves plenty of
-/// slack while still capping a runaway response.
-const MAX_TOKENS: u32 = 2048;
+/// `claude -p` startup + model load is ~1-3 s on a warm cache. 30 s is
+/// generous enough to cover a cold cache + a long transcript without
+/// letting a hung subprocess wedge the dictation pipeline forever.
+const SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-pub async fn polish(text: &str, settings: &Settings) -> Result<String> {
+pub fn polish(text: &str, settings: &Settings) -> Result<String> {
     if text.trim().is_empty() {
         return Ok(text.to_string());
     }
     match settings.cleanup_mode {
         CleanupMode::Off => Ok(text.to_string()),
-        CleanupMode::Anthropic => {
-            polish_anthropic(text, &settings.anthropic_api_key, &settings.cleanup_model).await
+        CleanupMode::Claude => polish_via_claude_cli(text, &settings.cleanup_model),
+    }
+}
+
+fn polish_via_claude_cli(text: &str, model: &str) -> Result<String> {
+    let mut child = Command::new("claude")
+        .args([
+            "-p",
+            "--model",
+            model,
+            "--no-session-persistence",
+            "--append-system-prompt",
+            SYSTEM_PROMPT,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow!(
+                    "`claude` CLI not found on PATH. Install Claude Code \
+                     (https://docs.claude.com/en/docs/claude-code) or turn \
+                     Cleanup off in Settings."
+                )
+            } else {
+                anyhow!("spawning `claude -p`: {e}")
+            }
+        })?;
+
+    // Pipe the raw transcript via stdin so we don't have to worry about
+    // shell quoting, argv length limits, or accidentally re-interpreting
+    // the user's spoken `--flag` as a CLI argument.
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("claude subprocess has no stdin pipe"))?;
+        stdin
+            .write_all(text.as_bytes())
+            .context("write transcript to claude stdin")?;
+        // stdin is dropped here, closing the pipe — claude knows we're done.
+    }
+
+    let output = wait_with_timeout(child, SUBPROCESS_TIMEOUT)?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "claude -p exited with {}: {}",
+            output.status,
+            truncate(stderr.trim(), 240)
+        ));
+    }
+
+    let cleaned = String::from_utf8(output.stdout)
+        .context("claude -p stdout was not valid UTF-8")?
+        .trim()
+        .to_string();
+    if cleaned.is_empty() {
+        // Treat empty output as failure — pasting nothing would be worse
+        // than pasting the raw transcript (which the caller falls back to).
+        return Err(anyhow!("claude -p returned an empty response"));
+    }
+    Ok(cleaned)
+}
+
+/// Wait for the subprocess with a wall-clock timeout. `std::process::Child`
+/// has no `wait_timeout` of its own, so poll `try_wait` on a short
+/// interval and kill the child if the budget is exceeded.
+fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait().context("polling claude subprocess")? {
+            Some(_status) => {
+                // Use `wait_with_output` for the captured stdout/stderr —
+                // it internally re-waits, which is fine since the process
+                // has already exited.
+                return child
+                    .wait_with_output()
+                    .context("collecting claude subprocess output");
+            }
+            None if start.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!(
+                    "claude -p timed out after {:.0}s",
+                    timeout.as_secs_f32()
+                ));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
     }
-}
-
-async fn polish_anthropic(text: &str, api_key: &str, model: &str) -> Result<String> {
-    if api_key.is_empty() {
-        return Err(anyhow!(
-            "cleanup mode is Anthropic but no API key is set in Settings"
-        ));
-    }
-    let client = reqwest::Client::builder()
-        .user_agent("parakeet-rs/0.1")
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .context("build reqwest client")?;
-
-    let body = serde_json::json!({
-        "model": model,
-        "max_tokens": MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
-        "messages": [{ "role": "user", "content": text }],
-    });
-
-    let resp = client
-        .post(API_URL)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .context("Anthropic API request failed")?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        // Pull the error body so the menu-bar status surfaces something
-        // useful (e.g. invalid key, model not found, rate limit).
-        let detail = resp.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "Anthropic API {status}: {}",
-            truncate(&detail, 240)
-        ));
-    }
-
-    let parsed: ApiResponse = resp.json().await.context("parse Anthropic response")?;
-    let cleaned: String = parsed
-        .content
-        .into_iter()
-        .filter_map(|c| if c.kind == "text" { Some(c.text) } else { None })
-        .collect::<Vec<_>>()
-        .join("");
-    Ok(cleaned.trim().to_string())
-}
-
-#[derive(Deserialize)]
-struct ApiResponse {
-    content: Vec<ContentBlock>,
-}
-
-#[derive(Deserialize)]
-struct ContentBlock {
-    #[serde(rename = "type")]
-    kind: String,
-    #[serde(default)]
-    text: String,
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -124,53 +155,26 @@ mod tests {
     use super::*;
     use crate::settings::{CleanupMode, Settings};
 
-    fn rt() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    }
-
     #[test]
     fn polish_off_is_identity() {
         let s = Settings {
             cleanup_mode: CleanupMode::Off,
             ..Settings::default()
         };
-        let out = rt().block_on(polish("Hello, world.", &s)).unwrap();
-        assert_eq!(out, "Hello, world.");
+        assert_eq!(polish("Hello, world.", &s).unwrap(), "Hello, world.");
     }
 
     #[test]
-    fn polish_empty_is_identity_even_when_mode_is_anthropic() {
-        // Empty input short-circuits before we hit the network or check the
-        // API key — important because the recogniser can hand us "" for a
-        // failed decode and we don't want to surface a "missing key" error
-        // for what is effectively a no-op.
+    fn polish_empty_is_identity_even_when_mode_is_claude() {
+        // Empty input short-circuits before we'd spawn the subprocess,
+        // which keeps cleanup-mode-on safe against the recogniser
+        // returning "" for a failed decode.
         let s = Settings {
-            cleanup_mode: CleanupMode::Anthropic,
-            anthropic_api_key: String::new(),
+            cleanup_mode: CleanupMode::Claude,
             ..Settings::default()
         };
-        assert_eq!(rt().block_on(polish("", &s)).unwrap(), "");
-        assert_eq!(rt().block_on(polish("   \n  ", &s)).unwrap(), "   \n  ");
-    }
-
-    #[test]
-    fn polish_anthropic_without_key_errors() {
-        let s = Settings {
-            cleanup_mode: CleanupMode::Anthropic,
-            anthropic_api_key: String::new(),
-            ..Settings::default()
-        };
-        let err = rt()
-            .block_on(polish("real transcript", &s))
-            .expect_err("missing key should error");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("API key") || msg.contains("api key"),
-            "error should mention the key: {msg}"
-        );
+        assert_eq!(polish("", &s).unwrap(), "");
+        assert_eq!(polish("   \n  ", &s).unwrap(), "   \n  ");
     }
 
     #[test]
@@ -178,4 +182,10 @@ mod tests {
         assert_eq!(truncate("abc", 10), "abc");
         assert_eq!(truncate("abcdefghij", 5), "abcde…");
     }
+
+    // Note: we don't unit-test the actual subprocess invocation here.
+    // The `claude` CLI talks to the network and bills the user's
+    // account on every call — wrong shape for a unit test. The
+    // integration test is "Set Cleanup = Claude in Settings, dictate
+    // something filler-heavy, watch the paste come out clean."
 }

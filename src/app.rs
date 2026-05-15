@@ -45,10 +45,6 @@ pub struct App {
     /// Lives for the program's lifetime; held here so the Settings UI can
     /// rebind it after the user records a new hotkey combo.
     pub hotkey: Mutex<Option<HotkeyHandle>>,
-    /// Shared handle to the process-wide tokio runtime. Used by the
-    /// synchronous transcribe thread to `block_on` async cleanup HTTP
-    /// calls without spinning up a per-request runtime.
-    pub tokio_handle: Mutex<Option<tokio::runtime::Handle>>,
 }
 
 impl App {
@@ -59,7 +55,6 @@ impl App {
             asr: Mutex::new(None),
             current_state: Mutex::new(DictationState::ModelLoading),
             hotkey: Mutex::new(None),
-            tokio_handle: Mutex::new(None),
         }
     }
 
@@ -177,29 +172,22 @@ impl App {
                     }
                 };
 
-                // Run the cleanup pass if enabled. Failure is non-fatal —
-                // the worst case is "user gets the raw transcript", which
-                // is the same as if cleanup were off. Surface the error in
-                // the menu bar but keep going.
+                // Run the cleanup pass if enabled. Failure is non-fatal
+                // — the worst case is "user gets the raw transcript",
+                // which is the same as if cleanup were off. Surface the
+                // error in the menu bar but keep going.
                 let settings = app.settings.load();
                 let cleaned = if matches!(settings.cleanup_mode, CleanupMode::Off) {
                     raw
                 } else {
                     app.set_state(DictationState::Polishing);
-                    let handle = app.tokio_handle.lock().clone();
-                    match handle {
-                        Some(h) => match h.block_on(cleanup::polish(&raw, &settings)) {
-                            Ok(t) => t,
-                            Err(e) => {
-                                log::error!("cleanup failed: {e:#}");
-                                menubar::set_status_text(&format!(
-                                    "Cleanup failed — using raw transcript ({e})"
-                                ));
-                                raw
-                            }
-                        },
-                        None => {
-                            log::error!("cleanup skipped: tokio handle not installed");
+                    match cleanup::polish(&raw, &settings) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::error!("cleanup failed: {e:#}");
+                            menubar::set_status_text(&format!(
+                                "Cleanup failed — using raw transcript ({e})"
+                            ));
                             raw
                         }
                     }

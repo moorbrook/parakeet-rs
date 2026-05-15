@@ -34,14 +34,15 @@ use crate::app::{glyphs_for_shortcut, is_capslock_token, AppHandle};
 use crate::settings::{CleanupMode, TriggerMode};
 
 const WINDOW_W: f64 = 480.0;
-const WINDOW_H: f64 = 440.0;
+const WINDOW_H: f64 = 400.0;
 const ROW_H: f64 = 26.0;
 const LABEL_W: f64 = 130.0;
 const PAD: f64 = 20.0;
 
 /// Models offered in the cleanup-model popup. Index matches the popup
-/// menu item position; we keep both the user-visible label and the API
-/// model id paired so the order is the only source of truth.
+/// menu item position; we keep both the user-visible label and the model
+/// id passed to `claude --model` paired so the order is the only source
+/// of truth.
 const CLEANUP_MODELS: &[(&str, &str)] = &[
     ("Haiku 4.5 (fast, recommended)", "claude-haiku-4-5"),
     ("Sonnet 4.6 (best quality)", "claude-sonnet-4-6"),
@@ -56,7 +57,6 @@ struct Ivars {
     mode_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     cleanup_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     cleanup_model_popup: RefCell<Option<Retained<NSPopUpButton>>>,
-    api_key_field: RefCell<Option<Retained<NSTextField>>>,
     // No window field. Storing a strong `Retained<NSWindow>` here while
     // the window also held a strong `Retained<SettingsController>` was a
     // textbook retain cycle that prevented either object from ever being
@@ -212,13 +212,9 @@ impl SettingsController {
         }
         if let Some(popup) = self.ivars().cleanup_popup.borrow().as_ref() {
             new.cleanup_mode = match unsafe { popup.indexOfSelectedItem() } {
-                1 => CleanupMode::Anthropic,
+                1 => CleanupMode::Claude,
                 _ => CleanupMode::Off,
             };
-        }
-        if let Some(field) = self.ivars().api_key_field.borrow().as_ref() {
-            let s: Retained<NSString> = unsafe { field.stringValue() };
-            new.anthropic_api_key = s.to_string().trim().to_string();
         }
         if let Some(popup) = self.ivars().cleanup_model_popup.borrow().as_ref() {
             let idx = unsafe { popup.indexOfSelectedItem() };
@@ -262,8 +258,8 @@ impl SettingsController {
         }
     }
 
-    /// Grey out the API key + model picker unless cleanup mode is on.
-    /// Removes the "I typed my key but cleanup is off" footgun.
+    /// Grey out the model picker unless cleanup mode is on. Removes the
+    /// "I picked Sonnet but cleanup is off" footgun.
     fn refresh_cleanup_enabled(&self) {
         let on = match self.ivars().cleanup_popup.borrow().as_ref() {
             Some(popup) => {
@@ -272,9 +268,6 @@ impl SettingsController {
             }
             None => false,
         };
-        if let Some(field) = self.ivars().api_key_field.borrow().as_ref() {
-            unsafe { field.setEnabled(on) };
-        }
         if let Some(popup) = self.ivars().cleanup_model_popup.borrow().as_ref() {
             unsafe { popup.setEnabled(on) };
         }
@@ -458,9 +451,9 @@ pub fn open(mtm: MainThreadMarker) {
     add_label(mtm, &content, "Cleanup", PAD, row4_y);
     let cleanup_popup = make_popup(
         mtm,
-        &["Off — paste raw transcript", "Anthropic Claude"],
+        &["Off — paste raw transcript", "Claude (via claude CLI)"],
         match settings.as_ref().map(|s| s.cleanup_mode) {
-            Some(CleanupMode::Anthropic) => 1,
+            Some(CleanupMode::Claude) => 1,
             _ => 0,
         },
         NSPoint::new(PAD + LABEL_W, row4_y - 4.0),
@@ -473,24 +466,9 @@ pub fn open(mtm: MainThreadMarker) {
     }
     *controller.ivars().cleanup_popup.borrow_mut() = Some(cleanup_popup);
 
-    // --- Row 5: API key (secure text field) -------------------------------
+    // --- Row 5: Model picker ----------------------------------------------
     let row5_y = row4_y - ROW_H - 10.0;
-    add_label(mtm, &content, "API key", PAD, row5_y);
-    let key_field = make_secure_field(
-        mtm,
-        settings
-            .as_ref()
-            .map(|s| s.anthropic_api_key.as_str())
-            .unwrap_or(""),
-        NSPoint::new(PAD + LABEL_W, row5_y - 4.0),
-        NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
-    );
-    unsafe { content.addSubview(&key_field) };
-    *controller.ivars().api_key_field.borrow_mut() = Some(key_field);
-
-    // --- Row 6: Model picker ----------------------------------------------
-    let row6_y = row5_y - ROW_H - 10.0;
-    add_label(mtm, &content, "Model", PAD, row6_y);
+    add_label(mtm, &content, "Model", PAD, row5_y);
     let labels: Vec<&str> = CLEANUP_MODELS.iter().map(|(label, _)| *label).collect();
     let stored_model = settings
         .as_ref()
@@ -504,32 +482,32 @@ pub fn open(mtm: MainThreadMarker) {
         mtm,
         &labels,
         selected_model_idx,
-        NSPoint::new(PAD + LABEL_W, row6_y - 4.0),
+        NSPoint::new(PAD + LABEL_W, row5_y - 4.0),
         NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
     );
     unsafe { content.addSubview(&model_popup) };
     *controller.ivars().cleanup_model_popup.borrow_mut() = Some(model_popup);
 
-    // Initial enabled-state sync: API key + model are greyed out when
-    // cleanup is Off, so a fresh-install user doesn't think they need
-    // to fill them in.
+    // Initial enabled-state sync: the model picker greys out when
+    // cleanup is Off so a fresh-install user doesn't think they need
+    // to set it.
     controller.refresh_cleanup_enabled();
 
-    // --- Row 7: Cleanup hint ----------------------------------------------
-    let row7_y = row6_y - 30.0;
+    // --- Row 6: Cleanup hint ----------------------------------------------
+    let row6_y = row5_y - 30.0;
     add_hint(
         mtm,
         &content,
         "Cleanup removes filler words, fixes punctuation, and honours\n\
-         commands like \"new paragraph\" and \"scratch that\". Your\n\
-         API key is stored in the macOS Keychain, not on disk.",
+         commands like \"new paragraph\" and \"scratch that\". Runs via\n\
+         `claude -p` — install Claude Code and log in to use this.",
         PAD,
-        row7_y - 38.0,
+        row6_y - 38.0,
         WINDOW_W - PAD * 2.0,
         46.0,
     );
 
-    // --- Row 8: Buttons (bottom-right) ------------------------------------
+    // --- Row 7: Buttons (bottom-right) ------------------------------------
     let btn_w = 90.0;
     let btn_h = 28.0;
     let btn_y = PAD;
@@ -618,29 +596,6 @@ fn add_section_label(mtm: MainThreadMarker, parent: &NSView, text: &str, x: f64,
         label.setFont(Some(&font));
         parent.addSubview(&label);
     }
-}
-
-/// NSSecureTextField for the API key. Same metrics as a regular NSTextField
-/// but hides the contents like a password field.
-fn make_secure_field(
-    mtm: MainThreadMarker,
-    initial: &str,
-    origin: NSPoint,
-    size: NSSize,
-) -> Retained<NSTextField> {
-    let frame = NSRect::new(origin, size);
-    let field: Retained<objc2_app_kit::NSSecureTextField> = unsafe {
-        let alloc = objc2_app_kit::NSSecureTextField::alloc(mtm);
-        msg_send![alloc, initWithFrame: frame]
-    };
-    unsafe {
-        field.setStringValue(&NSString::from_str(initial));
-        field.setPlaceholderString(Some(&NSString::from_str("sk-ant-…")));
-    }
-    // Up-cast to NSTextField — the controller's ivars hold the base type so
-    // the same `stringValue` accessor works for both regular and secure.
-    let as_text: Retained<NSTextField> = unsafe { Retained::cast_unchecked(field) };
-    as_text
 }
 
 fn make_button(

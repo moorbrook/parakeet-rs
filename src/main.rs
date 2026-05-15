@@ -18,7 +18,6 @@ mod audio;
 mod cleanup;
 mod hotkey;
 mod hud;
-mod keychain;
 mod menubar;
 mod model_fetch;
 mod objc_util;
@@ -103,16 +102,14 @@ fn main() -> Result<()> {
     // when the user picks a new combo.
     *app.hotkey.lock() = Some(hotkey_handle);
 
-    // Tokio runtime drives the model download + spawn_blocking ASR work
-    // + the cleanup-pass HTTP call. Stash the handle on `App` so the
-    // synchronous transcribe thread can `block_on` the cleanup call
-    // without spinning up a second runtime per dictation.
+    // Tokio runtime drives the model download + spawn_blocking ASR
+    // load. The cleanup pass runs synchronously via `claude -p` and
+    // doesn't need the runtime — see `crate::cleanup`.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("parakeet-tokio")
         .build()
         .context("build tokio runtime")?;
-    *app.tokio_handle.lock() = Some(runtime.handle().clone());
     {
         let app = app.clone();
         runtime.spawn(async move {
