@@ -1,0 +1,49 @@
+# ---------- Rust ----------
+# Cargo build artifacts. Match at any depth so a nested workspace stays clean.
+# The sherpa-onnx-prebuilt cache (~600 MB of static libs / dylibs) lives here too.
+target/
+**/*.rs.bk
+*.pdb
+*.profraw
+
+# ---------- Tauri ----------
+# Tauri 2 generates per-platform shims here at build time
+src-tauri/gen/
+
+# ---------- bun / Node / Vite ----------
+node_modules/
+dist/
+.npm/
+.pnp.*
+.yarn/
+
+# Vite cache + transform output
+.vite/
+*.tsbuildinfo
+
+# ---------- macOS ----------
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# ---------- Editors / IDE ----------
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.#*
+\#*\#
+
+# ---------- Secrets / env ----------
+.env
+.env.*
+!.env.example
+
+# ---------- Logs & temp ----------
+*.log
+.cache/

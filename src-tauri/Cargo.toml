@@ -1,0 +1,89 @@
+[package]
+name = "parakeet-rs"
+version = "0.1.0"
+description = "Voice-to-text dictation on Apple Silicon — Parakeet TDT 0.6B v3, fully local"
+authors = ["parakeet-rs"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "parakeet_rs_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+# Release profile tuned for shipping:
+# - fat LTO + single codegen unit gives the compiler full cross-crate
+#   inlining and dead-code elimination, important since the audio path
+#   crosses several small crates.
+# - panic=abort drops unwinding tables (~few hundred KB).
+# - strip=symbols removes the debug symbol table.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+opt-level = 3
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-store = "2"
+tauri-plugin-clipboard-manager = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+parking_lot = "0.12"
+once_cell = "1"
+
+# Audio capture
+cpal = "0.15"
+
+# Local Parakeet ASR via sherpa-onnx Rust bindings.
+#
+# Linkage = shared (dylib), not static. The upstream static onnxruntime
+# build for osx-arm64 is compiled WITHOUT the CoreML EP (sherpa-onnx
+# defines SHERPA_ONNX_DISABLE_COREML in its static-onnxruntime cmake path).
+# The shared-lib release uses Microsoft's official `libonnxruntime.dylib`,
+# which DOES export `_OrtSessionOptionsAppendExecutionProvider_CoreML`.
+# Verified by inspecting the released archive — see ADR-0012 + ADR-0015.
+sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"] }
+
+# HTTP for first-run model download from Hugging Face.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+bytes = "1"
+
+# Memory-map the model file for ds4-style page-touch warmup.
+memmap2 = "0.9"
+
+# Apple-specific: thread QoS, P-core scheduling.
+libc = "0.2"
+
+# Keystroke / paste injection.
+enigo = "0.3"
+
+# Native SF Symbols rendering for the menu bar tray icon. Pin versions that
+# Tauri 2.11 already pulls in transitively, so we don't drag a second copy.
+objc2 = "0.5"
+objc2-app-kit = { version = "0.2", features = [
+    "NSImage",
+    "NSBitmapImageRep",
+    "NSImageRep",
+    "NSGraphicsContext",
+] }
+objc2-foundation = { version = "0.2", features = [
+    "NSString",
+    "NSGeometry",
+    "NSDictionary",
+    "NSData",
+] }
