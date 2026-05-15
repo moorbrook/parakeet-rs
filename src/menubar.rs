@@ -19,6 +19,8 @@ use objc2_app_kit::{
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
 use crate::app::{AppHandle, DictationState};
+use crate::settings::TriggerMode;
+use crate::settings_ui;
 use crate::sf_symbol;
 
 define_class!(
@@ -35,9 +37,24 @@ define_class!(
     impl MenuController {
         #[unsafe(method(toggleDictation:))]
         fn toggle_dictation(&self, _sender: *mut NSObject) {
+            // Menu clicks always behave like a Tap press — they can't
+            // express a hold/release pair. In Hold mode this means a menu
+            // click starts the session and a second click stops it.
             if let Some(app) = AppHandle::get() {
-                app.on_hotkey();
+                app.on_hotkey_press();
+                // For Hold mode + active session, simulate the release
+                // edge so the menu-click toggle stays sane.
+                if app.session.lock().is_some()
+                    && app.settings.load().trigger_mode == TriggerMode::Hold
+                {
+                    app.on_hotkey_release();
+                }
             }
+        }
+
+        #[unsafe(method(openSettings:))]
+        fn open_settings(&self, _sender: *mut NSObject) {
+            settings_ui::open(self.mtm());
         }
 
         #[unsafe(method(quit:))]
@@ -62,6 +79,7 @@ struct MenuBar {
     status_item: Retained<NSStatusItem>,
     status_header: Retained<NSMenuItem>,
     toggle_item: Retained<NSMenuItem>,
+    mode_item: Retained<NSMenuItem>,
     _controller: Retained<MenuController>,
 }
 
@@ -99,6 +117,7 @@ pub fn install(mtm: MainThreadMarker) -> Result<(), anyhow::Error> {
     let menu = NSMenu::new(mtm);
 
     let status_header = make_menu_item(mtm, "Model: loading…", None, None, false);
+    let mode_item = make_menu_item(mtm, "Mode: Tap (VAD)", None, None, false);
     let separator_1 = NSMenuItem::separatorItem(mtm);
     let toggle_item = make_menu_item(
         mtm,
@@ -108,6 +127,14 @@ pub fn install(mtm: MainThreadMarker) -> Result<(), anyhow::Error> {
         false,
     );
     let separator_2 = NSMenuItem::separatorItem(mtm);
+    let settings_item = make_menu_item(
+        mtm,
+        "Settings…",
+        Some(&controller),
+        Some(sel!(openSettings:)),
+        true,
+    );
+    let separator_3 = NSMenuItem::separatorItem(mtm);
     let quit_item = make_menu_item(
         mtm,
         "Quit Parakeet",
@@ -117,9 +144,12 @@ pub fn install(mtm: MainThreadMarker) -> Result<(), anyhow::Error> {
     );
 
     menu.addItem(&status_header);
+    menu.addItem(&mode_item);
     menu.addItem(&separator_1);
     menu.addItem(&toggle_item);
     menu.addItem(&separator_2);
+    menu.addItem(&settings_item);
+    menu.addItem(&separator_3);
     menu.addItem(&quit_item);
 
     unsafe { status_item.setMenu(Some(&menu)) };
@@ -129,6 +159,7 @@ pub fn install(mtm: MainThreadMarker) -> Result<(), anyhow::Error> {
             status_item,
             status_header,
             toggle_item,
+            mode_item,
             _controller: controller,
         }))
         .map_err(|_| anyhow::anyhow!("MenuBar installed twice"))?;
@@ -164,12 +195,25 @@ fn make_menu_item(
 /// these single-property setters on the status item / menu item are stable
 /// across threads in practice on macOS 14+. (Cleaner alternative: dispatch
 /// through CFRunLoop; not worth the complexity for personal use.)
-pub fn refresh(state: DictationState, asr_ready: bool, shortcut: &str) {
+pub fn refresh(
+    state: DictationState,
+    asr_ready: bool,
+    shortcut: &str,
+    trigger_mode: TriggerMode,
+) {
     let Some(slot) = MENU_BAR.get() else {
         return;
     };
     let mtm = MainThreadMarker::new().unwrap_or_else(|| unsafe { MainThreadMarker::new_unchecked() });
     slot.with(mtm, |bar| {
+        let mode_verb = match trigger_mode {
+            TriggerMode::Tap => "Start",
+            TriggerMode::Hold => "Hold",
+        };
+        let mode_label = match trigger_mode {
+            TriggerMode::Tap => "Mode: Tap (VAD auto-stop)".to_string(),
+            TriggerMode::Hold => "Mode: Hold (release to paste)".to_string(),
+        };
         let (symbol, header_label, toggle_label, toggle_enabled) = match state {
             DictationState::ModelLoading => (
                 "arrow.down.circle",
@@ -184,7 +228,7 @@ pub fn refresh(state: DictationState, asr_ready: bool, shortcut: &str) {
                 } else {
                     "Model: loading…".to_string()
                 },
-                format!("Start Dictation  {shortcut}"),
+                format!("{mode_verb} Dictation  {shortcut}"),
                 asr_ready,
             ),
             DictationState::Listening => (
@@ -207,6 +251,7 @@ pub fn refresh(state: DictationState, asr_ready: bool, shortcut: &str) {
             }
         }
         unsafe { bar.status_header.setTitle(&NSString::from_str(&header_label)) };
+        unsafe { bar.mode_item.setTitle(&NSString::from_str(&mode_label)) };
         unsafe { bar.toggle_item.setTitle(&NSString::from_str(&toggle_label)) };
         bar.toggle_item.setEnabled(toggle_enabled);
     });

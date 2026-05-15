@@ -1,9 +1,10 @@
-//! Press-once / VAD-auto-stop dictation driver.
+//! Dictation-session driver. Two modes:
 //!
-//! Owns the cpal capture, a Silero VAD, and a small state machine that decides
-//! when an utterance is done. The hotkey handler in `lib.rs` calls `start`,
-//! then awaits an `Outcome` on the returned receiver. A second hotkey press
-//! before the VAD fires sends `cancel` and produces `Outcome::Cancelled`.
+//! - **`Mode::VadAutoStop`** (tap-once UX): runs Silero VAD on the capture
+//!   stream and finishes the session when it detects end-of-speech.
+//! - **`Mode::Manual`** (press-and-hold UX): no VAD — the caller decides
+//!   when to stop by calling `Session::finalize()`. Used when the hotkey
+//!   itself defines the speech window.
 
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -19,75 +20,111 @@ use crate::vad::{VAD_SAMPLE_RATE, Vad, WINDOW_SIZE};
 /// If the user starts dictation and says nothing within this window, give up.
 const NO_SPEECH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Hold-mode safety cap: refuse to record longer than this even if the user
+/// keeps the key held. Matches the VAD's `max_speech_duration` so both modes
+/// have the same upper bound on a single utterance.
+const MANUAL_MAX_RECORDING: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Silero VAD watches the stream and ends the session when speech stops.
+    VadAutoStop,
+    /// Caller drives stop explicitly via `Session::finalize()`.
+    Manual,
+}
+
 pub enum Outcome {
     /// End of speech reached. Carries the raw mono samples at the native
     /// capture rate so the ASR can do its own resample / decode.
     Speech { samples: Vec<f32>, sample_rate: u32 },
-    /// User hit the hotkey again before VAD fired.
+    /// User aborted before any audio was eligible to commit.
     Cancelled,
-    /// VAD never saw speech in the timeout window.
+    /// VAD never saw speech in the timeout window (VadAutoStop mode only).
     NoSpeech,
     Error(anyhow::Error),
 }
 
+enum Signal {
+    Cancel,
+    Finalize,
+}
+
 pub struct Session {
-    cancel_tx: Sender<()>,
+    signal_tx: Sender<Signal>,
     pub outcome_rx: Receiver<Outcome>,
     join: Option<JoinHandle<()>>,
 }
 
 impl Session {
+    /// Discard the in-flight recording. Produces `Outcome::Cancelled`.
     pub fn cancel(&self) {
-        let _ = self.cancel_tx.send(());
+        let _ = self.signal_tx.send(Signal::Cancel);
+    }
+
+    /// Stop capture immediately and commit whatever audio we've collected.
+    /// Used by Hold-mode hotkey release. Produces `Outcome::Speech` (or
+    /// `Outcome::Cancelled` if the buffer is empty).
+    pub fn finalize(&self) {
+        let _ = self.signal_tx.send(Signal::Finalize);
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let _ = self.cancel_tx.send(());
+        let _ = self.signal_tx.send(Signal::Cancel);
         if let Some(h) = self.join.take() {
             let _ = h.join();
         }
     }
 }
 
-/// Start a new dictation session. The session keeps running until the VAD
-/// detects end-of-speech, a cancel signal arrives, or `NO_SPEECH_TIMEOUT`
-/// elapses without any detected speech.
-pub fn start(vad_model: &Path) -> Result<Session> {
+/// Start a new dictation session in the given mode. `vad_model` is only
+/// loaded for `Mode::VadAutoStop`; in `Mode::Manual` the path is ignored.
+pub fn start(vad_model: &Path, mode: Mode) -> Result<Session> {
     let (tap_tx, tap_rx) = channel::<Vec<f32>>();
-    let (cancel_tx, cancel_rx) = channel::<()>();
+    let (signal_tx, signal_rx) = channel::<Signal>();
     let (outcome_tx, outcome_rx) = channel::<Outcome>();
 
     let capture = AudioCapture::start_with_tap(tap_tx).context("starting capture")?;
     let sample_rate = capture.sample_rate();
 
-    // Silero is a small RNN — single thread is plenty and avoids contention
-    // with the ASR's CoreML threads. Vad::load reuses sherpa-onnx's pooled
-    // ORT runtime so the cost is just creating the session.
-    let vad = Vad::load(vad_model, 1).context("loading Silero VAD")?;
+    let vad = if matches!(mode, Mode::VadAutoStop) {
+        // Silero is a small RNN — single thread is plenty.
+        Some(Vad::load(vad_model, 1).context("loading Silero VAD")?)
+    } else {
+        None
+    };
 
     let join = std::thread::Builder::new()
-        .name("vad-watcher".into())
+        .name(match mode {
+            Mode::VadAutoStop => "vad-watcher".into(),
+            Mode::Manual => "hold-watcher".into(),
+        })
         .spawn(move || {
-            let outcome = run(capture, vad, sample_rate, tap_rx, cancel_rx);
+            let outcome = match (mode, vad) {
+                (Mode::VadAutoStop, Some(vad)) => {
+                    run_vad(capture, vad, sample_rate, tap_rx, signal_rx)
+                }
+                (Mode::Manual, _) => run_manual(capture, sample_rate, tap_rx, signal_rx),
+                _ => Outcome::Error(anyhow!("invalid mode/vad combination")),
+            };
             let _ = outcome_tx.send(outcome);
         })
-        .context("spawning VAD watcher")?;
+        .context("spawning session watcher")?;
 
     Ok(Session {
-        cancel_tx,
+        signal_tx,
         outcome_rx,
         join: Some(join),
     })
 }
 
-fn run(
+fn run_vad(
     capture: AudioCapture,
     vad: Vad,
     sample_rate: u32,
     tap_rx: Receiver<Vec<f32>>,
-    cancel_rx: Receiver<()>,
+    signal_rx: Receiver<Signal>,
 ) -> Outcome {
     let resampler = match LinearResampler::create(sample_rate as i32, VAD_SAMPLE_RATE) {
         Some(r) => r,
@@ -105,8 +142,11 @@ fn run(
     let mut speech_started_at: Option<Instant> = None;
 
     loop {
-        if cancel_rx.try_recv().is_ok() {
-            return finish(capture, Outcome::Cancelled);
+        match signal_rx.try_recv() {
+            Ok(Signal::Cancel) => return finish(capture, Outcome::Cancelled),
+            // VAD mode treats an explicit finalize the same as VAD-end-of-speech.
+            Ok(Signal::Finalize) => return finish_with_recording(capture),
+            Err(_) => {}
         }
 
         let chunk = match tap_rx.recv_timeout(Duration::from_millis(20)) {
@@ -128,8 +168,6 @@ fn run(
         }
         window_buf.extend_from_slice(&chunk16);
 
-        // Silero expects 512-sample windows at 16 kHz. Drain in window-sized
-        // bites; anything left over stays in `window_buf` for next tick.
         while window_buf.len() >= WINDOW_SIZE as usize {
             let head: Vec<f32> = window_buf.drain(..WINDOW_SIZE as usize).collect();
             vad.accept_waveform(&head);
@@ -142,20 +180,42 @@ fn run(
                     speech_started_at = Some(Instant::now());
                 }
             } else if saw_speech {
-                // Silero only flips back to !detected after its own
-                // min_silence_duration grace period (we configured 150 ms),
-                // so a single false here is already end-of-speech.
                 return finish_with_recording(capture);
             }
 
-            // Safety net: respect max_speech_duration. If Silero hasn't fired
-            // an end-of-speech by then, force a cut.
             if let Some(t) = speech_started_at {
                 if t.elapsed() > Duration::from_secs(crate::vad::MAX_SPEECH_S as u64) {
                     return finish_with_recording(capture);
                 }
             }
         }
+    }
+}
+
+fn run_manual(
+    capture: AudioCapture,
+    _sample_rate: u32,
+    tap_rx: Receiver<Vec<f32>>,
+    signal_rx: Receiver<Signal>,
+) -> Outcome {
+    let session_start = Instant::now();
+    loop {
+        // Check controller signals every tick.
+        match signal_rx.try_recv() {
+            Ok(Signal::Cancel) => return finish(capture, Outcome::Cancelled),
+            Ok(Signal::Finalize) => return finish_with_recording(capture),
+            Err(_) => {}
+        }
+        // Drain the tap so the capture thread doesn't back up its channel.
+        // We don't need the chunks for anything in Manual mode — the audio
+        // is also being accumulated into AudioCapture's internal buffer,
+        // which is what `capture.stop()` returns.
+        while tap_rx.try_recv().is_ok() {}
+
+        if session_start.elapsed() > MANUAL_MAX_RECORDING {
+            return finish_with_recording(capture);
+        }
+        std::thread::sleep(Duration::from_millis(15));
     }
 }
 
@@ -167,6 +227,9 @@ fn finish_with_recording(capture: AudioCapture) -> Outcome {
                 sample_rate,
                 channels,
             } = rec;
+            if samples.is_empty() {
+                return Outcome::Cancelled;
+            }
             let mono = if channels <= 1 {
                 samples
             } else {

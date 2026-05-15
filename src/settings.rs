@@ -18,9 +18,22 @@ use serde::{Deserialize, Serialize};
 /// downloaded under that name still resolve.
 const BUNDLE_NAMESPACE: &str = "com.parakeet.rs";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TriggerMode {
+    /// Tap once to start; Silero VAD detects end-of-speech and auto-pastes.
+    /// A second tap during dictation cancels.
+    #[default]
+    Tap,
+    /// Press and hold to dictate; release to immediately paste. No VAD.
+    Hold,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub hotkey: String,
+    #[serde(default)]
+    pub trigger_mode: TriggerMode,
     pub inject_mode: String,
     /// Language hint for the recognizer, e.g. "eng_Latn". Empty = autodetect.
     pub language: String,
@@ -30,6 +43,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             hotkey: "CmdOrCtrl+Shift+Space".to_string(),
+            trigger_mode: TriggerMode::default(),
             inject_mode: "paste".to_string(),
             language: String::new(),
         }

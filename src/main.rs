@@ -22,6 +22,7 @@ mod paste;
 mod performance;
 mod qos;
 mod settings;
+mod settings_ui;
 mod sf_symbol;
 mod streamer;
 mod vad;
@@ -53,16 +54,19 @@ fn main() -> Result<()> {
     // Status-bar menu (uses sf_symbol::load internally).
     menubar::install(mtm).context("install menu bar")?;
 
-    // Hotkey: a ⌘⇧Space press calls App::on_hotkey.
-    let app_for_hotkey = app.clone();
-    let _hotkey = hotkey::register(
+    // Hotkey: press/release edges call App::on_hotkey_press / on_hotkey_release.
+    // In Tap mode only press matters; in Hold mode release is the commit edge.
+    let app_for_press = app.clone();
+    let app_for_release = app.clone();
+    let hotkey_handle = hotkey::register(
         &app.settings.load().hotkey,
-        Arc::new(move || app_for_hotkey.on_hotkey()),
+        Arc::new(move || app_for_press.on_hotkey_press()),
+        Arc::new(move || app_for_release.on_hotkey_release()),
     )
     .context("register global hotkey")?;
-    // Hold the handle for the program's lifetime by leaking it. Cleaner
-    // than threading a "shutdown" channel into `App` for personal use.
-    std::mem::forget(_hotkey);
+    // Stash the handle in AppState so the Settings UI can call `rebind`
+    // when the user picks a new combo.
+    *app.hotkey.lock() = Some(hotkey_handle);
 
     // Tokio runtime drives the model download + spawn_blocking ASR work.
     let runtime = tokio::runtime::Builder::new_multi_thread()

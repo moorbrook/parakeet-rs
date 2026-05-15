@@ -1,6 +1,7 @@
 //! Top-level coordinator. Owns the recogniser, the active dictation session,
 //! the settings store, and the menubar/hotkey wiring. Talks to AppKit only
-//! through `crate::menubar`; everything else is plain Rust.
+//! through `crate::menubar` and `crate::settings_ui`; everything else is
+//! plain Rust.
 //!
 //! There is exactly one `App` per process. It lives behind an `Arc` inside
 //! the `AppHandle` global so the AppKit menu-action selectors (which can't
@@ -12,11 +13,12 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::asr::Asr;
+use crate::hotkey::HotkeyHandle;
 use crate::menubar;
 use crate::model_fetch::{self, Progress};
-use crate::settings::SettingsStore;
-use crate::streamer::{Outcome, Session};
-use crate::{paste, performance, streamer, warmup};
+use crate::settings::{Settings, SettingsStore, TriggerMode};
+use crate::streamer::{self, Mode as StreamerMode, Outcome, Session};
+use crate::{paste, performance, warmup};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DictationState {
@@ -36,6 +38,9 @@ pub struct App {
     /// Set once the model is downloaded and the recogniser is warm.
     pub asr: Mutex<Option<Arc<Asr>>>,
     pub current_state: Mutex<DictationState>,
+    /// Lives for the program's lifetime; held here so the Settings UI can
+    /// rebind it after the user records a new hotkey combo.
+    pub hotkey: Mutex<Option<HotkeyHandle>>,
 }
 
 impl App {
@@ -45,29 +50,49 @@ impl App {
             settings,
             asr: Mutex::new(None),
             current_state: Mutex::new(DictationState::ModelLoading),
+            hotkey: Mutex::new(None),
         }
     }
 
-    /// Hotkey / menu "Toggle Dictation" entry point. Cancels a running
-    /// session, otherwise starts a new one.
-    pub fn on_hotkey(self: &Arc<Self>) {
+    /// Hotkey-press edge. Behaviour depends on the configured TriggerMode:
+    /// - Tap mode: toggle (start a session, or cancel one in flight).
+    /// - Hold mode: always start a session. Release is the commit edge.
+    pub fn on_hotkey_press(self: &Arc<Self>) {
+        let mode = self.settings.load().trigger_mode;
         let active = self.session.lock().is_some();
-        if active {
-            if let Some(s) = self.session.lock().as_ref() {
-                s.cancel();
+        match (mode, active) {
+            (TriggerMode::Tap, true) => {
+                if let Some(s) = self.session.lock().as_ref() {
+                    s.cancel();
+                }
             }
+            (TriggerMode::Tap, false) => self.start_session(StreamerMode::VadAutoStop),
+            (TriggerMode::Hold, true) => {
+                // Spurious second press while already recording — ignore;
+                // the user is still holding the key from the first edge.
+            }
+            (TriggerMode::Hold, false) => self.start_session(StreamerMode::Manual),
+        }
+    }
+
+    /// Hotkey-release edge. Only meaningful in Hold mode; in Tap mode the
+    /// auto-key-repeat or release noise doesn't change anything.
+    pub fn on_hotkey_release(self: &Arc<Self>) {
+        if self.settings.load().trigger_mode != TriggerMode::Hold {
             return;
         }
-        self.start_session();
+        if let Some(s) = self.session.lock().as_ref() {
+            s.finalize();
+        }
     }
 
-    fn start_session(self: &Arc<Self>) {
+    fn start_session(self: &Arc<Self>, mode: StreamerMode) {
         if self.asr.lock().is_none() {
             log::warn!("hotkey ignored: model still loading");
             return;
         }
         let vad_path = self.settings.vad_path();
-        let session = match streamer::start(&vad_path) {
+        let session = match streamer::start(&vad_path, mode) {
             Ok(s) => s,
             Err(e) => {
                 log::error!("start session failed: {e:#}");
@@ -161,8 +186,23 @@ impl App {
     pub fn refresh_menu(&self) {
         let current = *self.current_state.lock();
         let asr_ready = self.asr.lock().is_some();
-        let shortcut = glyphs_for_shortcut(&self.settings.load().hotkey);
-        menubar::refresh(current, asr_ready, &shortcut);
+        let s = self.settings.load();
+        let shortcut = glyphs_for_shortcut(&s.hotkey);
+        menubar::refresh(current, asr_ready, &shortcut, s.trigger_mode);
+    }
+
+    /// Persist new settings AND apply runtime side-effects (rebinding the
+    /// global hotkey if it changed).
+    pub fn apply_settings(self: &Arc<Self>, new: Settings) -> anyhow::Result<()> {
+        let prev = self.settings.load();
+        self.settings.save(&new)?;
+        if prev.hotkey != new.hotkey {
+            if let Some(handle) = self.hotkey.lock().as_ref() {
+                handle.rebind(&new.hotkey)?;
+            }
+        }
+        self.refresh_menu();
+        Ok(())
     }
 
     /// Run the first-run model download + page-touch + recogniser load +
@@ -259,7 +299,7 @@ impl AppHandle {
 
 /// Render the stored shortcut token as a glyph string for the menu.
 /// `CmdOrCtrl+Shift+Space` → `⌘⇧Space`.
-fn glyphs_for_shortcut(token: &str) -> String {
+pub fn glyphs_for_shortcut(token: &str) -> String {
     let mut mods = String::new();
     let mut key = String::new();
     for part in token.split('+').map(str::trim) {
