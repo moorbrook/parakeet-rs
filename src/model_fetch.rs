@@ -19,7 +19,10 @@ const SILERO_VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 
 /// Parakeet TDT triplet + tokens, all relative to the per-model dir.
-const ASR_FILES: &[&str] = &[
+/// `pub(crate)` so `settings.rs`'s tests can cross-check that this list
+/// stays in sync with the four files `SettingsStore::model_present()`
+/// gates startup on.
+pub(crate) const ASR_FILES: &[&str] = &[
     "tokens.txt",
     "decoder.int8.onnx",
     "joiner.int8.onnx",
@@ -129,4 +132,46 @@ async fn download_to(label: &str, url: &str, dest: &Path, on_progress: &Progress
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Guard rails for the download set. We can't hit the network in a unit
+    //! test, but we *can* pin the upstream URLs (so an accidental edit is
+    //! visible in PR review) and cross-check that the four files we
+    //! download are exactly the four files `Settings::model_present()`
+    //! requires — drift between those lists means a successful first-run
+    //! fetch can still leave the recogniser refusing to load. (That
+    //! cross-check lives in `settings::tests` so it can reach the private
+    //! `SettingsStore` fields.)
+    use super::*;
+
+    #[test]
+    fn hf_repo_url_is_the_canonical_int8_upload() {
+        // Changing this URL means every existing user re-downloads ~640 MB
+        // on their next launch. Catch the change in review, not in prod.
+        assert_eq!(
+            HF_REPO,
+            "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main"
+        );
+    }
+
+    #[test]
+    fn silero_url_is_the_k2_fsa_release_asset() {
+        // sherpa-onnx-bundled Silero VAD model. Mirrored on the project's
+        // own release page (not Hugging Face) so the version is pinned.
+        assert_eq!(
+            SILERO_VAD_URL,
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+        );
+    }
+
+    #[test]
+    fn asr_files_list_has_no_duplicates() {
+        let mut copy: Vec<&&str> = ASR_FILES.iter().collect();
+        copy.sort();
+        let len_before = copy.len();
+        copy.dedup();
+        assert_eq!(len_before, copy.len(), "duplicate entry in ASR_FILES");
+    }
 }
