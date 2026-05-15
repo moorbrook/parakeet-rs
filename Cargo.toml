@@ -81,9 +81,14 @@ memmap2 = "0.9"
 # Apple-specific: thread QoS, P-core scheduling.
 libc = "0.2"
 
-# Global hotkey via Carbon RegisterEventHotKey (the same path Tauri uses
-# under the hood, just without the Tauri wrapper).
-global-hotkey = "0.6"
+# CGEventTap-based global hotkey detector. `core-graphics` gives us
+# `CGEventTap` (HID-level keyboard listening with right-side modifier
+# discrimination), and `core-foundation` gives us the CFRunLoop the tap
+# needs to be attached to. Both are already in our transitive tree via
+# cpal/core-graphics; pinning them direct avoids the "multiple versions"
+# trap and makes the dep relationship explicit.
+core-foundation = "0.10"
+core-graphics = "0.24"
 
 # Clipboard via NSPasteboard.
 arboard = "3"
@@ -97,6 +102,10 @@ enigo = "0.3"
 # same objc2 0.6.x line that other crates in our tree pull in transitively
 # so we don't end up with two copies of the runtime glue.
 objc2 = "0.6"
+# `block2` is needed for the `addGlobalMonitorForEventsMatchingMask:handler:`
+# block-based NSEvent monitor we use to catch media-key (Eject, Play, Vol*,
+# Brightness*) events.
+block2 = "0.6"
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSResponder",
@@ -114,6 +123,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSView",
     "NSWindow",
     "NSButton",
+    "block2",
     "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3", features = [

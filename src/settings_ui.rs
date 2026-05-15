@@ -30,7 +30,7 @@ use objc2_foundation::{
     NSString,
 };
 
-use crate::app::{glyphs_for_shortcut, AppHandle};
+use crate::app::{glyphs_for_shortcut, is_capslock_token, AppHandle};
 use crate::settings::TriggerMode;
 
 const WINDOW_W: f64 = 460.0;
@@ -121,10 +121,14 @@ define_class!(
             let event: &NSEvent = unsafe { &*(event_obj as *const NSEvent) };
             if let Some(token) = ns_event_to_token(event) {
                 let glyphs = glyphs_for_shortcut(&token);
-                *self.ivars().recording_token.borrow_mut() = Some(token);
+                *self.ivars().recording_token.borrow_mut() = Some(token.clone());
                 if let Some(btn) = self.ivars().shortcut_button.borrow().as_ref() {
                     unsafe { btn.setTitle(&NSString::from_str(&glyphs)) };
                 }
+                // Recording a Caps Lock binding flips us into the locked-
+                // Hold UI state so the user understands their Tap/Hold
+                // choice no longer applies.
+                self.refresh_mode_popup_for(&token);
             }
         }
     }
@@ -134,6 +138,24 @@ impl SettingsController {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(Ivars::default());
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// Lock or unlock the trigger-mode popup based on the active binding.
+    /// Caps Lock only fires a single FlagsChanged event per physical tap,
+    /// so Tap vs Hold can't make a meaningful runtime difference — we
+    /// force Hold semantics and visually grey out the choice.
+    fn refresh_mode_popup_for(&self, token: &str) {
+        let Some(popup) = self.ivars().mode_popup.borrow().clone() else {
+            return;
+        };
+        if is_capslock_token(token) {
+            unsafe {
+                popup.selectItemAtIndex(1); // 1 = Hold
+                popup.setEnabled(false);
+            }
+        } else {
+            unsafe { popup.setEnabled(true) };
+        }
     }
 
     fn close_window(&self) {
@@ -163,16 +185,32 @@ define_class!(
     impl RecordingWindow {
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            let ctrl = self.ivars().borrow().clone();
-            if let Some(c) = ctrl {
-                let obj: *const NSEvent = event;
-                let _: () = unsafe {
-                    msg_send![&*c, captureKey: obj as *mut NSObject]
-                };
+            self.forward(event);
+        }
+
+        // Caps Lock arrives via `flagsChanged:`, not `keyDown:`, because
+        // the OS treats it as a modifier toggle. We only forward Caps Lock
+        // specifically (keycode 57) so a user holding Shift while recording
+        // doesn't accidentally commit "Shift" as the binding.
+        #[unsafe(method(flagsChanged:))]
+        fn flags_changed(&self, event: &NSEvent) {
+            let keycode = unsafe { event.keyCode() };
+            if keycode == 57 {
+                self.forward(event);
             }
         }
     }
 );
+
+impl RecordingWindow {
+    fn forward(&self, event: &NSEvent) {
+        let ctrl = self.ivars().borrow().clone();
+        if let Some(c) = ctrl {
+            let obj: *const NSEvent = event;
+            let _: () = unsafe { msg_send![&*c, captureKey: obj as *mut NSObject] };
+        }
+    }
+}
 
 /// Open the Settings window (or focus it if already open).
 pub fn open(mtm: MainThreadMarker) {
@@ -238,16 +276,24 @@ pub fn open(mtm: MainThreadMarker) {
     unsafe { content.addSubview(&popup) };
     *controller.ivars().mode_popup.borrow_mut() = Some(popup);
 
+    // If the persisted binding is Caps Lock, the trigger-mode popup starts
+    // greyed out (locked to Hold). Plain bindings keep the user's choice.
+    if let Some(s) = settings.as_ref() {
+        controller.refresh_mode_popup_for(&s.hotkey);
+    }
+
     // --- Row 3: Hint text --------------------------------------------------
     let row3_y = row2_y - ROW_H - 10.0;
     add_hint(
         mtm,
         &content,
-        "Tap: press once to start, Parakeet stops when you finish speaking.\nHold: press and hold while speaking, release to paste.",
+        "Tap: press once to start, Parakeet stops when you finish speaking.\n\
+         Hold: press and hold while speaking, release to paste.\n\
+         Caps Lock: tap to start, tap again to paste. Trigger mode locked.",
         PAD,
-        row3_y - 30.0,
+        row3_y - 50.0,
         WINDOW_W - PAD * 2.0,
-        40.0,
+        60.0,
     );
 
     // --- Row 4: Buttons (bottom-right) ------------------------------------
@@ -373,11 +419,22 @@ fn make_popup(
     popup
 }
 
-/// Convert an NSEvent.keyDown into our internal `"CmdOrCtrl+Shift+Space"`
-/// token. Returns None for modifier-only events (so holding shift doesn't
-/// commit a half-recorded combo).
+/// Convert an NSEvent into our internal hotkey token. Accepts:
+///   - `KeyDown` → chord token (`CmdOrCtrl+Shift+Space`, `F5`, etc.)
+///   - `FlagsChanged` with keycode 57 → `CapsLock`
+///
+/// Returns None for modifier-only `KeyDown` events (so holding Shift
+/// during recording doesn't commit a half-recorded combo).
 fn ns_event_to_token(event: &NSEvent) -> Option<String> {
-    if unsafe { event.r#type() } != NSEventType::KeyDown {
+    let event_type = unsafe { event.r#type() };
+    // Caps Lock arrives as a FlagsChanged event with keyCode 57.
+    if event_type == NSEventType::FlagsChanged {
+        if unsafe { event.keyCode() } == 57 {
+            return Some("CapsLock".to_string());
+        }
+        return None;
+    }
+    if event_type != NSEventType::KeyDown {
         return None;
     }
     let flags = unsafe { event.modifierFlags() };

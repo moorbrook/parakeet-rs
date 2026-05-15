@@ -56,12 +56,15 @@ fn main() -> Result<()> {
 
     // Hotkey: press/release edges call App::on_hotkey_press / on_hotkey_release.
     // In Tap mode only press matters; in Hold mode release is the commit edge.
+    // `mtm` is required because the NSEvent global monitor for media keys
+    // has to be installed on the main thread.
     let app_for_press = app.clone();
     let app_for_release = app.clone();
     let hotkey_handle = hotkey::register(
         &app.settings.load().hotkey,
         Arc::new(move || app_for_press.on_hotkey_press()),
         Arc::new(move || app_for_release.on_hotkey_release()),
+        mtm,
     )
     .context("register global hotkey")?;
     // Stash the handle in AppState so the Settings UI can call `rebind`

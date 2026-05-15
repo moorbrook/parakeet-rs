@@ -58,7 +58,7 @@ impl App {
     /// - Tap mode: toggle (start a session, or cancel one in flight).
     /// - Hold mode: always start a session. Release is the commit edge.
     pub fn on_hotkey_press(self: &Arc<Self>) {
-        let mode = self.settings.load().trigger_mode;
+        let mode = effective_trigger_mode(&self.settings.load());
         let active = self.session.lock().is_some();
         match (mode, active) {
             (TriggerMode::Tap, true) => {
@@ -78,7 +78,7 @@ impl App {
     /// Hotkey-release edge. Only meaningful in Hold mode; in Tap mode the
     /// auto-key-repeat or release noise doesn't change anything.
     pub fn on_hotkey_release(self: &Arc<Self>) {
-        if self.settings.load().trigger_mode != TriggerMode::Hold {
+        if effective_trigger_mode(&self.settings.load()) != TriggerMode::Hold {
             return;
         }
         if let Some(s) = self.session.lock().as_ref() {
@@ -188,7 +188,11 @@ impl App {
         let asr_ready = self.asr.lock().is_some();
         let s = self.settings.load();
         let shortcut = glyphs_for_shortcut(&s.hotkey);
-        menubar::refresh(current, asr_ready, &shortcut, s.trigger_mode);
+        // Show what we'll actually do, not what the user requested. Caps
+        // Lock forces Hold-mode semantics (tap-to-start, tap-to-stop)
+        // because the OS doesn't surface true press/release events for it.
+        let effective_mode = effective_trigger_mode(&s);
+        menubar::refresh(current, asr_ready, &shortcut, effective_mode);
     }
 
     /// Persist new settings AND apply runtime side-effects (rebinding the
@@ -298,11 +302,23 @@ impl AppHandle {
 }
 
 /// Render the stored shortcut token as a glyph string for the menu.
-/// `CmdOrCtrl+Shift+Space` → `⌘⇧Space`.
+/// Examples:
+///   `CmdOrCtrl+Shift+Space` → `⌘⇧Space`
+///   `CapsLock`              → `⇪`
+///   `Eject`                 → `⏏`
 pub fn glyphs_for_shortcut(token: &str) -> String {
+    let trimmed = token.trim();
+    if !trimmed.contains('+') {
+        match trimmed.to_ascii_lowercase().as_str() {
+            "capslock" | "caps_lock" | "caps-lock" => return "⇪".to_string(),
+            "eject" => return "⏏".to_string(),
+            _ => {} // fall through to chord renderer
+        }
+    }
+
     let mut mods = String::new();
     let mut key = String::new();
-    for part in token.split('+').map(str::trim) {
+    for part in trimmed.split('+').map(str::trim) {
         let g = match part.to_ascii_lowercase().as_str() {
             "cmd" | "command" | "cmdorctrl" | "commandorcontrol" | "super" | "meta" => "⌘",
             "ctrl" | "control" => "⌃",
@@ -322,6 +338,27 @@ pub fn glyphs_for_shortcut(token: &str) -> String {
         mods.push_str(g);
     }
     format!("{mods}{key}")
+}
+
+/// True if the hotkey token names Caps Lock. The CGEventTap surfaces only
+/// one event per physical Caps Lock tap (the modifier toggle), so the
+/// Tap/Hold trigger-mode distinction doesn't apply — `effective_trigger_mode`
+/// forces Hold so the second tap can finalise the session.
+pub fn is_capslock_token(token: &str) -> bool {
+    matches!(
+        token.trim().to_ascii_lowercase().as_str(),
+        "capslock" | "caps_lock" | "caps-lock"
+    )
+}
+
+/// The trigger mode we actually use, after applying the Caps-Lock override.
+/// For every other binding this just returns the stored `trigger_mode`.
+pub fn effective_trigger_mode(s: &Settings) -> TriggerMode {
+    if is_capslock_token(&s.hotkey) {
+        TriggerMode::Hold
+    } else {
+        s.trigger_mode
+    }
 }
 
 fn fmt_bytes(n: u64) -> String {

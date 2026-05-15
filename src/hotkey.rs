@@ -1,140 +1,371 @@
-//! Global hotkey registration via the `global-hotkey` crate, which under
-//! the hood calls `RegisterEventHotKey` on macOS. We expose both press and
-//! release callbacks so the app can implement Hold-to-dictate UX where
-//! `release == paste`.
+//! Global hotkey detection. Two sources cover all the keys we care about:
 //!
-//! Caps Lock is intentionally NOT supported here: macOS surfaces it as a
-//! sticky toggle through Carbon, so `global-hotkey` can't see momentary
-//! down/up events. Real momentary Caps Lock would need a `CGEventTap`;
-//! that's deferred to a follow-up.
+//! 1. **`CGEventTap` at the HID level** sees every regular keyboard event
+//!    (`KeyDown` / `KeyUp` / `FlagsChanged`) with full left/right modifier
+//!    discrimination. Handles chord hotkeys like `⌘⇧Space` and Caps Lock.
+//! 2. **`NSEvent.addGlobalMonitorForEventsMatchingMask:handler:`** sees
+//!    system-defined events (`NSEventType::SystemDefined`, subtype 8 =
+//!    `AuxControlButtons`). Handles media keys like Eject, Play, Vol+/Vol-,
+//!    Brightness, which never appear in CGEvent KeyDown streams.
+//!
+//! **Permissions.** macOS 10.15+ requires the **Input Monitoring** TCC
+//! permission for HID-level taps *and* global NSEvent monitors. The
+//! Accessibility permission we already grab for the ⌘V paste chord is *not*
+//! sufficient. On first launch the user is prompted to allow Parakeet in
+//! System Settings → Privacy & Security → Input Monitoring.
 
+use std::cell::Cell;
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use block2::RcBlock;
+use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
+use core_graphics::event::{
+    CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType, CGKeyCode, EventField, KeyCode,
+};
+use objc2_app_kit::{NSEvent, NSEventMask, NSEventSubtype, NSEventType};
+use objc2_foundation::MainThreadMarker;
 use parking_lot::Mutex;
 
-/// Long-lived hotkey registration. Drop the handle to unregister.
+/// Closure type that the tap fires on press/release edges.
+pub type EventFn = Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// The hotkey can be three shapes today:
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Binding {
+    /// Standard chord — modifier(s) + a non-modifier key, e.g. `⌘⇧Space`.
+    Chord {
+        required_mods: CGEventFlags,
+        main_key: CGKeyCode,
+    },
+    /// Caps Lock as a dictation toggle. Each physical tap of the key flips
+    /// the AlphaShift bit and produces a single `FlagsChanged` event; we
+    /// alternate `on_press` / `on_release` on consecutive taps and swallow
+    /// the event so the system's Caps Lock state never actually toggles.
+    /// (True press-and-hold momentary on Caps Lock would need IOHIDManager;
+    /// the toggle path here matches how Wispr Flow and SuperWhisper do it.)
+    CapsLockToggle,
+    /// The Eject key. Reaches us via the `NSEvent` system-defined monitor
+    /// (subtype 8 = `AUX_CONTROL_BUTTONS`, key type `NX_KEYTYPE_EJECT = 14`).
+    /// Other media keys (Play, Next, Volume, etc.) intentionally aren't
+    /// supported — Parakeet has no use for them as dictation triggers, and
+    /// binding them would steal a system function the user actually wants.
+    Eject,
+}
+
 pub struct HotkeyHandle {
-    manager: GlobalHotKeyManager,
-    current: Mutex<Option<HotKey>>,
+    binding: Arc<Mutex<Binding>>,
 }
 
 impl HotkeyHandle {
-    /// Swap the active hotkey out for a new one. Used by the Settings UI
-    /// after the user records a new combo.
+    /// Swap the active hotkey for a new one. Both the CGEventTap thread and
+    /// the NSEvent monitor read the binding through this shared `Arc<Mutex>`
+    /// on every event, so the change takes effect on the next keypress.
     pub fn rebind(&self, new_spec: &str) -> Result<()> {
-        let new_hk = parse(new_spec).with_context(|| format!("parsing hotkey: {new_spec}"))?;
-        let mut slot = self.current.lock();
-        if let Some(old) = slot.take() {
-            let _ = self.manager.unregister(old);
-        }
-        self.manager
-            .register(new_hk)
-            .context("registering new hotkey")?;
-        *slot = Some(new_hk);
+        let new = parse(new_spec).with_context(|| format!("parsing hotkey: {new_spec}"))?;
+        *self.binding.lock() = new;
         Ok(())
     }
 }
 
-/// Callbacks fired from a background thread when the hotkey press/release
-/// edge crosses. Wrapped in `Arc<dyn Fn(...)>` so they can be cloned cheaply
-/// into the polling thread.
-pub type EventFn = Arc<dyn Fn() + Send + Sync + 'static>;
+static TAP_STARTED: OnceLock<()> = OnceLock::new();
+static NS_MONITOR_INSTALLED: OnceLock<()> = OnceLock::new();
+// The NSEvent monitor handle returned by AppKit isn't `Send` (it's a raw
+// objc reference to a NSCFType), so it can't live in a static. AppKit
+// holds its own strong reference via the monitor's internal list — so as
+// long as we don't drop our handle, the monitor stays installed. We
+// `std::mem::forget` it after install so it stays alive for the program's
+// lifetime without needing a static.
 
-static PUMP_STARTED: OnceLock<()> = OnceLock::new();
-
-/// Register the hotkey and start the background event-pump thread. Returns
-/// a handle that owns the manager; keep it alive for the lifetime of the
-/// program (or call `rebind` to change the hotkey on the fly).
+/// Install both detectors and return a handle. Subsequent calls in the same
+/// process replace the binding rather than spawning new detectors. The
+/// `MainThreadMarker` is required because `NSEvent::addGlobalMonitorFor…`
+/// must be invoked on the main thread.
 pub fn register(
     spec: &str,
     on_press: EventFn,
     on_release: EventFn,
+    mtm: MainThreadMarker,
 ) -> Result<HotkeyHandle> {
-    let manager = GlobalHotKeyManager::new().context("creating GlobalHotKeyManager")?;
-    let hotkey = parse(spec).with_context(|| format!("parsing hotkey: {spec}"))?;
-    manager.register(hotkey).context("registering hotkey")?;
+    let initial = parse(spec).with_context(|| format!("parsing hotkey: {spec}"))?;
+    let binding = Arc::new(Mutex::new(initial));
 
-    // Spawn the event-pump exactly once per process — `GlobalHotKeyEvent::receiver()`
-    // returns a singleton channel that's safe to read from one thread only.
-    if PUMP_STARTED.set(()).is_ok() {
-        let receiver = GlobalHotKeyEvent::receiver();
+    // ---------- 1. CGEventTap thread ----------
+    if TAP_STARTED.set(()).is_ok() {
+        let binding_for_tap = binding.clone();
+        let on_press_for_tap = on_press.clone();
+        let on_release_for_tap = on_release.clone();
         thread::Builder::new()
-            .name("hotkey-pump".into())
-            .spawn(move || loop {
-                while let Ok(event) = receiver.try_recv() {
-                    match event.state {
-                        HotKeyState::Pressed => on_press(),
-                        HotKeyState::Released => on_release(),
-                    }
-                }
-                // 25 ms tick keeps the thread responsive without burning a
-                // core. The Carbon RegisterEventHotKey hook lands events on
-                // the main thread; the receiver channel relays them.
-                thread::sleep(Duration::from_millis(25));
+            .name("hotkey-tap".into())
+            .spawn(move || {
+                crate::qos::set_user_interactive();
+                run_tap(
+                    binding_for_tap,
+                    on_press_for_tap,
+                    on_release_for_tap,
+                );
             })
-            .context("spawning hotkey pump")?;
+            .context("spawn hotkey-tap thread")?;
     }
 
-    Ok(HotkeyHandle {
-        manager,
-        current: Mutex::new(Some(hotkey)),
-    })
+    // ---------- 2. NSEvent system-defined monitor (media keys) ----------
+    if NS_MONITOR_INSTALLED.set(()).is_ok() {
+        install_media_key_monitor(mtm, binding.clone(), on_press, on_release)?;
+    }
+
+    Ok(HotkeyHandle { binding })
 }
 
-/// Parse a token of the form `CmdOrCtrl+Shift+Space` into a `HotKey`. Keep
-/// in lock-step with the strings the menu/glyph rendering produces.
-fn parse(spec: &str) -> Result<HotKey> {
-    let mut mods = Modifiers::empty();
-    let mut code: Option<Code> = None;
-    for raw in spec.split('+').map(str::trim) {
+/// CGEventTap callback runs on its own dedicated thread (we spawn it). The
+/// callback fires the user-supplied closures on each press / release edge.
+fn run_tap(binding: Arc<Mutex<Binding>>, on_press: EventFn, on_release: EventFn) {
+    // Edge-detection state for chord hotkeys. CGEventTap delivers a KeyDown
+    // for every auto-repeat tick; we only want the initial press.
+    let chord_held = Cell::new(false);
+    // Toggle state for Caps Lock. Each FlagsChanged event on Caps Lock
+    // alternates press → release → press → release.
+    let caps_held = Cell::new(false);
+
+    let tap = CGEventTap::new(
+        CGEventTapLocation::HID,
+        CGEventTapPlacement::HeadInsertEventTap,
+        // `Default` mode lets us return `None` from the callback to swallow
+        // events — required to suppress Caps Lock's normal AlphaShift toggle
+        // when CapsLockToggle is the active binding.
+        CGEventTapOptions::Default,
+        vec![
+            CGEventType::KeyDown,
+            CGEventType::KeyUp,
+            CGEventType::FlagsChanged,
+        ],
+        move |_proxy, event_type, event| {
+            let bind = *binding.lock();
+            let flags = event.get_flags();
+            let keycode =
+                event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as CGKeyCode;
+
+            match bind {
+                Binding::Chord {
+                    required_mods,
+                    main_key,
+                } => {
+                    match event_type {
+                        CGEventType::KeyDown
+                            if keycode == main_key
+                                && mods_match(flags, required_mods)
+                                && !chord_held.get() =>
+                        {
+                            chord_held.set(true);
+                            on_press();
+                        }
+                        CGEventType::KeyUp if keycode == main_key && chord_held.get() => {
+                            chord_held.set(false);
+                            on_release();
+                        }
+                        _ => {}
+                    }
+                    Some(event.clone())
+                }
+                Binding::CapsLockToggle => {
+                    if matches!(event_type, CGEventType::FlagsChanged)
+                        && keycode == KeyCode::CAPS_LOCK
+                    {
+                        if caps_held.get() {
+                            caps_held.set(false);
+                            on_release();
+                        } else {
+                            caps_held.set(true);
+                            on_press();
+                        }
+                        // Swallow the event so the OS-level AlphaShift state
+                        // doesn't toggle. Caps Lock effectively becomes our
+                        // private dictation key.
+                        None
+                    } else {
+                        Some(event.clone())
+                    }
+                }
+                Binding::Eject => Some(event.clone()),
+            }
+        },
+    );
+
+    let tap = match tap {
+        Ok(t) => t,
+        Err(_) => {
+            log::error!(
+                "CGEventTap::new failed — usually means the Input Monitoring \
+                 permission hasn't been granted. Open System Settings → \
+                 Privacy & Security → Input Monitoring and enable Parakeet, \
+                 then relaunch."
+            );
+            return;
+        }
+    };
+
+    let loop_source = match tap.mach_port.create_runloop_source(0) {
+        Ok(s) => s,
+        Err(_) => {
+            log::error!("create_runloop_source failed; hotkey detector inactive");
+            return;
+        }
+    };
+    let current = CFRunLoop::get_current();
+    unsafe { current.add_source(&loop_source, kCFRunLoopCommonModes) };
+    tap.enable();
+    log::info!("hotkey tap active (CGEventTap at HID level)");
+    CFRunLoop::run_current(); // blocks forever
+}
+
+/// NSEvent global monitor for media keys. Runs callbacks on the main thread.
+fn install_media_key_monitor(
+    _mtm: MainThreadMarker,
+    binding: Arc<Mutex<Binding>>,
+    on_press: EventFn,
+    on_release: EventFn,
+) -> Result<()> {
+    // Per-monitor edge-detection state for media key auto-repeat.
+    let media_held = Arc::new(Mutex::new(false));
+
+    let media_held_for_block = media_held.clone();
+    let block = RcBlock::new(move |event: NonNull<NSEvent>| {
+        let event: &NSEvent = unsafe { event.as_ref() };
+        if unsafe { event.r#type() } != NSEventType::SystemDefined {
+            return;
+        }
+        // Subtype 8 (= NSEventSubtype::ScreenChanged numerically; the same
+        // integer value is `NX_SUBTYPE_AUX_CONTROL_BUTTONS` when the event
+        // is SystemDefined — Apple's constants are overloaded by integer).
+        if unsafe { event.subtype() } != NSEventSubtype::ScreenChanged {
+            return;
+        }
+        let data1 = unsafe { event.data1() };
+        let keytype = ((data1 & 0xFFFF_0000) >> 16) as i32;
+        let keystate = ((data1 & 0xFF00) >> 8) as i32;
+        let is_down = keystate == 0x0A; // NX_KEYDOWN
+
+        let bind = *binding.lock();
+        // Only the Eject binding cares about system-defined events today.
+        if !matches!(bind, Binding::Eject) {
+            return;
+        }
+        // NX_KEYTYPE_EJECT = 14
+        if keytype != 14 {
+            return;
+        }
+
+        let mut held = media_held_for_block.lock();
+        if is_down && !*held {
+            *held = true;
+            on_press();
+        } else if !is_down && *held {
+            *held = false;
+            on_release();
+        }
+    });
+
+    // SAFETY: The block is `'static` (closure captures only owned `Arc`s).
+    // AppKit retains the block internally, so it lives as long as the
+    // monitor is registered. We hold the returned handle to keep the
+    // monitor alive for the program's life.
+    let handle = unsafe {
+        NSEvent::addGlobalMonitorForEventsMatchingMask_handler(NSEventMask::SystemDefined, &block)
+    };
+    let Some(handle) = handle else {
+        log::warn!(
+            "NSEvent global monitor install returned nil — Input Monitoring \
+             permission probably not granted yet. Media-key bindings will be inert."
+        );
+        return Ok(());
+    };
+
+    // Leak the handle to keep the monitor alive for the program's life.
+    // Dropping it would call `removeMonitor:` and stop our media-key
+    // detection.
+    std::mem::forget(handle);
+    log::info!("media-key monitor active (NSEvent global, system-defined)");
+    Ok(())
+}
+
+/// Side-agnostic modifier match. The required modifier bits must all be set
+/// on the event; AlphaShift (Caps Lock state), NumericPad, Help, SecondaryFn
+/// and the NonCoalesced bit don't disqualify a chord.
+fn mods_match(actual: CGEventFlags, required: CGEventFlags) -> bool {
+    let mod_mask = CGEventFlags::CGEventFlagShift
+        | CGEventFlags::CGEventFlagControl
+        | CGEventFlags::CGEventFlagAlternate
+        | CGEventFlags::CGEventFlagCommand;
+    (actual & mod_mask) == (required & mod_mask)
+}
+
+/// Parse a token of the form `CmdOrCtrl+Shift+Space`, or a single bare key
+/// name like `CapsLock`, `Eject`, `F5`, `Space`.
+pub fn parse(spec: &str) -> Result<Binding> {
+    let trimmed = spec.trim();
+    if !trimmed.contains('+') {
+        match trimmed.to_ascii_lowercase().as_str() {
+            "capslock" | "caps_lock" | "caps-lock" => return Ok(Binding::CapsLockToggle),
+            "eject" => return Ok(Binding::Eject),
+            _ => {} // fall through to chord parser
+        }
+    }
+
+    let mut required_mods = CGEventFlags::empty();
+    let mut main_key: Option<CGKeyCode> = None;
+    for raw in trimmed.split('+').map(str::trim) {
         match raw.to_ascii_lowercase().as_str() {
             "cmd" | "command" | "cmdorctrl" | "commandorcontrol" | "super" | "meta" => {
-                mods |= Modifiers::META
+                required_mods |= CGEventFlags::CGEventFlagCommand
             }
-            "ctrl" | "control" => mods |= Modifiers::CONTROL,
-            "alt" | "option" => mods |= Modifiers::ALT,
-            "shift" => mods |= Modifiers::SHIFT,
+            "ctrl" | "control" => required_mods |= CGEventFlags::CGEventFlagControl,
+            "alt" | "option" => required_mods |= CGEventFlags::CGEventFlagAlternate,
+            "shift" => required_mods |= CGEventFlags::CGEventFlagShift,
             other => {
-                code = Some(match other {
-                    "space" => Code::Space,
-                    "enter" | "return" => Code::Enter,
-                    "tab" => Code::Tab,
-                    "esc" | "escape" => Code::Escape,
-                    "backspace" => Code::Backspace,
-                    "f1" => Code::F1, "f2" => Code::F2, "f3" => Code::F3,
-                    "f4" => Code::F4, "f5" => Code::F5, "f6" => Code::F6,
-                    "f7" => Code::F7, "f8" => Code::F8, "f9" => Code::F9,
-                    "f10" => Code::F10, "f11" => Code::F11, "f12" => Code::F12,
-                    "f13" => Code::F13, "f14" => Code::F14, "f15" => Code::F15,
-                    "f16" => Code::F16, "f17" => Code::F17, "f18" => Code::F18,
-                    "f19" => Code::F19,
-                    s if s.len() == 1 => match s.chars().next().unwrap().to_ascii_lowercase() {
-                        'a' => Code::KeyA, 'b' => Code::KeyB, 'c' => Code::KeyC,
-                        'd' => Code::KeyD, 'e' => Code::KeyE, 'f' => Code::KeyF,
-                        'g' => Code::KeyG, 'h' => Code::KeyH, 'i' => Code::KeyI,
-                        'j' => Code::KeyJ, 'k' => Code::KeyK, 'l' => Code::KeyL,
-                        'm' => Code::KeyM, 'n' => Code::KeyN, 'o' => Code::KeyO,
-                        'p' => Code::KeyP, 'q' => Code::KeyQ, 'r' => Code::KeyR,
-                        's' => Code::KeyS, 't' => Code::KeyT, 'u' => Code::KeyU,
-                        'v' => Code::KeyV, 'w' => Code::KeyW, 'x' => Code::KeyX,
-                        'y' => Code::KeyY, 'z' => Code::KeyZ,
-                        '0' => Code::Digit0, '1' => Code::Digit1, '2' => Code::Digit2,
-                        '3' => Code::Digit3, '4' => Code::Digit4, '5' => Code::Digit5,
-                        '6' => Code::Digit6, '7' => Code::Digit7, '8' => Code::Digit8,
-                        '9' => Code::Digit9,
-                        c => return Err(anyhow!("unsupported single-char key: {c}")),
-                    },
-                    other => return Err(anyhow!("unsupported key token: {other}")),
-                });
+                main_key = Some(parse_key(other)?);
             }
         }
     }
-    let code = code.ok_or_else(|| anyhow!("hotkey missing a key"))?;
-    Ok(HotKey::new(Some(mods), code))
+    let main_key =
+        main_key.ok_or_else(|| anyhow!("hotkey missing a key (no non-modifier component)"))?;
+    Ok(Binding::Chord {
+        required_mods,
+        main_key,
+    })
+}
+
+fn parse_key(s: &str) -> Result<CGKeyCode> {
+    Ok(match s {
+        "space" => KeyCode::SPACE,
+        "enter" | "return" => KeyCode::RETURN,
+        "tab" => KeyCode::TAB,
+        "esc" | "escape" => KeyCode::ESCAPE,
+        "backspace" | "delete" => KeyCode::DELETE,
+        "f1" => KeyCode::F1, "f2" => KeyCode::F2, "f3" => KeyCode::F3,
+        "f4" => KeyCode::F4, "f5" => KeyCode::F5, "f6" => KeyCode::F6,
+        "f7" => KeyCode::F7, "f8" => KeyCode::F8, "f9" => KeyCode::F9,
+        "f10" => KeyCode::F10, "f11" => KeyCode::F11, "f12" => KeyCode::F12,
+        "f13" => KeyCode::F13, "f14" => KeyCode::F14, "f15" => KeyCode::F15,
+        "f16" => KeyCode::F16, "f17" => KeyCode::F17, "f18" => KeyCode::F18,
+        "f19" => KeyCode::F19, "f20" => KeyCode::F20,
+        // Bare letter / digit / punctuation keys map to Carbon virtual
+        // keycodes from HIToolbox/Events.h. Inline since core-graphics
+        // `KeyCode` only exposes constants for special keys.
+        "a" => 0x00, "s" => 0x01, "d" => 0x02, "f" => 0x03,
+        "h" => 0x04, "g" => 0x05, "z" => 0x06, "x" => 0x07,
+        "c" => 0x08, "v" => 0x09, "b" => 0x0B, "q" => 0x0C,
+        "w" => 0x0D, "e" => 0x0E, "r" => 0x0F, "y" => 0x10,
+        "t" => 0x11, "1" => 0x12, "2" => 0x13, "3" => 0x14,
+        "4" => 0x15, "6" => 0x16, "5" => 0x17, "=" => 0x18,
+        "9" => 0x19, "7" => 0x1A, "-" => 0x1B, "8" => 0x1C,
+        "0" => 0x1D, "]" => 0x1E, "o" => 0x1F, "u" => 0x20,
+        "[" => 0x21, "i" => 0x22, "p" => 0x23, "l" => 0x25,
+        "j" => 0x26, "'" => 0x27, "k" => 0x28, ";" => 0x29,
+        "\\" => 0x2A, "," => 0x2B, "/" => 0x2C, "n" => 0x2D,
+        "m" => 0x2E, "." => 0x2F, "`" => 0x32,
+        other => return Err(anyhow!("unsupported key token: {other}")),
+    })
 }
