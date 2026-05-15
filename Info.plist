@@ -8,5 +8,10 @@
   <string>Parakeet uses Accessibility to paste transcribed text into the focused window.</string>
   <key>LSUIElement</key>
   <true/>
+  <!-- CFBundleIconFile names the .icns inside Contents/Resources/ when
+       we eventually ship a .app bundle. The `.icns` extension is omitted
+       per Apple's convention. -->
+  <key>CFBundleIconFile</key>
+  <string>icon</string>
 </dict>
 </plist>
