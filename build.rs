@@ -29,10 +29,8 @@ fn main() {
         // bare `cargo run` works without first copying dylibs alongside
         // the binary. Used as a fallback only — production .app bundles
         // ship the dylibs in Contents/Frameworks.
-        if let Some(dir) = locate_libonnxruntime().and_then(|p| {
-            p.parent()
-                .map(|p| p.to_path_buf())
-        }) {
+        if let Some(dir) = locate_libonnxruntime().and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
         }
     }

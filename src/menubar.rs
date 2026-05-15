@@ -9,8 +9,9 @@
 //! forwards each action to the singleton `App` registered in `app::AppHandle`,
 //! so the AppKit runtime doesn't have to carry any Rust state.
 
-use std::sync::OnceLock;
+use std::cell::RefCell;
 
+use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
@@ -83,24 +84,40 @@ struct MenuBar {
     _controller: Retained<MenuController>,
 }
 
-// SAFETY: All AppKit interaction goes through `with_main`, which gates
-// access on a fresh `MainThreadMarker`. The wrapper itself never moves the
-// `Retained<...>` handles off-thread.
-struct MainOnly<T>(parking_lot::Mutex<Option<T>>);
+// The `MenuBar` holds AppKit objects that aren't `Send` and must only be
+// mutated from the main thread. A `thread_local!` slot keeps the storage
+// in the main thread's TLS; the public `refresh` / `set_status_text`
+// entry points either run the work inline (when already on main) or
+// bounce it onto main via GCD before touching anything.
+//
+// The previous design fabricated a `MainThreadMarker` with `new_unchecked()`
+// from off-main callers and gated access through a `Mutex<Option<MenuBar>>`
+// with manual `Send` / `Sync` impls — Undefined Behaviour as far as AppKit
+// is concerned, even if it survived in practice on recent macOS releases.
+thread_local! {
+    static MENU_BAR: RefCell<Option<MenuBar>> = const { RefCell::new(None) };
+}
 
-unsafe impl<T> Send for MainOnly<T> {}
-unsafe impl<T> Sync for MainOnly<T> {}
-
-impl<T> MainOnly<T> {
-    fn new(v: T) -> Self {
-        Self(parking_lot::Mutex::new(Some(v)))
-    }
-    fn with<R>(&self, _mtm: MainThreadMarker, f: impl FnOnce(&mut T) -> R) -> Option<R> {
-        self.0.lock().as_mut().map(f)
+/// Run `f` on the main thread, either immediately (if we're already on
+/// main) or by enqueueing onto the main dispatch queue.
+fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
+    if MainThreadMarker::new().is_some() {
+        f();
+    } else {
+        DispatchQueue::main().exec_async(f);
     }
 }
 
-static MENU_BAR: OnceLock<MainOnly<MenuBar>> = OnceLock::new();
+/// Run `f` on the main thread with a usable `MainThreadMarker`. The
+/// argument-taking variant avoids the impl-Trait dance for callers that
+/// also need to capture state by `Send` `'static`.
+fn on_main<F: FnOnce(MainThreadMarker) + Send + 'static>(f: F) {
+    dispatch_to_main(move || {
+        let mtm =
+            MainThreadMarker::new().expect("dispatch_to_main ran the closure off the main thread");
+        f(mtm);
+    });
+}
 
 pub fn install(mtm: MainThreadMarker) -> Result<(), anyhow::Error> {
     let bar = NSStatusBar::systemStatusBar();
@@ -154,16 +171,19 @@ pub fn install(mtm: MainThreadMarker) -> Result<(), anyhow::Error> {
 
     unsafe { status_item.setMenu(Some(&menu)) };
 
-    MENU_BAR
-        .set(MainOnly::new(MenuBar {
+    MENU_BAR.with(|slot| {
+        if slot.borrow().is_some() {
+            return Err(anyhow::anyhow!("MenuBar installed twice"));
+        }
+        *slot.borrow_mut() = Some(MenuBar {
             status_item,
             status_header,
             toggle_item,
             mode_item,
             _controller: controller,
-        }))
-        .map_err(|_| anyhow::anyhow!("MenuBar installed twice"))?;
-    Ok(())
+        });
+        Ok(())
+    })
 }
 
 fn make_menu_item(
@@ -191,21 +211,25 @@ fn make_menu_item(
 }
 
 /// Refresh icon + labels for the given app state. Safe to call from any
-/// thread; if invoked off-main we use an unchecked main-thread marker since
-/// these single-property setters on the status item / menu item are stable
-/// across threads in practice on macOS 14+. (Cleaner alternative: dispatch
-/// through CFRunLoop; not worth the complexity for personal use.)
-pub fn refresh(
+/// thread; the actual AppKit work happens on the main queue.
+pub fn refresh(state: DictationState, asr_ready: bool, shortcut: &str, trigger_mode: TriggerMode) {
+    let shortcut = shortcut.to_string();
+    on_main(move |mtm| refresh_on_main(mtm, state, asr_ready, &shortcut, trigger_mode));
+}
+
+fn refresh_on_main(
+    mtm: MainThreadMarker,
     state: DictationState,
     asr_ready: bool,
     shortcut: &str,
     trigger_mode: TriggerMode,
 ) {
-    let Some(slot) = MENU_BAR.get() else {
-        return;
-    };
-    let mtm = MainThreadMarker::new().unwrap_or_else(|| unsafe { MainThreadMarker::new_unchecked() });
-    slot.with(mtm, |bar| {
+    MENU_BAR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(bar) = slot.as_mut() else {
+            return;
+        };
+
         let mode_verb = match trigger_mode {
             TriggerMode::Tap => "Start",
             TriggerMode::Hold => "Hold",
@@ -250,7 +274,10 @@ pub fn refresh(
                 unsafe { button.setImage(Some(&img)) };
             }
         }
-        unsafe { bar.status_header.setTitle(&NSString::from_str(&header_label)) };
+        unsafe {
+            bar.status_header
+                .setTitle(&NSString::from_str(&header_label))
+        };
         unsafe { bar.mode_item.setTitle(&NSString::from_str(&mode_label)) };
         unsafe { bar.toggle_item.setTitle(&NSString::from_str(&toggle_label)) };
         bar.toggle_item.setEnabled(toggle_enabled);
@@ -258,11 +285,12 @@ pub fn refresh(
 }
 
 pub fn set_status_text(text: &str) {
-    let Some(slot) = MENU_BAR.get() else {
-        return;
-    };
-    let mtm = MainThreadMarker::new().unwrap_or_else(|| unsafe { MainThreadMarker::new_unchecked() });
-    slot.with(mtm, |bar| {
-        unsafe { bar.status_header.setTitle(&NSString::from_str(text)) };
+    let text = text.to_string();
+    on_main(move |_mtm| {
+        MENU_BAR.with(|slot| {
+            if let Some(bar) = slot.borrow_mut().as_mut() {
+                unsafe { bar.status_header.setTitle(&NSString::from_str(&text)) };
+            }
+        });
     });
 }

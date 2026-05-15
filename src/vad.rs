@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 
 /// Silero operates at 16 kHz natively.
@@ -69,5 +69,4 @@ impl Vad {
             self.inner.pop();
         }
     }
-
 }

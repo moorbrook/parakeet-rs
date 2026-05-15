@@ -9,11 +9,12 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
 
-const HF_REPO: &str = "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main";
+const HF_REPO: &str =
+    "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main";
 const SILERO_VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
 
@@ -82,12 +83,7 @@ pub async fn ensure_model(
     Ok(())
 }
 
-async fn download_to(
-    label: &str,
-    url: &str,
-    dest: &Path,
-    on_progress: &ProgressFn,
-) -> Result<()> {
+async fn download_to(label: &str, url: &str, dest: &Path, on_progress: &ProgressFn) -> Result<()> {
     let tmp = dest.with_extension("part");
     let client = reqwest::Client::builder()
         .user_agent("parakeet-rs/0.1")

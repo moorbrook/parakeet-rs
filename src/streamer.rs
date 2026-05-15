@@ -7,15 +7,15 @@
 //!   itself defines the speech window.
 
 use std::path::Path;
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use sherpa_onnx::LinearResampler;
 
 use crate::audio::{AudioCapture, Recording};
-use crate::vad::{VAD_SAMPLE_RATE, Vad, WINDOW_SIZE};
+use crate::vad::{Vad, VAD_SAMPLE_RATE, WINDOW_SIZE};
 
 /// If the user starts dictation and says nothing within this window, give up.
 const NO_SPEECH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,7 +36,10 @@ pub enum Mode {
 pub enum Outcome {
     /// End of speech reached. Carries the raw mono samples at the native
     /// capture rate so the ASR can do its own resample / decode.
-    Speech { samples: Vec<f32>, sample_rate: u32 },
+    Speech {
+        samples: Vec<f32>,
+        sample_rate: u32,
+    },
     /// User aborted before any audio was eligible to commit.
     Cancelled,
     /// VAD never saw speech in the timeout window (VadAutoStop mode only).

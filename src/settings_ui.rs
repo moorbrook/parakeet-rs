@@ -26,8 +26,7 @@ use objc2_app_kit::{
     NSWindowStyleMask,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize,
-    NSString,
+    MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
 };
 
 use crate::app::{glyphs_for_shortcut, is_capslock_token, AppHandle};
@@ -46,7 +45,37 @@ struct Ivars {
     recording_token: RefCell<Option<String>>,
     shortcut_button: RefCell<Option<Retained<NSButton>>>,
     mode_popup: RefCell<Option<Retained<NSPopUpButton>>>,
-    window: RefCell<Option<Retained<NSWindow>>>,
+    // No window field. Storing a strong `Retained<NSWindow>` here while
+    // the window also held a strong `Retained<SettingsController>` was a
+    // textbook retain cycle that prevented either object from ever being
+    // freed. Both lifetimes are now owned by `LIVE_SETTINGS` (a single
+    // thread-local on the main thread) and routed through helpers.
+}
+
+/// Single-instance handle to the live settings window + its controller.
+/// Held in a `thread_local!` because both objects are AppKit and must only
+/// be touched from the main thread — that constraint also makes the
+/// "exactly one instance" semantics automatic.
+struct LiveSettings {
+    controller: Retained<SettingsController>,
+    window: Retained<RecordingWindow>,
+}
+
+thread_local! {
+    static LIVE_SETTINGS: RefCell<Option<LiveSettings>> = const { RefCell::new(None) };
+}
+
+fn with_live_controller<R>(f: impl FnOnce(&SettingsController) -> R) -> Option<R> {
+    LIVE_SETTINGS.with(|slot| slot.borrow().as_ref().map(|l| f(&l.controller)))
+}
+
+fn drop_live_settings() {
+    LIVE_SETTINGS.with(|slot| {
+        // Drop both handles in one shot — taking out of the RefCell first
+        // so any windowWillClose callback re-entrant through here finds an
+        // empty slot and short-circuits.
+        let _ = slot.borrow_mut().take();
+    });
 }
 
 define_class!(
@@ -61,9 +90,10 @@ define_class!(
     unsafe impl NSWindowDelegate for SettingsController {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _note: &NSNotification) {
-            // Release our retained window so the app doesn't keep it alive
-            // after the close button is clicked.
-            *self.ivars().window.borrow_mut() = None;
+            // Drop the live-settings handle so both the controller and the
+            // window (which would otherwise be held alive by the static
+            // slot) can be deallocated.
+            drop_live_settings();
         }
     }
 
@@ -159,25 +189,30 @@ impl SettingsController {
     }
 
     fn close_window(&self) {
-        // Take ownership of the Retained out of the RefCell *before* calling
-        // `close()`. NSWindow::close fires `windowWillClose` synchronously,
-        // which calls back into our delegate and tries to clear the same
-        // RefCell. Holding an immutable borrow across that call panics with
-        // `BorrowMutError` — exactly the crash we saw on Save.
-        let w = self.ivars().window.borrow_mut().take();
-        if let Some(w) = w {
-            unsafe { w.close() };
+        // Take the live-settings handle out of the thread-local FIRST so
+        // the windowWillClose callback that fires synchronously from
+        // `NSWindow::close` finds an empty slot and skips its own cleanup
+        // (avoids re-entrancy on the same RefCell).
+        let live = LIVE_SETTINGS.with(|slot| slot.borrow_mut().take());
+        if let Some(live) = live {
+            unsafe { live.window.close() };
+            // `live` drops here; the controller + window both deallocate.
         }
     }
 }
 
-// A custom NSWindow that forwards keyDown events to the SettingsController
-// during shortcut recording. AppKit normally swallows un-targeted keys, so
-// we hook them at the window level.
+// A custom NSWindow that forwards keyDown / flagsChanged events to the
+// active SettingsController during shortcut recording. AppKit normally
+// swallows un-targeted keys, so we hook them at the window level.
+//
+// Critically: this subclass does NOT hold a strong reference to the
+// controller. It reads the controller from `LIVE_SETTINGS` on each
+// event. Storing the controller here strongly was half of the retain
+// cycle that previously kept windows alive after close.
 define_class!(
     #[unsafe(super = NSWindow)]
     #[thread_kind = MainThreadOnly]
-    #[ivars = RefCell<Option<Retained<SettingsController>>>]
+    #[ivars = ()]
     struct RecordingWindow;
 
     unsafe impl NSObjectProtocol for RecordingWindow {}
@@ -185,7 +220,7 @@ define_class!(
     impl RecordingWindow {
         #[unsafe(method(keyDown:))]
         fn key_down(&self, event: &NSEvent) {
-            self.forward(event);
+            forward_to_live_controller(event);
         }
 
         // Caps Lock arrives via `flagsChanged:`, not `keyDown:`, because
@@ -196,33 +231,43 @@ define_class!(
         fn flags_changed(&self, event: &NSEvent) {
             let keycode = unsafe { event.keyCode() };
             if keycode == 57 {
-                self.forward(event);
+                forward_to_live_controller(event);
             }
         }
     }
 );
 
-impl RecordingWindow {
-    fn forward(&self, event: &NSEvent) {
-        let ctrl = self.ivars().borrow().clone();
-        if let Some(c) = ctrl {
-            let obj: *const NSEvent = event;
-            let _: () = unsafe { msg_send![&*c, captureKey: obj as *mut NSObject] };
-        }
-    }
+fn forward_to_live_controller(event: &NSEvent) {
+    let obj: *const NSEvent = event;
+    let _ = with_live_controller(|c| unsafe {
+        let _: () = msg_send![c, captureKey: obj as *mut NSObject];
+    });
 }
 
-/// Open the Settings window (or focus it if already open).
+/// Open the Settings window, or focus the existing one if it's already up.
+/// This is the only public entry point; the menu-action selector and any
+/// future call site both flow through here.
 pub fn open(mtm: MainThreadMarker) {
+    // Dedupe: if a window is already live, just bring it back to the front.
+    let already_open = LIVE_SETTINGS.with(|slot| slot.borrow().as_ref().map(|l| l.window.clone()));
+    if let Some(existing) = already_open {
+        let ns_app = NSApplication::sharedApplication(mtm);
+        #[allow(deprecated)]
+        unsafe {
+            ns_app.activateIgnoringOtherApps(true)
+        };
+        existing.makeKeyAndOrderFront(None);
+        return;
+    }
+
     let controller = SettingsController::new(mtm);
 
     // Window frame: NSWindow expects bottom-left origin. We center after.
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, WINDOW_H));
-    let mask = NSWindowStyleMask::Titled
-        | NSWindowStyleMask::Closable
-        | NSWindowStyleMask::Miniaturizable;
+    let mask =
+        NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable;
     let window: Retained<RecordingWindow> = unsafe {
-        let alloc = RecordingWindow::alloc(mtm).set_ivars(RefCell::new(Some(controller.clone())));
+        let alloc = RecordingWindow::alloc(mtm).set_ivars(());
         msg_send![
             super(alloc),
             initWithContentRect: frame,
@@ -235,9 +280,7 @@ pub fn open(mtm: MainThreadMarker) {
     window.setTitle(&NSString::from_str("Parakeet Settings"));
 
     // Build form contents.
-    let content = window
-        .contentView()
-        .expect("window must have content view");
+    let content = window.contentView().expect("window must have content view");
     let settings = AppHandle::get().map(|a| a.settings.load());
 
     // --- Row 1: Hotkey -----------------------------------------------------
@@ -323,17 +366,26 @@ pub fn open(mtm: MainThreadMarker) {
         content.addSubview(&cancel_btn);
     }
 
-    // Wire the window delegate and remember it.
+    // Wire the window delegate and store both halves in the singleton
+    // slot. No back-pointer from the window to the controller — that was
+    // the retain cycle. The window's keyDown / flagsChanged forwarders
+    // read the controller out of the slot on each event.
     let delegate_proto = ProtocolObject::from_ref(&*controller);
     window.setDelegate(Some(delegate_proto));
-    *controller.ivars().window.borrow_mut() =
-        Some(unsafe { Retained::cast_unchecked::<NSWindow>(window.clone()) });
+    LIVE_SETTINGS.with(|slot| {
+        *slot.borrow_mut() = Some(LiveSettings {
+            controller: controller.clone(),
+            window: window.clone(),
+        });
+    });
 
     // Center + show. The agent app isn't otherwise frontmost, so activate.
     window.center();
     let ns_app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
-    unsafe { ns_app.activateIgnoringOtherApps(true) };
+    unsafe {
+        ns_app.activateIgnoringOtherApps(true)
+    };
     window.makeKeyAndOrderFront(None);
 }
 
@@ -342,9 +394,7 @@ pub fn open(mtm: MainThreadMarker) {
 // -----------------------------------------------------------------------
 
 fn add_label(mtm: MainThreadMarker, parent: &NSView, text: &str, x: f64, y: f64) {
-    let label = unsafe {
-        NSTextField::labelWithString(&NSString::from_str(text), mtm)
-    };
+    let label = unsafe { NSTextField::labelWithString(&NSString::from_str(text), mtm) };
     unsafe {
         label.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(LABEL_W, ROW_H)));
         label.setTextColor(Some(&NSColor::labelColor()));
@@ -352,18 +402,8 @@ fn add_label(mtm: MainThreadMarker, parent: &NSView, text: &str, x: f64, y: f64)
     }
 }
 
-fn add_hint(
-    mtm: MainThreadMarker,
-    parent: &NSView,
-    text: &str,
-    x: f64,
-    y: f64,
-    w: f64,
-    h: f64,
-) {
-    let label = unsafe {
-        NSTextField::labelWithString(&NSString::from_str(text), mtm)
-    };
+fn add_hint(mtm: MainThreadMarker, parent: &NSView, text: &str, x: f64, y: f64, w: f64, h: f64) {
+    let label = unsafe { NSTextField::labelWithString(&NSString::from_str(text), mtm) };
     unsafe {
         label.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)));
         label.setTextColor(Some(&NSColor::secondaryLabelColor()));
@@ -463,15 +503,24 @@ fn ns_event_to_token(event: &NSEvent) -> Option<String> {
         "\u{1b}" => "Escape".to_string(),
         "\u{7f}" => "Backspace".to_string(),
         // Function keys arrive as private-use codepoints.
-        "\u{f704}" => "F1".to_string(), "\u{f705}" => "F2".to_string(),
-        "\u{f706}" => "F3".to_string(), "\u{f707}" => "F4".to_string(),
-        "\u{f708}" => "F5".to_string(), "\u{f709}" => "F6".to_string(),
-        "\u{f70a}" => "F7".to_string(), "\u{f70b}" => "F8".to_string(),
-        "\u{f70c}" => "F9".to_string(), "\u{f70d}" => "F10".to_string(),
-        "\u{f70e}" => "F11".to_string(), "\u{f70f}" => "F12".to_string(),
-        "\u{f710}" => "F13".to_string(), "\u{f711}" => "F14".to_string(),
-        "\u{f712}" => "F15".to_string(), "\u{f713}" => "F16".to_string(),
-        "\u{f714}" => "F17".to_string(), "\u{f715}" => "F18".to_string(),
+        "\u{f704}" => "F1".to_string(),
+        "\u{f705}" => "F2".to_string(),
+        "\u{f706}" => "F3".to_string(),
+        "\u{f707}" => "F4".to_string(),
+        "\u{f708}" => "F5".to_string(),
+        "\u{f709}" => "F6".to_string(),
+        "\u{f70a}" => "F7".to_string(),
+        "\u{f70b}" => "F8".to_string(),
+        "\u{f70c}" => "F9".to_string(),
+        "\u{f70d}" => "F10".to_string(),
+        "\u{f70e}" => "F11".to_string(),
+        "\u{f70f}" => "F12".to_string(),
+        "\u{f710}" => "F13".to_string(),
+        "\u{f711}" => "F14".to_string(),
+        "\u{f712}" => "F15".to_string(),
+        "\u{f713}" => "F16".to_string(),
+        "\u{f714}" => "F17".to_string(),
+        "\u{f715}" => "F18".to_string(),
         "\u{f716}" => "F19".to_string(),
         other if other.chars().count() == 1 => {
             let c = other.chars().next().unwrap();

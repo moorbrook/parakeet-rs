@@ -12,11 +12,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
 use sherpa_onnx::{
-    OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
-    OfflineTransducerModelConfig,
+    OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
 };
 
 /// Below this real-time factor we assume CoreML is not engaged.
@@ -94,18 +93,15 @@ impl Asr {
     }
 
     pub fn recognize(&self, samples: &[f32], sample_rate: u32) -> Result<String> {
-        let decoded = self.recognize_with_timing(samples, sample_rate, /* warmup = */ false)?;
+        let decoded =
+            self.recognize_with_timing(samples, sample_rate, /* warmup = */ false)?;
         Ok(decoded.text)
     }
 
     /// Like `recognize` but doesn't log RTFx — used by the throwaway-first
     /// pass of `warmup::dummy_decode`, where timing is dominated by CoreML
     /// graph compilation rather than steady-state inference.
-    pub fn recognize_silent_warmup(
-        &self,
-        samples: &[f32],
-        sample_rate: u32,
-    ) -> Result<String> {
+    pub fn recognize_silent_warmup(&self, samples: &[f32], sample_rate: u32) -> Result<String> {
         let decoded = self.recognize_with_timing(samples, sample_rate, /* warmup = */ true)?;
         Ok(decoded.text)
     }

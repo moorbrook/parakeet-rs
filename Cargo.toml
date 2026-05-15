@@ -90,6 +90,12 @@ libc = "0.2"
 core-foundation = "0.10"
 core-graphics = "0.24"
 
+# Grand Central Dispatch wrappers. Used to bounce AppKit mutations from
+# background threads (tokio download progress, ASR spawn_blocking, the
+# session-watcher std::thread) to the main queue, where NSStatusItem /
+# NSMenuItem mutation is actually legal.
+dispatch2 = "0.3"
+
 # Clipboard via NSPasteboard.
 arboard = "3"
 

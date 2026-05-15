@@ -316,14 +316,21 @@ pub fn glyphs_for_shortcut(token: &str) -> String {
         }
     }
 
-    let mut mods = String::new();
+    // Collect modifier flags first so we can render in macOS HIG canonical
+    // order (⌃ ⌥ ⇧ ⌘) regardless of which order the user typed them.
+    let mut has_ctrl = false;
+    let mut has_alt = false;
+    let mut has_shift = false;
+    let mut has_cmd = false;
     let mut key = String::new();
     for part in trimmed.split('+').map(str::trim) {
-        let g = match part.to_ascii_lowercase().as_str() {
-            "cmd" | "command" | "cmdorctrl" | "commandorcontrol" | "super" | "meta" => "⌘",
-            "ctrl" | "control" => "⌃",
-            "alt" | "option" => "⌥",
-            "shift" => "⇧",
+        match part.to_ascii_lowercase().as_str() {
+            "cmd" | "command" | "cmdorctrl" | "commandorcontrol" | "super" | "meta" => {
+                has_cmd = true
+            }
+            "ctrl" | "control" => has_ctrl = true,
+            "alt" | "option" => has_alt = true,
+            "shift" => has_shift = true,
             other => {
                 key = match other {
                     "space" => "Space".to_string(),
@@ -332,12 +339,24 @@ pub fn glyphs_for_shortcut(token: &str) -> String {
                     "esc" | "escape" => "⎋".to_string(),
                     other => other.to_uppercase(),
                 };
-                continue;
             }
-        };
-        mods.push_str(g);
+        }
     }
-    format!("{mods}{key}")
+    let mut out = String::new();
+    if has_ctrl {
+        out.push('⌃');
+    }
+    if has_alt {
+        out.push('⌥');
+    }
+    if has_shift {
+        out.push('⇧');
+    }
+    if has_cmd {
+        out.push('⌘');
+    }
+    out.push_str(&key);
+    out
 }
 
 /// True if the hotkey token names Caps Lock. The CGEventTap surfaces only
@@ -370,5 +389,70 @@ fn fmt_bytes(n: u64) -> String {
         format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.2} GB", n as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::TriggerMode;
+
+    #[test]
+    fn glyphs_render_chord_modifiers_in_canonical_order() {
+        // Token order is whatever the user typed; the glyph order is
+        // always ⌃ ⌥ ⇧ ⌘ → key per macOS HIG, so two equivalent token
+        // orderings render identically.
+        assert_eq!(glyphs_for_shortcut("CmdOrCtrl+Shift+Space"), "⇧⌘Space");
+        assert_eq!(glyphs_for_shortcut("Shift+CmdOrCtrl+Space"), "⇧⌘Space");
+        assert_eq!(glyphs_for_shortcut("Alt+CmdOrCtrl+E"), "⌥⌘E");
+        assert_eq!(glyphs_for_shortcut("Ctrl+Alt+Shift+Cmd+A"), "⌃⌥⇧⌘A");
+    }
+
+    #[test]
+    fn glyphs_render_named_keys() {
+        assert_eq!(glyphs_for_shortcut("F5"), "F5");
+        assert_eq!(glyphs_for_shortcut("Enter"), "⏎");
+        assert_eq!(glyphs_for_shortcut("Escape"), "⎋");
+    }
+
+    #[test]
+    fn glyphs_render_special_bindings() {
+        assert_eq!(glyphs_for_shortcut("CapsLock"), "⇪");
+        assert_eq!(glyphs_for_shortcut("caps-lock"), "⇪");
+        assert_eq!(glyphs_for_shortcut("Eject"), "⏏");
+    }
+
+    #[test]
+    fn is_capslock_token_matches_aliases() {
+        assert!(is_capslock_token("CapsLock"));
+        assert!(is_capslock_token("caps_lock"));
+        assert!(is_capslock_token("caps-lock"));
+        assert!(is_capslock_token("  CAPSLOCK  "));
+        assert!(!is_capslock_token("Eject"));
+        assert!(!is_capslock_token("CmdOrCtrl+Shift+Space"));
+    }
+
+    #[test]
+    fn effective_mode_forces_hold_for_capslock() {
+        let s = Settings {
+            hotkey: "CapsLock".into(),
+            trigger_mode: TriggerMode::Tap,
+            ..Settings::default()
+        };
+        assert_eq!(effective_trigger_mode(&s), TriggerMode::Hold);
+        // Stored mode is untouched (the override is runtime-only).
+        assert_eq!(s.trigger_mode, TriggerMode::Tap);
+    }
+
+    #[test]
+    fn effective_mode_passes_through_for_other_bindings() {
+        let mut s = Settings {
+            hotkey: "F5".into(),
+            trigger_mode: TriggerMode::Hold,
+            ..Settings::default()
+        };
+        assert_eq!(effective_trigger_mode(&s), TriggerMode::Hold);
+        s.trigger_mode = TriggerMode::Tap;
+        assert_eq!(effective_trigger_mode(&s), TriggerMode::Tap);
     }
 }

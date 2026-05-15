@@ -35,9 +35,9 @@ unsafe extern "C" {
     fn CGRequestListenEventAccess() -> bool;
 }
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use block2::RcBlock;
-use core_foundation::runloop::{CFRunLoop, kCFRunLoopCommonModes};
+use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
     CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventType, CGKeyCode, EventField, KeyCode,
@@ -140,11 +140,7 @@ pub fn register(
             .name("hotkey-tap".into())
             .spawn(move || {
                 crate::qos::set_user_interactive();
-                run_tap(
-                    binding_for_tap,
-                    on_press_for_tap,
-                    on_release_for_tap,
-                );
+                run_tap(binding_for_tap, on_press_for_tap, on_release_for_tap);
             })
             .context("spawn hotkey-tap thread")?;
     }
@@ -409,28 +405,156 @@ fn parse_key(s: &str) -> Result<CGKeyCode> {
         "tab" => KeyCode::TAB,
         "esc" | "escape" => KeyCode::ESCAPE,
         "backspace" | "delete" => KeyCode::DELETE,
-        "f1" => KeyCode::F1, "f2" => KeyCode::F2, "f3" => KeyCode::F3,
-        "f4" => KeyCode::F4, "f5" => KeyCode::F5, "f6" => KeyCode::F6,
-        "f7" => KeyCode::F7, "f8" => KeyCode::F8, "f9" => KeyCode::F9,
-        "f10" => KeyCode::F10, "f11" => KeyCode::F11, "f12" => KeyCode::F12,
-        "f13" => KeyCode::F13, "f14" => KeyCode::F14, "f15" => KeyCode::F15,
-        "f16" => KeyCode::F16, "f17" => KeyCode::F17, "f18" => KeyCode::F18,
-        "f19" => KeyCode::F19, "f20" => KeyCode::F20,
+        "f1" => KeyCode::F1,
+        "f2" => KeyCode::F2,
+        "f3" => KeyCode::F3,
+        "f4" => KeyCode::F4,
+        "f5" => KeyCode::F5,
+        "f6" => KeyCode::F6,
+        "f7" => KeyCode::F7,
+        "f8" => KeyCode::F8,
+        "f9" => KeyCode::F9,
+        "f10" => KeyCode::F10,
+        "f11" => KeyCode::F11,
+        "f12" => KeyCode::F12,
+        "f13" => KeyCode::F13,
+        "f14" => KeyCode::F14,
+        "f15" => KeyCode::F15,
+        "f16" => KeyCode::F16,
+        "f17" => KeyCode::F17,
+        "f18" => KeyCode::F18,
+        "f19" => KeyCode::F19,
+        "f20" => KeyCode::F20,
         // Bare letter / digit / punctuation keys map to Carbon virtual
         // keycodes from HIToolbox/Events.h. Inline since core-graphics
         // `KeyCode` only exposes constants for special keys.
-        "a" => 0x00, "s" => 0x01, "d" => 0x02, "f" => 0x03,
-        "h" => 0x04, "g" => 0x05, "z" => 0x06, "x" => 0x07,
-        "c" => 0x08, "v" => 0x09, "b" => 0x0B, "q" => 0x0C,
-        "w" => 0x0D, "e" => 0x0E, "r" => 0x0F, "y" => 0x10,
-        "t" => 0x11, "1" => 0x12, "2" => 0x13, "3" => 0x14,
-        "4" => 0x15, "6" => 0x16, "5" => 0x17, "=" => 0x18,
-        "9" => 0x19, "7" => 0x1A, "-" => 0x1B, "8" => 0x1C,
-        "0" => 0x1D, "]" => 0x1E, "o" => 0x1F, "u" => 0x20,
-        "[" => 0x21, "i" => 0x22, "p" => 0x23, "l" => 0x25,
-        "j" => 0x26, "'" => 0x27, "k" => 0x28, ";" => 0x29,
-        "\\" => 0x2A, "," => 0x2B, "/" => 0x2C, "n" => 0x2D,
-        "m" => 0x2E, "." => 0x2F, "`" => 0x32,
+        "a" => 0x00,
+        "s" => 0x01,
+        "d" => 0x02,
+        "f" => 0x03,
+        "h" => 0x04,
+        "g" => 0x05,
+        "z" => 0x06,
+        "x" => 0x07,
+        "c" => 0x08,
+        "v" => 0x09,
+        "b" => 0x0B,
+        "q" => 0x0C,
+        "w" => 0x0D,
+        "e" => 0x0E,
+        "r" => 0x0F,
+        "y" => 0x10,
+        "t" => 0x11,
+        "1" => 0x12,
+        "2" => 0x13,
+        "3" => 0x14,
+        "4" => 0x15,
+        "6" => 0x16,
+        "5" => 0x17,
+        "=" => 0x18,
+        "9" => 0x19,
+        "7" => 0x1A,
+        "-" => 0x1B,
+        "8" => 0x1C,
+        "0" => 0x1D,
+        "]" => 0x1E,
+        "o" => 0x1F,
+        "u" => 0x20,
+        "[" => 0x21,
+        "i" => 0x22,
+        "p" => 0x23,
+        "l" => 0x25,
+        "j" => 0x26,
+        "'" => 0x27,
+        "k" => 0x28,
+        ";" => 0x29,
+        "\\" => 0x2A,
+        "," => 0x2B,
+        "/" => 0x2C,
+        "n" => 0x2D,
+        "m" => 0x2E,
+        "." => 0x2F,
+        "`" => 0x32,
         other => return Err(anyhow!("unsupported key token: {other}")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_chord_with_modifiers() {
+        let b = parse("CmdOrCtrl+Shift+Space").unwrap();
+        let Binding::Chord {
+            required_mods,
+            main_key,
+        } = b
+        else {
+            panic!("expected Chord, got {b:?}");
+        };
+        assert_eq!(main_key, KeyCode::SPACE);
+        assert!(required_mods.contains(CGEventFlags::CGEventFlagCommand));
+        assert!(required_mods.contains(CGEventFlags::CGEventFlagShift));
+        assert!(!required_mods.contains(CGEventFlags::CGEventFlagControl));
+    }
+
+    #[test]
+    fn parse_bare_function_key() {
+        let b = parse("F5").unwrap();
+        let Binding::Chord {
+            required_mods,
+            main_key,
+        } = b
+        else {
+            panic!("expected Chord");
+        };
+        assert_eq!(main_key, KeyCode::F5);
+        assert!(required_mods.is_empty());
+    }
+
+    #[test]
+    fn parse_caps_lock() {
+        assert!(matches!(
+            parse("CapsLock").unwrap(),
+            Binding::CapsLockToggle
+        ));
+        assert!(matches!(
+            parse("caps_lock").unwrap(),
+            Binding::CapsLockToggle
+        ));
+    }
+
+    #[test]
+    fn parse_eject() {
+        assert!(matches!(parse("Eject").unwrap(), Binding::Eject));
+        assert!(matches!(parse("eject").unwrap(), Binding::Eject));
+    }
+
+    #[test]
+    fn parse_rejects_modifier_only_chord() {
+        // "Shift" alone has no main key; should error rather than silently
+        // produce a useless binding.
+        assert!(parse("Shift").is_err());
+        assert!(parse("Shift+Ctrl").is_err());
+    }
+
+    #[test]
+    fn mods_match_is_side_agnostic_and_ignores_capslock() {
+        let required = CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagShift;
+        // Cmd + Shift, no AlphaShift — should match.
+        assert!(mods_match(required, required));
+        // Same Cmd + Shift but with Caps Lock state set — irrelevant, should match.
+        assert!(mods_match(
+            required | CGEventFlags::CGEventFlagAlphaShift,
+            required
+        ));
+        // Missing Shift — should NOT match.
+        assert!(!mods_match(CGEventFlags::CGEventFlagCommand, required));
+        // Extra Ctrl — should NOT match.
+        assert!(!mods_match(
+            required | CGEventFlags::CGEventFlagControl,
+            required
+        ));
+    }
 }

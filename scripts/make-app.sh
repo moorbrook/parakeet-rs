@@ -74,15 +74,86 @@ done
 install_name_tool -add_rpath '@executable_path/../Frameworks' "$EXE"
 
 # --- 5. ad-hoc code-sign -------------------------------------------------
-# Gatekeeper on macOS 14+ rejects unsigned binaries by default. The `-`
-# identity is the ad-hoc signature: enough to run on the dev machine, not
-# enough for distribution. For real distribution you'd substitute a
-# Developer ID Application certificate.
+# Gatekeeper on macOS 14+ rejects unsigned binaries by default. We sign
+# each piece individually rather than with `--deep`, because `--deep` is
+# deprecated, silently glosses over nested-bundle problems, and produces
+# signatures that don't survive notarisation. Order matters: dylibs
+# first (leaves), executable last (root).
+#
+# `--options runtime` enables Hardened Runtime, which is mandatory for
+# notarisation. `--entitlements` attaches the mic + apple-events strings.
+# The `-` identity is the ad-hoc signature: enough to run locally on this
+# Mac, NOT enough for distribution. For real shipping you'd swap `-` for
+# a `Developer ID Application: <Name> (TEAMID)` identity, then run
+# `xcrun notarytool submit ... --wait` and `xcrun stapler staple` —
+# documented at the bottom of this script.
 
-echo "5. ad-hoc code-sign"
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || {
-  echo "  warn: codesign failed; the .app may still run if SIP allows" >&2
+echo "5. code-sign"
+SIGN_ID="${PARAKEET_SIGN_ID:--}"          # `-` = ad-hoc
+ENTITLEMENTS="$ROOT/entitlements.plist"
+
+# Hardened Runtime + the entitlements file are required for notarisation
+# but BREAK ad-hoc signing: ad-hoc gives each artefact a different pseudo
+# Team ID, and Hardened Runtime then refuses to load the dylibs because
+# the bundle's Team ID doesn't match theirs. So both extras stay off for
+# the ad-hoc path; the Developer-ID path turns them on.
+if [ "$SIGN_ID" = "-" ]; then
+  EXTRA_FLAGS=()
+else
+  EXTRA_FLAGS=(--options runtime --timestamp --entitlements "$ENTITLEMENTS")
+fi
+
+sign_one() {
+  local target="$1"
+  # `${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}` is the bash 3.x-compatible
+  # idiom for expanding an array that may be empty under `set -u`.
+  # Plain `${EXTRA_FLAGS[@]}` errors with "unbound variable" on the
+  # macOS-stock bash when the ad-hoc branch leaves the array empty.
+  codesign --force --sign "$SIGN_ID" \
+           ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+           "$target" >/dev/null 2>&1 || {
+    echo "  warn: codesign failed on $target" >&2
+    return 1
+  }
 }
+
+# Leaves first: every dylib in Contents/Frameworks/.
+for lib in "$APP"/Contents/Frameworks/*.dylib; do
+  [ -f "$lib" ] && sign_one "$lib"
+done
+# Then the main executable.
+sign_one "$APP/Contents/MacOS/parakeet-rs"
+# Then the bundle as a whole — codesign requires this last step to seal
+# the Contents/_CodeSignature resource manifest.
+sign_one "$APP"
+
+# --- 6. verify -----------------------------------------------------------
+# `--verify --deep --strict` walks every nested signature, the kind of
+# check Apple's notary service performs. Surface any breakage early.
+
+echo "6. verify signature"
+codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -3
+spctl --assess --type execute --verbose=2 "$APP" 2>&1 | tail -2 || {
+  echo "  note: spctl rejected the ad-hoc signature — that's expected; it'd"
+  echo "        accept a Developer-ID-signed + notarised build."
+}
+
+# --- Distribution notes (NOT run by default) -----------------------------
+# To produce a build a user can download from the internet without
+# Gatekeeper warnings:
+#
+#   1. Get a Developer ID Application cert into your login keychain.
+#   2. PARAKEET_SIGN_ID="Developer ID Application: <Name> (TEAMID)" \
+#        ./scripts/make-app.sh
+#   3. ditto -c -k --keepParent "$APP" Parakeet.zip
+#   4. xcrun notarytool submit Parakeet.zip \
+#        --apple-id you@example.com --team-id TEAMID \
+#        --password APP_SPECIFIC_PASSWORD --wait
+#   5. xcrun stapler staple "$APP"
+#   6. ditto -c -k --keepParent "$APP" Parakeet-notarised.zip
+#
+# Steps 3–6 only matter for distribution. Local installs work with
+# `SIGN_ID=-` (the default), which is the ad-hoc identity.
 
 echo
 echo "Built $APP"

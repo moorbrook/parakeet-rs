@@ -55,8 +55,7 @@ fn main() -> Result<()> {
     // via the AppHandle singleton.
     let settings = SettingsStore::new().context("init settings store")?;
     let app = Arc::new(App::new(settings));
-    AppHandle::set(app.clone())
-        .map_err(|_| anyhow::anyhow!("AppHandle already initialised"))?;
+    AppHandle::set(app.clone()).map_err(|_| anyhow::anyhow!("AppHandle already initialised"))?;
 
     // Status-bar menu (uses sf_symbol::load internally).
     menubar::install(mtm).context("install menu bar")?;

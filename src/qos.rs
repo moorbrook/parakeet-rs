@@ -20,8 +20,7 @@ unsafe extern "C" {
 
 /// Pin the calling thread to performance cores by raising its QoS class.
 pub fn set_user_interactive() {
-    let rc =
-        unsafe { pthread_set_qos_class_self_np(QosClass::UserInteractive as libc::c_int, 0) };
+    let rc = unsafe { pthread_set_qos_class_self_np(QosClass::UserInteractive as libc::c_int, 0) };
     if rc != 0 {
         log::warn!("pthread_set_qos_class_self_np returned {rc}");
     }

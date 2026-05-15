@@ -6,13 +6,13 @@
 //! 2. a `mpsc::Sender<Vec<f32>>` "tap" that hands a copy of every cpal callback
 //!    chunk to the VAD watcher in `streamer.rs` so it can react in real time.
 
+use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
-use std::sync::mpsc::{Sender, channel};
 use std::thread::JoinHandle;
 
-use anyhow::{Context, Result, anyhow};
-use cpal::SampleFormat;
+use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::SampleFormat;
 use parking_lot::Mutex;
 
 use crate::qos;
@@ -45,9 +45,8 @@ impl AudioCapture {
             .name("audio-capture".into())
             .spawn(move || {
                 qos::set_user_interactive();
-                let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(
-                    16_000 * 30,
-                )));
+                let buffer: Arc<Mutex<Vec<f32>>> =
+                    Arc::new(Mutex::new(Vec::with_capacity(16_000 * 30)));
                 let (sample_rate, channels, stream) =
                     match build_stream(buffer.clone(), tap.clone()) {
                         Ok(v) => v,
@@ -114,7 +113,9 @@ fn build_stream(
     let device = host
         .default_input_device()
         .ok_or_else(|| anyhow!("no default input device"))?;
-    let config = device.default_input_config().context("default input config")?;
+    let config = device
+        .default_input_config()
+        .context("default input config")?;
     let sample_rate = config.sample_rate().0;
     let channels = config.channels();
     let err_fn = |err| log::error!("audio stream error: {err}");
