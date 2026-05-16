@@ -6,6 +6,22 @@ authors = ["parakeet-rs"]
 edition = "2021"
 rust-version = "1.77"
 
+# Workspace-wide lint configuration. Replaces per-file `#![warn(...)]`
+# attributes so the policy is reviewable in one place.
+#
+# `unsafe_op_in_unsafe_fn`: inside `unsafe fn`, each unsafe op must
+#   still be wrapped in `unsafe { ... }` and accompanied by a
+#   `// SAFETY:` comment. Default-allow in Rust today; we promote it
+#   to a warning so the AppKit/objc2 FFI surface stays auditable.
+# `undocumented_unsafe_blocks`: every `unsafe { ... }` block must have
+#   a `// SAFETY:` comment immediately above. Catches the "drive-by
+#   unsafe with no justification" pattern.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
 # Metadata read by `cargo-bundle` when assembling Parakeet.app.
 # Run `cargo bundle --release` to produce target/release/bundle/osx/Parakeet.app.
 [package.metadata.bundle]
@@ -114,24 +130,34 @@ objc2 = "0.6"
 # block-based NSEvent monitor we use to catch media-key (Eject, Play, Vol*,
 # Brightness*) events.
 block2 = "0.6"
+# Per-class features rather than --all-features so transitive dep
+# changes can't quietly turn on bindings we never audited.
 objc2-app-kit = { version = "0.3", features = [
-    "NSApplication",
+    "NSApplication",           # NSApplication + NSApplicationDelegate
     "NSResponder",
     "NSRunningApplication",
     "NSStatusBar",
-    "NSStatusBarButton",
+    "NSStatusBarButton",       # NSVariableStatusItemLength etc.
     "NSStatusItem",
     "NSMenu",
     "NSMenuItem",
     "NSImage",
     "NSImageRep",
-    "NSEvent",
+    "NSEvent",                 # NSEvent + NSEventMask + NSEventSubtype
     "NSCell",
     "NSControl",
     "NSView",
-    "NSWindow",
-    "NSButton",
-    "NSAlert",
+    "NSWindow",                # NSWindowStyleMask, NSWindowDelegate, NSBackingStoreType, NSFloatingWindowLevel, NSWindowCollectionBehavior
+    "NSButton",                # NSBezelStyle
+    "NSPanel",                 # HUD overlay (NSNonactivatingPanel)
+    "NSPopUpButton",           # Settings popups
+    "NSTextField",             # Settings labels + hint text
+    "NSScreen",                # Multi-display HUD + Settings positioning
+    "NSColor",                 # Label colors, panel chrome
+    "NSFont",                  # Settings hint text
+    "NSText",                  # NSTextAlignment
+    "NSVisualEffectView",      # HUD chrome (replaces hand-rolled CALayer bg)
+    "NSAlert",                 # NSAlertStyle, permissions UI
     "NSWorkspace",
     "block2",
     "objc2-core-foundation",
@@ -145,3 +171,16 @@ objc2-foundation = { version = "0.3", features = [
     "NSRunLoop",
     "NSNotification",
 ] }
+
+# llama.cpp via FFI for the §6 cleanup tier (Qwen 3.5 2B Q4 GGUF). Metal
+# backend on Apple Silicon — same FFI pattern as sherpa-onnx. Default
+# features (openmp, android-shared-stdcxx) disabled — openmp duplicates
+# work on top of Apple's GCD scheduler; android-shared-stdcxx is
+# irrelevant on macOS.
+llama-cpp-2 = { version = "0.1", default-features = false, features = ["metal", "sampler"] }
+encoding_rs = "0.8"
+
+[dev-dependencies]
+# Isolated per-test data dirs for SettingsStore tests, so parallel
+# `cargo test` runs don't race on a shared `/tmp/parakeet-test` path.
+tempfile = "3"

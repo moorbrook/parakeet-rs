@@ -26,6 +26,7 @@ use objc2::rc::Retained;
 use objc2::{define_class, msg_send, MainThreadOnly};
 use objc2_app_kit::{
     NSBackingStoreType, NSColor, NSFont, NSPanel, NSScreen, NSTextAlignment, NSTextField,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
     NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
@@ -102,44 +103,50 @@ pub fn install(mtm: MainThreadMarker) {
             panel.setReleasedWhenClosed(false);
         }
 
-        // Content view: rounded dark background via CALayer. We rely on
-        // the system's wantsLayer auto-creation rather than swapping in a
-        // custom NSView subclass — saves a class definition for a UI
-        // element that doesn't need any custom drawing.
-        let content = panel
-            .contentView()
-            .expect("borderless panel must still have a content view");
+        // Content chrome: `NSVisualEffectView` with the HUD material.
+        // Auto-adapts to light / dark mode, respects Increase Contrast
+        // and Reduce Transparency in System Settings → Accessibility.
+        // Replaces the previous hand-rolled CALayer setBackgroundColor
+        // approach (hardcoded RGB, ignored every accessibility pref).
+        let effect_view: Retained<NSVisualEffectView> = unsafe {
+            let alloc = NSVisualEffectView::alloc(mtm);
+            NSVisualEffectView::initWithFrame(
+                alloc,
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(HUD_W, HUD_H)),
+            )
+        };
         unsafe {
-            content.setWantsLayer(true);
-            if let Some(layer) = content.layer() {
-                // CALayer's `setCornerRadius` / `setBackgroundColor` accessors
-                // aren't exposed on the objc2-quartz-core types we get
-                // through `content.layer()` without pulling in additional
-                // feature flags. Just dispatch through `msg_send!` — these
-                // are stable AppKit selectors with no risk of drift.
+            effect_view.setMaterial(NSVisualEffectMaterial::HUDWindow);
+            effect_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+            effect_view.setState(NSVisualEffectState::Active);
+            // Rounded corners on the effect view's own layer. AppKit
+            // gives `NSVisualEffectView` a backing layer for free
+            // (wantsLayer = true is implicit for this class).
+            if let Some(layer) = effect_view.layer() {
                 let _: () = msg_send![&*layer, setCornerRadius: CORNER_RADIUS];
                 let _: () = msg_send![&*layer, setMasksToBounds: true];
-                // Translucent black with system-dark feel. Matches the
-                // visual weight of HUD overlays elsewhere on macOS.
-                let bg = NSColor::colorWithRed_green_blue_alpha(0.10, 0.10, 0.12, 0.92);
-                let cg = bg.CGColor();
-                let _: () = msg_send![&*layer, setBackgroundColor: &*cg];
             }
+            // Use the effect view as the panel's content. The label
+            // becomes its only subview.
+            panel.setContentView(Some(&effect_view));
         }
 
-        // Centred label inside the panel content.
+        // Centred label inside the effect view.
         let label_frame = NSRect::new(NSPoint::new(12.0, 0.0), NSSize::new(HUD_W - 24.0, HUD_H));
         let label =
             unsafe { NSTextField::labelWithString(&NSString::from_str("Listening…"), mtm) };
         unsafe {
             label.setFrame(label_frame);
             label.setAlignment(NSTextAlignment::Center);
+            // White text reads on the HUDWindow material in both light
+            // and dark modes; HUD material is intentionally dark in
+            // both appearances per Apple's HIG.
             label.setTextColor(Some(&NSColor::whiteColor()));
             let font = NSFont::systemFontOfSize(14.0);
             label.setFont(Some(&font));
             label.setDrawsBackground(false);
             label.setBordered(false);
-            content.addSubview(&label);
+            effect_view.addSubview(&label);
         }
 
         position_on_screen(mtm, &panel);
@@ -192,6 +199,19 @@ fn show_state_main(state: DictationState) {
                     hud.visible = false;
                 }
             }
+        }
+    });
+}
+
+/// Reposition the HUD on the current main screen. Called from the
+/// `AppDelegate::applicationDidChangeScreenParameters:` hook when the
+/// display configuration changes (monitor un/replug, resolution swap,
+/// Spaces reshuffle). Safe to call when the HUD isn't visible —
+/// `setFrame` just moves the panel for the next show.
+pub fn reposition_on_screen(mtm: MainThreadMarker) {
+    HUD.with(|slot| {
+        if let Some(hud) = slot.borrow().as_ref() {
+            position_on_screen(mtm, &hud.panel);
         }
     });
 }

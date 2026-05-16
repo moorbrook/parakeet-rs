@@ -23,7 +23,7 @@ use objc2::class;
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
-use objc2_foundation::{NSDictionary, NSNumber, NSObject, NSString};
+use objc2_foundation::{NSDictionary, NSNumber, NSString};
 
 unsafe extern "C" {
     /// `<CoreGraphics/CGEventSource.h>`. Returns true if the calling
@@ -125,7 +125,7 @@ fn accessibility_granted_with_prompt() -> bool {
         // option lifts the system Accessibility dialog (or, if denied,
         // takes the user to the right pane in System Settings) on the
         // first call per launch.
-        let key = NSString::retain(kAXTrustedCheckOptionPrompt);
+        let key = ax_trusted_check_option_prompt_key();
         let value = NSNumber::new_bool(true);
         let opts: Retained<NSDictionary<NSString, NSNumber>> =
             NSDictionary::from_slices(&[&*key], &[&*value]);
@@ -139,17 +139,22 @@ fn accessibility_granted() -> bool {
     unsafe { AXIsProcessTrustedWithOptions(null) }
 }
 
-/// Helper: hold an unretained NSString safely via the global symbol.
-trait NSStringRetain {
-    fn retain(raw: *const NSString) -> Retained<NSString>;
-}
-impl NSStringRetain for NSString {
-    fn retain(raw: *const NSString) -> Retained<NSString> {
-        // SAFETY: `kAXTrustedCheckOptionPrompt` is a non-NULL CFString
-        // constant exported by HIServices and lives for the program's
-        // lifetime; calling retain on it gives us a sound `Retained`.
-        unsafe { Retained::retain(raw.cast_mut()) }.expect("global NSString constant was NULL")
-    }
+/// Return the `kAXTrustedCheckOptionPrompt` `NSString`, with a graceful
+/// fallback to a hand-constructed string if the HIServices global
+/// symbol resolves NULL.
+///
+/// Apple documents the *value* of this option key as the stable string
+/// literal `"AXTrustedCheckOptionPrompt"`. If a future SDK ever
+/// reshuffles the symbol export, the hand-constructed fallback still
+/// produces a working prompt dialog — vs. the previous `.expect(...)`
+/// which would panic the app on launch.
+fn ax_trusted_check_option_prompt_key() -> Retained<NSString> {
+    // SAFETY: `kAXTrustedCheckOptionPrompt` is exported by HIServices on
+    // every macOS we support. It MAY be null on a stripped-down system
+    // or a future SDK change — `Retained::retain` returns `None` in that
+    // case and we fall back to the documented literal.
+    let from_symbol = unsafe { Retained::retain(kAXTrustedCheckOptionPrompt.cast_mut()) };
+    from_symbol.unwrap_or_else(|| NSString::from_str("AXTrustedCheckOptionPrompt"))
 }
 
 /// Request every permission we need (showing system prompts the first
@@ -279,11 +284,3 @@ pub fn present_missing_alert_blocking(
     }
 }
 
-// Suppress dead-code warning on the now-unused intermediate symbol from
-// the previous direct-call API. Kept around so external callers that ask
-// for status without prompting still have it.
-#[allow(dead_code)]
-fn _unused() {
-    let _ = (mic_status,);
-    let _: &NSObject = unsafe { &*(std::ptr::null::<NSObject>()) };
-}

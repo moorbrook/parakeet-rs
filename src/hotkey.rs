@@ -20,6 +20,9 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
 
+use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
+
 // Public CoreGraphics APIs (macOS 10.15+) for checking and requesting
 // the Input Monitoring permission. Not exposed by the `core-graphics`
 // crate, so we declare them directly.
@@ -344,13 +347,51 @@ fn install_media_key_monitor(
         return Ok(());
     };
 
-    // Leak the handle to keep the monitor alive for the program's life.
-    // Dropping it would call `removeMonitor:` and stop our media-key
-    // detection.
-    std::mem::forget(handle);
-    log::info!("media-key monitor active (NSEvent global, system-defined)");
+    // RAII: store the handle in a process-lifetime `OnceLock` so the
+    // monitor lives for the program's life AND the handle gets
+    // `removeMonitor:`-ed if the slot is ever taken out. Previously
+    // this was `std::mem::forget(handle)` — clean from a leak-tools
+    // perspective today, but blocks any future "rebind the media-key
+    // monitor without process restart" use case.
+    if MEDIA_KEY_MONITOR.set(MediaKeyMonitor { token: handle }).is_err() {
+        log::warn!("media-key monitor already installed — ignoring duplicate install");
+    } else {
+        log::info!("media-key monitor active (NSEvent global, system-defined)");
+    }
     Ok(())
 }
+
+/// RAII wrapper for the NSEvent global monitor token. On drop, sends
+/// `+[NSEvent removeMonitor:]` so the system stops dispatching events
+/// to our block. We keep one of these alive for the life of the
+/// process via the `MEDIA_KEY_MONITOR` `OnceLock`.
+struct MediaKeyMonitor {
+    token: Retained<AnyObject>,
+}
+
+impl Drop for MediaKeyMonitor {
+    fn drop(&mut self) {
+        // `NSEvent::removeMonitor` returns void and takes an `id` —
+        // safe to call with our retained token. AppKit handles its
+        // own internal teardown of the block at this point.
+        unsafe {
+            NSEvent::removeMonitor(&self.token);
+        }
+    }
+}
+
+// SAFETY: `Retained<AnyObject>` isn't `Send + Sync` because Cocoa
+// object access generally needs care across threads, but our specific
+// access pattern is single-threaded: this token is *set* exactly
+// once (on the main thread, from `install_media_key_monitor`), is
+// only *read* by `Drop` (which only runs when the `OnceLock` itself
+// is being torn down, which doesn't happen — the static lives for
+// the program's life), and is never aliased or mutated thereafter.
+// `removeMonitor:` itself is documented as thread-safe.
+unsafe impl Send for MediaKeyMonitor {}
+unsafe impl Sync for MediaKeyMonitor {}
+
+static MEDIA_KEY_MONITOR: std::sync::OnceLock<MediaKeyMonitor> = std::sync::OnceLock::new();
 
 /// Side-agnostic modifier match. The required modifier bits must all be set
 /// on the event; AlphaShift (Caps Lock state), NumericPad, Help, SecondaryFn

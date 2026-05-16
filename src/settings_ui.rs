@@ -20,11 +20,11 @@ use std::cell::RefCell;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSApplication, NSBackingStoreType, NSButton, NSColor, NSEvent, NSEventModifierFlags,
-    NSEventType, NSPopUpButton, NSResponder, NSTextField, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSEventType, NSPopUpButton, NSResponder, NSScreen, NSTextField, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -39,15 +39,6 @@ const ROW_H: f64 = 26.0;
 const LABEL_W: f64 = 130.0;
 const PAD: f64 = 20.0;
 
-/// Models offered in the cleanup-model popup. Index matches the popup
-/// menu item position; we keep both the user-visible label and the model
-/// id passed to `claude --model` paired so the order is the only source
-/// of truth.
-const CLEANUP_MODELS: &[(&str, &str)] = &[
-    ("Haiku 4.5 (fast, recommended)", "claude-haiku-4-5"),
-    ("Sonnet 4.6 (best quality)", "claude-sonnet-4-6"),
-];
-
 #[derive(Default)]
 struct Ivars {
     /// Built-up token like `"CmdOrCtrl+Shift+Space"` while the user is
@@ -56,7 +47,6 @@ struct Ivars {
     shortcut_button: RefCell<Option<Retained<NSButton>>>,
     mode_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     cleanup_popup: RefCell<Option<Retained<NSPopUpButton>>>,
-    cleanup_model_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     // No window field. Storing a strong `Retained<NSWindow>` here while
     // the window also held a strong `Retained<SettingsController>` was a
     // textbook retain cycle that prevented either object from ever being
@@ -125,13 +115,13 @@ define_class!(
             crate::objc_util::selector_guard("save:", || self.save_inner());
         }
 
-        /// Cleanup-mode popup changed. Enable / disable the API key + model
-        /// inputs to make it obvious they only matter when cleanup is on.
+        /// Cleanup-mode popup changed. Selector kept as a no-op so the
+        /// UI sender wiring stays valid; the actual toggle effect is
+        /// applied on Save (we don't load the 1.2 GB Qwen GGUF on every
+        /// dropdown flip).
         #[unsafe(method(cleanupModeChanged:))]
         fn cleanup_mode_changed(&self, _sender: *mut NSObject) {
-            crate::objc_util::selector_guard("cleanupModeChanged:", || {
-                self.refresh_cleanup_enabled();
-            });
+            crate::objc_util::selector_guard("cleanupModeChanged:", || {});
         }
 
         #[unsafe(method(cancel:))]
@@ -155,16 +145,17 @@ define_class!(
         /// Captured by the custom NSWindow subclass below — see
         /// `RecordingWindow::keyDown`. Converts the NSEvent into a token
         /// like `"CmdOrCtrl+Shift+Space"` and updates the button label.
+        ///
+        /// `event: &NSEvent` is typed natively here (objc2 0.6 handles
+        /// the ObjC `id`-shaped argument). The previous version took a
+        /// `*mut NSObject` and cast it back, which bypassed objc2's
+        /// retain tracking for zero benefit.
         #[unsafe(method(captureKey:))]
-        fn capture_key(&self, event_obj: *mut NSObject) {
+        fn capture_key(&self, event: &NSEvent) {
             crate::objc_util::selector_guard("captureKey:", || {
                 if self.ivars().recording_token.borrow().is_none() {
                     return;
                 }
-                // Re-interpret the opaque sender as an NSEvent pointer.
-                // The RecordingWindow forwards events through this
-                // selector.
-                let event: &NSEvent = unsafe { &*(event_obj as *const NSEvent) };
                 if let Some(token) = ns_event_to_token(event) {
                     let glyphs = glyphs_for_shortcut(&token);
                     *self.ivars().recording_token.borrow_mut() = Some(token.clone());
@@ -212,19 +203,9 @@ impl SettingsController {
         }
         if let Some(popup) = self.ivars().cleanup_popup.borrow().as_ref() {
             new.cleanup_mode = match unsafe { popup.indexOfSelectedItem() } {
-                1 => CleanupMode::Claude,
+                1 => CleanupMode::On,
                 _ => CleanupMode::Off,
             };
-        }
-        if let Some(popup) = self.ivars().cleanup_model_popup.borrow().as_ref() {
-            let idx = unsafe { popup.indexOfSelectedItem() };
-            if let Some((_, id)) = idx
-                .try_into()
-                .ok()
-                .and_then(|i: usize| CLEANUP_MODELS.get(i))
-            {
-                new.cleanup_model = (*id).to_string();
-            }
         }
 
         if let Err(e) = app.apply_settings(new) {
@@ -255,21 +236,6 @@ impl SettingsController {
             }
         } else {
             unsafe { popup.setEnabled(true) };
-        }
-    }
-
-    /// Grey out the model picker unless cleanup mode is on. Removes the
-    /// "I picked Sonnet but cleanup is off" footgun.
-    fn refresh_cleanup_enabled(&self) {
-        let on = match self.ivars().cleanup_popup.borrow().as_ref() {
-            Some(popup) => {
-                let idx = unsafe { popup.indexOfSelectedItem() };
-                idx == 1
-            }
-            None => false,
-        };
-        if let Some(popup) = self.ivars().cleanup_model_popup.borrow().as_ref() {
-            unsafe { popup.setEnabled(on) };
         }
     }
 
@@ -341,9 +307,12 @@ define_class!(
 );
 
 fn forward_to_live_controller(event: &NSEvent) {
-    let obj: *const NSEvent = event;
+    // objc2 0.6 sends typed `&NSEvent` arguments through `msg_send!`
+    // without a manual pointer cast — the runtime glue marshalls it
+    // as an ObjC `id`. The previous `obj as *mut NSObject` cast
+    // bypassed retain tracking for no benefit.
     let _ = with_live_controller(|c| unsafe {
-        let _: () = msg_send![c, captureKey: obj as *mut NSObject];
+        let _: () = msg_send![c, captureKey: event];
     });
 }
 
@@ -355,10 +324,10 @@ pub fn open(mtm: MainThreadMarker) {
     let already_open = LIVE_SETTINGS.with(|slot| slot.borrow().as_ref().map(|l| l.window.clone()));
     if let Some(existing) = already_open {
         let ns_app = NSApplication::sharedApplication(mtm);
-        #[allow(deprecated)]
-        unsafe {
-            ns_app.activateIgnoringOtherApps(true)
-        };
+        // Use the non-deprecated `activate` (matches main.rs). The old
+        // `activateIgnoringOtherApps(true)` is documented for removal in
+        // a future objc2-app-kit minor bump.
+        ns_app.activate();
         existing.makeKeyAndOrderFront(None);
         return;
     }
@@ -381,6 +350,11 @@ pub fn open(mtm: MainThreadMarker) {
     };
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(&NSString::from_str("Parakeet Settings"));
+    // State restoration: AppKit autosaves the frame (position + size)
+    // under this name into NSUserDefaults, restored on the next open.
+    // Cheaper than implementing NSWindowRestoration for a single
+    // floating settings window.
+    window.setFrameAutosaveName(&NSString::from_str("ParakeetSettings"));
 
     // Build form contents.
     let content = window.contentView().expect("window must have content view");
@@ -451,9 +425,12 @@ pub fn open(mtm: MainThreadMarker) {
     add_label(mtm, &content, "Cleanup", PAD, row4_y);
     let cleanup_popup = make_popup(
         mtm,
-        &["Off — paste raw transcript", "Claude (via claude CLI)"],
+        &[
+            "Off — paste raw transcript",
+            "On — Qwen 3.5 2B local (≈1.2 GB)",
+        ],
         match settings.as_ref().map(|s| s.cleanup_mode) {
-            Some(CleanupMode::Claude) => 1,
+            Some(CleanupMode::On) => 1,
             _ => 0,
         },
         NSPoint::new(PAD + LABEL_W, row4_y - 4.0),
@@ -466,45 +443,19 @@ pub fn open(mtm: MainThreadMarker) {
     }
     *controller.ivars().cleanup_popup.borrow_mut() = Some(cleanup_popup);
 
-    // --- Row 5: Model picker ----------------------------------------------
-    let row5_y = row4_y - ROW_H - 10.0;
-    add_label(mtm, &content, "Model", PAD, row5_y);
-    let labels: Vec<&str> = CLEANUP_MODELS.iter().map(|(label, _)| *label).collect();
-    let stored_model = settings
-        .as_ref()
-        .map(|s| s.cleanup_model.as_str())
-        .unwrap_or("claude-haiku-4-5");
-    let selected_model_idx = CLEANUP_MODELS
-        .iter()
-        .position(|(_, id)| *id == stored_model)
-        .unwrap_or(0) as isize;
-    let model_popup = make_popup(
-        mtm,
-        &labels,
-        selected_model_idx,
-        NSPoint::new(PAD + LABEL_W, row5_y - 4.0),
-        NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
-    );
-    unsafe { content.addSubview(&model_popup) };
-    *controller.ivars().cleanup_model_popup.borrow_mut() = Some(model_popup);
-
-    // Initial enabled-state sync: the model picker greys out when
-    // cleanup is Off so a fresh-install user doesn't think they need
-    // to set it.
-    controller.refresh_cleanup_enabled();
-
-    // --- Row 6: Cleanup hint ----------------------------------------------
-    let row6_y = row5_y - 30.0;
+    // --- Row 5: Cleanup hint ----------------------------------------------
+    let row5_y = row4_y - 30.0;
     add_hint(
         mtm,
         &content,
         "Cleanup removes filler words, fixes punctuation, and honours\n\
-         commands like \"new paragraph\" and \"scratch that\". Runs via\n\
-         `claude -p` — install Claude Code and log in to use this.",
+         commands like \"new paragraph\" and \"scratch that\". Runs\n\
+         in-process via llama.cpp + Metal on Apple Silicon — no cloud,\n\
+         no API key. First-time enable downloads ~1.2 GB of weights.",
         PAD,
-        row6_y - 38.0,
+        row5_y - 50.0,
         WINDOW_W - PAD * 2.0,
-        46.0,
+        60.0,
     );
 
     // --- Row 7: Buttons (bottom-right) ------------------------------------
@@ -547,14 +498,42 @@ pub fn open(mtm: MainThreadMarker) {
         });
     });
 
-    // Center + show. The agent app isn't otherwise frontmost, so activate.
-    window.center();
+    // Position on the screen containing the user's cursor (where they
+    // just clicked our menu-bar item), not necessarily the "main"
+    // screen. `NSWindow::center` uses `NSScreen::mainScreen`, which on
+    // a multi-display Mac is whichever screen has the keyboard focus —
+    // often NOT the screen the user is looking at when they invoke us.
+    center_on_cursor_screen(mtm, &window);
     let ns_app = NSApplication::sharedApplication(mtm);
-    #[allow(deprecated)]
-    unsafe {
-        ns_app.activateIgnoringOtherApps(true)
-    };
+    ns_app.activate();
     window.makeKeyAndOrderFront(None);
+}
+
+/// Center `window` on whichever `NSScreen` currently contains the
+/// mouse cursor. Falls back to the main screen if no screen contains
+/// the cursor (rare; happens during display reconfiguration).
+fn center_on_cursor_screen(mtm: MainThreadMarker, window: &RecordingWindow) {
+    let mouse = unsafe { NSEvent::mouseLocation() };
+    let screen = NSScreen::screens(mtm)
+        .iter()
+        .find(|s| {
+            let frame = s.frame();
+            mouse.x >= frame.origin.x
+                && mouse.x < frame.origin.x + frame.size.width
+                && mouse.y >= frame.origin.y
+                && mouse.y < frame.origin.y + frame.size.height
+        })
+        .map(|s| s.retain())
+        .or_else(|| NSScreen::mainScreen(mtm));
+    let Some(screen) = screen else {
+        return;
+    };
+    let visible = screen.visibleFrame();
+    let win_frame = window.frame();
+    let x = visible.origin.x + (visible.size.width - win_frame.size.width) / 2.0;
+    let y = visible.origin.y + (visible.size.height - win_frame.size.height) / 2.0;
+    let target = NSRect::new(NSPoint::new(x, y), win_frame.size);
+    unsafe { window.setFrame_display(target, true) };
 }
 
 // -----------------------------------------------------------------------

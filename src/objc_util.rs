@@ -18,6 +18,17 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 /// `&self` (an objc2 `Retained<…>`) and AppKit-owned references that
 /// aren't auto-marked `UnwindSafe`. We accept this in exchange for not
 /// having to plaster every selector with bespoke wrappers.
+///
+/// # **No-op in release builds**
+///
+/// `panic = "abort"` in `[profile.release]` (`Cargo.toml`) means
+/// `catch_unwind` does NOT catch panics — `body` aborts the process
+/// instead. The function still runs `body`, but the wrapper does
+/// nothing meaningful at the panic boundary. `install_panic_hook` in
+/// `main()` logs the panic message via `log::error!` *before* the
+/// abort handler runs; that log line is the only release-mode
+/// feedback path. In debug builds (`panic = "unwind"`) this guard
+/// works as expected.
 pub fn selector_guard<F: FnOnce()>(name: &'static str, body: F) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(body)) {
         let msg = payload_message(&payload);

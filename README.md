@@ -129,6 +129,12 @@ Both are required.
 
 ## Honest caveats
 
+- **Apple Silicon only (arm64)**: the bundled `libsherpa-onnx-c-api.dylib`
+  and `libonnxruntime.dylib` are arm64-only — Microsoft doesn't ship an
+  x86_64 build of onnxruntime with CoreML EP enabled. `scripts/make-app.sh`
+  runs `lipo -archs` on the release binary at the top of the script and
+  refuses to bundle anything that isn't arm64-only. There is no plan to
+  ship a universal binary. See [ADR-0002](docs/ADR.md#0002--macos-only).
 - **CoreML EP linkage and engagement (verified)**: `sherpa-onnx-sys` is
   configured with the `shared` feature instead of the default `static`,
   because the upstream static archive ships a CPU-only `libonnxruntime.a`

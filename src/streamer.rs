@@ -15,6 +15,7 @@ use anyhow::{anyhow, Context, Result};
 use sherpa_onnx::LinearResampler;
 
 use crate::audio::{AudioCapture, Recording};
+use crate::performance::{next_session_id, PhaseTimer, PhaseTimerMode};
 use crate::vad::{Vad, VAD_SAMPLE_RATE, WINDOW_SIZE};
 
 /// If the user starts dictation and says nothing within this window, give up.
@@ -36,9 +37,14 @@ pub enum Mode {
 pub enum Outcome {
     /// End of speech reached. Carries the raw mono samples at the native
     /// capture rate so the ASR can do its own resample / decode.
+    /// `timer` already has `mark_capture_end` (and `mark_vad_endpoint` in
+    /// VadAutoStop mode) populated; the consumer is responsible for the
+    /// remaining `mark_asr_*` / `mark_paste_done` calls and the final
+    /// `emit()`. See `docs/latency-plan.md` §1.
     Speech {
         samples: Vec<f32>,
         sample_rate: u32,
+        timer: PhaseTimer,
     },
     /// User aborted before any audio was eligible to commit.
     Cancelled,
@@ -111,6 +117,11 @@ pub fn start(vad_model: &Path, mode: Mode) -> Result<(Session, OutcomeRx)> {
         None
     };
 
+    // The latency clock starts here — mic is hot, the user is about to
+    // speak. The downstream `Outcome::Speech` carries this timer all the
+    // way through ASR and paste; cancellations / no-speech drop it.
+    let timer = PhaseTimer::start(PhaseTimerMode::Real, next_session_id());
+
     let join = std::thread::Builder::new()
         .name(match mode {
             Mode::VadAutoStop => "vad-watcher".into(),
@@ -119,9 +130,9 @@ pub fn start(vad_model: &Path, mode: Mode) -> Result<(Session, OutcomeRx)> {
         .spawn(move || {
             let outcome = match (mode, vad) {
                 (Mode::VadAutoStop, Some(vad)) => {
-                    run_vad(capture, vad, sample_rate, tap_rx, signal_rx)
+                    run_vad(capture, vad, sample_rate, tap_rx, signal_rx, timer)
                 }
-                (Mode::Manual, _) => run_manual(capture, sample_rate, tap_rx, signal_rx),
+                (Mode::Manual, _) => run_manual(capture, sample_rate, tap_rx, signal_rx, timer),
                 _ => Outcome::Error(anyhow!("invalid mode/vad combination")),
             };
             let _ = outcome_tx.send(outcome);
@@ -143,6 +154,7 @@ fn run_vad(
     sample_rate: u32,
     tap_rx: Receiver<Vec<f32>>,
     signal_rx: Receiver<Signal>,
+    timer: PhaseTimer,
 ) -> Outcome {
     let resampler = match LinearResampler::create(sample_rate as i32, VAD_SAMPLE_RATE) {
         Some(r) => r,
@@ -155,6 +167,7 @@ fn run_vad(
     };
 
     let mut window_buf: Vec<f32> = Vec::with_capacity(WINDOW_SIZE as usize * 4);
+    let mut window: Vec<f32> = Vec::with_capacity(WINDOW_SIZE as usize);
     let session_start = Instant::now();
     let mut saw_speech = false;
     let mut speech_started_at: Option<Instant> = None;
@@ -163,7 +176,7 @@ fn run_vad(
         match signal_rx.try_recv() {
             Ok(Signal::Cancel) => return finish(capture, Outcome::Cancelled),
             // VAD mode treats an explicit finalize the same as VAD-end-of-speech.
-            Ok(Signal::Finalize) => return finish_with_recording(capture),
+            Ok(Signal::Finalize) => return finish_at_vad_endpoint(capture, timer),
             Err(_) => {}
         }
 
@@ -187,8 +200,9 @@ fn run_vad(
         window_buf.extend_from_slice(&chunk16);
 
         while window_buf.len() >= WINDOW_SIZE as usize {
-            let head: Vec<f32> = window_buf.drain(..WINDOW_SIZE as usize).collect();
-            vad.accept_waveform(&head);
+            window.clear();
+            window.extend(window_buf.drain(..WINDOW_SIZE as usize));
+            vad.accept_waveform(&window);
             vad.drain_segments();
 
             let detected_now = vad.detected();
@@ -198,16 +212,21 @@ fn run_vad(
                     speech_started_at = Some(Instant::now());
                 }
             } else if saw_speech {
-                return finish_with_recording(capture);
+                return finish_at_vad_endpoint(capture, timer);
             }
 
             if let Some(t) = speech_started_at {
                 if t.elapsed() > Duration::from_secs(crate::vad::MAX_SPEECH_S as u64) {
-                    return finish_with_recording(capture);
+                    return finish_at_vad_endpoint(capture, timer);
                 }
             }
         }
     }
+}
+
+fn finish_at_vad_endpoint(capture: AudioCapture, mut timer: PhaseTimer) -> Outcome {
+    timer.mark_vad_endpoint();
+    finish_with_recording(capture, timer)
 }
 
 fn run_manual(
@@ -215,13 +234,17 @@ fn run_manual(
     _sample_rate: u32,
     tap_rx: Receiver<Vec<f32>>,
     signal_rx: Receiver<Signal>,
+    timer: PhaseTimer,
 ) -> Outcome {
     let session_start = Instant::now();
     loop {
         // Check controller signals every tick.
         match signal_rx.try_recv() {
             Ok(Signal::Cancel) => return finish(capture, Outcome::Cancelled),
-            Ok(Signal::Finalize) => return finish_with_recording(capture),
+            // Hold-mode endpoint = hotkey release. There's no VAD here,
+            // so `t_vad_endpoint` stays absent — `mark_capture_end` (in
+            // `finish_with_recording`) becomes the endpoint anchor.
+            Ok(Signal::Finalize) => return finish_with_recording(capture, timer),
             Err(_) => {}
         }
         // Drain the tap so the capture thread doesn't back up its channel.
@@ -231,13 +254,13 @@ fn run_manual(
         while tap_rx.try_recv().is_ok() {}
 
         if session_start.elapsed() > MANUAL_MAX_RECORDING {
-            return finish_with_recording(capture);
+            return finish_with_recording(capture, timer);
         }
         std::thread::sleep(Duration::from_millis(15));
     }
 }
 
-fn finish_with_recording(capture: AudioCapture) -> Outcome {
+fn finish_with_recording(capture: AudioCapture, mut timer: PhaseTimer) -> Outcome {
     match capture.stop() {
         Ok(rec) => {
             let Recording {
@@ -260,9 +283,12 @@ fn finish_with_recording(capture: AudioCapture) -> Outcome {
                 }
                 out
             };
+            let audio_s = mono.len() as f32 / sample_rate as f32;
+            timer.mark_capture_end(audio_s);
             Outcome::Speech {
                 samples: mono,
                 sample_rate,
+                timer,
             }
         }
         Err(e) => Outcome::Error(e),

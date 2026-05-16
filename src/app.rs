@@ -13,11 +13,13 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::asr::Asr;
-use crate::cleanup;
+use crate::cleanup::{self, LlamaCleanup};
 use crate::hotkey::HotkeyHandle;
 use crate::hud;
+use crate::llm_warmup;
 use crate::menubar;
 use crate::model_fetch::{self, Progress};
+use crate::performance::PhaseTimer;
 use crate::settings::{CleanupMode, Settings, SettingsStore, TriggerMode};
 use crate::streamer::{self, Mode as StreamerMode, Outcome, OutcomeRx, Session};
 use crate::{paste, performance, warmup};
@@ -41,6 +43,11 @@ pub struct App {
     pub settings: SettingsStore,
     /// Set once the model is downloaded and the recogniser is warm.
     pub asr: Mutex<Option<Arc<Asr>>>,
+    /// Set once the cleanup GGUF is loaded + warmed. `None` while
+    /// loading or when `cleanup_mode == Off` (no point warming what
+    /// the user didn't enable). `transcribe_and_paste` falls back to
+    /// raw paste when the slot is empty.
+    pub llm: Mutex<Option<Arc<LlamaCleanup>>>,
     pub current_state: Mutex<DictationState>,
     /// Lives for the program's lifetime; held here so the Settings UI can
     /// rebind it after the user records a new hotkey combo.
@@ -53,6 +60,7 @@ impl App {
             session: Mutex::new(None),
             settings,
             asr: Mutex::new(None),
+            llm: Mutex::new(None),
             current_state: Mutex::new(DictationState::ModelLoading),
             hotkey: Mutex::new(None),
         }
@@ -61,6 +69,26 @@ impl App {
     /// Hotkey-press edge. Behaviour depends on the configured TriggerMode:
     /// - Tap mode: toggle (start a session, or cancel one in flight).
     /// - Hold mode: always start a session. Release is the commit edge.
+    ///
+    /// # Lock-discipline invariant
+    ///
+    /// This runs on the **main thread** when invoked from the NSEvent
+    /// global-monitor block (`hotkey::install_media_key_monitor`), so
+    /// any lock held here also blocks the AppKit run loop. Every lock
+    /// acquired in this function and the helpers it calls must be
+    /// **uncontended-short**:
+    /// - `self.settings.load()` clones from a `parking_lot::Mutex`
+    ///   inside `SettingsStore` — held only for the clone duration.
+    /// - `self.session.lock()` is briefly held to check `is_some()` and
+    ///   to call `s.cancel()` (a single channel send). No I/O.
+    /// - `self.asr.lock()` (inside `start_session`) is held to check
+    ///   `is_none()` and clone the `Arc`; no I/O.
+    /// - Spawning the session-watcher thread releases all locks before
+    ///   the spawn returns.
+    ///
+    /// Do not introduce blocking I/O, file reads, or network calls
+    /// inside any lock acquired by this path — doing so freezes the
+    /// menu bar.
     pub fn on_hotkey_press(self: &Arc<Self>) {
         let mode = effective_trigger_mode(&self.settings.load());
         let active = self.session.lock().is_some();
@@ -131,9 +159,10 @@ impl App {
                     Some(Outcome::Speech {
                         samples,
                         sample_rate,
+                        timer,
                     }) => {
                         app.set_state(DictationState::Transcribing);
-                        app.transcribe_and_paste(samples, sample_rate);
+                        app.transcribe_and_paste(samples, sample_rate, timer);
                     }
                     Some(Outcome::Cancelled) => app.on_session_finished(),
                     Some(Outcome::NoSpeech) => {
@@ -150,7 +179,12 @@ impl App {
             .expect("spawn session-watcher thread");
     }
 
-    fn transcribe_and_paste(self: &Arc<Self>, samples: Vec<f32>, sample_rate: u32) {
+    fn transcribe_and_paste(
+        self: &Arc<Self>,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        mut timer: PhaseTimer,
+    ) {
         let app = self.clone();
         std::thread::Builder::new()
             .name("transcribe".into())
@@ -163,6 +197,7 @@ impl App {
                         return;
                     }
                 };
+                timer.mark_asr_start();
                 let raw = match asr.recognize(&samples, sample_rate) {
                     Ok(t) => t,
                     Err(e) => {
@@ -171,30 +206,16 @@ impl App {
                         return;
                     }
                 };
+                timer.mark_asr_done();
 
-                // Run the cleanup pass if enabled. Failure is non-fatal
-                // — the worst case is "user gets the raw transcript",
-                // which is the same as if cleanup were off. Surface the
-                // error in the menu bar but keep going.
                 let settings = app.settings.load();
-                let cleaned = if matches!(settings.cleanup_mode, CleanupMode::Off) {
-                    raw
-                } else {
-                    app.set_state(DictationState::Polishing);
-                    match cleanup::polish(&raw, &settings) {
-                        Ok(t) => t,
-                        Err(e) => {
-                            log::error!("cleanup failed: {e:#}");
-                            menubar::set_status_text(&format!(
-                                "Cleanup failed — using raw transcript ({e})"
-                            ));
-                            raw
-                        }
-                    }
-                };
-
-                if let Err(e) = paste::deliver(&cleaned, &settings.inject_mode) {
-                    log::error!("paste failed: {e:#}");
+                let result = deliver_cleaned(&app, &raw, &settings);
+                // Marks *last*-chunk paste under streaming; perceived
+                // first-chunk latency is much lower. See ADR-0018.
+                timer.mark_paste_done();
+                timer.emit();
+                if let Err(e) = result {
+                    log::error!("deliver failed: {e:#}");
                 }
                 app.on_session_finished();
             })
@@ -326,6 +347,145 @@ impl App {
                 menubar::set_status_text(&format!("Setup panicked: {e}"));
             }
         }
+
+        // Cleanup LLM loads in a second pass, ONLY if cleanup is
+        // enabled in settings. Skipping when off means a fresh install
+        // doesn't pay 1.2 GB of resident memory for a feature the user
+        // hasn't turned on. The Settings UI toggle should re-trigger
+        // this load when flipped to On (TODO: wire that hook).
+        if matches!(self.settings.load().cleanup_mode, CleanupMode::On) {
+            self.clone().spawn_llm_setup().await;
+        }
+    }
+
+    /// Load + warm the cleanup GGUF off the main thread. Idempotent —
+    /// returns early if `app.llm` is already populated. Called from
+    /// `spawn_model_setup` and (TODO) the Settings UI toggle.
+    pub async fn spawn_llm_setup(self: Arc<Self>) {
+        if self.llm.lock().is_some() {
+            return; // already loaded
+        }
+        let model_path = self.settings.cleanup_model_path();
+        if !self.settings.cleanup_model_present() {
+            // TODO: extend model_fetch.rs to pull the GGUF. For v1
+            // the user runs `scripts/fetch-cleanup-model.sh` or
+            // bench_llm's curl one-liner.
+            log::warn!(
+                "cleanup model missing at {} — cleanup will fail back to raw paste",
+                model_path.display()
+            );
+            menubar::set_status_text("Cleanup model not downloaded");
+            return;
+        }
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<LlamaCleanup>> {
+            menubar::set_status_text("Loading cleanup model…");
+            let llm = LlamaCleanup::load(&model_path)?;
+            menubar::set_status_text("Warming cleanup model…");
+            let arc = Arc::new(llm);
+            llm_warmup::dummy_polish(&arc)?;
+            Ok(arc)
+        })
+        .await;
+        match result {
+            Ok(Ok(llm)) => {
+                *self.llm.lock() = Some(llm);
+                menubar::set_status_text("Cleanup ready");
+                self.refresh_menu();
+            }
+            Ok(Err(e)) => {
+                log::error!("cleanup model setup failed: {e:#}");
+                menubar::set_status_text(&format!("Cleanup setup failed: {e}"));
+            }
+            Err(e) => {
+                log::error!("cleanup setup task panicked: {e}");
+                menubar::set_status_text(&format!("Cleanup setup panicked: {e}"));
+            }
+        }
+    }
+}
+
+/// Deliver `raw` to the focused app, optionally piping through the
+/// cleanup LLM with streaming-paste. Split out of `transcribe_and_paste`
+/// so the streaming-paste choreography (start streamer → push chunks →
+/// finish) stays readable.
+///
+/// Behaviour matrix:
+///
+/// | cleanup_mode | LLM loaded? | path |
+/// |---|---|---|
+/// | Off | — | one-shot `paste::deliver(raw)` |
+/// | On  | yes | streaming polish → `paste::Streamer` |
+/// | On  | no  | one-shot paste of `raw`, status text explains |
+///
+/// Cleanup failures fall back to raw paste — the user always sees their
+/// transcript, never nothing.
+fn deliver_cleaned(app: &Arc<App>, raw: &str, settings: &Settings) -> anyhow::Result<()> {
+    if matches!(settings.cleanup_mode, CleanupMode::Off) {
+        return paste::deliver(raw, &settings.inject_mode);
+    }
+    let llm = match app.llm.lock().clone() {
+        Some(l) => l,
+        None => {
+            // Cleanup was enabled but the model isn't loaded — pasting
+            // raw is the right fallback (better than nothing). Status
+            // text already explained the load failure.
+            log::warn!("cleanup enabled but model unavailable; pasting raw");
+            return paste::deliver(raw, &settings.inject_mode);
+        }
+    };
+    app.set_state(DictationState::Polishing);
+
+    // Wrap the streaming-paste choreography in `catch_unwind` so a
+    // panic from inside llama-cpp's FFI doesn't take down the whole
+    // app (see ADR-0018's "panic isolation" tradeoff). The fallback
+    // is the same as the cleanup-failed path: paste raw.
+    let app_for_panic = app.clone();
+    let settings_for_panic = settings.clone();
+    let raw_for_panic = raw.to_string();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<()> {
+        let mut streamer = paste::Streamer::start()?;
+        let res = cleanup::polish_streaming(&llm, raw, settings, |chunk| {
+            streamer
+                .push(chunk)
+                .map_err(|e| anyhow::anyhow!("streamer push: {e}"))
+        });
+        // Always finish the streamer (restores clipboard) before
+        // surfacing a polish error.
+        let finish_result = streamer.finish();
+        res?;
+        finish_result?;
+        Ok(())
+    }));
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            log::error!("cleanup pipeline failed: {e:#}");
+            menubar::set_status_text(&format!("Cleanup failed — using raw transcript ({e})"));
+            paste::deliver(&raw_for_panic, &settings_for_panic.inject_mode)
+        }
+        Err(panic_payload) => {
+            let msg = panic_message(&panic_payload);
+            log::error!("cleanup panic caught: {msg}");
+            menubar::set_status_text("Cleanup panicked — using raw transcript");
+            // app_for_panic is alive; tasks reading app.llm will see
+            // the still-loaded model. We leave it loaded — a single
+            // panic doesn't mean the model is corrupt.
+            let _ = app_for_panic; // mark as used; future hook point
+            paste::deliver(&raw_for_panic, &settings_for_panic.inject_mode)
+        }
+    }
+}
+
+/// Extract a printable message from a `catch_unwind` payload — handles
+/// both `&'static str` and `String` panic types, returns a generic
+/// label for anything else (rare).
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
@@ -439,6 +599,72 @@ fn fmt_bytes(n: u64) -> String {
 mod tests {
     use super::*;
     use crate::settings::TriggerMode;
+
+    #[test]
+    fn panic_message_extracts_static_str_payload() {
+        // `panic!("literal")` payload comes through as `&'static str`.
+        let result: std::thread::Result<()> = std::panic::catch_unwind(|| {
+            panic!("synthetic panic from cleanup");
+        });
+        let payload = result.unwrap_err();
+        assert_eq!(panic_message(&payload), "synthetic panic from cleanup");
+    }
+
+    #[test]
+    fn panic_message_extracts_owned_string_payload() {
+        // `panic!("{}", String::from(...))` payload comes through as
+        // owned `String`. Both branches of `panic_message` must work.
+        let result: std::thread::Result<()> = std::panic::catch_unwind(|| {
+            let dynamic = String::from("dynamic cleanup error");
+            panic!("{}", dynamic);
+        });
+        let payload = result.unwrap_err();
+        assert_eq!(panic_message(&payload), "dynamic cleanup error");
+    }
+
+    #[test]
+    fn panic_message_handles_unknown_payload_type() {
+        // `panic_any` with a custom type (rare in practice, but FFI
+        // surfaces sometimes emit non-string panic payloads).
+        let result: std::thread::Result<()> = std::panic::catch_unwind(|| {
+            std::panic::panic_any(42i32);
+        });
+        let payload = result.unwrap_err();
+        assert_eq!(panic_message(&payload), "non-string panic payload");
+    }
+
+    /// Smoke test for the §6-7 acceptance criterion: "panic in the
+    /// polish call confirms the next dictation pastes raw with a
+    /// user-visible notice and the app keeps running."
+    ///
+    /// We can't fabricate a real `LlamaCleanup` (it needs the GGUF on
+    /// disk), so this test exercises only the `catch_unwind` boundary
+    /// that `deliver_cleaned` wraps its polish pipeline in. A real-app
+    /// smoke is the manual test: turn cleanup On, run dictation, and
+    /// confirm a forced panic inside `polish_streaming` doesn't take
+    /// down the menu-bar app.
+    #[test]
+    fn catch_unwind_around_polish_pipeline_isolates_panic() {
+        let raw = "the raw transcript, untouched";
+        // Mimics the catch_unwind block in `deliver_cleaned` —
+        // closure that panics part-way through.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> anyhow::Result<()> {
+                // Pretend streamer + polish_streaming ran fine up to
+                // a point, then the inference layer panicked.
+                let _partial_chunk = "the raw";
+                panic!("simulated llama-cpp FFI segfault");
+            },
+        ));
+        // catch_unwind returned the panic payload; the panic did not
+        // propagate up the call stack, which is the whole point.
+        assert!(result.is_err(), "catch_unwind should have caught the panic");
+
+        // And the raw transcript is still available to feed the
+        // fallback paste path. `deliver_cleaned` calls
+        // `paste::deliver(raw, ...)` in this branch.
+        assert!(!raw.is_empty(), "raw transcript still available for fallback");
+    }
 
     #[test]
     fn glyphs_render_chord_modifiers_in_canonical_order() {

@@ -20,7 +20,21 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/target/release/bundle/osx/Parakeet.app"
 BIN_SRC="$ROOT/target/release/parakeet-rs"
 DYLIB_SRC="$ROOT/target/release"
-EXTRA_PLIST="$ROOT/Info.plist"
+
+# --- 0. arm64-only architecture gate -------------------------------------
+# parakeet-rs is Apple Silicon only (ADR-0002). sherpa-onnx and the
+# onnxruntime dylibs we bundle are arm64-only — silently producing a
+# fat / Intel binary would yield a .app that crashes on launch. Pin the
+# expected arch here so a wrong CI matrix entry fails loudly instead.
+if [ -f "$BIN_SRC" ]; then
+  if ! lipo -archs "$BIN_SRC" | grep -qx arm64; then
+    echo "ERROR: $BIN_SRC is not arm64-only (got: $(lipo -archs "$BIN_SRC"))" >&2
+    echo "       parakeet-rs ships Apple Silicon only — see docs/ADR.md ADR-0002." >&2
+    exit 1
+  fi
+fi
+# NOTE: there is no repo-root Info.plist; all custom keys are merged
+# into cargo-bundle's generated plist via PlistBuddy below.
 
 echo "1. cargo bundle --release"
 cd "$ROOT"
@@ -28,8 +42,11 @@ cargo bundle --release >/dev/null
 
 # --- 2. merge Info.plist -------------------------------------------------
 # cargo-bundle writes a clean Info.plist with the bundle-id, version, icon,
-# category, etc. We need to add our own keys (mic permission, apple-events,
-# LSUIElement). PlistBuddy reads/writes Apple's plist format natively.
+# category, etc. We add our own keys (usage strings, LSUIElement, HiDPI,
+# application category, copyright) here via PlistBuddy. There is NO
+# repo-root Info.plist — every custom key lives in this script so the
+# `target/release/bundle/osx/Parakeet.app/Contents/Info.plist` produced
+# by cargo-bundle + this script is the single source of truth.
 
 echo "2. merge custom Info.plist keys"
 PLIST="$APP/Contents/Info.plist"
@@ -38,11 +55,22 @@ add_key() {
   /usr/libexec/PlistBuddy -c "Delete :$key" "$PLIST" 2>/dev/null || true
   /usr/libexec/PlistBuddy -c "Add :$key $type $value" "$PLIST"
 }
+# TCC usage strings (required by macOS for the listed entitlements).
 add_key NSMicrophoneUsageDescription string \
   "Parakeet needs microphone access to transcribe your speech to text."
 add_key NSAppleEventsUsageDescription string \
   "Parakeet uses Accessibility to paste transcribed text into the focused window."
+# Menu-bar agent app: no Dock icon, no main menu strip.
 add_key LSUIElement bool true
+# Default-true on modern macOS, but explicit is safer — avoids the
+# rare case of a launcher (lipo'd or non-standard runtime) thinking
+# the app wants 72-dpi rendering.
+add_key NSHighResolutionCapable bool true
+# App Store / Spotlight categorization. Productivity covers
+# dictation, transcription, voice-to-text utilities.
+add_key LSApplicationCategoryType string "public.app-category.productivity"
+# Required for notarization + nice-to-have for the Get Info pane.
+add_key NSHumanReadableCopyright string "Copyright © 2026 parakeet-rs"
 
 # --- 3. bundle dylibs ----------------------------------------------------
 # sherpa-onnx-sys copied them to target/release/ during the cargo build.

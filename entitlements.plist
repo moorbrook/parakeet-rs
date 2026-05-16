@@ -1,5 +1,28 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for parakeet-rs (ad-hoc / Developer ID, NOT sandboxed).
+
+  Sandbox status: OFF. `com.apple.security.app-sandbox` is intentionally
+  absent. We need:
+    - HID-level keyboard listening via CGEventTap (for global hotkeys)
+    - NSEvent.addGlobalMonitor (for media keys)
+    - Direct file I/O outside the app container (model weights live in
+      ~/Library/Application Support/com.parakeet.rs/)
+  None of these are sandbox-friendly. Distribution model is Developer ID
+  + hardened runtime + notarization, not Mac App Store.
+
+  If we ever turn on `com.apple.security.app-sandbox`, the
+  `com.apple.security.automation.apple-events` entitlement below must
+  be paired with `com.apple.security.temporary-exception.apple-events`
+  enumerating each target bundle ID we send keystrokes to — otherwise
+  the AX paste path stops working under sandbox confinement.
+
+  NSAccessibilityUsageDescription is NOT required: macOS treats
+  Accessibility as a TCC capability granted via System Settings →
+  Privacy & Security → Accessibility, not via a usage string.
+  NSAppleEventsUsageDescription IS required (lives in Info.plist).
+-->
 <plist version="1.0">
 <dict>
   <key>com.apple.security.device.audio-input</key>

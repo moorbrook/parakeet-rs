@@ -1,0 +1,5 @@
+model,backend,prompt_tokens,out_tokens,n,metric,mean,p50,p95,p99
+qwen3.5-2b-q4_k_m,llama.cpp+metal,322,55,100,ttft_ms,2.0,2.0,2.0,2.0
+qwen3.5-2b-q4_k_m,llama.cpp+metal,322,55,100,gen_ms,548.4,548.0,558.1,567.0
+qwen3.5-2b-q4_k_m,llama.cpp+metal,322,55,100,total_ms,550.9,550.0,560.1,570.0
+qwen3.5-2b-q4_k_m,llama.cpp+metal,322,55,100,tokens_per_s,100.3,100.4,101.7,101.9

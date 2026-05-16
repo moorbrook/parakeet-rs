@@ -741,6 +741,230 @@ makes CoreML EP unreliable.
 
 ---
 
+## 0018 — Cleanup backend: llama.cpp + Qwen 3.5 2B Q4_K_M
+
+**Status:** Accepted (Phase-0 measured)
+
+**Context.** [docs/latency-plan.md](./latency-plan.md) §6 calls for a
+Candle vs OminiX-MLX head-to-head on Gemma 4 E2B 4-bit. Research surfaced
+three blockers before any bench could run:
+
+1. **Gemma 4 doesn't exist in Candle 0.10.2.** Candle *main* branch added
+   `pub mod gemma4` recently, but no `quantized-gemma4` example yet —
+   fp16/bf16 weights only (~10 GB for 5.1B-loaded E2B).
+2. **OminiX-MLX ships no Gemma crate.** Adopting it for Gemma 4 means
+   writing a new `gemma4-mlx` crate from scratch (per
+   [docs/gemma4-mlx-implementation.md](./gemma4-mlx-implementation.md)),
+   which catalogues seven architectural divergences from Qwen3. Multi-day
+   port + token-parity validation against Python mlx-lm. Out of scope as
+   the v1 cleanup backend; gated on a measured Candle/llama.cpp miss.
+3. **Gemma 4 E2B doesn't fit the <2 GB disk budget.** Q4_K_M is ~3 GB
+   ([bartowski/google_gemma-4-E2B-it-GGUF](https://huggingface.co/bartowski/google_gemma-4-E2B-it-GGUF)).
+   Going lower than Q4_K_M (Q3_K_M ~2.4 GB, Q2_K ~1.9 GB) hits the steep
+   small-model quant degradation curve flagged by the [Qwen3
+   quantization study](https://arxiv.org/html/2505.02214v1).
+
+**Decision.** Replace `claude -p` (current `src/cleanup.rs` path) with
+in-process inference via **llama.cpp + Qwen 3.5 2B-Instruct Q4_K_M**.
+
+- **Model:** [`unsloth/Qwen3.5-2B-GGUF`](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF)
+  → `Qwen3.5-2B-Q4_K_M.gguf` (1.22 GB on disk).
+- **Backend:** [`llama-cpp-2`](https://crates.io/crates/llama-cpp-2)
+  Rust binding (crates.io, default-features off, `metal` feature on).
+  llama.cpp builds llama.cpp's C++ core via cmake at first compile.
+- **Chat template:** ChatML with `/no_think` directive — Qwen 3.5's
+  reasoning mode is on by default and would blow past our output cap
+  inside the `<think>` block. The directive disables thinking; we
+  additionally pre-close an empty `<think></think>` on the assistant
+  side as belt-and-braces.
+
+**Why Qwen 3.5 2B, not the originally-spec'd Gemma 4 E2B.**
+
+Per the size-matched comparison in
+[Maniac](https://www.maniac.ai/blog/qwen-3-5-vs-gemma-4-benchmarks-by-size):
+
+| Benchmark | Gemma 4 E2B | Qwen 3.5 2B | Winner |
+|-----------|-------------|-------------|--------|
+| MMLU-Pro | 60.0 | **66.5** | Qwen (+6.5pp) |
+| TAU2-Bench | 24.5 | **48.8** | Qwen (+24pp) |
+| MMMU-Pro | 44.2 | **50.3** | Qwen (+6.1pp) |
+| MMMLU | **67.4** | 63.1 | Gemma (+4.3pp) |
+
+Qwen 3.5 2B beats Gemma 4 E2B on 3/4 size-class benchmarks, fits the
+<2 GB disk budget at acceptable Q4_K_M quant, is one model generation
+newer (Feb 2026 vs Gemma 4's earlier 2026 release), and works in the
+shipping `llama-cpp-2` Rust binding today. Gemma 4 wins only on
+multilingual MMMLU — not load-bearing for English-language dictation
+cleanup.
+
+**Why llama.cpp, not Candle.** Candle ships neither Qwen 3.5 (new
+hybrid Gated-DeltaNet architecture, `Qwen3_5ForConditionalGeneration`)
+nor Gemma 4 Q4. llama.cpp picked up both within days of release. The
+"pure Rust" constraint in the latency plan is interpreted as
+"no Python, no subprocess, no HTTP" — FFI to a well-maintained C++
+library (analogous to sherpa-onnx for ASR) satisfies it. The Metal
+backend on Apple Silicon delivers ~100 tok/s on Qwen 3.5 2B Q4_K_M
+(measured below).
+
+**Measured Phase-0 numbers, M5 Pro 24 GB, 100 iterations
+(`bench/cleanup-backends.csv`):**
+
+| Metric | Mean | p50 | p95 | p99 |
+|---|---|---|---|---|
+| TTFT (ms) | 2.0 | 2.0 | 2.0 | 2.0 |
+| Generation (ms) | 548 | 548 | 558 | 567 |
+| **Total per polish (ms)** | **551** | **550** | **560** | **570** |
+| Decode (tokens/sec) | 100.3 | 100.4 | 101.7 | 101.9 |
+
+Cold model load: 229 ms (incurred once per process; cleanup ready
+before the user's first hotkey press if loaded in `llm_warmup.rs`).
+Output: 55 tokens (one cleaned paragraph) for a 240-character noisy
+input. p99 / p50 = 1.04 — variance is negligible, Metal kernel
+scheduling is steady-state from iteration 1.
+
+**Latency budget consequence.** Projected total post-endpoint latency
+on a 5 s utterance with cleanup:
+
+```
+   362 ms   ASR (§1 measured)
++  150 ms   VAD hangover (vad.rs:15)
++   50 ms   paste finalize (latency-plan estimate)
++  550 ms   cleanup (this bench, p50)
+= 1112 ms   total p50
+```
+
+That's **~112 ms over the latency-plan §6 acceptance criterion of
+≤ 1.0 s p50 with cleanup**. Three mitigations on the table for the
+§4 cleanup-rewrite work, in order of effort:
+
+1. **Stream the paste**: emit cleaned tokens to NSPasteboard + ⌘V
+   incrementally as the model generates, rather than buffering until
+   end-of-sequence. The user feels latency as "first token visible",
+   not "last token visible". Saves ~300–400 ms perceived; the actual
+   wall clock to last-token is unchanged.
+2. **Trim output cap**: typical cleanup output for a 30-token input
+   is 20–35 output tokens. Cap at 40 → ~400 ms gen → total ~960 ms p50,
+   under budget. Risk: long dictations get truncated; need fallback to
+   raw paste if the cap hits.
+3. **Ship at ~1.1 s p50, advertise honestly**: still ~5× faster than
+   `claude -p` subprocess (1–3 s startup alone). The §6 acceptance
+   number gets a footnote: "1.0 s p50 was an aspirational target;
+   measured v1 is 1.1 s p50 within budget for streaming-paste v1.1."
+
+Recommend (1) for §4: streaming paste is the lever that buys the most
+perceived-latency improvement and aligns with how cloud dictation
+tools (Wispr Flow, etc.) deliver their <700 ms feel.
+
+**Rejected alternatives revisited.**
+
+- **OminiX-MLX + new `gemma4-mlx` crate.** The implementation doc
+  ([gemma4-mlx-implementation.md](./gemma4-mlx-implementation.md))
+  estimates this as "from-scratch work" with 7 architectural
+  divergences from Qwen3. Plan-faithful but multi-day. Defer; revisit
+  if the measured llama.cpp number ever misses a tightened budget.
+- **Candle main + gemma4 fp16.** ~10 GB on-disk, blows past the <2 GB
+  user constraint, and the loader is not yet quantized.
+- **Direct Anthropic API.** Rejected by project directive (see
+  [`feedback_no_anthropic_api`](../README.md) in agent memory and the
+  `cleanup_mode` `#[serde(alias = "anthropic")]` in `src/settings.rs`).
+- **`mlx-rs` direct.** Same multi-day port story as OminiX-MLX without
+  the shared infrastructure crates.
+
+**Open issues to handle in §4 cleanup rewrite.**
+
+- The `/no_think` directive currently leaks into the model's output as
+  trailing text (Qwen 3.5 echoes it). Strip the trailing token in
+  post-processing.
+- Streaming-paste is non-trivial against `paste::deliver`'s current
+  "single clipboard write + ⌘V chord" shape. Either re-architect to
+  stream-and-overwrite (accessibility-API territory; see
+  [ADR-0011](#0011-direct-accessibility-text-injection) deferred) or
+  buffer-and-paste-all-at-once with a visual streaming indicator in
+  the HUD.
+- Model file management: ~1.22 GB download on first cleanup-enabled
+  launch, cached at `~/Library/Application Support/com.parakeet.rs/llm/qwen3.5-2b-q4_k_m/`.
+  Reuse the `model_fetch.rs` pattern from Parakeet's first-run flow.
+
+**References.**
+
+- `bench/cleanup-backends.csv` — full 100-row Phase-0 data, this M5 Pro.
+- `src/bin/bench_llm.rs` — the bench harness.
+- [Welcome Gemma 4 — Hugging Face](https://huggingface.co/blog/gemma4)
+- [unsloth/Qwen3.5-2B-GGUF](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF)
+- [llama-cpp-2 crate](https://crates.io/crates/llama-cpp-2)
+- [Qwen 3.5 vs Gemma 4 size-matched benchmarks — Maniac](https://www.maniac.ai/blog/qwen-3-5-vs-gemma-4-benchmarks-by-size)
+- [Qwen3 quantization empirical study (arxiv)](https://arxiv.org/html/2505.02214v1)
+
+---
+
+## 0017 — CoreML `ModelCacheDirectory` blocked at the sherpa-onnx Rust binding
+
+**Status:** Blocked / Deferred
+
+**Context.** [docs/latency-plan.md](./latency-plan.md) §2 wants us to set
+ONNX Runtime's CoreML EP `ModelCacheDirectory` provider option to
+`~/Library/Caches/parakeet-rs/coreml/`. ORT 1.20+ supports it; we link
+`libonnxruntime.1.24.4.dylib`, so the underlying EP can consume it.
+Expected win: seconds off **first-dictation-after-launch** cold start
+(does not move warm p50, per the plan).
+
+**Investigation.** Surveyed sherpa-onnx 1.13.2 (current crates.io latest):
+
+- `OfflineModelConfig` exposes a single `provider: Option<String>` field
+  (just `"coreml"`). No `provider_config`, no `coreml_*` sub-struct,
+  no key/value map for arbitrary EP options.
+  ( `~/.cargo/registry/.../sherpa-onnx-1.13.2/src/offline_asr.rs:475` )
+- The sys binding mirrors the upstream C struct exactly — also a single
+  `*const c_char`. ( `sherpa-onnx-sys-1.13.2/src/offline_asr.rs:178` )
+- Upstream `SherpaOnnxOfflineRecognizerConfig` (k2-fsa/sherpa-onnx C
+  API) does NOT carry a `provider_config` field. Only the *online*
+  recognizer's `SherpaOnnxOnlineModelConfig` has one — and even there
+  the CoreML sub-struct only surfaces `coreml_provider`, not
+  `model_cache_directory`.
+- `rg -i 'coreml|provider_config|model_cache'` across both crates
+  returns zero matches outside the provider-name string itself.
+
+**Decision.** Defer §2 until we can pass arbitrary CoreML EP options
+through to `OrtSessionOptionsAppendExecutionProvider_CoreML_V2`.
+Paths forward, in increasing cost:
+
+1. **Wait for sherpa-onnx upstream.** File an issue requesting the
+   offline path's `OfflineModelConfig` gain a `provider_config` field
+   matching the online path. Low effort to file; weeks–months to land.
+2. **Vendored fork of sherpa-onnx-sys.** Patch the C struct +
+   `to_sys` bridge locally; rebuild the sys crate against our fork.
+   Adds a maintenance liability — every sherpa-onnx upgrade has to
+   re-apply the patch.
+3. **Drop sherpa-onnx for the ASR path.** Switch to direct ORT
+   bindings (`ort` crate) and feed the `.onnx` files ourselves. Big
+   refactor; would absorb the encoder/decoder/joiner glue sherpa
+   currently provides for the NeMo transducer family.
+
+**Why deferring is OK.** The §1 baseline (bench/baseline.csv,
+2026-05-16, M5 Pro 24 GB) puts the 5 s ASR-only p50 at **362 ms**.
+Adding the latency plan's 150 ms VAD hangover + 50 ms paste finalize
+≈ 562 ms total post-endpoint — already inside the §6 acceptance
+criterion of ≤ 700 ms p50 no-cleanup. The §2 optimization helps
+*first-launch* cold start only (where the user feels CoreML's MLProgram
+graph compile cost). That's a real win to grab eventually, but it's
+not gating the ship of §6 (cleanup rewrite + acceptance numbers).
+
+**Open question.** Empirically verify whether CoreML's own framework-level
+cache at `~/Library/Caches/com.apple.MLModelCompiler/` already short-
+circuits enough of the recompile cost that the ORT-layer cache is
+marginal. If it does, this ADR closes as "no work needed"; if it doesn't,
+path 2 (vendored fork) becomes the right move.
+
+**Consequences.**
+- `src/asr.rs:72` left unchanged.
+- Latency plan §2 acceptance criterion ("CoreML model cache directory
+  is configured…") reads "Deferred — see ADR-0017" in the final
+  rollup.
+- Bench harness from §1 is already in place to measure the win when
+  the binding option lands.
+
+---
+
 ## Index of open decisions vs targets
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |

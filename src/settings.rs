@@ -32,24 +32,20 @@ pub enum TriggerMode {
 /// Optional LLM post-processing pass between ASR output and paste. Used to
 /// strip filler words, fix punctuation, and honour inline editing commands
 /// (e.g. "new paragraph", "scratch that").
+///
+/// v1 ships a single backend: Qwen 3.5 2B Q4_K_M via in-process
+/// `llama-cpp-2` (Metal on Apple Silicon). See [ADR-0018](../docs/ADR.md).
+/// No `cleanup_model` setting — the model is fixed at the backend's
+/// expected path and changing it requires a code change, not a config
+/// change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CleanupMode {
     /// No post-processing; paste the raw ASR transcript.
     #[default]
     Off,
-    /// Shell out to `claude -p` with the user's existing Claude Code
-    /// login. No API key required, no key for us to store.
-    ///
-    /// `alias = "anthropic"` lets a settings.json written by the
-    /// previous Anthropic-API build still parse cleanly; the wire form
-    /// is "claude" going forward.
-    #[serde(alias = "anthropic")]
-    Claude,
-}
-
-fn default_cleanup_model() -> String {
-    "claude-haiku-4-5".to_string()
+    /// In-process Qwen 3.5 2B Q4_K_M via `llama-cpp-2` Metal backend.
+    On,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,8 +58,6 @@ pub struct Settings {
     pub language: String,
     #[serde(default)]
     pub cleanup_mode: CleanupMode,
-    #[serde(default = "default_cleanup_model")]
-    pub cleanup_model: String,
 }
 
 impl Default for Settings {
@@ -74,7 +68,6 @@ impl Default for Settings {
             inject_mode: "paste".to_string(),
             language: String::new(),
             cleanup_mode: CleanupMode::default(),
-            cleanup_model: default_cleanup_model(),
         }
     }
 }
@@ -165,6 +158,25 @@ impl SettingsStore {
             && self.tokens_path().exists()
             && self.vad_path().exists()
     }
+
+    /// Cleanup-pass GGUF weights, downloaded on first cleanup-enabled
+    /// launch into the same per-bundle data directory as the ASR model.
+    /// v1 ships exactly one supported model (Qwen 3.5 2B Q4_K_M) — see
+    /// [ADR-0018](../../docs/ADR.md). The directory + filename are
+    /// fixed; changing them requires a model-fetch update, not a
+    /// settings change.
+    pub fn cleanup_model_path(&self) -> PathBuf {
+        self.data_dir
+            .join("llm")
+            .join("qwen3.5-2b-q4_k_m")
+            .join("Qwen3.5-2B-Q4_K_M.gguf")
+    }
+
+    /// True iff the cleanup-pass GGUF is on disk. The cleanup loader
+    /// gates on this before attempting to call llama.cpp.
+    pub fn cleanup_model_present(&self) -> bool {
+        self.cleanup_model_path().exists()
+    }
 }
 
 #[cfg(test)]
@@ -249,79 +261,59 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_defaults_are_off_with_haiku_model() {
-        // The cleanup pass is opt-in: a fresh install neither spawns a
-        // subprocess nor bills the user's Claude account. Pin the
-        // default so an accidental flip doesn't silently start.
+    fn cleanup_defaults_to_off() {
+        // The cleanup pass is opt-in: a fresh install doesn't load the
+        // ~1.2 GB Qwen GGUF until the user enables cleanup explicitly.
+        // Pin the default so an accidental flip doesn't silently start
+        // a download + warmup the user didn't ask for.
         let s = Settings::default();
         assert_eq!(s.cleanup_mode, CleanupMode::Off);
-        assert_eq!(s.cleanup_model, "claude-haiku-4-5");
     }
 
     #[test]
-    fn cleanup_fields_round_trip_through_json() {
+    fn cleanup_mode_on_round_trips_lowercase() {
         let s = Settings {
-            cleanup_mode: CleanupMode::Claude,
-            cleanup_model: "claude-sonnet-4-6".into(),
+            cleanup_mode: CleanupMode::On,
             ..Settings::default()
         };
         let raw = serde_json::to_string(&s).unwrap();
         // Lowercase enum form, same as TriggerMode.
         assert!(
-            raw.contains("\"cleanup_mode\":\"claude\""),
+            raw.contains("\"cleanup_mode\":\"on\""),
             "expected lowercase cleanup_mode, got: {raw}"
         );
         let back: Settings = serde_json::from_str(&raw).unwrap();
-        assert_eq!(back.cleanup_mode, CleanupMode::Claude);
-        assert_eq!(back.cleanup_model, "claude-sonnet-4-6");
+        assert_eq!(back.cleanup_mode, CleanupMode::On);
     }
 
     #[test]
-    fn legacy_anthropic_mode_token_still_parses() {
-        // A settings.json written by the brief Anthropic-API era of
-        // this app used "anthropic" as the cleanup_mode value. The
-        // `#[serde(alias = "anthropic")]` on CleanupMode::Claude maps
-        // that legacy token onto the new variant so the upgrade is
-        // seamless — no "your hotkey just disappeared" surprise.
-        let raw = r#"{
-            "hotkey": "F5",
-            "trigger_mode": "tap",
-            "inject_mode": "paste",
-            "language": "",
-            "cleanup_mode": "anthropic",
-            "cleanup_model": "claude-haiku-4-5"
-        }"#;
-        let s: Settings = serde_json::from_str(raw).expect("legacy mode token should map");
-        assert_eq!(s.cleanup_mode, CleanupMode::Claude);
-    }
-
-    #[test]
-    fn settings_json_never_contains_api_key_field() {
-        // The previous Anthropic-API path serialised `anthropic_api_key`.
-        // The `claude -p` path doesn't need a key at all — the user's
-        // existing Claude Code OAuth login is the credential. Pin that
-        // the field is GONE from the wire format so nobody re-introduces
-        // a leak vector by, say, adding it back to feed a fallback path.
+    fn settings_json_never_contains_api_key_or_model_name() {
+        // The Anthropic-API era and the `claude -p` era both wrote
+        // identifier fields (`anthropic_api_key`, `cleanup_model`) into
+        // settings.json. The in-process llama.cpp path has neither —
+        // no key, exactly one supported model. Pin that nothing in the
+        // wire shape lets a future change reintroduce them by accident.
         let s = Settings {
-            cleanup_mode: CleanupMode::Claude,
+            cleanup_mode: CleanupMode::On,
             ..Settings::default()
         };
         let raw = serde_json::to_string(&s).unwrap();
         assert!(
-            !raw.contains("anthropic_api_key"),
-            "settings.json must not contain anthropic_api_key: {raw}"
-        );
-        assert!(
             !raw.contains("api_key"),
             "settings.json must not contain any *api_key* field: {raw}"
+        );
+        assert!(
+            !raw.contains("cleanup_model"),
+            "settings.json must not contain cleanup_model: {raw}"
         );
     }
 
     #[test]
-    fn missing_cleanup_fields_take_safe_defaults() {
+    fn missing_cleanup_fields_default_to_off() {
         // A settings.json from before the cleanup feature existed must
         // still parse — and importantly, it must come out with cleanup
-        // OFF so an upgrade doesn't silently start spawning subprocesses.
+        // OFF so an upgrade doesn't silently start downloading 1.2 GB
+        // of model weights without consent.
         let raw = r#"{
             "hotkey": "CmdOrCtrl+Shift+Space",
             "trigger_mode": "tap",
@@ -330,7 +322,23 @@ mod tests {
         }"#;
         let s: Settings = serde_json::from_str(raw).expect("pre-cleanup file should parse");
         assert_eq!(s.cleanup_mode, CleanupMode::Off);
-        assert_eq!(s.cleanup_model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn cleanup_model_path_lives_under_data_dir() {
+        // The cleanup GGUF cache layout is a shipped invariant — a
+        // launch that changes this strands existing users' downloads.
+        let store = synthetic_store(tempfile::tempdir().unwrap().keep());
+        let cm = store.cleanup_model_path();
+        assert!(cm.starts_with(store.data_dir()));
+        assert_eq!(
+            cm,
+            store
+                .data_dir()
+                .join("llm")
+                .join("qwen3.5-2b-q4_k_m")
+                .join("Qwen3.5-2B-Q4_K_M.gguf")
+        );
     }
 
     #[test]
@@ -339,7 +347,7 @@ mod tests {
         // `model_dir()` and the VAD into `data_dir/models/`. If anyone
         // renames the model subdirectory, every existing user has to
         // re-download 640 MB. Pin the layout.
-        let store = synthetic_store(PathBuf::from("/tmp/parakeet-test"));
+        let store = synthetic_store(tempfile::tempdir().unwrap().keep());
         let model_dir = store.model_dir();
         assert!(model_dir.starts_with(store.data_dir()));
         assert_eq!(
@@ -373,7 +381,7 @@ mod tests {
         // `*_path()` accessors point at files that exist. If those two
         // lists ever drift, first-run reports "Model ready." and the
         // recogniser fails to load on the next launch.
-        let store = synthetic_store(PathBuf::from("/tmp/parakeet-test"));
+        let store = synthetic_store(tempfile::tempdir().unwrap().keep());
         let model_dir = store.model_dir();
 
         let mut gated: Vec<PathBuf> = vec![
