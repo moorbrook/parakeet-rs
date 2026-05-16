@@ -5,6 +5,7 @@ description = "Voice-to-text dictation on Apple Silicon — Parakeet TDT 0.6B v3
 authors = ["parakeet-rs"]
 edition = "2021"
 rust-version = "1.77"
+license = "MIT OR Apache-2.0"
 
 # Workspace-wide lint configuration. Replaces per-file `#![warn(...)]`
 # attributes so the policy is reviewable in one place.

@@ -159,3 +159,25 @@ Both are required.
 `cargo build --release` finishes in ~36 s on a cold cache, no warnings.
 `bun run build` produces both HTML entry points cleanly.
 End-to-end runtime test is up to you — needs a live mic and Accessibility grant.
+
+## License
+
+Dual-licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or
+  <https://opensource.org/licenses/MIT>)
+
+at your option. This matches the Rust ecosystem convention. Unless you
+explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this project shall be dual-licensed as above, without
+any additional terms or conditions.
+
+The runtime-downloaded models ship under their own licenses:
+
+- **Parakeet TDT 0.6B v3** (NVIDIA) — see
+  [the model card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
+- **Silero VAD** — MIT
+- **Qwen 3.5 2B Instruct** (cleanup pass) — Apache-2.0
+  ([model card](https://huggingface.co/Qwen/Qwen3.5-2B-Instruct))
