@@ -38,18 +38,44 @@ define_class!(
     impl MenuController {
         #[unsafe(method(toggleDictation:))]
         fn toggle_dictation(&self, _sender: *mut NSObject) {
-            // Menu clicks always behave like a Tap press — they can't
-            // express a hold/release pair. In Hold mode this means a menu
-            // click starts the session and a second click stops it.
+            // Menu clicks can't express a real hold/release pair, so we
+            // dispatch based on current state instead. Driving the
+            // press/release pair back-to-back on Idle+Hold would (and
+            // previously did) start a session and immediately finalize
+            // it, recording near-zero audio.
             crate::objc_util::selector_guard("toggleDictation:", || {
                 if let Some(app) = AppHandle::get() {
-                    app.on_hotkey_press();
-                    // For Hold mode + active session, simulate the release
-                    // edge so the menu-click toggle stays sane.
-                    if app.session.lock().is_some()
-                        && app.settings.load().trigger_mode == TriggerMode::Hold
-                    {
-                        app.on_hotkey_release();
+                    let state = *app.current_state.lock();
+                    // `effective_trigger_mode` applies the Caps Lock
+                    // override — stored Tap becomes runtime Hold for
+                    // a Caps Lock binding. Using raw `trigger_mode`
+                    // here would make the menu Stop a no-op for that
+                    // combination (press routes through Hold semantics
+                    // but Stop tried Tap-cancel).
+                    let mode =
+                        crate::app::effective_trigger_mode(&app.settings.load());
+                    match state {
+                        // Click while idle: start a session. Press
+                        // handler decides Tap vs Hold internally.
+                        DictationState::Idle => app.on_hotkey_press(),
+                        // Click while listening: stop. In Tap mode a
+                        // second press cancels; in Hold mode the
+                        // release edge finalizes.
+                        DictationState::Listening => match mode {
+                            TriggerMode::Tap => app.on_hotkey_press(),
+                            TriggerMode::Hold => app.on_hotkey_release(),
+                        },
+                        // Click while post-processing: ignore. A new
+                        // session has to wait for the in-flight one
+                        // to finish (matches the hotkey gate in
+                        // App::on_hotkey_press).
+                        DictationState::Transcribing
+                        | DictationState::Polishing
+                        | DictationState::ModelLoading => {
+                            log::debug!(
+                                "toggleDictation: ignored from state {state:?}"
+                            );
+                        }
                     }
                 }
             });
