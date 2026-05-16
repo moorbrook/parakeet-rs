@@ -448,16 +448,20 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
             .push(chunk)
             .map_err(|e| anyhow::anyhow!("streamer push: {e}"))
     });
-    // Capture fired-state BEFORE `finish` consumes the streamer.
-    // If any chunks were pasted, falling back to raw would append
-    // raw text on top of partial cleaned output — strictly worse than
-    // just keeping the partial.
-    let any_streamed = streamer.has_fired();
-    let finish_result = streamer.finish();
     match outcome {
-        PolishOutcome::Ok => finish_result,
+        PolishOutcome::Ok => {
+            // Success: flush the unbroken-boundary tail (often the
+            // model's last fragment) and restore the clipboard.
+            streamer.commit()
+        }
         PolishOutcome::Error(e) => {
             log::error!("cleanup pipeline failed: {e:#}");
+            // Sample fired-state BEFORE `abort` consumes the streamer.
+            // `abort` deliberately does NOT flush the pending tail, so
+            // this snapshot won't drift under us the way a `commit`-then-
+            // snapshot would.
+            let any_streamed = streamer.has_fired();
+            streamer.abort();
             if any_streamed {
                 menubar::set_status_text(&format!(
                     "Cleanup failed mid-stream — partial output kept ({e})"
@@ -474,6 +478,8 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
             log::error!("cleanup panic caught: {msg}");
             // We leave the model loaded — a single panic doesn't mean
             // the weights are corrupt, and reloading would cost ~250 ms.
+            let any_streamed = streamer.has_fired();
+            streamer.abort();
             if any_streamed {
                 menubar::set_status_text("Cleanup panicked mid-stream — partial output kept");
                 Ok(())

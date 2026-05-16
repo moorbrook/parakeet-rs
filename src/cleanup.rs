@@ -302,6 +302,25 @@ where
     if prompt_tokens == 0 {
         return Err(anyhow!("empty prompt after tokenization"));
     }
+    // Enforce the context budget BEFORE allocating the batch. Without
+    // this, a prompt at the full `ctx_size` would still pass the
+    // `< max_total` loop guard but write the first generated token at
+    // KV position == ctx_size — outside the KV cache, undefined
+    // behaviour in llama.cpp.
+    if cfg.max_output_tokens <= 0 {
+        return Err(anyhow!(
+            "GenerateConfig.max_output_tokens must be > 0; got {}",
+            cfg.max_output_tokens
+        ));
+    }
+    let ctx_size_usize = cfg.ctx_size as usize;
+    let max_output_usize = cfg.max_output_tokens as usize;
+    if prompt_tokens + max_output_usize > ctx_size_usize {
+        return Err(anyhow!(
+            "prompt ({prompt_tokens} tokens) + max_output ({max_output_usize}) \
+             exceeds ctx_size ({ctx_size_usize}); shorten the input or raise ctx_size"
+        ));
+    }
 
     // Size the prefill batch to the full context. A hardcoded 512 was
     // smaller than the prompt-token budget documented in `GenerateConfig`

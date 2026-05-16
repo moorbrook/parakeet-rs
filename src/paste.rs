@@ -116,12 +116,15 @@ impl Streamer {
         self.fired
     }
 
-    /// Force-flush any buffered text and restore the original clipboard.
-    /// Always call this even on the error path — `Drop` does it too,
-    /// but `finish` returns the restore error if there is one.
-    pub fn finish(mut self) -> Result<()> {
-        // Drain anything still pending (the model's last fragment
-        // before EOS is often a word with no trailing space).
+    /// Successful end-of-stream. Flushes any buffered tail (the model's
+    /// last fragment before EOS is often a word with no trailing space),
+    /// then restores the user's clipboard.
+    ///
+    /// **Don't call this on a polish error/panic path** — flushing the
+    /// tail there would visibly commit a fragment of cleaned output AND
+    /// allow the caller's error branch to additionally paste raw, producing
+    /// a `partial + raw` mess. Use `abort` instead.
+    pub fn commit(mut self) -> Result<()> {
         if !self.pending.is_empty() {
             self.flush_now()?;
         }
@@ -132,6 +135,18 @@ impl Streamer {
             let _ = restore_clipboard(&saved);
         }
         Ok(())
+    }
+
+    /// Aborted end-of-stream. Discards the pending tail (does NOT flush)
+    /// and restores the user's clipboard. Use this when polish errored
+    /// or panicked mid-stream so the caller can decide between "keep the
+    /// partial cleaned text already on screen" and "paste raw as
+    /// fallback" without an extra fragment muddying the state.
+    pub fn abort(mut self) {
+        self.pending.clear();
+        if let Some(saved) = self.saved_clipboard.take() {
+            let _ = restore_clipboard(&saved);
+        }
     }
 
     fn flush_now(&mut self) -> Result<()> {
