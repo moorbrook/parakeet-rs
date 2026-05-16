@@ -140,14 +140,19 @@ SIGN_ID="${PARAKEET_SIGN_ID:--}"          # `-` = ad-hoc
 ENTITLEMENTS="$ROOT/entitlements.plist"
 
 # Hardened Runtime + the entitlements file are required for notarisation
-# but BREAK ad-hoc signing: ad-hoc gives each artefact a different pseudo
-# Team ID, and Hardened Runtime then refuses to load the dylibs because
-# the bundle's Team ID doesn't match theirs. So both extras stay off for
-# the ad-hoc path; the Developer-ID path turns them on.
-if [ "$SIGN_ID" = "-" ]; then
-  EXTRA_FLAGS=()
-else
+# but BREAK every non-Developer-ID signing path: under Hardened Runtime
+# the dyld team-ID check rejects dylibs whose synthesised team ID
+# doesn't match the main executable's. Ad-hoc (`-`) gives each artefact
+# a different pseudo team ID. Self-signed local-dev certs share a CN
+# but have `TeamIdentifier=not set`, and macOS still enforces a
+# mismatch — observed on macOS 26.4.1 with "different Team IDs"
+# aborts during `dyld4::prepare` at launch. Only enable Hardened
+# Runtime for genuine `Developer ID Application:` identities, where
+# the real team ID lets the check pass.
+if [[ "$SIGN_ID" == "Developer ID Application:"* ]]; then
   EXTRA_FLAGS=(--options runtime --timestamp --entitlements "$ENTITLEMENTS")
+else
+  EXTRA_FLAGS=()
 fi
 
 sign_one() {
