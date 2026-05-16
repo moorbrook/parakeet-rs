@@ -31,6 +31,21 @@ use enigo::{Enigo, Keyboard, Settings};
 /// password fields) lose characters under that rate.
 const MIN_PASTE_INTERVAL: Duration = Duration::from_millis(60);
 
+/// Delay between writing to NSPasteboard and firing the ⌘V chord.
+///
+/// `pasteboardd` propagates clipboard updates to subscribed apps
+/// asynchronously. If our ⌘V hits the focused app's keyDown handler
+/// before that propagation lands, the app reads the OLD clipboard —
+/// in this app's case, whatever the prior dictation pasted. Old
+/// `enigo`-based chord had enough TSM overhead to mask this; the
+/// CGEvent-direct rewrite is microseconds and exposed the race.
+///
+/// 20 ms is the empirical sweet spot (Alfred / Raycast use the same
+/// range): low enough not to be perceptible against the ~100 ms
+/// streaming-paste rhythm, high enough that the focused app's
+/// pasteboard read sees the new value on every chord.
+const PASTEBOARD_SETTLE_DELAY: Duration = Duration::from_millis(20);
+
 pub fn deliver(text: &str, mode: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
@@ -40,6 +55,7 @@ pub fn deliver(text: &str, mode: &str) -> Result<()> {
         "clipboard" => copy_to_clipboard(text),
         _ => {
             copy_to_clipboard(text)?;
+            std::thread::sleep(PASTEBOARD_SETTLE_DELAY);
             send_paste_chord()
         }
     }
@@ -154,6 +170,12 @@ impl Streamer {
     fn flush_now(&mut self) -> Result<()> {
         let chunk: String = std::mem::take(&mut self.pending);
         copy_to_clipboard(&chunk)?;
+        // See `PASTEBOARD_SETTLE_DELAY`. Without this, the FIRST
+        // chunk of a streaming paste — fired before `pasteboardd`
+        // has propagated our `copy_to_clipboard` to the focused
+        // app — pastes whatever was on the clipboard BEFORE we
+        // started (typically the previous dictation's transcript).
+        std::thread::sleep(PASTEBOARD_SETTLE_DELAY);
         send_paste_chord()?;
         self.last_push_at = Some(Instant::now());
         self.fired = true;
