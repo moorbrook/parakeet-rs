@@ -40,11 +40,23 @@ const MIN_PASTE_INTERVAL: Duration = Duration::from_millis(60);
 /// `enigo`-based chord had enough TSM overhead to mask this; the
 /// CGEvent-direct rewrite is microseconds and exposed the race.
 ///
-/// 20 ms is the empirical sweet spot (Alfred / Raycast use the same
-/// range): low enough not to be perceptible against the ~100 ms
-/// streaming-paste rhythm, high enough that the focused app's
-/// pasteboard read sees the new value on every chord.
-const PASTEBOARD_SETTLE_DELAY: Duration = Duration::from_millis(20);
+/// 35 ms picked empirically — 20 ms was enough on some target apps
+/// but not on slower ones (the user saw the prior dictation pasted
+/// in place of the current chunk). Alfred / Raycast use the 30-50 ms
+/// range for the same reason.
+const PASTEBOARD_SETTLE_DELAY: Duration = Duration::from_millis(35);
+
+/// Delay between the LAST `flush_now` chord and `restore_clipboard`
+/// in `Streamer::commit`. Without it, the restore can overwrite the
+/// clipboard with the saved (pre-dictation) value BEFORE the focused
+/// app has dequeued the queued ⌘V event and read the pasteboard —
+/// the app then pastes the saved value (the prior dictation's output)
+/// instead of the chunk we just wrote.
+///
+/// Longer than `PASTEBOARD_SETTLE_DELAY` because the target app's
+/// event-dequeue latency can be substantial under load (Slack /
+/// Chrome on a slow frame can take >60 ms to process the keyDown).
+const RESTORE_SETTLE_DELAY: Duration = Duration::from_millis(120);
 
 pub fn deliver(text: &str, mode: &str) -> Result<()> {
     if text.is_empty() {
@@ -143,8 +155,17 @@ impl Streamer {
     /// allow the caller's error branch to additionally paste raw, producing
     /// a `partial + raw` mess. Use `abort` instead.
     pub fn commit(mut self) -> Result<()> {
-        if !self.pending.is_empty() {
+        let flushed_tail = !self.pending.is_empty();
+        if flushed_tail {
             self.flush_now()?;
+        }
+        // If we fired ANY chord (either now or earlier in the stream),
+        // the focused app may still be dequeuing the last ⌘V. We must
+        // not overwrite the clipboard with the saved value until the
+        // app has read it, or the app pastes the saved value (= prior
+        // transcript) instead of the chunk we just wrote.
+        if self.fired {
+            std::thread::sleep(RESTORE_SETTLE_DELAY);
         }
         // Restore the user's clipboard so the cleanup pass doesn't
         // steal their copy buffer. Best-effort — if restore fails
@@ -152,6 +173,10 @@ impl Streamer {
         if let Some(saved) = self.saved_clipboard.take() {
             let _ = restore_clipboard(&saved);
         }
+        // Silence the unused-binding lint on debug builds — `flushed_tail`
+        // is captured for future audit tooling that wants to know if the
+        // commit included a tail flush.
+        let _ = flushed_tail;
         Ok(())
     }
 
@@ -162,6 +187,12 @@ impl Streamer {
     /// fallback" without an extra fragment muddying the state.
     pub fn abort(mut self) {
         self.pending.clear();
+        // Same restore-race as `commit`: if any chunk was already
+        // chord-pasted, the focused app may still be processing the
+        // last ⌘V. Wait before clobbering the clipboard.
+        if self.fired {
+            std::thread::sleep(RESTORE_SETTLE_DELAY);
+        }
         if let Some(saved) = self.saved_clipboard.take() {
             let _ = restore_clipboard(&saved);
         }
