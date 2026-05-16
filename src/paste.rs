@@ -107,6 +107,15 @@ impl Streamer {
         self.flush_now()
     }
 
+    /// True iff `push` has actually fired at least one ⌘V chord. The
+    /// `deliver_cleaned` fallback path uses this to avoid double-pasting
+    /// raw text on top of already-streamed cleaned output when polish
+    /// fails or panics mid-stream — a partial cleaned result is strictly
+    /// less bad than `partial + raw` appended.
+    pub fn has_fired(&self) -> bool {
+        self.fired
+    }
+
     /// Force-flush any buffered text and restore the original clipboard.
     /// Always call this even on the error path — `Drop` does it too,
     /// but `finish` returns the restore error if there is one.
@@ -195,19 +204,10 @@ fn send_paste_chord() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn streamer_buffers_until_word_boundary() {
-        // Sanity-check the boundary detection without touching the
-        // real clipboard (`flush_now` would). Use a custom probe.
-        let mut probe = String::new();
-        for chunk in &["Hel", "lo, ", "wor", "ld!"] {
-            probe.push_str(chunk);
-        }
-        assert_eq!(probe, "Hello, world!");
-        // Boundary chars: ' ', '.', ',' etc.
-        assert!('.'.is_ascii_punctuation());
-        assert!(' '.is_whitespace());
-    }
+    // Streamer behaviour is exercised via integration: see
+    // `polish_streaming_*` tests in `cleanup.rs` plus the manual
+    // smoke described in `docs/latency-plan.md`. The clipboard side
+    // of `flush_now` is genuinely untestable without a real AppKit
+    // pasteboard; we save a no-value unit test rather than pretend
+    // to cover it.
 }

@@ -50,12 +50,16 @@ osx_minimum_system_version = "11.0"
 # - fat LTO + single codegen unit gives the compiler full cross-crate
 #   inlining and dead-code elimination, important since the audio path
 #   crosses several small crates.
-# - panic=abort drops unwinding tables (~few hundred KB).
+# - panic="unwind" is REQUIRED for the cleanup-pipeline panic-isolation
+#   acceptance criterion (latency-plan.md §7): a panic from the llama-cpp
+#   safe wrapper must be caught by `catch_unwind` in `run_polish_isolated`
+#   so the next dictation falls back to raw paste. `panic="abort"` would
+#   make that defense dead in release builds.
 # - strip=symbols removes the debug symbol table.
 [profile.release]
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = "symbols"
 opt-level = 3
 

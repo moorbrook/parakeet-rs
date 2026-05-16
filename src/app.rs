@@ -13,10 +13,9 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::asr::Asr;
-use crate::cleanup::{self, LlamaCleanup};
+use crate::cleanup::{self, CleanupBackend, LlamaCleanup};
 use crate::hotkey::HotkeyHandle;
 use crate::hud;
-use crate::llm_warmup;
 use crate::menubar;
 use crate::model_fetch::{self, Progress};
 use crate::performance::PhaseTimer;
@@ -46,8 +45,10 @@ pub struct App {
     /// Set once the cleanup GGUF is loaded + warmed. `None` while
     /// loading or when `cleanup_mode == Off` (no point warming what
     /// the user didn't enable). `transcribe_and_paste` falls back to
-    /// raw paste when the slot is empty.
-    pub llm: Mutex<Option<Arc<LlamaCleanup>>>,
+    /// raw paste when the slot is empty. Boxed behind the
+    /// [`CleanupBackend`] trait so tests can swap in a fake without
+    /// needing a real GGUF on disk.
+    pub llm: Mutex<Option<Arc<dyn CleanupBackend>>>,
     pub current_state: Mutex<DictationState>,
     /// Lives for the program's lifetime; held here so the Settings UI can
     /// rebind it after the user records a new hotkey combo.
@@ -189,13 +190,10 @@ impl App {
         std::thread::Builder::new()
             .name("transcribe".into())
             .spawn(move || {
-                let asr = match app.asr.lock().clone() {
-                    Some(a) => a,
-                    None => {
-                        log::error!("transcribe: model gone");
-                        app.on_session_finished();
-                        return;
-                    }
+                let Some(asr) = app.asr.lock().clone() else {
+                    log::error!("transcribe: model gone");
+                    app.on_session_finished();
+                    return;
                 };
                 timer.mark_asr_start();
                 let raw = match asr.recognize(&samples, sample_rate) {
@@ -251,7 +249,7 @@ impl App {
 
     /// Persist new settings AND apply runtime side-effects (rebinding the
     /// global hotkey if it changed).
-    pub fn apply_settings(self: &Arc<Self>, new: Settings) -> anyhow::Result<()> {
+    pub fn apply_settings(self: &Arc<Self>, new: &Settings) -> anyhow::Result<()> {
         // Refuse to persist an empty / unparseable hotkey. The Settings
         // UI also validates before calling us, but this is the canonical
         // chokepoint — any future caller (CLI flag, scripted import)
@@ -263,7 +261,7 @@ impl App {
             .map_err(|e| anyhow::anyhow!("hotkey {:?} is not parseable: {e}", new.hotkey))?;
 
         let prev = self.settings.load();
-        self.settings.save(&new)?;
+        self.settings.save(new)?;
         if prev.hotkey != new.hotkey {
             if let Some(handle) = self.hotkey.lock().as_ref() {
                 handle.rebind(&new.hotkey)?;
@@ -360,7 +358,16 @@ impl App {
 
     /// Load + warm the cleanup GGUF off the main thread. Idempotent —
     /// returns early if `app.llm` is already populated. Called from
-    /// `spawn_model_setup` and (TODO) the Settings UI toggle.
+    /// `spawn_model_setup` today.
+    ///
+    /// **Not single-flight.** The `is_some()` check and the eventual
+    /// write into `self.llm` are not atomic; two concurrent callers
+    /// would both observe `None`, both load the 1.2 GB GGUF, and race
+    /// at write-time. Today only the boot path invokes this, so the
+    /// race is unreachable. **Before wiring the Settings UI toggle
+    /// hook (TODO in `spawn_model_setup`), gate this on a `Mutex<bool>`
+    /// "loading-in-progress" flag** so the toggle can't trigger a
+    /// duplicate load while the boot load is still in flight.
     pub async fn spawn_llm_setup(self: Arc<Self>) {
         if self.llm.lock().is_some() {
             return; // already loaded
@@ -377,15 +384,15 @@ impl App {
             menubar::set_status_text("Cleanup model not downloaded");
             return;
         }
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<LlamaCleanup>> {
-            menubar::set_status_text("Loading cleanup model…");
-            let llm = LlamaCleanup::load(&model_path)?;
-            menubar::set_status_text("Warming cleanup model…");
-            let arc = Arc::new(llm);
-            llm_warmup::dummy_polish(&arc)?;
-            Ok(arc)
-        })
-        .await;
+        let result =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<dyn CleanupBackend>> {
+                menubar::set_status_text("Loading cleanup model…");
+                let llm = LlamaCleanup::load(&model_path)?;
+                menubar::set_status_text("Warming cleanup model…");
+                llm.warmup()?;
+                Ok(Arc::new(llm))
+            })
+            .await;
         match result {
             Ok(Ok(llm)) => {
                 *self.llm.lock() = Some(llm);
@@ -419,7 +426,7 @@ impl App {
 ///
 /// Cleanup failures fall back to raw paste — the user always sees their
 /// transcript, never nothing.
-fn deliver_cleaned(app: &Arc<App>, raw: &str, settings: &Settings) -> anyhow::Result<()> {
+fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<()> {
     if matches!(settings.cleanup_mode, CleanupMode::Off) {
         return paste::deliver(raw, &settings.inject_mode);
     }
@@ -435,51 +442,95 @@ fn deliver_cleaned(app: &Arc<App>, raw: &str, settings: &Settings) -> anyhow::Re
     };
     app.set_state(DictationState::Polishing);
 
-    // Wrap the streaming-paste choreography in `catch_unwind` so a
-    // panic from inside llama-cpp's FFI doesn't take down the whole
-    // app (see ADR-0018's "panic isolation" tradeoff). The fallback
-    // is the same as the cleanup-failed path: paste raw.
-    let app_for_panic = app.clone();
-    let settings_for_panic = settings.clone();
-    let raw_for_panic = raw.to_string();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<()> {
-        let mut streamer = paste::Streamer::start()?;
-        let res = cleanup::polish_streaming(&llm, raw, settings, |chunk| {
-            streamer
-                .push(chunk)
-                .map_err(|e| anyhow::anyhow!("streamer push: {e}"))
-        });
-        // Always finish the streamer (restores clipboard) before
-        // surfacing a polish error.
-        let finish_result = streamer.finish();
-        res?;
-        finish_result?;
-        Ok(())
+    let mut streamer = paste::Streamer::start()?;
+    let outcome = run_polish_isolated(llm.as_ref(), raw, settings, |chunk| {
+        streamer
+            .push(chunk)
+            .map_err(|e| anyhow::anyhow!("streamer push: {e}"))
+    });
+    // Capture fired-state BEFORE `finish` consumes the streamer.
+    // If any chunks were pasted, falling back to raw would append
+    // raw text on top of partial cleaned output — strictly worse than
+    // just keeping the partial.
+    let any_streamed = streamer.has_fired();
+    let finish_result = streamer.finish();
+    match outcome {
+        PolishOutcome::Ok => finish_result,
+        PolishOutcome::Error(e) => {
+            log::error!("cleanup pipeline failed: {e:#}");
+            if any_streamed {
+                menubar::set_status_text(&format!(
+                    "Cleanup failed mid-stream — partial output kept ({e})"
+                ));
+                Ok(())
+            } else {
+                menubar::set_status_text(&format!(
+                    "Cleanup failed — using raw transcript ({e})"
+                ));
+                paste::deliver(raw, &settings.inject_mode)
+            }
+        }
+        PolishOutcome::Panicked(msg) => {
+            log::error!("cleanup panic caught: {msg}");
+            // We leave the model loaded — a single panic doesn't mean
+            // the weights are corrupt, and reloading would cost ~250 ms.
+            if any_streamed {
+                menubar::set_status_text("Cleanup panicked mid-stream — partial output kept");
+                Ok(())
+            } else {
+                menubar::set_status_text("Cleanup panicked — using raw transcript");
+                paste::deliver(raw, &settings.inject_mode)
+            }
+        }
+    }
+}
+
+/// Outcome of one `polish_streaming` call run inside `catch_unwind`.
+///
+/// Splitting the success / typed-error / panic-payload triplet into a
+/// concrete enum lets us unit-test the panic-isolation seam without
+/// dragging `paste::Streamer` (which touches the system clipboard)
+/// into the test.
+#[derive(Debug)]
+enum PolishOutcome {
+    Ok,
+    Error(anyhow::Error),
+    Panicked(String),
+}
+
+/// Run the cleanup backend with a `catch_unwind` boundary. `on_chunk`
+/// is called from inside the unwind boundary — if it panics, the panic
+/// is caught the same way a polish-internal panic would be.
+///
+/// "Panic isolation" here means **Rust panics** from `llama-cpp-2`'s
+/// safe wrapper layer (e.g. an `assert!` inside the binding, a tokenise
+/// failure that the binding maps to `unwrap`). It does NOT catch C++
+/// exceptions, SIGSEGV from the GGML backend, or `abort()` from the
+/// underlying llama.cpp C++ — those bypass Rust's unwinding machinery
+/// entirely. The fallback is best-effort, not bulletproof.
+fn run_polish_isolated<F>(
+    backend: &dyn CleanupBackend,
+    text: &str,
+    settings: &Settings,
+    mut on_chunk: F,
+) -> PolishOutcome
+where
+    F: FnMut(&str) -> anyhow::Result<()>,
+{
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cleanup::polish_streaming(backend, text, settings, &mut on_chunk)
     }));
     match result {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => {
-            log::error!("cleanup pipeline failed: {e:#}");
-            menubar::set_status_text(&format!("Cleanup failed — using raw transcript ({e})"));
-            paste::deliver(&raw_for_panic, &settings_for_panic.inject_mode)
-        }
-        Err(panic_payload) => {
-            let msg = panic_message(&panic_payload);
-            log::error!("cleanup panic caught: {msg}");
-            menubar::set_status_text("Cleanup panicked — using raw transcript");
-            // app_for_panic is alive; tasks reading app.llm will see
-            // the still-loaded model. We leave it loaded — a single
-            // panic doesn't mean the model is corrupt.
-            let _ = app_for_panic; // mark as used; future hook point
-            paste::deliver(&raw_for_panic, &settings_for_panic.inject_mode)
-        }
+        Ok(Ok(())) => PolishOutcome::Ok,
+        Ok(Err(e)) => PolishOutcome::Error(e),
+        Err(payload) => PolishOutcome::Panicked(panic_message(&*payload)),
     }
 }
 
 /// Extract a printable message from a `catch_unwind` payload — handles
 /// both `&'static str` and `String` panic types, returns a generic
 /// label for anything else (rare).
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -607,7 +658,9 @@ mod tests {
             panic!("synthetic panic from cleanup");
         });
         let payload = result.unwrap_err();
-        assert_eq!(panic_message(&payload), "synthetic panic from cleanup");
+        // `&*payload` derefs the Box so `downcast_ref` sees the inner
+        // type (`&'static str`) instead of the Box itself.
+        assert_eq!(panic_message(&*payload), "synthetic panic from cleanup");
     }
 
     #[test]
@@ -619,7 +672,7 @@ mod tests {
             panic!("{}", dynamic);
         });
         let payload = result.unwrap_err();
-        assert_eq!(panic_message(&payload), "dynamic cleanup error");
+        assert_eq!(panic_message(&*payload), "dynamic cleanup error");
     }
 
     #[test]
@@ -630,40 +683,138 @@ mod tests {
             std::panic::panic_any(42i32);
         });
         let payload = result.unwrap_err();
-        assert_eq!(panic_message(&payload), "non-string panic payload");
+        assert_eq!(panic_message(&*payload), "non-string panic payload");
     }
 
-    /// Smoke test for the §6-7 acceptance criterion: "panic in the
-    /// polish call confirms the next dictation pastes raw with a
-    /// user-visible notice and the app keeps running."
-    ///
-    /// We can't fabricate a real `LlamaCleanup` (it needs the GGUF on
-    /// disk), so this test exercises only the `catch_unwind` boundary
-    /// that `deliver_cleaned` wraps its polish pipeline in. A real-app
-    /// smoke is the manual test: turn cleanup On, run dictation, and
-    /// confirm a forced panic inside `polish_streaming` doesn't take
-    /// down the menu-bar app.
-    #[test]
-    fn catch_unwind_around_polish_pipeline_isolates_panic() {
-        let raw = "the raw transcript, untouched";
-        // Mimics the catch_unwind block in `deliver_cleaned` —
-        // closure that panics part-way through.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-            || -> anyhow::Result<()> {
-                // Pretend streamer + polish_streaming ran fine up to
-                // a point, then the inference layer panicked.
-                let _partial_chunk = "the raw";
-                panic!("simulated llama-cpp FFI segfault");
-            },
-        ));
-        // catch_unwind returned the panic payload; the panic did not
-        // propagate up the call stack, which is the whole point.
-        assert!(result.is_err(), "catch_unwind should have caught the panic");
+    // Test backends for the §6-7 panic-isolation acceptance criterion.
+    // Real `LlamaCleanup` can't be constructed without a GGUF on disk,
+    // so we drive `run_polish_isolated` through fakes that exercise
+    // each `PolishOutcome` arm directly.
+    struct OkBackend;
+    impl crate::cleanup::CleanupBackend for OkBackend {
+        fn polish_into(
+            &self,
+            text: &str,
+            on_chunk: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            on_chunk(&format!("polished: {text}"))
+        }
+        fn warmup(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
 
-        // And the raw transcript is still available to feed the
-        // fallback paste path. `deliver_cleaned` calls
-        // `paste::deliver(raw, ...)` in this branch.
-        assert!(!raw.is_empty(), "raw transcript still available for fallback");
+    struct ErroringBackend;
+    impl crate::cleanup::CleanupBackend for ErroringBackend {
+        fn polish_into(
+            &self,
+            _text: &str,
+            _on_chunk: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            Err(anyhow::anyhow!("simulated polish error"))
+        }
+        fn warmup(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PanickingBackend;
+    impl crate::cleanup::CleanupBackend for PanickingBackend {
+        fn polish_into(
+            &self,
+            _text: &str,
+            _on_chunk: &mut dyn FnMut(&str) -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            panic!("simulated llama-cpp safe-wrapper panic");
+        }
+        fn warmup(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn run_polish_isolated_returns_ok_when_backend_succeeds() {
+        let backend = OkBackend;
+        let settings = Settings {
+            cleanup_mode: CleanupMode::On,
+            ..Settings::default()
+        };
+        let mut captured = String::new();
+        let outcome = run_polish_isolated(&backend, "hello", &settings, |c| {
+            captured.push_str(c);
+            Ok(())
+        });
+        assert!(matches!(outcome, PolishOutcome::Ok));
+        assert_eq!(captured, "polished: hello");
+    }
+
+    #[test]
+    fn run_polish_isolated_classifies_typed_error_separately_from_panic() {
+        // An `Err(...)` from the backend should NOT trip catch_unwind —
+        // it's a typed failure, not a panic. The fallback paste is
+        // still raw, but the user-facing message includes the error.
+        let backend = ErroringBackend;
+        let settings = Settings {
+            cleanup_mode: CleanupMode::On,
+            ..Settings::default()
+        };
+        let mut captured = String::new();
+        let outcome = run_polish_isolated(&backend, "hello", &settings, |c| {
+            captured.push_str(c);
+            Ok(())
+        });
+        match outcome {
+            PolishOutcome::Error(e) => {
+                assert!(e.to_string().contains("simulated polish error"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_polish_isolated_catches_panic_and_recovers_payload() {
+        // The §6-7 acceptance: a panic inside the polish call MUST be
+        // caught here so the dictation pipeline can fall back to raw
+        // paste. This is the load-bearing test for ADR-0018's panic
+        // isolation tradeoff.
+        let backend = PanickingBackend;
+        let settings = Settings {
+            cleanup_mode: CleanupMode::On,
+            ..Settings::default()
+        };
+        let mut captured = String::new();
+        let outcome = run_polish_isolated(&backend, "hello", &settings, |c| {
+            captured.push_str(c);
+            Ok(())
+        });
+        match outcome {
+            PolishOutcome::Panicked(msg) => {
+                assert!(
+                    msg.contains("simulated llama-cpp safe-wrapper panic"),
+                    "expected the panic payload, got: {msg}"
+                );
+            }
+            other => panic!("expected Panicked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_polish_isolated_off_mode_bypasses_backend_panic() {
+        // CleanupMode::Off should short-circuit BEFORE reaching the
+        // backend — even a PanickingBackend should never be invoked.
+        // Caller's `on_chunk` sees the raw text exactly once.
+        let backend = PanickingBackend;
+        let settings = Settings {
+            cleanup_mode: CleanupMode::Off,
+            ..Settings::default()
+        };
+        let mut captured = String::new();
+        let outcome = run_polish_isolated(&backend, "raw text", &settings, |c| {
+            captured.push_str(c);
+            Ok(())
+        });
+        assert!(matches!(outcome, PolishOutcome::Ok));
+        assert_eq!(captured, "raw text");
     }
 
     #[test]

@@ -208,7 +208,7 @@ impl SettingsController {
             };
         }
 
-        if let Err(e) = app.apply_settings(new) {
+        if let Err(e) = app.apply_settings(&new) {
             log::error!("save settings failed: {e:#}");
         }
         self.close_window();

@@ -28,7 +28,6 @@ pub mod audio;
 pub mod cleanup;
 pub mod hotkey;
 pub mod hud;
-pub mod llm_warmup;
 pub mod menubar;
 pub mod model_fetch;
 pub mod objc_util;

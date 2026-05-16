@@ -2,8 +2,9 @@
 //!
 //! Loads a GGUF file via llama.cpp (Metal backend on Apple Silicon),
 //! runs N polish iterations against a fixed sample transcript using
-//! the exact `SYSTEM_PROMPT` from `src/cleanup.rs`, and emits one
-//! `llm_timer` log line per iteration to stderr in this shape:
+//! the exact `SYSTEM_PROMPT` and decode loop from `src/cleanup.rs`,
+//! and emits one `llm_timer` log line per iteration to stderr in this
+//! shape:
 //!
 //! ```text
 //! llm_timer session_id=bench-qwen3.5-2b-r042-... model=qwen3.5-2b-q4_k_m \
@@ -11,24 +12,27 @@
 //!   total_ms=655 tokens_per_s=122.9
 //! ```
 //!
+//! Sampler, batch sizing, and `GenerateConfig` come from
+//! `cleanup::generate` + `cleanup::PROD_GENERATE_CONFIG`, so any change
+//! to the production decode path shows up here on the next bench run
+//! rather than silently invalidating the CSV.
+//!
 //! `scripts/bench-llm.sh` orchestrates download + run + aggregate into
 //! `bench/cleanup-backends.csv`. See `docs/latency-plan.md` §6.
 
-use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use llama_cpp_2::context::params::LlamaContextParams;
 use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::model::LlamaModel;
 
-use parakeet_rs::cleanup::{format_chat, SYSTEM_PROMPT};
+use parakeet_rs::cleanup::{
+    self, format_chat, GenerateOutcome, PROD_GENERATE_CONFIG, SYSTEM_PROMPT,
+};
 use parakeet_rs::performance::next_session_id;
 
 /// A representative messy dictation transcript — fillers, no punctuation,
@@ -38,26 +42,19 @@ use parakeet_rs::performance::next_session_id;
 /// "60 tokens" referred to the *output*; this is the input).
 const SAMPLE_INPUT: &str = "um so I was thinking we could you know probably uh move the deadline back to next Friday I mean it's getting kind of tight and like the team's been a bit stretched with the migration work and all the on-call stuff so yeah let's just push it";
 
-/// Hard cap on generated tokens. Sized to comfortably cover the cleanup
-/// output for the sample input (the cleaned form is a sentence or two,
-/// well under 80 tokens). Acts as a safety brake against runaway gen.
-const MAX_OUTPUT_TOKENS: i32 = 80;
-
-/// KV-cache context size. Prompt + max output must fit. The system
-/// prompt + sample input + 80 output tokens lands well under 1024.
-const CTX_SIZE: u32 = 1024;
-
-/// Model tag baked into the `llm_timer` log line. The aggregator
-/// (`scripts/bench-aggregate.py`) buckets rows by this string, so two
-/// runs against the same GGUF should share a tag, and a swap to a
-/// different quant should change it.
-const MODEL_TAG: &str = "qwen3.5-2b-q4_k_m";
-
 struct Args {
     model_path: PathBuf,
     reps: usize,
     warmup_reps: usize,
     show_output: bool,
+    /// Tag baked into the `llm_timer` log line. The aggregator
+    /// (`scripts/bench-aggregate.py`) buckets rows by this string, so
+    /// two runs against the same GGUF should share a tag, and a swap
+    /// to a different quant should change it. Defaults to the model
+    /// filename stem (lowercased) so it tracks `--model` honestly
+    /// instead of lying when the user supplies a different GGUF;
+    /// `--tag` overrides for cross-quant comparison runs.
+    model_tag: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -65,12 +62,11 @@ fn parse_args() -> Result<Args, String> {
     let mut reps: usize = 100;
     let mut warmup_reps: usize = 3;
     let mut show_output = false;
+    let mut model_tag: Option<String> = None;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--model" => {
-                model_path = Some(PathBuf::from(it.next().ok_or("--model needs PATH")?))
-            }
+            "--model" => model_path = Some(PathBuf::from(it.next().ok_or("--model needs PATH")?)),
             "--reps" => {
                 reps = it
                     .next()
@@ -86,6 +82,7 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("--warmup-reps: {e}"))?
             }
             "--show-output" => show_output = true,
+            "--tag" => model_tag = Some(it.next().ok_or("--tag needs STRING")?),
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -98,20 +95,33 @@ fn parse_args() -> Result<Args, String> {
         reps,
         warmup_reps,
         show_output,
+        model_tag,
     })
+}
+
+/// Derive a default model tag from the GGUF filename. `--tag` overrides.
+fn default_tag(model_path: &std::path::Path) -> String {
+    model_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "unknown-model".to_string())
 }
 
 fn print_usage() {
     eprintln!(
-        "usage: bench_llm --model PATH [--reps N] [--warmup-reps N] [--show-output]\n\
+        "usage: bench_llm --model PATH [--reps N] [--warmup-reps N] [--show-output] [--tag NAME]\n\
          \n\
          Runs N polish iterations of a fixed sample transcript through the GGUF\n\
-         at PATH, using the exact `SYSTEM_PROMPT` from src/cleanup.rs. Emits\n\
-         one `llm_timer` log line per iteration on stderr.\n\
+         at PATH, using the exact `SYSTEM_PROMPT` and decode loop from\n\
+         src/cleanup.rs. Emits one `llm_timer` log line per iteration on stderr.\n\
          \n\
          `--show-output` prints the generated text for the first measured\n\
          iteration only — useful for sanity-checking the prompt/template\n\
-         pipeline before trusting the numbers."
+         pipeline before trusting the numbers.\n\
+         \n\
+         `--tag NAME` sets the aggregator bucket; defaults to the model\n\
+         filename stem (lowercased)."
     );
 }
 
@@ -144,8 +154,12 @@ fn run(args: &Args) -> Result<()> {
     let model = LlamaModel::load_from_file(&backend, &args.model_path, &model_params)
         .with_context(|| format!("loading model {}", args.model_path.display()))?;
     let load_ms = t_load_start.elapsed().as_millis();
+    let model_tag = args
+        .model_tag
+        .clone()
+        .unwrap_or_else(|| default_tag(&args.model_path));
     log::info!(
-        "llm_load model={MODEL_TAG} path={} load_ms={load_ms}",
+        "llm_load model={model_tag} path={} load_ms={load_ms}",
         args.model_path.display()
     );
 
@@ -161,100 +175,58 @@ fn run(args: &Args) -> Result<()> {
     // a `warmup-` session_id prefix so the aggregator drops them.
     for i in 0..args.warmup_reps {
         let sid = format!("warmup-r{i:03}-{}", next_session_id());
-        let _ = run_one(&backend, &model, &chat_prompt, &sid, false)?;
+        run_one(&backend, &model, &chat_prompt, &sid, &model_tag, false)?;
     }
     // Measured reps.
     for i in 0..args.reps {
-        let sid = format!("bench-{MODEL_TAG}-r{i:03}-{}", next_session_id());
+        let sid = format!("bench-{model_tag}-r{i:03}-{}", next_session_id());
         let show = args.show_output && i == 0;
-        let _ = run_one(&backend, &model, &chat_prompt, &sid, show)?;
+        run_one(&backend, &model, &chat_prompt, &sid, &model_tag, show)?;
     }
     Ok(())
 }
 
-/// One polish iteration. Builds a fresh context per call so the KV cache
-/// doesn't carry state between iterations (production cleanup is one
-/// shot per dictation; warming a shared KV cache across reps would
-/// over-state real-world performance).
+/// One polish iteration. Drives `cleanup::generate` (same function the
+/// production polish path uses) and reports timing in the shape the
+/// aggregator expects.
 fn run_one(
     backend: &LlamaBackend,
     model: &LlamaModel,
     prompt: &str,
     sid: &str,
+    model_tag: &str,
     show_output: bool,
 ) -> Result<()> {
-    let ctx_params = LlamaContextParams::default()
-        .with_n_ctx(NonZeroU32::new(CTX_SIZE));
-    let mut ctx = model
-        .new_context(backend, ctx_params)
-        .context("create llama context")?;
-
-    let t_iter_start = Instant::now();
-
-    // Tokenize. ChatML's `<|im_start|>` already implies sequence boundaries,
-    // so AddBos::Never avoids a duplicate <bos> token.
-    let tokens_list = model
-        .str_to_token(prompt, AddBos::Never)
-        .context("tokenize prompt")?;
-    let prompt_tokens = tokens_list.len();
-
-    let mut batch = LlamaBatch::new(512, 1);
-    let last_index = (tokens_list.len() - 1) as i32;
-    for (i, token) in (0_i32..).zip(tokens_list.into_iter()) {
-        batch.add(token, i, &[0], i == last_index)?;
-    }
-
-    // Prompt-processing (prefill) step — TTFT clock ends after this returns.
-    ctx.decode(&mut batch).context("prefill decode")?;
-    let ttft_ms = t_iter_start.elapsed().as_millis() as u32;
-
-    // Greedy sampling: deterministic, repeatable. The cleanup task wants
-    // exact output, not creative variation; greedy also gives the cleanest
-    // tokens/sec measurement (no sampler temperature overhead).
-    let mut sampler = LlamaSampler::chain_simple([
-        LlamaSampler::dist(1234),
-        LlamaSampler::greedy(),
-    ]);
-
-    let mut n_cur = batch.n_tokens();
-    let mut n_decode: u32 = 0;
-    let max_total = prompt_tokens as i32 + MAX_OUTPUT_TOKENS;
-
-    let mut decoder = if show_output {
-        Some(encoding_rs::UTF_8.new_decoder())
-    } else {
-        None
-    };
     let mut output_buf = String::new();
+    let GenerateOutcome {
+        prompt_tokens,
+        out_tokens,
+        ttft,
+        gen_time,
+    } = cleanup::generate(backend, model, prompt, &PROD_GENERATE_CONFIG, |piece| {
+        if show_output {
+            output_buf.push_str(piece);
+        }
+        Ok(())
+    })?;
 
-    let t_gen_start = Instant::now();
-    while n_cur <= max_total {
-        let token = sampler.sample(&ctx, batch.n_tokens() - 1);
-        sampler.accept(token);
-        if model.is_eog_token(token) {
-            break;
-        }
-        if let Some(dec) = decoder.as_mut() {
-            let piece = model.token_to_piece(token, dec, true, None)?;
-            output_buf.push_str(&piece);
-        }
-        batch.clear();
-        batch.add(token, n_cur, &[0], true)?;
-        n_cur += 1;
-        ctx.decode(&mut batch).context("gen decode")?;
-        n_decode += 1;
-    }
-    let gen_ms = t_gen_start.elapsed().as_millis() as u32;
-    let total_ms = t_iter_start.elapsed().as_millis() as u32;
+    // `Duration::as_millis()` returns `u128`. Bench reps are sub-second
+    // on every platform we care about — a >49-day rep would mean the
+    // model is wedged, which is a bug, not a measurement worth logging.
+    // Fail loudly instead of silently logging `u32::MAX`.
+    let ttft_ms = u32::try_from(ttft.as_millis()).expect("ttft >49 days indicates wedged model");
+    let gen_ms =
+        u32::try_from(gen_time.as_millis()).expect("gen_time >49 days indicates wedged model");
+    let total_ms = ttft_ms.saturating_add(gen_ms);
     let tokens_per_s = if gen_ms > 0 {
-        (n_decode as f32 * 1000.0) / gen_ms as f32
+        f64::from(out_tokens) * 1000.0 / f64::from(gen_ms)
     } else {
         0.0
     };
 
     log::info!(
-        "llm_timer session_id={sid} model={MODEL_TAG} prompt_tokens={prompt_tokens} \
-         out_tokens={n_decode} ttft_ms={ttft_ms} gen_ms={gen_ms} \
+        "llm_timer session_id={sid} model={model_tag} prompt_tokens={prompt_tokens} \
+         out_tokens={out_tokens} ttft_ms={ttft_ms} gen_ms={gen_ms} \
          total_ms={total_ms} tokens_per_s={tokens_per_s:.1}"
     );
 
