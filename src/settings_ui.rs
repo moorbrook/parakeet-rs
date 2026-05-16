@@ -329,6 +329,8 @@ pub fn open(mtm: MainThreadMarker) {
         // a future objc2-app-kit minor bump.
         ns_app.activate();
         existing.makeKeyAndOrderFront(None);
+        // See `orderFrontRegardless` rationale in the create path below.
+        unsafe { existing.orderFrontRegardless() };
         return;
     }
 
@@ -507,6 +509,15 @@ pub fn open(mtm: MainThreadMarker) {
     let ns_app = NSApplication::sharedApplication(mtm);
     ns_app.activate();
     window.makeKeyAndOrderFront(None);
+    // LSUIElement apps (menu-bar agents) don't reliably steal focus
+    // from another foreground app via `activate()` alone — observed
+    // symptom: Settings opens BEHIND the previously-active window.
+    // `orderFrontRegardless` skips the cooperative activation check
+    // and forces the window above whatever's currently frontmost.
+    // The window still doesn't become key in another app's space,
+    // but the user can see it and click to focus, which is the
+    // important part.
+    unsafe { window.orderFrontRegardless() };
 }
 
 /// Center `window` on whichever `NSScreen` currently contains the
