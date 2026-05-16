@@ -24,7 +24,18 @@ unsafe_op_in_unsafe_fn = "warn"
 undocumented_unsafe_blocks = "warn"
 
 # Metadata read by `cargo-bundle` when assembling Parakeet.app.
-# Run `cargo bundle --release` to produce target/release/bundle/osx/Parakeet.app.
+# Run `scripts/make-app.sh` (which calls `cargo bundle --release --bin
+# parakeet-rs`) to produce target/release/bundle/osx/Parakeet.app.
+#
+# We need BOTH sections:
+# - `[package.metadata.bundle]` — global defaults; used when bundling
+#   without `--bin` (e.g. for the lib package itself).
+# - `[package.metadata.bundle.bin.parakeet-rs]` — per-bin overrides;
+#   used when bundling with `--bin parakeet-rs` (which we need because
+#   the crate also exposes `bench_asr` and `bench_llm` binaries).
+#   Without this section, cargo-bundle uses the binary's raw name
+#   (`parakeet-rs`) for the .app filename and skips our custom display
+#   name / identifier / icon.
 [package.metadata.bundle]
 name = "Parakeet"
 identifier = "com.parakeet.rs"
@@ -46,6 +57,16 @@ osx_minimum_system_version = "11.0"
 # produces a malformed plist with two `<plist>` roots. Custom Info.plist
 # keys (NSMicrophoneUsageDescription, NSAppleEventsUsageDescription,
 # LSUIElement) are stitched in by `scripts/make-app.sh` after bundling.
+
+[package.metadata.bundle.bin.parakeet-rs]
+name = "Parakeet"
+identifier = "com.parakeet.rs"
+icon = ["assets/icon.icns"]
+version = "0.1.0"
+copyright = "Copyright (c) 2026 parakeet-rs"
+category = "Productivity"
+short_description = "Voice-to-text dictation, fully local, Apple Silicon."
+osx_minimum_system_version = "11.0"
 
 # Release profile tuned for shipping:
 # - fat LTO + single codegen unit gives the compiler full cross-crate

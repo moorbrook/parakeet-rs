@@ -36,9 +36,14 @@ fi
 # NOTE: there is no repo-root Info.plist; all custom keys are merged
 # into cargo-bundle's generated plist via PlistBuddy below.
 
-echo "1. cargo bundle --release"
+echo "1. cargo bundle --release --bin parakeet-rs"
 cd "$ROOT"
-cargo bundle --release >/dev/null
+# Explicit `--bin parakeet-rs` because the crate also exposes
+# `bench_asr` and `bench_llm` binaries (under `src/bin/`); without
+# the flag cargo-bundle picks the first one alphabetically (bench_asr),
+# which produces a .app whose `Contents/MacOS/parakeet-rs` is missing
+# and breaks every subsequent step.
+cargo bundle --release --bin parakeet-rs >/dev/null
 
 # --- 2. merge Info.plist -------------------------------------------------
 # cargo-bundle writes a clean Info.plist with the bundle-id, version, icon,
