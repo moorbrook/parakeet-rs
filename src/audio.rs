@@ -45,8 +45,12 @@ impl AudioCapture {
             .name("audio-capture".into())
             .spawn(move || {
                 qos::set_user_interactive();
-                let buffer: Arc<Mutex<Vec<f32>>> =
-                    Arc::new(Mutex::new(Vec::with_capacity(16_000 * 30)));
+                // Allocate zero-capacity here; we don't yet know the
+                // device's native sample rate. Hardcoding `16_000 * 30`
+                // is wrong on every Mac (built-in mics are 44.1 / 48
+                // kHz mono or stereo) and forces a reallocation
+                // mid-recording, blocking the realtime cpal callback.
+                let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
                 let (sample_rate, channels, stream) =
                     match build_stream(buffer.clone(), tap.clone()) {
                         Ok(v) => v,
@@ -55,6 +59,16 @@ impl AudioCapture {
                             return;
                         }
                     };
+                // `buffer` stores INTERLEAVED native-channel samples
+                // (the F32/I16/U16 callbacks at `build_stream` push
+                // `data` verbatim, not the down-mixed mono). 30 s at
+                // 48 kHz stereo is 2.88 M samples ≈ 11 MB; 96 kHz
+                // stereo is ~23 MB. Worst case is generous but
+                // single-shot (per dictation session) so the
+                // allocation amortises away.
+                buffer
+                    .lock()
+                    .reserve(sample_rate as usize * channels as usize * 30);
                 if let Err(e) = stream.play().context("starting stream") {
                     let _ = ready_tx.send(Err(e));
                     return;

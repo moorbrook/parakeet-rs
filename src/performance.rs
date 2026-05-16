@@ -5,6 +5,7 @@
 use std::ffi::CString;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// `sysctlbyname("hw.perflevel0.logicalcpu")` returns the P-core count on
@@ -195,16 +196,34 @@ impl fmt::Display for OptF32 {
     }
 }
 
-/// Monotonically-increasing session ID, prefixed with the boot-time
-/// epoch second so two app launches don't collide in the same log.
+/// Monotonically-increasing session ID. The shape is
+/// `<epoch_secs:x>-<launch_nonce:x>-<counter:04x>` so:
+///
+/// - The epoch prefix keeps logs roughly time-sorted across launches.
+/// - The launch nonce (PID xor a one-shot per-process random value)
+///   disambiguates two app launches that land in the same second —
+///   without it both would start at counter `0000` and collide in the
+///   aggregator. The nonce is computed once per process.
+/// - The counter disambiguates two dictations within a single launch.
 pub fn next_session_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static LAUNCH_NONCE: OnceLock<u32> = OnceLock::new();
+    let nonce = *LAUNCH_NONCE.get_or_init(|| {
+        let pid = std::process::id();
+        // Mix in a per-process random so two launches with sequential
+        // PIDs (common in CI) still diverge.
+        let rand = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        pid ^ rand
+    });
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!("{ts:x}-{n:04x}")
+    format!("{ts:x}-{nonce:x}-{n:04x}")
 }
 
 #[cfg(test)]
