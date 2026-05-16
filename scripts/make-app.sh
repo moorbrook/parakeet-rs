@@ -187,9 +187,20 @@ codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -3
 # distributable, which is a release blocker — fail the script so CI /
 # release scripts see a non-zero exit.
 if ! spctl --assess --type execute --verbose=2 "$APP" 2>&1 | tail -2; then
+  # Distinguish "self-signed local dev cert" from "real Developer ID".
+  # Developer ID identities are named "Developer ID Application: …"; any
+  # other signed identity is a self-signed local dev cert (e.g. the
+  # "Parakeet Local Dev" cert created for stable TCC entries across
+  # rebuilds). Both ad-hoc and local-dev rejections are expected; only
+  # Developer-ID rejection blocks distribution.
   if [ "$SIGN_ID" = "-" ]; then
     echo "  note: spctl rejected the ad-hoc signature — that's expected; it'd"
     echo "        accept a Developer-ID-signed + notarised build."
+  elif [[ "$SIGN_ID" != "Developer ID Application:"* ]]; then
+    echo "  note: spctl rejected the self-signed cert '$SIGN_ID' — that's"
+    echo "        expected; Gatekeeper only trusts Developer ID + notarised"
+    echo "        builds. The bundle still launches locally and TCC entries"
+    echo "        are stable across rebuilds with this cert."
   else
     echo "ERROR: spctl rejected the bundle signed with '$SIGN_ID'. This build" >&2
     echo "       is not distributable. Common causes: identity missing from" >&2
