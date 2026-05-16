@@ -121,16 +121,27 @@ async fn download_to(label: &str, url: &str, dest: &Path, on_progress: &Progress
     file.flush().await?;
     drop(file);
 
+    // Validate the .part length BEFORE renaming. A short/truncated
+    // download would otherwise produce a final file that `ensure_model`
+    // accepts on the next launch (it only checks `exists()`), bricking
+    // startup with a corrupt model that no UI path retries. Failed
+    // validation removes the .part so the next launch redownloads.
+    if total > 0 {
+        let part_size = tokio::fs::metadata(&tmp)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if part_size != total {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(anyhow!(
+                "{label} short download: got {part_size} of {total} bytes (discarded)"
+            ));
+        }
+    }
+
     tokio::fs::rename(&tmp, dest)
         .await
         .context("rename .part to final")?;
-
-    let final_size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
-    if total > 0 && final_size != total {
-        return Err(anyhow!(
-            "{label} short download: got {final_size} of {total} bytes"
-        ));
-    }
     Ok(())
 }
 
