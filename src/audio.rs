@@ -150,6 +150,7 @@ fn build_stream(
         out
     };
 
+
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
             let cfg: cpal::StreamConfig = config.into();
@@ -161,6 +162,7 @@ fn build_stream(
                     move |data: &[f32], _| {
                         buffer.lock().extend_from_slice(data);
                         let mono = to_mono(data, channels);
+                        crate::hud::set_audio_level(peak_amplitude(&mono));
                         let _ = tap.send(mono);
                     }
                 },
@@ -180,6 +182,7 @@ fn build_stream(
                             data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
                         buffer.lock().extend_from_slice(&floats);
                         let mono = to_mono(&floats, channels);
+                        crate::hud::set_audio_level(peak_amplitude(&mono));
                         let _ = tap.send(mono);
                     }
                 },
@@ -204,6 +207,7 @@ fn build_stream(
                             .collect();
                         buffer.lock().extend_from_slice(&floats);
                         let mono = to_mono(&floats, channels);
+                        crate::hud::set_audio_level(peak_amplitude(&mono));
                         let _ = tap.send(mono);
                     }
                 },
@@ -214,4 +218,17 @@ fn build_stream(
         other => anyhow::bail!("unsupported sample format: {other:?}"),
     };
     Ok((sample_rate, channels, stream))
+}
+
+/// Peak absolute amplitude across a chunk, clamped to [0, 1]. Cheap
+/// (one fold, no allocation) so the cpal realtime callback can call
+/// it per chunk without risking xruns. Used to drive the HUD's
+/// listening-state waveform bars.
+fn peak_amplitude(samples: &[f32]) -> f32 {
+    samples
+        .iter()
+        .copied()
+        .map(f32::abs)
+        .fold(0.0_f32, f32::max)
+        .min(1.0)
 }
