@@ -55,18 +55,25 @@ const CORNER_RADIUS: f64 = 12.0;
 // one.
 
 const BARS_COUNT: usize = 7;
-const BAR_WIDTH: f64 = 4.0;
-const BAR_GAP: f64 = 4.0;
-const BAR_HEIGHT_MIN: f64 = 4.0;
-const BAR_HEIGHT_MAX: f64 = 28.0;
+const BAR_WIDTH: f64 = 6.0;
+const BAR_GAP: f64 = 5.0;
+const BAR_HEIGHT_MIN: f64 = 8.0;
+const BAR_HEIGHT_MAX: f64 = 36.0;
 /// Left edge of the leftmost bar inside the HUD's content view.
-/// `HUD_W = 220`; label area is x ∈ [12, 132], bars area is
-/// x ∈ [140, 192] (7*4 + 6*4 = 52 px wide). 28 px right margin.
-const BARS_ORIGIN_X: f64 = 140.0;
+/// `HUD_W = 220`; label area is x ∈ [14, 126], bars area is
+/// x ∈ [130, 202] (7*6 + 6*5 = 72 px wide). 18 px right margin.
+const BARS_ORIGIN_X: f64 = 130.0;
+/// Empirical gain applied to the raw mic peak before it drives bar
+/// height. A typical conversational voice peaks at ~0.2-0.4 on a
+/// MacBook built-in mic; without a gain factor the bars only swing
+/// to ~1/3 of their max height and the effect reads as "broken".
+/// `(level * BAR_LEVEL_GAIN).min(1.0)` clamps loud bursts to full
+/// height instead of clipping math elsewhere.
+const BAR_LEVEL_GAIN: f32 = 3.0;
 /// Lerp coefficient per tick — higher = snappier reactions, lower =
-/// smoother. 0.45 at 30 fps tracks fast speech onsets cleanly without
+/// smoother. 0.5 at 30 fps tracks speech onsets cleanly without
 /// looking jittery on background noise.
-const BAR_LERP: f32 = 0.45;
+const BAR_LERP: f32 = 0.5;
 /// Frame period for the bar animation.
 const BAR_TICK: Duration = Duration::from_millis(33);
 
@@ -192,8 +199,9 @@ pub fn install(mtm: MainThreadMarker) {
         // Label takes the left portion of the HUD; bars go in the right
         // portion. The label is left-aligned (was Center) so the
         // "● Listening…" text doesn't visually drift away from the bars.
+        // BARS_ORIGIN_X is 130; label area is x ∈ [14, 126].
         let label_frame =
-            NSRect::new(NSPoint::new(16.0, 0.0), NSSize::new(BARS_ORIGIN_X - 24.0, HUD_H));
+            NSRect::new(NSPoint::new(14.0, 0.0), NSSize::new(BARS_ORIGIN_X - 18.0, HUD_H));
         let label =
             unsafe { NSTextField::labelWithString(&NSString::from_str("Listening…"), mtm) };
         unsafe {
@@ -356,18 +364,24 @@ fn bar_tick(my_gen: u64) {
     if ANIMATION_GEN.load(Ordering::Relaxed) != my_gen {
         return;
     }
-    let level = current_audio_level();
+    // Empirical gain so normal speech swings the bars close to their
+    // max height. Without this, conversational voice maxes out at
+    // ~1/3 of `BAR_HEIGHT_MAX` and the indicator reads as broken.
+    let level = (current_audio_level() * BAR_LEVEL_GAIN).min(1.0);
     HUD.with(|slot| {
         let mut slot = slot.borrow_mut();
         let Some(hud) = slot.as_mut() else {
             return;
         };
         for (i, bar) in hud.bars.iter().enumerate() {
-            // Bell-curve profile so middle bars run taller than the
-            // outer ones — looks more "voice-shaped" than a flat row.
+            // Subtle bell-curve profile so middle bars run a hair
+            // taller — looks more "voice-shaped" than a flat row,
+            // but only mildly so (outer bars at 85% of centre)
+            // because the user complained that strong attenuation
+            // made the outer bars invisible.
             let centre = (BARS_COUNT - 1) as f32 / 2.0;
             let dist = (i as f32 - centre).abs() / centre;
-            let profile = 1.0 - 0.35 * dist;
+            let profile = 1.0 - 0.15 * dist;
             let target =
                 (BAR_HEIGHT_MIN as f32) + (BAR_HEIGHT_MAX - BAR_HEIGHT_MIN) as f32 * level * profile;
             // Lerp toward target; clamp to [MIN, MAX].
