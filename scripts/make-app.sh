@@ -101,6 +101,20 @@ for old in $(otool -l "$EXE" | awk '/cmd LC_RPATH/{getline;getline;print $2}'); 
 done
 install_name_tool -add_rpath '@executable_path/../Frameworks' "$EXE"
 
+# Verify the rpath actually took. `install_name_tool -add_rpath` can
+# silently no-op if the binary's signature blocks it (e.g. some macOS
+# versions reject load-command edits on previously-signed binaries);
+# without an rpath the .app aborts at launch with
+# "Library not loaded: @rpath/libsherpa-onnx-c-api.dylib ... no
+# LC_RPATH's found", which we'd otherwise only learn about from a
+# user crash report.
+if ! otool -l "$EXE" | awk '/cmd LC_RPATH/{getline;getline;print $2}' \
+     | grep -qx '@executable_path/../Frameworks'; then
+  echo "ERROR: install_name_tool -add_rpath silently failed on $EXE" >&2
+  echo "       Bundle would abort at launch with 'no LC_RPATH found'." >&2
+  exit 1
+fi
+
 # --- 5. ad-hoc code-sign -------------------------------------------------
 # Gatekeeper on macOS 14+ rejects unsigned binaries by default. We sign
 # each piece individually rather than with `--deep`, because `--deep` is

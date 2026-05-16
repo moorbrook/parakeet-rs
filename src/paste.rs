@@ -18,9 +18,11 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use arboard::Clipboard;
-use enigo::{Direction, Enigo, Key, Keyboard, Settings};
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation, CGKeyCode};
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+use enigo::{Enigo, Keyboard, Settings};
 
 /// Minimum wall-clock gap between consecutive paste chords. Without
 /// throttling, a fast token stream (~100 tok/s) on word boundaries
@@ -183,37 +185,59 @@ fn restore_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Type `text` one character at a time. Only used when the user
+/// explicitly sets `inject_mode = "type"`; the default delivery is
+/// clipboard+chord above.
+///
+/// **Same TSM main-thread caveat as the old `send_paste_chord`** —
+/// `Enigo::new` calls into the Text Services Manager which asserts
+/// main-thread-only. If this path is ever taken from the `transcribe`
+/// worker it will abort the process. The CGEvent rewrite of
+/// `send_paste_chord` didn't touch this because no current code path
+/// exercises `type` mode; if you wire it up, marshal the call to the
+/// main thread via GCD first.
 fn type_text(text: &str) -> Result<()> {
     let mut enigo = Enigo::new(&Settings::default()).context("init enigo")?;
     enigo.text(text).context("typing text")?;
     Ok(())
 }
 
-/// Synthesise `⌘V` via enigo's `Key::Unicode('v')` chord. This is the
-/// QWERTY-correct path. **Known limitation:** `Key::Unicode` is keymap-
-/// sensitive — on Dvorak / Colemak / non-QWERTY layouts the character
-/// `v` doesn't map to the V keycode the focused app expects, and the
-/// chord may produce a different character (Dvorak's `v` is on the
-/// QWERTY `.` position, so ⌘V there is interpreted as ⌘. → "Hide
-/// Window" in some apps).
+/// ANSI 'V' keycode (Carbon HIToolbox / `Events.h`). Constant per
+/// macOS — `CGEventCreateKeyboardEvent` interprets keycodes as
+/// physical positions on the ANSI layout, so this is correct on
+/// QWERTY, Dvorak, Colemak, etc., regardless of the user's active
+/// keymap. The previous `enigo::Key::Unicode('v')` path was keymap-
+/// sensitive (Dvorak's `v` lives on QWERTY's `.` position).
+const ANSI_V: CGKeyCode = 0x09;
+
+/// Synthesise `⌘V` directly through `CGEventCreateKeyboardEvent` +
+/// `CGEventPost`. Keycode-based (so keymap-correct), and — crucially —
+/// **safe to call from any thread**.
 ///
-/// Fix paths if this ever bites a user:
-/// - Switch to `CGEventCreateKeyboardEvent(ANSI_V)` (keycode-based, not
-///   character-based) and post directly via `CGEventPost`.
-/// - Add an `inject_mode = "applescript"` debug path that runs
-///   `osascript -e 'tell application "System Events" to keystroke "v"
-///   using command down'`, which AppleScript translates correctly per
-///   the user's active keymap.
-///
-/// Today the recogniser's only English-only target users are
-/// QWERTY-only, so the limitation is documented rather than fixed.
+/// The previous implementation used `enigo`, which calls
+/// `TSMGetInputSourceProperty` (Text Services Manager) inside
+/// `Enigo::new`. On modern macOS that function asserts main-thread-
+/// only via `dispatch_assert_queue`; calling it from the `transcribe`
+/// or `streamer-push` worker thread aborts the process with
+/// `EXC_BREAKPOINT` / `SIGTRAP`. This dictation app pastes from a
+/// worker thread by design (the transcribe path streams chunks),
+/// so the TSM assert was a hard, reproducible crash on every paste.
+/// `CGEventPost` doesn't go through TSM and has no main-thread
+/// requirement.
 fn send_paste_chord() -> Result<()> {
-    let mut enigo = Enigo::new(&Settings::default()).context("init enigo")?;
-    enigo.key(Key::Meta, Direction::Press).context("⌘ down")?;
-    enigo
-        .key(Key::Unicode('v'), Direction::Click)
-        .context("press v")?;
-    enigo.key(Key::Meta, Direction::Release).context("⌘ up")?;
+    // HIDSystemState (vs CombinedSessionState) posts the events as if
+    // they came from a real input device — matches what the user's
+    // own keyboard would produce.
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|()| anyhow!("CGEventSource::new failed"))?;
+    let keydown = CGEvent::new_keyboard_event(source.clone(), ANSI_V, true)
+        .map_err(|()| anyhow!("CGEventCreateKeyboardEvent keydown V failed"))?;
+    keydown.set_flags(CGEventFlags::CGEventFlagCommand);
+    keydown.post(CGEventTapLocation::HID);
+    let keyup = CGEvent::new_keyboard_event(source, ANSI_V, false)
+        .map_err(|()| anyhow!("CGEventCreateKeyboardEvent keyup V failed"))?;
+    keyup.set_flags(CGEventFlags::CGEventFlagCommand);
+    keyup.post(CGEventTapLocation::HID);
     Ok(())
 }
 
