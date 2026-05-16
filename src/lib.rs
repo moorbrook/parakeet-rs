@@ -25,6 +25,7 @@ pub mod app;
 pub mod app_delegate;
 pub mod asr;
 pub mod audio;
+pub mod ax_paste;
 pub mod cleanup;
 pub mod hotkey;
 pub mod hud;

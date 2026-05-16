@@ -66,9 +66,19 @@ pub fn deliver(text: &str, mode: &str) -> Result<()> {
         "type" => type_text(text),
         "clipboard" => copy_to_clipboard(text),
         _ => {
-            copy_to_clipboard(text)?;
-            std::thread::sleep(PASTEBOARD_SETTLE_DELAY);
-            send_paste_chord()
+            // Try direct AX insertion first — no clipboard write, no
+            // ⌘V chord, no race. Falls through to clipboard+⌘V if the
+            // focused app doesn't expose `AXSelectedText`
+            // (Electron-with-custom-input, canvas-based UIs).
+            match crate::ax_paste::insert_text(text) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    log::debug!("AX insert failed, falling back to clipboard+⌘V: {e:#}");
+                    copy_to_clipboard(text)?;
+                    std::thread::sleep(PASTEBOARD_SETTLE_DELAY);
+                    send_paste_chord()
+                }
+            }
         }
     }
 }
@@ -84,10 +94,16 @@ pub struct Streamer {
     /// they don't end on a word boundary. Avoids pasting fragments
     /// like "thi" then "s is the" — one cohesive paste per word.
     pending: String,
-    /// Set to true once a `push` actually fires a paste, so we know
-    /// the cursor has moved. Used by `finish` to decide whether to
-    /// run a final ⌘V for any remaining buffered tail.
+    /// Set to true once a `push` actually inserted text (via either
+    /// AX or clipboard+⌘V). Used by `commit` / `abort` to decide
+    /// whether the cursor has moved.
     fired: bool,
+    /// Set when the clipboard+⌘V fallback path was used at least
+    /// once. Drives `RESTORE_SETTLE_DELAY` + `restore_clipboard` in
+    /// `commit` / `abort` — both are skipped when AX worked for
+    /// every chunk, so the clipboard is untouched and there's
+    /// nothing to wait for or restore.
+    clipboard_dirty: bool,
 }
 
 impl Streamer {
@@ -104,6 +120,7 @@ impl Streamer {
             last_push_at: None,
             pending: String::new(),
             fired: false,
+            clipboard_dirty: false,
         })
     }
 
@@ -155,28 +172,25 @@ impl Streamer {
     /// allow the caller's error branch to additionally paste raw, producing
     /// a `partial + raw` mess. Use `abort` instead.
     pub fn commit(mut self) -> Result<()> {
-        let flushed_tail = !self.pending.is_empty();
-        if flushed_tail {
+        if !self.pending.is_empty() {
             self.flush_now()?;
         }
-        // If we fired ANY chord (either now or earlier in the stream),
-        // the focused app may still be dequeuing the last ⌘V. We must
-        // not overwrite the clipboard with the saved value until the
-        // app has read it, or the app pastes the saved value (= prior
-        // transcript) instead of the chunk we just wrote.
-        if self.fired {
+        // Clipboard restore is only needed if we actually wrote to
+        // the clipboard during the stream (i.e. AX fallback fired
+        // at least once). When AX worked for every chunk, the
+        // user's clipboard is already untouched — nothing to wait
+        // for, nothing to restore.
+        if self.clipboard_dirty {
+            // The focused app may still be dequeuing the last ⌘V;
+            // wait before overwriting the clipboard with the saved
+            // value, otherwise the app's paste handler reads the
+            // saved value (= prior transcript) instead of the chunk
+            // we just wrote.
             std::thread::sleep(RESTORE_SETTLE_DELAY);
+            if let Some(saved) = self.saved_clipboard.take() {
+                let _ = restore_clipboard(&saved);
+            }
         }
-        // Restore the user's clipboard so the cleanup pass doesn't
-        // steal their copy buffer. Best-effort — if restore fails
-        // we'd rather not crash the dictation flow.
-        if let Some(saved) = self.saved_clipboard.take() {
-            let _ = restore_clipboard(&saved);
-        }
-        // Silence the unused-binding lint on debug builds — `flushed_tail`
-        // is captured for future audit tooling that wants to know if the
-        // commit included a tail flush.
-        let _ = flushed_tail;
         Ok(())
     }
 
@@ -187,27 +201,33 @@ impl Streamer {
     /// fallback" without an extra fragment muddying the state.
     pub fn abort(mut self) {
         self.pending.clear();
-        // Same restore-race as `commit`: if any chunk was already
-        // chord-pasted, the focused app may still be processing the
-        // last ⌘V. Wait before clobbering the clipboard.
-        if self.fired {
+        // Same condition as `commit`: only wait + restore if we
+        // actually touched the clipboard. AX-only streams skip both.
+        if self.clipboard_dirty {
             std::thread::sleep(RESTORE_SETTLE_DELAY);
-        }
-        if let Some(saved) = self.saved_clipboard.take() {
-            let _ = restore_clipboard(&saved);
+            if let Some(saved) = self.saved_clipboard.take() {
+                let _ = restore_clipboard(&saved);
+            }
         }
     }
 
     fn flush_now(&mut self) -> Result<()> {
         let chunk: String = std::mem::take(&mut self.pending);
-        copy_to_clipboard(&chunk)?;
-        // See `PASTEBOARD_SETTLE_DELAY`. Without this, the FIRST
-        // chunk of a streaming paste — fired before `pasteboardd`
-        // has propagated our `copy_to_clipboard` to the focused
-        // app — pastes whatever was on the clipboard BEFORE we
-        // started (typically the previous dictation's transcript).
-        std::thread::sleep(PASTEBOARD_SETTLE_DELAY);
-        send_paste_chord()?;
+        // Try AX insert first — no clipboard write, no ⌘V chord, no
+        // race against pasteboardd / the focused app's keyDown
+        // handler. Falls back to clipboard+⌘V if AX fails (most
+        // common when the focused element doesn't support
+        // `AXSelectedText` — Electron-with-custom-input, canvas
+        // editors). Mixing modes per chunk is safe: AX inserts at
+        // the caret, ⌘V also inserts at the caret, so chunks land
+        // in order regardless of how each one was delivered.
+        if let Err(e) = crate::ax_paste::insert_text(&chunk) {
+            log::debug!("AX insert failed, falling back to clipboard+⌘V: {e:#}");
+            copy_to_clipboard(&chunk)?;
+            std::thread::sleep(PASTEBOARD_SETTLE_DELAY);
+            send_paste_chord()?;
+            self.clipboard_dirty = true;
+        }
         self.last_push_at = Some(Instant::now());
         self.fired = true;
         Ok(())
