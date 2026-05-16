@@ -180,14 +180,21 @@ fn run_vad(
             Err(_) => {}
         }
 
+        // Check the no-speech timeout on EVERY iteration, not only in
+        // the `Timeout` arm below. A silent (but live) mic still
+        // delivers zero-filled chunks at the device's framerate, so
+        // `recv_timeout` returns `Ok` every tick and the Timeout arm
+        // never runs. Without this check the capture buffer grows
+        // unbounded until `MAX_SPEECH_S` kicks in (which only starts
+        // after `saw_speech` flips), i.e. forever if the user never
+        // speaks.
+        if !saw_speech && session_start.elapsed() > NO_SPEECH_TIMEOUT {
+            return finish(capture, Outcome::NoSpeech);
+        }
+
         let chunk = match tap_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(c) => c,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if !saw_speech && session_start.elapsed() > NO_SPEECH_TIMEOUT {
-                    return finish(capture, Outcome::NoSpeech);
-                }
-                continue;
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Outcome::Error(anyhow!("audio tap closed before VAD finished"));
             }
@@ -234,17 +241,23 @@ fn run_manual(
     _sample_rate: u32,
     tap_rx: Receiver<Vec<f32>>,
     signal_rx: Receiver<Signal>,
-    timer: PhaseTimer,
+    mut timer: PhaseTimer,
 ) -> Outcome {
     let session_start = Instant::now();
     loop {
         // Check controller signals every tick.
         match signal_rx.try_recv() {
             Ok(Signal::Cancel) => return finish(capture, Outcome::Cancelled),
-            // Hold-mode endpoint = hotkey release. There's no VAD here,
-            // so `t_vad_endpoint` stays absent — `mark_capture_end` (in
-            // `finish_with_recording`) becomes the endpoint anchor.
-            Ok(Signal::Finalize) => return finish_with_recording(capture, timer),
+            // Hold-mode endpoint = hotkey release. Mark the endpoint
+            // HERE (release entry), NOT inside `finish_with_recording`.
+            // `finish_with_recording` runs `capture.stop()` which
+            // joins the audio thread — that gap (a few ms) is the
+            // user's actual release-to-paste latency and shouldn't
+            // be excluded from `dur_post_endpoint_ms`.
+            Ok(Signal::Finalize) => {
+                timer.mark_vad_endpoint();
+                return finish_with_recording(capture, timer);
+            }
             Err(_) => {}
         }
         // Drain the tap so the capture thread doesn't back up its channel.
@@ -254,6 +267,10 @@ fn run_manual(
         while tap_rx.try_recv().is_ok() {}
 
         if session_start.elapsed() > MANUAL_MAX_RECORDING {
+            // Auto-cap fallback for "user forgot to release". Mark
+            // the cap-hit moment as the endpoint so latency math
+            // doesn't include the post-cap stop+join overhead either.
+            timer.mark_vad_endpoint();
             return finish_with_recording(capture, timer);
         }
         std::thread::sleep(Duration::from_millis(15));
