@@ -183,6 +183,27 @@ fn run_tap(binding: Arc<Mutex<Binding>>, on_press: EventFn, on_release: EventFn)
             CGEventType::FlagsChanged,
         ],
         move |_proxy, event_type, event| {
+            // macOS posts these synthetic event types when the OS has
+            // disabled our tap — typically because the on_press
+            // callback took >0.25 s (Silero VAD load + CPAL mic open
+            // is the usual culprit). Log loudly so the user has a
+            // diagnostic path; re-enabling from inside the callback
+            // requires access to the tap itself (chicken-and-egg with
+            // the `move` capture), so a restart is currently required.
+            // TODO: capture a Weak<MachPort> after construction and
+            // call CGEventTapEnable on it here.
+            if matches!(
+                event_type,
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+            ) {
+                log::error!(
+                    "CGEventTap disabled by macOS (type={event_type:?}) — hotkey detection \
+                     is dead until the app restarts. Cause: an on_press handler ran \
+                     longer than the tap timeout (~0.25 s)."
+                );
+                return Some(event.clone());
+            }
+
             let bind = *binding.lock();
             let flags = event.get_flags();
             let keycode =
