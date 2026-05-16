@@ -1,6 +1,10 @@
 # Implementing a `gemma4-mlx` crate on OminiX-MLX
 
-Companion to [latency-plan.md](./latency-plan.md). This doc is the implementation map for the OminiX-MLX side of the Phase-0 cleanup-backend benchmark.
+> **Status: DISQUALIFIED for parakeet-rs cleanup tier.** Gemma 4 E2B 4-bit on-disk size exceeds 2 GB, the cap parakeet-rs accepts for the first-run cleanup-model download. The candidate has been dropped from the Phase-0 benchmark in [latency-plan.md §6](./latency-plan.md).
+>
+> This document is preserved as a reference in case (a) a smaller Gemma 4 quant (sub-2 GB int3 / mixed-precision) becomes available, or (b) the 2 GB cap is revisited. Everything below is still accurate for someone wanting to write a `gemma4-mlx` crate on OminiX-MLX — only the recommendation that parakeet-rs should is rescinded.
+
+Companion to [latency-plan.md](./latency-plan.md). This doc was originally the implementation map for the OminiX-MLX side of the Phase-0 cleanup-backend benchmark.
 
 **Key fact up front:** [OminiX-MLX](https://github.com/OminiX-ai/OminiX-MLX) ships model crates for Qwen3, GLM4, Mixtral, Mistral, etc. **It does not ship a Gemma crate.** Choosing OminiX-MLX for Gemma 4 means writing a new `gemma4-mlx` workspace member from scratch, following the existing `qwen3-mlx` pattern.
 
