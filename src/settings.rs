@@ -107,15 +107,57 @@ impl SettingsStore {
         self.cache.lock().clone()
     }
 
-    #[allow(dead_code)] // Reserved for the future settings-save UI.
     pub fn save(&self, s: &Settings) -> Result<()> {
-        *self.cache.lock() = s.clone();
+        // Atomic write: serialise + fsync to a unique temp file in the
+        // same directory, then rename over the target, then fsync the
+        // directory so the rename itself is durable across power loss.
+        // The in-memory cache is updated AFTER the rename succeeds —
+        // otherwise an I/O failure would leave the running process and
+        // the on-disk file disagreeing, and the next boot's
+        // `unwrap_or_default()` parse would silently revert to defaults.
+        //
+        // Tmp path is unique per save (pid + nonce) so two concurrent
+        // saves can't truncate each other's tmp file mid-write or race
+        // on `rename`.
+        //
         // Pretty-printed so it's grep-friendly when debugging. There is
-        // no secret to special-case anymore — `claude -p` uses the
-        // user's existing Claude Code login, so the on-disk file holds
-        // only preferences.
+        // no secret to special-case — the in-process llama.cpp path has
+        // no API key.
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
+
         let raw = serde_json::to_string_pretty(s)?;
-        std::fs::write(&self.settings_path, raw)?;
+        let nonce = SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let parent = self
+            .settings_path
+            .parent()
+            .context("settings_path must have a parent dir")?;
+        let stem = self
+            .settings_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("settings.json");
+        let tmp_path = parent.join(format!(".{stem}.tmp.{pid}.{nonce}"));
+        {
+            let mut tmp = std::fs::File::create(&tmp_path)
+                .with_context(|| format!("creating temp file {}", tmp_path.display()))?;
+            tmp.write_all(raw.as_bytes())
+                .context("writing settings tmp file")?;
+            // fsync the file so the rename below isn't observed before
+            // the bytes hit the platter.
+            tmp.sync_all().context("fsync settings tmp file")?;
+        }
+        std::fs::rename(&tmp_path, &self.settings_path)
+            .with_context(|| format!("renaming {} into place", tmp_path.display()))?;
+        // fsync the directory so the rename is durable. macOS HFS+/APFS
+        // honour this; on a crash between rename and the next dir-sync,
+        // the file would otherwise revert to its pre-rename inode.
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        *self.cache.lock() = s.clone();
         Ok(())
     }
 
