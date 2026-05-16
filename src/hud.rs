@@ -63,13 +63,14 @@ const BAR_HEIGHT_MAX: f64 = 36.0;
 /// `HUD_W = 220`; label area is x ∈ [14, 126], bars area is
 /// x ∈ [130, 202] (7*6 + 6*5 = 72 px wide). 18 px right margin.
 const BARS_ORIGIN_X: f64 = 130.0;
-/// Empirical gain applied to the raw mic peak before it drives bar
-/// height. A typical conversational voice peaks at ~0.2-0.4 on a
-/// MacBook built-in mic; without a gain factor the bars only swing
-/// to ~1/3 of their max height and the effect reads as "broken".
+/// Empirical gain applied to the raw mic peak before the compressive
+/// curve. A typical conversational voice peaks at ~0.2-0.4 on a
+/// MacBook built-in mic; whispering / late-night peaks at ~0.05-0.10.
 /// `(level * BAR_LEVEL_GAIN).min(1.0)` clamps loud bursts to full
-/// height instead of clipping math elsewhere.
-const BAR_LEVEL_GAIN: f32 = 3.0;
+/// height instead of clipping math elsewhere; the `.sqrt()` in
+/// `bar_tick` then lifts the quiet end so soft speech is still
+/// clearly visible.
+const BAR_LEVEL_GAIN: f32 = 4.0;
 /// Lerp coefficient per tick — higher = snappier reactions, lower =
 /// smoother. 0.5 at 30 fps tracks speech onsets cleanly without
 /// looking jittery on background noise.
@@ -364,10 +365,14 @@ fn bar_tick(my_gen: u64) {
     if ANIMATION_GEN.load(Ordering::Relaxed) != my_gen {
         return;
     }
-    // Empirical gain so normal speech swings the bars close to their
-    // max height. Without this, conversational voice maxes out at
-    // ~1/3 of `BAR_HEIGHT_MAX` and the indicator reads as broken.
-    let level = (current_audio_level() * BAR_LEVEL_GAIN).min(1.0);
+    // Two-stage response curve: linear gain to bring conversational
+    // voice into the [0, 1] range, then `sqrt` to compress so even
+    // quiet/whispered input (peak ~0.05-0.1) lifts the bars
+    // noticeably. With gain=4.0 and sqrt:
+    //   peak=0.05 → gained=0.20 → curved=0.45 (44% of max-min span)
+    //   peak=0.15 → gained=0.60 → curved=0.77 (77%)
+    //   peak=0.30 → gained=1.20 → clamp=1.00 → curved=1.00 (100%)
+    let level = ((current_audio_level() * BAR_LEVEL_GAIN).min(1.0)).sqrt();
     HUD.with(|slot| {
         let mut slot = slot.borrow_mut();
         let Some(hud) = slot.as_mut() else {
