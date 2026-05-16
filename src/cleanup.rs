@@ -182,10 +182,12 @@ impl CleanupBackend for LlamaCleanup {
     ) -> Result<()> {
         let _guard = self.polish_lock.lock();
         let prompt = format_chat(SYSTEM_PROMPT, text);
-        // Look-back buffer: Qwen 3.5 sometimes echoes `/no_think` at the
-        // very end of its output (the directive bleeds through). We
-        // hold up to 12 chars (enough to cover "/no_think") and trim
-        // the suffix on the final flush.
+        // Look-back buffer: Qwen 3.5 sometimes echoes the `/no_think`
+        // directive at the very end of its output — and the model
+        // even "cleans" it on the way out, so we've seen both the
+        // literal `/no_think` and natural-language variants like
+        // `No think`, `no_think`, etc. 16 chars is enough headroom
+        // for " No think." plus a leading char or two.
         let mut pending = String::new();
         let outcome = generate(
             &self.backend,
@@ -194,14 +196,10 @@ impl CleanupBackend for LlamaCleanup {
             &PROD_GENERATE_CONFIG,
             |piece| {
                 pending.push_str(piece);
-                flush_safe_prefix(&mut pending, 12, on_chunk)
+                flush_safe_prefix(&mut pending, 16, on_chunk)
             },
         )?;
-        let trimmed = pending.trim_end_matches(char::is_whitespace);
-        let final_str = trimmed
-            .strip_suffix("/no_think")
-            .unwrap_or(trimmed)
-            .trim_end_matches(char::is_whitespace);
+        let final_str = strip_no_think_tail(&pending);
         if !final_str.is_empty() {
             on_chunk(final_str)?;
         }
@@ -392,6 +390,56 @@ where
     })
 }
 
+/// Strip any of the `/no_think` directive's echoes from the END of
+/// the model's output. The directive disables Qwen 3.5's reasoning
+/// trace; pre-filling `<think></think>` empty on the assistant side
+/// usually suffices, but the model occasionally echoes the directive
+/// — sometimes literally as `/no_think`, sometimes "cleaned" into
+/// natural-language variants like `No think.` or `no think`. Tail
+/// strip is case-insensitive and chews through trailing punctuation
+/// in both directions (before and after the matched suffix).
+fn strip_no_think_tail(s: &str) -> &str {
+    const TERMINAL: &[char] = &[
+        ' ', '\t', '\n', '\r', '.', '!', '?', ',', ';', ':',
+    ];
+    let trimmed = s.trim_end_matches(TERMINAL);
+    const SUFFIXES: &[&str] = &[
+        "/no_think",
+        "/no think",
+        "no_think",
+        "no think",
+        "/nothink",
+        "nothink",
+    ];
+    for suffix in SUFFIXES {
+        if let Some(stripped) = strip_suffix_ascii_ci(trimmed, suffix) {
+            return stripped.trim_end_matches(TERMINAL);
+        }
+    }
+    trimmed
+}
+
+/// ASCII case-insensitive suffix strip. Returns `Some(prefix)` if
+/// `haystack` ends with `needle` (compared case-insensitively, ASCII
+/// only — the needles we feed it are pure ASCII directive variants),
+/// `None` otherwise. Guards against splitting `haystack` inside a
+/// multi-byte UTF-8 codepoint.
+fn strip_suffix_ascii_ci<'a>(haystack: &'a str, needle: &str) -> Option<&'a str> {
+    if haystack.len() < needle.len() {
+        return None;
+    }
+    let split = haystack.len() - needle.len();
+    if !haystack.is_char_boundary(split) {
+        return None;
+    }
+    let tail = &haystack[split..];
+    if tail.eq_ignore_ascii_case(needle) {
+        Some(&haystack[..split])
+    } else {
+        None
+    }
+}
+
 /// Emit everything except the last `hold` chars of `pending` to
 /// `on_chunk`, then truncate `pending` to keep only the tail. Lets us
 /// look back at the most recent characters in case they're the start
@@ -465,6 +513,30 @@ mod tests {
         fn warmup(&self) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn strip_no_think_tail_handles_directive_variants() {
+        // The Qwen `/no_think` directive bleeds into the model's
+        // output in several shapes. All must be stripped from the
+        // tail; the prefix must survive intact.
+        assert_eq!(strip_no_think_tail("Hello, world. /no_think"), "Hello, world");
+        assert_eq!(strip_no_think_tail("Hello. /no_think."), "Hello");
+        assert_eq!(strip_no_think_tail("Hello no_think"), "Hello");
+        assert_eq!(strip_no_think_tail("Hello. No think."), "Hello");
+        assert_eq!(strip_no_think_tail("Hello no think"), "Hello");
+        assert_eq!(strip_no_think_tail("Hello nothink"), "Hello");
+        assert_eq!(strip_no_think_tail("Hello /nothink"), "Hello");
+        // Case-insensitive
+        assert_eq!(strip_no_think_tail("Hello NO_THINK"), "Hello");
+        assert_eq!(strip_no_think_tail("Hello /No_Think."), "Hello");
+        // Stripping doesn't consume legitimate content
+        assert_eq!(strip_no_think_tail("Don't think about it."), "Don't think about it");
+        // Multi-byte chars in the prefix don't trip char-boundary checks
+        assert_eq!(strip_no_think_tail("héllo /no_think"), "héllo");
+        // Empty / no-match passes through (with trailing punct trimmed)
+        assert_eq!(strip_no_think_tail(""), "");
+        assert_eq!(strip_no_think_tail("Hello."), "Hello");
     }
 
     #[test]
