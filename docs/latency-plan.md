@@ -11,7 +11,7 @@ Before any plan, the load-bearing facts from this checkout:
 - **ASR is offline, not streaming.** `src/asr.rs:72` constructs an `OfflineRecognizer`; `src/asr.rs:122` creates a fresh stream per utterance, feeds the whole captured waveform, then calls `decode` once. There is no partial-transcript path today.
 - **Decode is RTFx-bound, not constant.** [ADR.md](./ADR.md) line 32 measures **7.8× real-time on M5 Pro** (the minimum-spec target), so a 5 s utterance = ~640 ms of ASR decode alone.
 - **VAD hangover is already 150 ms.** `src/vad.rs:15` sets `MIN_SILENCE_S = 0.150`. There is no 500–800 ms threshold to "tighten."
-- **Current pipeline on main is ASR → `claude -p` subprocess → paste.** Main has `src/cleanup.rs` tracked since commit `c046668`, switched in `5824e20` to spawn `claude -p` per polish request. Its own source comment puts subprocess startup at ~1–3 s on a warm cache (`src/cleanup.rs:34-36`), which is a structural latency floor we cannot fit under a <1 s p50 target. This plan **replaces that backend** with in-process Rust inference via HuggingFace Candle (see §6). The `claude -p` path is removed. No Python, no subprocess, no HTTP — pure Rust.
+- **Current pipeline on main is ASR → `claude -p` subprocess → paste.** Main has `src/cleanup.rs` tracked since commit `c046668`, switched in `5824e20` to spawn `claude -p` per polish request. Its own source comment puts subprocess startup at ~1–3 s on a warm cache (`src/cleanup.rs:34-36`), which is a structural latency floor we cannot fit under a <1 s p50 target. This plan **replaces that backend** with in-process Rust inference via `llama-cpp-2` + Metal, running Qwen 3.5 2B-it Q4_K_M (see §6). The `claude -p` path is removed. No Python, no subprocess, no HTTP — pure Rust on the call side.
 - **`src/performance.rs` is CPU topology only**, not per-stage latency tracing. There is nothing measuring the budget today.
 - **CoreML cache is not configured.** `src/asr.rs:72` requests `provider="coreml"` but no `ModelCacheDirectory` is set, so the EP recompiles subgraphs on cold start.
 - **The ADR already publishes the latency story.** ADR.md:250 reports `~840 ms` on a 5 s utterance (150 ms VAD + 640 ms ASR + ~50 ms finalize). Current target is `<1 s p50 with WER ≤ 2%`. ADR-0009 documents that the streaming-Parakeet swap was evaluated and rejected.
@@ -87,46 +87,56 @@ Files: `src/vad.rs` (only if benchmark says so).
 
 ### 6. Cleanup tier — in-process Rust inference (replaces `claude -p`)
 
-Cleanup is **fully local, fully in-process, pure Rust**. No Python, no subprocess, no HTTP. Architecture:
+Cleanup is **fully local, fully in-process, pure Rust on the call side**. No Python, no subprocess, no HTTP. Architecture:
 
 ```
 Rust app
-  └── src/cleanup.rs ── direct call ──▶  Gemma 4 E2B-it, 4-bit quant
-                                          (loaded into Metal via Rust ML framework)
+  └── src/cleanup.rs ── direct call ──▶  llama-cpp-2 (Metal feature)
+                                            └── Qwen 3.5 2B-it Q4_K_M (1.28 GB on disk)
 ```
 
-**Why in-process, not a sidecar:** every layer of indirection costs latency. `claude -p` pays 1–3 s for subprocess startup. An `mlx_lm.server` Python sidecar pays 1–3 ms per HTTP round-trip plus Python interpreter overhead in the bundle. In-process pays 0 ms for IPC. The ~140 ms gap to Wispr Flow is too tight to spend on transport tax we can avoid.
+**Why in-process, not a sidecar:** every layer of indirection costs latency. `claude -p` pays 1–3 s for subprocess startup. A Python sidecar pays HTTP round-trip plus interpreter overhead in the bundle. In-process pays 0 ms for IPC. The ~140 ms gap to Wispr Flow is too tight to spend on transport tax we can avoid.
 
-**Two Rust-native candidates — pick by benchmark, not opinion:**
+**Chosen stack — single candidate after constraints:**
 
-- **HuggingFace Candle** (`candle-core`, `candle-transformers`, `candle-nn`): minimalist Rust ML framework. Metal backend on Apple Silicon. Reported "day-0 Gemma 4 support across all modalities" (third-party summaries; **verify against the upstream `candle-transformers` crate before committing**). Mature crate, active maintainer, large user base.
-- **OminiX-MLX**: Rust bindings to Apple's MLX with "dedicated crates for each model family, built for production use with zero Python." Closer to Apple's stack, likely faster on the same quantization since MLX's Metal kernels are hand-tuned by Apple's ML team. Smaller user base, less battle-tested.
+Filtering by `<2 GB on disk` + `newest generation` + `Apple Silicon optimized` + `pure-Rust shippable` collapses the candidate space to exactly one:
 
-Both are pure-Rust callers. Both leave the user-visible architecture identical: one in-process function call from `src/cleanup.rs`. The tradeoff is performance vs maturity, and it's settled by measurement.
+- **Model: Qwen 3.5 2B-Instruct Q4_K_M** (1.28 GB on disk; Feb 2026 release; beats Gemma 4 E2B on 3/4 size-matched benchmarks).
+- **Runtime: `llama-cpp-2`** (Rust binding on crates.io to upstream llama.cpp, `metal` feature flag for Apple Silicon acceleration).
 
-**Phase-0 benchmark (gates the whole cleanup tier):**
+**Why this and not the alternatives that were explored:**
 
-Before any cleanup wiring lands in `cleanup.rs`, run a head-to-head on M5 Pro 24 GB:
+- **Gemma 4 E2B** — disqualified; no sub-2 GB variant at quality-grade quant. See [gemma4-mlx-implementation.md](./gemma4-mlx-implementation.md) for the disqualification note.
+- **HuggingFace Candle** — doesn't yet ship Qwen 3.5 support (it has Qwen 3, not 3.5 — different generation).
+- **OminiX-MLX** — has no Qwen 3.5 crate; using it would mean writing a `qwen35-mlx` crate from scratch, same architecture-port problem as the Gemma 4 case.
+- **`mlx-rs` direct** — same from-scratch architecture-port problem.
 
-- Same model weights (Gemma 4 E2B-it 4-bit, both libraries' supported quant format).
-- Same prompt: the existing `SYSTEM_PROMPT` from `src/cleanup.rs` on main, plus a 60-token transcript input.
-- Measure: time-to-first-token (TTFT), tokens/sec sustained, peak resident RAM, cold-load time, p50/p95/p99 over 100 polish requests.
-- Stretch: include candle + Qwen 3.5 2B-Instruct Q4 as a third row, since Candle's Qwen support is older and stabler than its Gemma 4 support.
+llama.cpp's upstream Qwen 3.5 support landed at release; `llama-cpp-2` wraps it. Zero porting work, working Metal acceleration, available today.
 
-Output: a CSV in `bench/cleanup-backends.csv` and a one-page ADR with the winning library, model, and quant. The plan locks in only after this lands.
+**Total install footprint:**
+
+- Parakeet (today): ~700 MB
+- Qwen 3.5 2B-it Q4_K_M: 1.28 GB
+- **Total: ~2.0 GB** — right at the cap.
+
+**`bench_llm` (validates the chosen stack against the budget):**
+
+Before cleanup wiring lands in `cleanup.rs`, build `bench_llm` as a standalone binary that:
+
+- Loads Qwen 3.5 2B-it Q4_K_M via llama-cpp-2 with Metal.
+- Runs the existing `SYSTEM_PROMPT` from `src/cleanup.rs` on main, plus a 60-token transcript input.
+- Measures: time-to-first-token (TTFT), tokens/sec sustained, peak resident RAM, cold-load time, **p50 / p95 / p99 over 100 polish requests** on M5 Pro 24 GB.
+- Output: `bench/cleanup-llm.csv` + a short ADR citing the numbers.
+
+If `bench_llm` reports ≤300 ms p50 polish latency, the chosen stack is confirmed and cleanup wiring follows. If it misses, the CSV tells us what to fix next (faster quant? smaller model? streaming generation? KV-cache reuse across the dictation session?) rather than which library to swap to. No more pivots without real numbers.
 
 **Tiers, in order of latency cost:**
 
 - **Raw mode (default for short utterances): no cleanup.** Paste raw Parakeet output. Parakeet TDT 0.6B v3 produces capitalised, punctuated output (per NVIDIA model card), though the published WER does not evaluate formatting quality. For short single-sentence dictations the raw output is usable as-is — and it's the only path that hits Wispr Flow's <700 ms.
-- **In-process cleanup (default for normal dictations):** Candle or OminiX-MLX, whichever wins the Phase-0 benchmark. Candidate model: Gemma 4 E2B-it 4-bit (with Qwen 3.5 2B Q4 as the documented fallback if Gemma 4 support in the winning crate is too fresh to ship on).
-
-  Note: "E" in Gemma cards denotes *effective* parameters. The 4-bit quant is realistically in the **2.5–3.5 GB on-disk / RAM range** including KV cache, not the 1.3 GB earlier drafts claimed.
-
-  Expected polish latency on M5 Pro for a 60-token output: **TBD — established by the Phase-0 benchmark.** A defensible upper bound is **≤300 ms p50** to keep total perceived latency under 1.0 s. The benchmark either confirms or invalidates this; the acceptance criteria use whatever number it produces, not a guess.
-
+- **In-process cleanup (default for normal dictations):** llama-cpp-2 + Qwen 3.5 2B-it Q4_K_M. Expected polish latency on M5 Pro for a 60-token output: **TBD — established by `bench_llm`.** A defensible upper bound is **≤300 ms p50** to keep total perceived latency under 1.0 s. The benchmark either confirms or refutes this; acceptance numbers use what it produces, not a guess.
 - **No cloud fallback.** Project policy disallows direct Anthropic API. `claude -p` startup cost makes it incompatible with the latency target. If the in-process model fails to load (corrupted weights, OOM on a non-minimum-spec machine) → fall back to raw paste with a one-line user notice. Don't degrade silently to a slow path.
 
-**Crash isolation tradeoff:** in-process inference means a panic / FFI segfault in the model runtime kills the dictation app. Candle is pure Rust, so the risk surface is Rust panics only — wrap polish calls in `std::panic::catch_unwind` and the failure mode is "this dictation pastes raw, the app keeps running." OminiX-MLX wraps Apple's MLX C++ via FFI; a hard segfault there cannot be caught by `catch_unwind` and would crash the whole app. This is another input to the Phase-0 ADR — if MLX wins on speed but introduces real crash risk, Candle's slightly slower path may still be the right ship.
+**Crash isolation tradeoff:** `llama-cpp-2` wraps upstream llama.cpp (C++) via FFI. A Rust panic on the call side is catchable with `std::panic::catch_unwind` (failure mode: this dictation pastes raw, app keeps running). A hard segfault inside llama.cpp is not catchable by `catch_unwind` and would crash the whole app. Mitigation: upstream llama.cpp is mature and battle-tested, so hard crashes are rare in practice; `bench_llm` running 100 requests is a smoke test for stability under load. If we ever see segfaults in real use, the escape hatch is a Rust sidecar process talking to the main app over a unix socket (defeats the in-process latency win, but recovers crash isolation).
 
 **Model lifecycle:**
 
@@ -135,9 +145,9 @@ Output: a CSV in `bench/cleanup-backends.csv` and a one-page ADR with the winnin
 - First-launch model download: pull from Hugging Face on first cleanup-enabled launch, cached in `~/Library/Application Support/parakeet-rs/llm/`. Same first-run download pattern as Parakeet today.
 - Warm a dummy 1-token inference before declaring cleanup ready, so the first real polish doesn't pay the lazy-init cost.
 
-**RAM budget on minimum spec (M5 Pro 24 GB):** Parakeet mmap ~640 MB + ORT arenas + in-process LLM ~3 GB (weights + KV cache + scratch buffers) + app + OS overhead ≈ 4–5 GB resident. Comfortably under a quarter of 24 GB. Memory is not the constraint; latency is.
+**RAM budget on minimum spec (M5 Pro 24 GB):** Parakeet mmap ~640 MB + ORT arenas + Qwen 3.5 2B Q4 ~1.6 GB resident (weights + KV cache + scratch buffers) + app + OS overhead ≈ 3 GB resident. Comfortably under an eighth of 24 GB. Memory is not the constraint; latency is.
 
-Files: `src/cleanup.rs` (rewrite — drop `Command::new("claude")`, replace with direct call into the winning inference crate), new `src/llm_warmup.rs` paralleling `src/warmup.rs`, `Cargo.toml` (drop subprocess deps, add the winning inference crate + its tokenizer dep).
+Files: `src/cleanup.rs` (rewrite — drop `Command::new("claude")`, replace with direct call into `llama-cpp-2`), new `src/llm_warmup.rs` paralleling `src/warmup.rs`, new `src/bin/bench_llm.rs`, `Cargo.toml` (drop subprocess deps, add `llama-cpp-2` with `metal` feature).
 
 ### 7. Things explicitly NOT in this plan (and why)
 
@@ -155,14 +165,14 @@ For this plan to be considered complete, all numbers measured on the minimum spe
 3. Warm p50 for a 5 s utterance, **no cleanup**, is **≤ 700 ms** — matches Wispr Flow's published cloud number, on-device. (Current baseline is ~840 ms; the ~140 ms comes from CoreML cache + verified warmup + any free VAD/finalize trims the benchmark surfaces.)
 4. Warm p50 for a 5 s utterance, **with in-process cleanup**, is **≤ 1.0 s**. The LLM must be warm (model loaded + dummy inference done) before this measurement.
 5. No regression in `tests/` — settings round-trip and model-fetch URL stability tests pass (commit `70c46c3`).
-6. Phase-0 benchmark (`bench/cleanup-backends.csv`) compares Candle vs OminiX-MLX on the same Gemma 4 E2B 4-bit weights and prompt; the ADR cites it as the basis for the chosen library.
+6. `bench_llm` runs the existing `SYSTEM_PROMPT` through Qwen 3.5 2B-it Q4_K_M via llama-cpp-2 + Metal over 100 polish requests; outputs TTFT / tokens/sec / p50/p95/p99 in `bench/cleanup-llm.csv`. The cleanup-tier ADR cites the numbers.
 7. In-process inference is wrapped in `std::panic::catch_unwind`; a smoke test that injects a panic from the polish call confirms the next dictation pastes raw with a user-visible notice and the app keeps running.
 
 ## Constraints
 
 - Stay on Rust + native AppKit (no Tauri/WebKit additions; the `objc2-app-kit` bindings in `Cargo.toml` are the current direction).
 - **Fully local, fully Rust, in-process.** No cloud transport for cleanup. No `claude -p`. No Anthropic API. No Python sidecar. No HTTP. No subprocess of any kind for the polish path.
-- Phase-0 benchmark (Candle vs OminiX-MLX on Gemma 4 E2B 4-bit) gates the cleanup-tier ADR. Do not pick a library before the numbers exist.
+- `bench_llm` validates the chosen stack (llama-cpp-2 + Qwen 3.5 2B Q4) against the ≤300 ms p50 budget before cleanup wiring lands in `src/cleanup.rs`. No pivots without real numbers.
 - Minimum hardware is M5 Pro 24 GB; do not add code paths or settings UI for lower tiers.
 - New dependencies need a one-paragraph justification in an ADR.
 - Use `parking_lot::Mutex` (already in tree) for shared state.
@@ -178,8 +188,7 @@ For this plan to be considered complete, all numbers measured on the minimum spe
 - `src/performance.rs` — current CPU-topology-only scope.
 - NVIDIA Parakeet TDT 0.6B v3 model card — punctuation/capitalization claim.
 - Google Gemma 4 model card — "E" = effective parameters, not total.
-- [HuggingFace Candle](https://github.com/huggingface/candle) — minimalist Rust ML framework with Metal backend. Day-0 Gemma 4 support per third-party summaries; verify in `candle-transformers` before committing.
-- [OminiX-MLX](https://github.com/OminiX-ai/OminiX-MLX) — Rust bindings to Apple's MLX with per-model-family crates. Closer to Apple's stack; smaller user base.
-- [mlx-rs](https://github.com/oxiglade/mlx-rs) — lower-level alternative if neither of the above ships Gemma 4 cleanly. Lacks tokenizer / chat-template helpers; you'd build them.
-- Hugging Face `tokenizers` crate for the Gemma 4 tokenizer.json regardless of which inference library wins.
+- [`llama-cpp-2`](https://crates.io/crates/llama-cpp-2) — Rust binding to upstream llama.cpp; `metal` feature flag enables Apple Silicon acceleration. The chosen runtime.
+- Qwen 3.5 2B-Instruct Q4_K_M GGUF on Hugging Face — the chosen model (Feb 2026, 1.28 GB on disk).
+- [gemma4-mlx-implementation.md](./gemma4-mlx-implementation.md) — companion doc; Gemma 4 disqualified for the 2 GB cap. Kept as a reference if a smaller Gemma quant ships or the cap is revisited.
 - `src/cleanup.rs` on main (commits `c046668`, `5824e20`) — current `claude -p` subprocess implementation, being replaced by this plan.
