@@ -23,6 +23,15 @@ use crate::settings::{CleanupMode, Settings, SettingsStore, TriggerMode};
 use crate::streamer::{self, Mode as StreamerMode, Outcome, OutcomeRx, Session};
 use crate::{paste, performance, warmup};
 
+/// Pre-populated stop edge — see `App::pending_terminate`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminateKind {
+    /// Tap-mode 2nd press during the cold-start gap.
+    Cancel,
+    /// Hold-mode release during the cold-start gap.
+    Finalize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DictationState {
     /// Model still downloading / loading.
@@ -49,6 +58,18 @@ pub struct App {
     /// [`CleanupBackend`] trait so tests can swap in a fake without
     /// needing a real GGUF on disk.
     pub llm: Mutex<Option<Arc<dyn CleanupBackend>>>,
+    /// Single-flight gate for the cleanup-LLM load. `true` while a
+    /// load is in flight; both the boot path and the Settings-toggle
+    /// path check this so a rapid toggle can't trigger duplicate
+    /// 1.2 GB loads racing to write `llm`.
+    pub llm_loading: Mutex<bool>,
+    /// Cancel/finalize edge fired during the gap between
+    /// `try_claim_listening` (state→Listening) and `start_session`
+    /// populating the session slot. Drained by `start_session` after
+    /// the slot is populated. Without this queue a fast hold-release
+    /// or tap-cancel during the cold-start gap is silently dropped
+    /// and recording runs to the 30 s VAD cap.
+    pending_terminate: Mutex<Option<TerminateKind>>,
     pub current_state: Mutex<DictationState>,
     /// Lives for the program's lifetime; held here so the Settings UI can
     /// rebind it after the user records a new hotkey combo.
@@ -62,6 +83,8 @@ impl App {
             settings,
             asr: Mutex::new(None),
             llm: Mutex::new(None),
+            llm_loading: Mutex::new(false),
+            pending_terminate: Mutex::new(None),
             current_state: Mutex::new(DictationState::ModelLoading),
             hotkey: Mutex::new(None),
         }
@@ -92,19 +115,96 @@ impl App {
     /// menu bar.
     pub fn on_hotkey_press(self: &Arc<Self>) {
         let mode = effective_trigger_mode(&self.settings.load());
-        let active = self.session.lock().is_some();
-        match (mode, active) {
-            (TriggerMode::Tap, true) => {
-                if let Some(s) = self.session.lock().as_ref() {
-                    s.cancel();
-                }
+
+        // Lock `session` FIRST, then read `current_state`. This
+        // matches `try_claim_listening`, the watcher's atomic
+        // transition, and `on_hotkey_release`. A state-first read
+        // would race with the watcher's atomic transition out of
+        // Listening: reading `Listening`, then taking `session.lock()`
+        // and finding `None` (watcher already finished), would queue
+        // a stale `pending_terminate` that the NEXT session inherits
+        // and self-cancels with.
+        let session = self.session.lock();
+        let state = *self.current_state.lock();
+
+        // Tap-mode 2nd press during Listening cancels the in-flight
+        // recording. The cancel path is the only non-start handler.
+        if mode == TriggerMode::Tap && state == DictationState::Listening {
+            if let Some(s) = session.as_ref() {
+                s.cancel();
+            } else {
+                // `state=Listening` + `session=None` only happens
+                // inside the cold-start gap (try_claim_listening has
+                // claimed Listening, start_session_blocking hasn't
+                // populated the slot yet). The starter drains this
+                // queue after populating; both check+write happen
+                // under the session lock so the drain can't slip in
+                // between.
+                *self.pending_terminate.lock() = Some(TerminateKind::Cancel);
             }
-            (TriggerMode::Tap, false) => self.start_session(StreamerMode::VadAutoStop),
-            (TriggerMode::Hold, true) => {
-                // Spurious second press while already recording — ignore;
-                // the user is still holding the key from the first edge.
-            }
-            (TriggerMode::Hold, false) => self.start_session(StreamerMode::Manual),
+            return;
+        }
+
+        // Drop the session lock before falling through to the start
+        // path; `try_claim_listening` re-acquires it (parking_lot
+        // Mutexes aren't reentrant). The `state` snapshot we took
+        // under the lock is consistent with `session` at read time;
+        // even if state changes after we drop, `try_claim_listening`
+        // re-checks atomically and bails if Idle is no longer true.
+        drop(session);
+
+        // Otherwise we're trying to start a new session. ONLY allow
+        // that from Idle. Pressing during Transcribing/Polishing must
+        // not spawn a second session — the prior session's
+        // `on_session_finished` would later overwrite the new
+        // session's Listening state with Idle, and the user would see
+        // their second dictation silently disappear. Same idea for
+        // ModelLoading (mic capture would fail anyway).
+        if !matches!(state, DictationState::Idle) {
+            log::debug!("hotkey press ignored from state {state:?}");
+            return;
+        }
+
+        // Claim Idle→Listening atomically so two concurrent presses
+        // (CGEventTap + media-key NSEvent monitor in the same run-loop
+        // tick) can't both start the mic.
+        if !self.try_claim_listening() {
+            return;
+        }
+        let stream_mode = match mode {
+            TriggerMode::Tap => StreamerMode::VadAutoStop,
+            TriggerMode::Hold => StreamerMode::Manual,
+        };
+        self.start_session(stream_mode);
+    }
+
+    /// Atomically check both `session.is_none()` AND
+    /// `current_state == Idle`, and on success transition state to
+    /// Listening. Returns `true` if THIS caller now owns the
+    /// session-start path. Callers that get `false` must NOT start
+    /// the streamer.
+    ///
+    /// Lock order: `session` → `current_state`. The watcher uses the
+    /// same order when transitioning state out of Listening, so this
+    /// gate observes either the pre- or post-watcher state — never an
+    /// in-between with `state=Idle` but `session=Some` (which would
+    /// let a hotkey claim a slot the old watcher is about to clear,
+    /// and then the watcher's `take()` would cancel the new session).
+    fn try_claim_listening(&self) -> bool {
+        let session = self.session.lock();
+        if session.is_some() {
+            return false;
+        }
+        let mut cur = self.current_state.lock();
+        if matches!(*cur, DictationState::Idle) {
+            *cur = DictationState::Listening;
+            drop(cur);
+            drop(session);
+            self.refresh_menu();
+            hud::show_state(DictationState::Listening);
+            true
+        } else {
+            false
         }
     }
 
@@ -114,67 +214,166 @@ impl App {
         if effective_trigger_mode(&self.settings.load()) != TriggerMode::Hold {
             return;
         }
-        if let Some(s) = self.session.lock().as_ref() {
+        // Hold the session lock across check + queue write so the
+        // session-starter worker can't install + drain
+        // `pending_terminate` between our check and our write. See
+        // the matching comment in `on_hotkey_press` for the same
+        // pattern.
+        let session = self.session.lock();
+        if let Some(s) = session.as_ref() {
             s.finalize();
+            return;
+        }
+        // Session slot empty — could be (a) no session in flight or
+        // (b) we're in the try_claim_listening → start_session gap.
+        // Distinguish via state: only queue if state is Listening
+        // (i.e. a start is in progress).
+        if matches!(*self.current_state.lock(), DictationState::Listening) {
+            *self.pending_terminate.lock() = Some(TerminateKind::Finalize);
         }
     }
 
+    /// Spawn a worker thread that opens the mic + loads Silero VAD and,
+    /// once both are ready, populates `app.session` and starts the
+    /// session-watcher. Assumes `try_claim_listening` has already
+    /// transitioned state to Listening.
+    ///
+    /// The cold-start work (~100-300 ms for CPAL + Silero) runs on the
+    /// worker, NOT on the caller's thread. This matters because the
+    /// caller of `on_hotkey_press` is often the CGEventTap callback,
+    /// which has a hard ~250 ms budget before macOS disables the tap
+    /// (`kCGEventTapDisabledByTimeout`). Doing the load inline would
+    /// kill all subsequent hotkey events until the app restarts.
+    ///
+    /// During the worker's setup window, a press/release edge may
+    /// arrive (Tap-cancel or Hold-release). Those edges are queued in
+    /// `pending_terminate` by `on_hotkey_press` / `on_hotkey_release`
+    /// when the session slot is empty, and drained here as soon as
+    /// the slot is populated.
     fn start_session(self: &Arc<Self>, mode: StreamerMode) {
         if self.asr.lock().is_none() {
             log::warn!("hotkey ignored: model still loading");
+            *self.pending_terminate.lock() = None;
+            self.set_state(DictationState::Idle);
             return;
         }
         let vad_path = self.settings.vad_path();
+        let app = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("session-starter".into())
+            .spawn(move || {
+                let app_for_panic = Arc::clone(&app);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    app.start_session_blocking(mode, vad_path);
+                }));
+                if let Err(payload) = result {
+                    let msg = panic_message(&*payload);
+                    app_for_panic.recover_from_panic("session-starter", &msg);
+                }
+            })
+            .expect("spawn session-starter thread");
+    }
+
+    /// Synchronous body of `start_session`. Runs on the
+    /// `session-starter` worker; never call from the AppKit main
+    /// thread or the CGEventTap callback — `streamer::start` opens
+    /// the mic and loads Silero VAD (~100-300 ms cold).
+    fn start_session_blocking(self: Arc<Self>, mode: StreamerMode, vad_path: std::path::PathBuf) {
         let (session, outcome_rx) = match streamer::start(&vad_path, mode) {
             Ok(pair) => pair,
             Err(e) => {
                 log::error!("start session failed: {e:#}");
+                *self.pending_terminate.lock() = None;
+                self.set_state(DictationState::Idle);
                 return;
             }
         };
-        self.set_state(DictationState::Listening);
 
-        // Park the command half in app.session for the lifetime of the
-        // recording. on_hotkey_release / on_hotkey_press reach the active
-        // session through here. The watcher owns only the outcome
-        // receiver — it can't accidentally interfere with the command
-        // path.
+        // Park the command half in app.session and drain
+        // `pending_terminate` while holding the session lock so a
+        // concurrent press/release can't slip its edge in between our
+        // slot-populate and the drain.
         {
             let mut slot = self.session.lock();
             let prev = slot.replace(session);
             debug_assert!(prev.is_none(), "session slot was not cleared");
+            if let Some(kind) = self.pending_terminate.lock().take() {
+                if let Some(s) = slot.as_ref() {
+                    match kind {
+                        TerminateKind::Cancel => s.cancel(),
+                        TerminateKind::Finalize => s.finalize(),
+                    }
+                }
+            }
         }
 
-        let app = self.clone();
+        let app = Arc::clone(&self);
         std::thread::Builder::new()
             .name("session-watcher".into())
             .spawn(move || {
-                let OutcomeRx(rx) = outcome_rx;
-                let outcome = rx.recv().ok();
-                // Drop the command half NOW that the recording is done.
-                // This both shuts down the capture thread (Drop sends a
-                // Cancel) and clears `app.session` so the next hotkey
-                // press sees an idle slot.
-                drop(app.session.lock().take());
-                match outcome {
-                    Some(Outcome::Speech {
-                        samples,
-                        sample_rate,
-                        timer,
-                    }) => {
-                        app.set_state(DictationState::Transcribing);
-                        app.transcribe_and_paste(samples, sample_rate, timer);
+                let app_for_panic = Arc::clone(&app);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let OutcomeRx(rx) = outcome_rx;
+                    let outcome = rx.recv().ok();
+
+                    // Transition `current_state` AND clear `session`
+                    // under the SAME `session.lock()`. Lock order
+                    // matches `try_claim_listening`:
+                    // session → current_state. This closes two
+                    // opposite TOCTOU windows:
+                    //
+                    //   (a) `state=Listening` AND `session=None`
+                    //       (queue writes leak to next session) —
+                    //       fixed by transitioning state inside the
+                    //       critical section.
+                    //   (b) `state=Idle/Transcribing` AND
+                    //       `session=Some` (hotkey claims, starter
+                    //       populates the slot atop the stale old
+                    //       session, the old watcher's drop then
+                    //       cancels the new one) — fixed by
+                    //       `try_claim_listening` also locking session.
+                    let target_state = match &outcome {
+                        Some(Outcome::Speech { .. }) => DictationState::Transcribing,
+                        _ => {
+                            if app.asr.lock().is_some() {
+                                DictationState::Idle
+                            } else {
+                                DictationState::ModelLoading
+                            }
+                        }
+                    };
+                    {
+                        let mut slot = app.session.lock();
+                        *app.current_state.lock() = target_state;
+                        *slot = None;
                     }
-                    Some(Outcome::Cancelled) => app.on_session_finished(),
-                    Some(Outcome::NoSpeech) => {
-                        log::info!("VAD heard nothing; aborting session");
-                        app.on_session_finished();
+                    // Menu + HUD refresh outside the lock (AppKit calls
+                    // can be slow / re-entrant; never hold a Mutex
+                    // across them).
+                    app.refresh_menu();
+                    hud::show_state(target_state);
+
+                    match outcome {
+                        Some(Outcome::Speech {
+                            samples,
+                            sample_rate,
+                            timer,
+                        }) => {
+                            app.transcribe_and_paste(samples, sample_rate, timer);
+                        }
+                        Some(Outcome::Cancelled) => {}
+                        Some(Outcome::NoSpeech) => {
+                            log::info!("VAD heard nothing; aborting session");
+                        }
+                        Some(Outcome::Error(e)) => {
+                            log::error!("session error: {e:#}");
+                        }
+                        None => {}
                     }
-                    Some(Outcome::Error(e)) => {
-                        log::error!("session error: {e:#}");
-                        app.on_session_finished();
-                    }
-                    None => app.on_session_finished(),
+                }));
+                if let Err(payload) = result {
+                    let msg = panic_message(&*payload);
+                    app_for_panic.recover_from_panic("session-watcher", &msg);
                 }
             })
             .expect("spawn session-watcher thread");
@@ -190,32 +389,39 @@ impl App {
         std::thread::Builder::new()
             .name("transcribe".into())
             .spawn(move || {
-                let Some(asr) = app.asr.lock().clone() else {
-                    log::error!("transcribe: model gone");
-                    app.on_session_finished();
-                    return;
-                };
-                timer.mark_asr_start();
-                let raw = match asr.recognize(&samples, sample_rate) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        log::error!("recognise failed: {e:#}");
+                let app_for_panic = Arc::clone(&app);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let Some(asr) = app.asr.lock().clone() else {
+                        log::error!("transcribe: model gone");
                         app.on_session_finished();
                         return;
-                    }
-                };
-                timer.mark_asr_done();
+                    };
+                    timer.mark_asr_start();
+                    let raw = match asr.recognize(&samples, sample_rate) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::error!("recognise failed: {e:#}");
+                            app.on_session_finished();
+                            return;
+                        }
+                    };
+                    timer.mark_asr_done();
 
-                let settings = app.settings.load();
-                let result = deliver_cleaned(&app, &raw, &settings);
-                // Marks *last*-chunk paste under streaming; perceived
-                // first-chunk latency is much lower. See ADR-0018.
-                timer.mark_paste_done();
-                timer.emit();
-                if let Err(e) = result {
-                    log::error!("deliver failed: {e:#}");
+                    let settings = app.settings.load();
+                    let result = deliver_cleaned(&app, &raw, &settings);
+                    // Marks *last*-chunk paste under streaming; perceived
+                    // first-chunk latency is much lower. See ADR-0018.
+                    timer.mark_paste_done();
+                    timer.emit();
+                    if let Err(e) = result {
+                        log::error!("deliver failed: {e:#}");
+                    }
+                    app.on_session_finished();
+                }));
+                if let Err(payload) = result {
+                    let msg = panic_message(&*payload);
+                    app_for_panic.recover_from_panic("transcribe", &msg);
                 }
-                app.on_session_finished();
             })
             .expect("spawn transcribe thread");
     }
@@ -227,6 +433,36 @@ impl App {
             DictationState::ModelLoading
         };
         self.set_state(new_state);
+    }
+
+    /// Force-recover after a worker thread panic. The three spawned
+    /// worker threads (`session-starter`, `session-watcher`,
+    /// `transcribe`) can panic at any FFI boundary (sherpa-onnx, cpal,
+    /// llama.cpp, enigo, arboard). Without this recovery, a panic in
+    /// any of them would leave the app stuck in `Listening` /
+    /// `Transcribing` / `Polishing` forever — hotkey presses gated
+    /// on `Idle` would be silently ignored and the user would have to
+    /// quit.
+    ///
+    /// Called from `catch_unwind` handlers around each worker body.
+    fn recover_from_panic(self: &Arc<Self>, source: &str, msg: &str) {
+        log::warn!("recovering app state after {source} panic: {msg}");
+        let next_state = if self.asr.lock().is_some() {
+            DictationState::Idle
+        } else {
+            DictationState::ModelLoading
+        };
+        // Lock order: session → current_state → pending_terminate,
+        // matching `try_claim_listening` and the watcher.
+        {
+            let mut slot = self.session.lock();
+            *self.current_state.lock() = next_state;
+            *slot = None;
+        }
+        *self.pending_terminate.lock() = None;
+        self.refresh_menu();
+        hud::show_state(next_state);
+        menubar::set_status_text(&format!("{source} crashed — try again"));
     }
 
     pub fn set_state(&self, new_state: DictationState) {
@@ -266,6 +502,9 @@ impl App {
             if let Some(handle) = self.hotkey.lock().as_ref() {
                 handle.rebind(&new.hotkey)?;
             }
+        }
+        if prev.cleanup_mode != new.cleanup_mode {
+            self.handle_cleanup_mode_change(new.cleanup_mode);
         }
         self.refresh_menu();
         Ok(())
@@ -357,58 +596,165 @@ impl App {
     }
 
     /// Load + warm the cleanup GGUF off the main thread. Idempotent —
-    /// returns early if `app.llm` is already populated. Called from
-    /// `spawn_model_setup` today.
+    /// returns early if `app.llm` is already populated or another load
+    /// is in flight. Called from the boot path
+    /// (`spawn_model_setup`) AND from the Settings-UI toggle
+    /// (`apply_settings` → `handle_cleanup_mode_change`).
     ///
-    /// **Not single-flight.** The `is_some()` check and the eventual
-    /// write into `self.llm` are not atomic; two concurrent callers
-    /// would both observe `None`, both load the 1.2 GB GGUF, and race
-    /// at write-time. Today only the boot path invokes this, so the
-    /// race is unreachable. **Before wiring the Settings UI toggle
-    /// hook (TODO in `spawn_model_setup`), gate this on a `Mutex<bool>`
-    /// "loading-in-progress" flag** so the toggle can't trigger a
-    /// duplicate load while the boot load is still in flight.
+    /// Single-flight via `llm_loading: Mutex<bool>` — without that gate
+    /// a rapid toggle (boot still loading + user flips Off→On) could
+    /// fire two concurrent loads racing to write `llm`, each holding
+    /// 1.2 GB of GGUF weights resident.
     pub async fn spawn_llm_setup(self: Arc<Self>) {
-        if self.llm.lock().is_some() {
-            return; // already loaded
-        }
-        let model_path = self.settings.cleanup_model_path();
-        if !self.settings.cleanup_model_present() {
-            // TODO: extend model_fetch.rs to pull the GGUF. For v1
-            // the user runs `scripts/fetch-cleanup-model.sh` or
-            // bench_llm's curl one-liner.
-            log::warn!(
-                "cleanup model missing at {} — cleanup will fail back to raw paste",
-                model_path.display()
-            );
-            menubar::set_status_text("Cleanup model not downloaded");
+        if !self.try_claim_llm_load() {
             return;
         }
+        let app = Arc::clone(&self);
         let result =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<dyn CleanupBackend>> {
-                menubar::set_status_text("Loading cleanup model…");
-                let llm = LlamaCleanup::load(&model_path)?;
-                menubar::set_status_text("Warming cleanup model…");
-                llm.warmup()?;
-                Ok(Arc::new(llm))
-            })
-            .await;
+            tokio::task::spawn_blocking(move || load_llm_blocking(&app.settings)).await;
+        self.finalize_llm_load(result.unwrap_or_else(|e| Err(anyhow::anyhow!("task panic: {e}"))));
+    }
+
+    /// Returns `true` if THIS caller now owns the load; `false` if
+    /// either the slot is already populated or another load is in
+    /// flight. Releases the `llm_loading` flag in `finalize_llm_load`.
+    fn try_claim_llm_load(&self) -> bool {
+        let mut loading = self.llm_loading.lock();
+        if self.llm.lock().is_some() {
+            return false;
+        }
+        if *loading {
+            return false;
+        }
+        *loading = true;
+        true
+    }
+
+    fn finalize_llm_load(&self, result: anyhow::Result<Arc<dyn CleanupBackend>>) {
+        // Lock both `llm_loading` AND `llm` BEFORE inspecting state.
+        // Lock order is `llm_loading` → `llm` (same as
+        // `try_claim_llm_load`) to avoid deadlock. Clearing
+        // `llm_loading = false` happens INSIDE this critical section
+        // so a concurrent Off→On toggle running
+        // `try_claim_llm_load` either:
+        //   (a) sees `*loading == true` while we hold the lock,
+        //       waits, then observes `*loading == false` plus the
+        //       freshly-written `llm`; OR
+        //   (b) waits on `llm_loading.lock()`, then sees
+        //       `*loading == false` and either no `llm` (we
+        //       discarded the load) or a populated `llm` (we kept it).
+        // Either way the toggle's view is consistent — there's no
+        // window where loading is true but our work is done.
+        let mut loading = self.llm_loading.lock();
+        let mut llm_slot = self.llm.lock();
+        // `apply_settings` writes the new `cleanup_mode` to settings.cache
+        // BEFORE calling `handle_cleanup_mode_change`, and the Off
+        // handler must take `llm.lock()` to clear the slot. So if the
+        // user toggled Off after our load started, either:
+        //   - The Off handler ran before us and cleared `llm` while we
+        //     waited on llm_slot — we now read `mode_now = Off` from
+        //     settings.cache and discard.
+        //   - The Off handler is waiting on `llm_slot` behind us — it
+        //     will set `*llm_slot = None` after we drop. We must NOT
+        //     write `Some(llm)` only to have it cleared a moment
+        //     later, so reading mode here covers that case too.
+        let mode_now = self.settings.load().cleanup_mode;
+        let status: Option<String>;
         match result {
-            Ok(Ok(llm)) => {
-                *self.llm.lock() = Some(llm);
-                menubar::set_status_text("Cleanup ready");
-                self.refresh_menu();
-            }
-            Ok(Err(e)) => {
-                log::error!("cleanup model setup failed: {e:#}");
-                menubar::set_status_text(&format!("Cleanup setup failed: {e}"));
+            Ok(llm) => {
+                if matches!(mode_now, CleanupMode::On) {
+                    *llm_slot = Some(llm);
+                    status = Some("Cleanup ready".to_string());
+                } else {
+                    // Discard the just-loaded model — user flipped Off.
+                    drop(llm);
+                    log::info!(
+                        "cleanup load completed but mode is now Off; discarding loaded model"
+                    );
+                    status = None;
+                }
             }
             Err(e) => {
-                log::error!("cleanup setup task panicked: {e}");
-                menubar::set_status_text(&format!("Cleanup setup panicked: {e}"));
+                log::error!("cleanup model setup failed: {e:#}");
+                status = if matches!(mode_now, CleanupMode::On) {
+                    Some(format!("Cleanup setup failed: {e}"))
+                } else {
+                    None
+                };
+            }
+        }
+        *loading = false;
+        drop(llm_slot);
+        drop(loading);
+        if let Some(text) = status {
+            menubar::set_status_text(&text);
+            self.refresh_menu();
+        }
+    }
+
+    /// Settings-UI cleanup toggle hook. On→Off clears the slot
+    /// (releases the 1.2 GB of weights); Off→On spawns a worker
+    /// thread to load + warm, guarded by `try_claim_llm_load`.
+    /// Called from `apply_settings` when `cleanup_mode` changes.
+    fn handle_cleanup_mode_change(self: &Arc<Self>, new_mode: CleanupMode) {
+        match new_mode {
+            CleanupMode::Off => {
+                // Drop the Arc; if other threads hold clones (e.g. a
+                // polish-in-flight) the model lives until they're done.
+                *self.llm.lock() = None;
+                menubar::set_status_text("Cleanup disabled");
+                self.refresh_menu();
+            }
+            CleanupMode::On => {
+                if !self.try_claim_llm_load() {
+                    return;
+                }
+                let app = Arc::clone(self);
+                std::thread::Builder::new()
+                    .name("llm-toggle-load".into())
+                    .spawn(move || {
+                        let app_for_panic = Arc::clone(&app);
+                        let result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let load_result = load_llm_blocking(&app.settings);
+                                app.finalize_llm_load(load_result);
+                            }));
+                        if let Err(payload) = result {
+                            let msg = panic_message(&*payload);
+                            log::error!("llm-toggle-load panic: {msg}");
+                            // Clear `llm_loading` so a future On
+                            // toggle can retry. Without this the
+                            // toggle would silently no-op forever.
+                            *app_for_panic.llm_loading.lock() = false;
+                            menubar::set_status_text("Cleanup load crashed — try again");
+                        }
+                    })
+                    .expect("spawn llm-toggle-load thread");
             }
         }
     }
+}
+
+/// Synchronous cleanup-LLM load. Used by both the boot path (via
+/// `tokio::spawn_blocking`) and the Settings-toggle path (via
+/// `std::thread::spawn`). Updates the menubar status text as it goes
+/// so the user sees progress through the ~250 ms load + ~150 ms warm.
+fn load_llm_blocking(settings: &SettingsStore) -> anyhow::Result<Arc<dyn CleanupBackend>> {
+    let model_path = settings.cleanup_model_path();
+    if !settings.cleanup_model_present() {
+        // TODO: extend model_fetch.rs to pull the GGUF. For v1
+        // the user runs `scripts/fetch-cleanup-model.sh` or
+        // bench_llm's curl one-liner.
+        anyhow::bail!(
+            "cleanup model missing at {} — fetch the GGUF and toggle Cleanup again",
+            model_path.display()
+        );
+    }
+    menubar::set_status_text("Loading cleanup model…");
+    let llm = LlamaCleanup::load(&model_path)?;
+    menubar::set_status_text("Warming cleanup model…");
+    llm.warmup()?;
+    Ok(Arc::new(llm))
 }
 
 /// Deliver `raw` to the focused app, optionally piping through the
