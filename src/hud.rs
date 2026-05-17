@@ -174,6 +174,15 @@ pub fn install(mtm: MainThreadMarker) {
         // and Reduce Transparency in System Settings → Accessibility.
         // Replaces the previous hand-rolled CALayer setBackgroundColor
         // approach (hardcoded RGB, ignored every accessibility pref).
+        //
+        // Material note: `HUDWindow` used to render its dark variant
+        // in both system appearances on older macOS; recent releases
+        // surface the *light* HUDWindow variant when the system is in
+        // Light mode. Label text and bar pills below therefore use
+        // `NSColor::labelColor()` (semantic) instead of `whiteColor()`
+        // — `labelColor` is black on light backgrounds and white on
+        // dark, so the HUD stays legible whichever variant macOS
+        // picks for the material.
         let effect_view: Retained<NSVisualEffectView> = unsafe {
             let alloc = NSVisualEffectView::alloc(mtm);
             NSVisualEffectView::initWithFrame(
@@ -208,10 +217,10 @@ pub fn install(mtm: MainThreadMarker) {
         unsafe {
             label.setFrame(label_frame);
             label.setAlignment(NSTextAlignment::Left);
-            // White text reads on the HUDWindow material in both light
-            // and dark modes; HUD material is intentionally dark in
-            // both appearances per Apple's HIG.
-            label.setTextColor(Some(&NSColor::whiteColor()));
+            // Semantic label colour — black on the light HUD material,
+            // white on the dark one. Keeps the text legible whichever
+            // appearance variant macOS gave us for the chrome.
+            label.setTextColor(Some(&NSColor::labelColor()));
             let font = NSFont::systemFontOfSize(13.0);
             label.setFont(Some(&font));
             label.setDrawsBackground(false);
@@ -237,9 +246,11 @@ pub fn install(mtm: MainThreadMarker) {
             unsafe {
                 view.setWantsLayer(true);
                 if let Some(layer) = view.layer() {
-                    // Pure white pills on the HUD material. 85%
-                    // opacity reads as "active indicator" without
-                    // overpowering the rest of the chrome.
+                    // Semantic pill colour — black on light, white on
+                    // dark — at 85% opacity. Reads as "active
+                    // indicator" without overpowering the rest of
+                    // the chrome, whichever appearance the system
+                    // gave the visual-effect material.
                     //
                     // The `as *mut c_void` cast is to bypass an
                     // objc2-version mismatch between
@@ -248,8 +259,8 @@ pub fn install(mtm: MainThreadMarker) {
                     // (older objc2) — both encode as the same C ABI
                     // pointer, but the Rust types don't unify. The
                     // runtime only sees the pointer.
-                    let white_cg = NSColor::whiteColor().colorWithAlphaComponent(0.85).CGColor();
-                    let cg_ptr = Retained::as_ptr(&white_cg) as *mut std::ffi::c_void;
+                    let pill_cg = NSColor::labelColor().colorWithAlphaComponent(0.85).CGColor();
+                    let cg_ptr = Retained::as_ptr(&pill_cg) as *mut std::ffi::c_void;
                     let _: () = msg_send![&*layer, setBackgroundColor: cg_ptr];
                     let _: () = msg_send![&*layer, setCornerRadius: BAR_WIDTH / 2.0];
                 }
