@@ -31,7 +31,7 @@ use objc2_foundation::{
 };
 
 use crate::app::{glyphs_for_shortcut, is_capslock_token, AppHandle};
-use crate::settings::{CleanupMode, TriggerMode};
+use crate::settings::{PolishMode, TriggerMode};
 
 const WINDOW_W: f64 = 480.0;
 const WINDOW_H: f64 = 400.0;
@@ -46,7 +46,7 @@ struct Ivars {
     recording_token: RefCell<Option<String>>,
     shortcut_button: RefCell<Option<Retained<NSButton>>>,
     mode_popup: RefCell<Option<Retained<NSPopUpButton>>>,
-    cleanup_popup: RefCell<Option<Retained<NSPopUpButton>>>,
+    polish_popup: RefCell<Option<Retained<NSPopUpButton>>>,
     // No window field. Storing a strong `Retained<NSWindow>` here while
     // the window also held a strong `Retained<SettingsController>` was a
     // textbook retain cycle that prevented either object from ever being
@@ -115,13 +115,13 @@ define_class!(
             crate::objc_util::selector_guard("save:", || self.save_inner());
         }
 
-        /// Cleanup-mode popup changed. Selector kept as a no-op so the
+        /// Polish-mode popup changed. Selector kept as a no-op so the
         /// UI sender wiring stays valid; the actual toggle effect is
         /// applied on Save (we don't load the 1.2 GB Qwen GGUF on every
         /// dropdown flip).
-        #[unsafe(method(cleanupModeChanged:))]
-        fn cleanup_mode_changed(&self, _sender: *mut NSObject) {
-            crate::objc_util::selector_guard("cleanupModeChanged:", || {});
+        #[unsafe(method(polishModeChanged:))]
+        fn polish_mode_changed(&self, _sender: *mut NSObject) {
+            crate::objc_util::selector_guard("polishModeChanged:", || {});
         }
 
         #[unsafe(method(cancel:))]
@@ -201,10 +201,10 @@ impl SettingsController {
                 _ => TriggerMode::Tap,
             };
         }
-        if let Some(popup) = self.ivars().cleanup_popup.borrow().as_ref() {
-            new.cleanup_mode = match unsafe { popup.indexOfSelectedItem() } {
-                1 => CleanupMode::On,
-                _ => CleanupMode::Off,
+        if let Some(popup) = self.ivars().polish_popup.borrow().as_ref() {
+            new.polish_mode = match unsafe { popup.indexOfSelectedItem() } {
+                1 => PolishMode::On,
+                _ => PolishMode::Off,
             };
         }
 
@@ -418,39 +418,39 @@ pub fn open(mtm: MainThreadMarker) {
         60.0,
     );
 
-    // --- Section divider: Cleanup -----------------------------------------
+    // --- Section divider: Polish -----------------------------------------
     let section_y = row3_y - 80.0;
     add_section_label(mtm, &content, "Post-processing", PAD, section_y);
 
-    // --- Row 4: Cleanup mode popup ----------------------------------------
+    // --- Row 4: Polish mode popup ----------------------------------------
     let row4_y = section_y - ROW_H - 10.0;
-    add_label(mtm, &content, "Cleanup", PAD, row4_y);
-    let cleanup_popup = make_popup(
+    add_label(mtm, &content, "Polish", PAD, row4_y);
+    let polish_popup = make_popup(
         mtm,
         &[
             "Off — paste raw transcript",
             "On — Qwen 3.5 2B local (≈1.2 GB)",
         ],
-        match settings.as_ref().map(|s| s.cleanup_mode) {
-            Some(CleanupMode::On) => 1,
+        match settings.as_ref().map(|s| s.polish_mode) {
+            Some(PolishMode::On) => 1,
             _ => 0,
         },
         NSPoint::new(PAD + LABEL_W, row4_y - 4.0),
         NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
     );
     unsafe {
-        cleanup_popup.setTarget(Some(controller.as_ref()));
-        cleanup_popup.setAction(Some(sel!(cleanupModeChanged:)));
-        content.addSubview(&cleanup_popup);
+        polish_popup.setTarget(Some(controller.as_ref()));
+        polish_popup.setAction(Some(sel!(polishModeChanged:)));
+        content.addSubview(&polish_popup);
     }
-    *controller.ivars().cleanup_popup.borrow_mut() = Some(cleanup_popup);
+    *controller.ivars().polish_popup.borrow_mut() = Some(polish_popup);
 
-    // --- Row 5: Cleanup hint ----------------------------------------------
+    // --- Row 5: Polish hint ----------------------------------------------
     let row5_y = row4_y - 30.0;
     add_hint(
         mtm,
         &content,
-        "Cleanup removes filler words, fixes punctuation, and honours\n\
+        "Polish removes filler words, fixes punctuation, and honours\n\
          commands like \"new paragraph\" and \"scratch that\". Runs\n\
          in-process via llama.cpp + Metal on Apple Silicon — no cloud,\n\
          no API key. Requires the Qwen 3.5 2B Q4_K_M GGUF (~1.2 GB)\n\

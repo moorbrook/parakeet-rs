@@ -26,7 +26,7 @@
 //! The FSM owns the state ↔ session ↔ pending-terminate triple. It
 //! does NOT own:
 //!
-//! - The recogniser (`Asr`) or the cleanup LLM — those have monotonic
+//! - The recogniser (`Asr`) or the polish LLM — those have monotonic
 //!   "ready or not" semantics and don't interact with session state.
 //!   Callers pass `asr_ready: bool` (or a precomputed next state) on
 //!   transitions where it matters.
@@ -49,7 +49,7 @@ pub enum DictationState {
     Listening,
     /// Capture stopped, ASR running.
     Transcribing,
-    /// ASR done; LLM cleanup pass running.
+    /// ASR done; LLM polish pass running.
     Polishing,
 }
 

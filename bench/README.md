@@ -55,7 +55,7 @@ target before any optimization. §2 should still cut
 **first-dictation-after-launch** cold-start, which is what the user
 actually feels on app open; warm steady-state may not budge much.
 
-## §6 Phase-0 cleanup-backend bench: Qwen 3.5 2B Q4_K_M (2026-05-16, M5 Pro 24 GB)
+## §6 Phase-0 polish-backend bench: Qwen 3.5 2B Q4_K_M (2026-05-16, M5 Pro 24 GB)
 
 Driven by `src/bin/bench_llm.rs`. 100 polish iterations of a fixed
 240-char noisy transcript through `llama-cpp-2` (Metal feature)
@@ -79,7 +79,7 @@ Replay:
 # then aggregate inline — see ADR-0018 for the one-shot Python snippet
 ```
 
-Background and library-selection rationale: [ADR-0018](../docs/ADR.md#0018--cleanup-backend-llamacpp--qwen-35-2b-q4_k_m).
+Background and library-selection rationale: [ADR-0018](../docs/ADR.md#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m).
 
 ## Files
 
@@ -90,4 +90,4 @@ Background and library-selection rationale: [ADR-0018](../docs/ADR.md#0018--clea
 | `llm-raw.log`                | All `llm_timer` lines from the last LLM run.     |
 | `baseline.csv`               | Aggregated ASR baseline (pre-CoreML-cache).      |
 | `post-coreml-cache.csv`      | Aggregated post-§2 (deferred — see ADR-0017).    |
-| `cleanup-backends.csv`       | §6 Phase-0 cleanup backend numbers (this run).   |
+| `polish-backends.csv`       | §6 Phase-0 polish backend numbers (this run).   |

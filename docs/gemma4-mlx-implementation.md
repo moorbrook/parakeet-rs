@@ -1,10 +1,10 @@
 # Implementing a `gemma4-mlx` crate on OminiX-MLX
 
-> **Status: DISQUALIFIED for parakeet-rs cleanup tier.** Gemma 4 E2B 4-bit on-disk size exceeds 2 GB, the cap parakeet-rs accepts for the first-run cleanup-model download. The candidate has been dropped from the Phase-0 benchmark in [latency-plan.md §6](./latency-plan.md).
+> **Status: DISQUALIFIED for parakeet-rs polish tier.** Gemma 4 E2B 4-bit on-disk size exceeds 2 GB, the cap parakeet-rs accepts for the first-run polish-model download. The candidate has been dropped from the Phase-0 benchmark in [latency-plan.md §6](./latency-plan.md).
 >
 > This document is preserved as a reference in case (a) a smaller Gemma 4 quant (sub-2 GB int3 / mixed-precision) becomes available, or (b) the 2 GB cap is revisited. Everything below is still accurate for someone wanting to write a `gemma4-mlx` crate on OminiX-MLX — only the recommendation that parakeet-rs should is rescinded.
 
-Companion to [latency-plan.md](./latency-plan.md). This doc was originally the implementation map for the OminiX-MLX side of the Phase-0 cleanup-backend benchmark.
+Companion to [latency-plan.md](./latency-plan.md). This doc was originally the implementation map for the OminiX-MLX side of the Phase-0 polish-backend benchmark.
 
 **Key fact up front:** [OminiX-MLX](https://github.com/OminiX-ai/OminiX-MLX) ships model crates for Qwen3, GLM4, Mixtral, Mistral, etc. **It does not ship a Gemma crate.** Choosing OminiX-MLX for Gemma 4 means writing a new `gemma4-mlx` workspace member from scratch, following the existing `qwen3-mlx` pattern.
 
@@ -16,7 +16,7 @@ OminiX-MLX is a Cargo monorepo:
 - `mlx-rs/` — safe Rust bindings on top of `mlx-sys`
 - `mlx-rs-core/` — shared inference infrastructure (KV cache, RoPE, attention masks, SDPA, sampling)
 - per-model crates: `qwen3-mlx`, `glm4-mlx`, `mixtral-mlx`, `mistral-mlx`, …
-- `ominix-api/` — unified OpenAI-compatible HTTP server (we don't need this; we call the model crate directly from `src/cleanup.rs`)
+- `ominix-api/` — unified OpenAI-compatible HTTP server (we don't need this; we call the model crate directly from `src/polish.rs`)
 
 License: MIT/Apache-2.0 dual. Contributing a new model crate back upstream is the friendly path.
 
@@ -125,7 +125,7 @@ The HuggingFace `tokenizers` crate loads `tokenizer.json` directly. No special w
 
 ### 7. Skip multimodal entirely
 
-Gemma 4 E2B/E4B support audio + vision through additional encoders. For cleanup-only use you only need the text tower. **Do not port the vision encoder or audio frontend.** Avoids a large chunk of porting work and gigabytes of weights.
+Gemma 4 E2B/E4B support audio + vision through additional encoders. For polish-only use you only need the text tower. **Do not port the vision encoder or audio frontend.** Avoids a large chunk of porting work and gigabytes of weights.
 
 ### Things the same as Qwen3 — lift wholesale
 
@@ -176,9 +176,9 @@ The Phase-0 benchmark in [latency-plan.md §6](./latency-plan.md) currently fram
 | **Candle** | Add `candle-core` + `candle-transformers` deps; use existing Gemma 4 module. Library-deep work. |
 | **OminiX-MLX (with new `gemma4-mlx`)** | Write a new model crate from scratch (architecture port + weight loader + validation against the Python oracle). From-scratch work. |
 
-**Recommendation:** ship Candle integration first as the working baseline for the cleanup tier. Only invest in writing `gemma4-mlx` if a measured Candle Gemma 4 E2B 4-bit polish on M5 Pro fails the **≤300 ms p50** acceptance threshold from latency-plan.md §6. If Candle hits the number, OminiX-MLX isn't worth the from-scratch port for an expected ~10–25% speed bump.
+**Recommendation:** ship Candle integration first as the working baseline for the polish tier. Only invest in writing `gemma4-mlx` if a measured Candle Gemma 4 E2B 4-bit polish on M5 Pro fails the **≤300 ms p50** acceptance threshold from latency-plan.md §6. If Candle hits the number, OminiX-MLX isn't worth the from-scratch port for an expected ~10–25% speed bump.
 
-The latency-plan ADR for the cleanup backend should reflect this asymmetry: not "pick the fastest of two equivalent options" but "ship Candle; gate OminiX-MLX investment on a measured Candle miss."
+The latency-plan ADR for the polish backend should reflect this asymmetry: not "pick the fastest of two equivalent options" but "ship Candle; gate OminiX-MLX investment on a measured Candle miss."
 
 ## References
 

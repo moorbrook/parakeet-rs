@@ -18,11 +18,11 @@ ADRs target. Update whenever the code lands or a measurement is taken.
 |---|---|---|---|
 | End-of-speech → text appears | **press-once + Silero VAD auto-stop** wired (`streamer.rs`); 16 kHz resample inline; offline encoder runs at 7.8x RTFx on M5 Pro, so a 5 s utterance finalizes in ~640 ms after EoS | **<1 s p50 with WER ≤ 2% (revised)** — was <200 ms but retired after streaming-Parakeet survey found no viable substitute (see ADR-0009) | nothing for the revised target |
 | Recognition acceleration | **CoreML EP linked AND engaged.** `sherpa-onnx-sys` set to `shared` linkage; `libonnxruntime.1.24.4.dylib` exports `OrtSessionOptionsAppendExecutionProvider_CoreML` (verified by `nm -gU`); `build.rs` symbol check is green; the **2 s warmup decode runs at 7.8x real time**, well above the 2x CoreML floor that signals CPU fallback. ANE/GPU is in use. | CoreML EP routes ops to ANE / Metal / CPU per-op | **none — ADR-0012 + ADR-0015 fully shipped.** |
-| Resident set | ~800 MB (640 MB mmap'd ASR model + ORT arenas + audio buffers); +~1.6 GB when cleanup is On (Qwen 3.5 2B Q4 weights + KV cache); ~50 MB bundled dylibs | ≤2.5 GB steady state with cleanup On | none — ADR-0016 + ADR-0018 shipped |
+| Resident set | ~800 MB (640 MB mmap'd ASR model + ORT arenas + audio buffers); +~1.6 GB when polish is On (Qwen 3.5 2B Q4 weights + KV cache); ~50 MB bundled dylibs | ≤2.5 GB steady state with polish On | none — ADR-0016 + ADR-0018 shipped |
 | Settings window | Native `NSWindow` opened from menubar "Settings…" (`src/settings_ui.rs`); `orderFrontRegardless` so it surfaces above other apps | native, on-demand | none — shipped |
 | Menubar UX | SF Symbols (`mic` / `mic.fill` / `arrow.down.circle`) via `objc2_app_kit::NSImage`; state-reflective menu labels | HIG-conformant template image with state | none — shipped |
 | Paste path | `CGEventKeyboardSetUnicodeString` synthetic keystroke at `AnnotatedSession` tap layer (`src/ax_paste.rs`) | no clipboard mutation; works in terminals, browsers, native, Electron, IDEs | none — [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) shipped, supersedes ADR-0011 |
-| Smart formatting | In-process LLM cleanup pass: Qwen 3.5 2B Q4_K_M via llama-cpp-2 + Metal (`src/cleanup.rs`); opt-in via Settings → Cleanup → On | optional local cleanup, streaming output to cursor on word boundaries | none — [ADR-0018](#0018--cleanup-backend-llamacpp--qwen-35-2b-q4_k_m) shipped |
+| Smart formatting | In-process LLM polish pass: Qwen 3.5 2B Q4_K_M via llama-cpp-2 + Metal (`src/polish.rs`); opt-in via Settings → Polish → On | optional local polish, streaming output to cursor on word boundaries | none — [ADR-0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) shipped |
 
 **Foundational dependency cleared.** The CoreML EP blocker that gated
 almost every other ADR was resolved by the [ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage)
@@ -761,7 +761,7 @@ makes CoreML EP unreliable.
 
 ---
 
-## 0018 — Cleanup backend: llama.cpp + Qwen 3.5 2B Q4_K_M
+## 0018 — Polish backend: llama.cpp + Qwen 3.5 2B Q4_K_M
 
 **Status:** Accepted (Phase-0 measured)
 
@@ -777,14 +777,14 @@ three blockers before any bench could run:
    [docs/gemma4-mlx-implementation.md](./gemma4-mlx-implementation.md)),
    which catalogues seven architectural divergences from Qwen3. Multi-day
    port + token-parity validation against Python mlx-lm. Out of scope as
-   the v1 cleanup backend; gated on a measured Candle/llama.cpp miss.
+   the v1 polish backend; gated on a measured Candle/llama.cpp miss.
 3. **Gemma 4 E2B doesn't fit the <2 GB disk budget.** Q4_K_M is ~3 GB
    ([bartowski/google_gemma-4-E2B-it-GGUF](https://huggingface.co/bartowski/google_gemma-4-E2B-it-GGUF)).
    Going lower than Q4_K_M (Q3_K_M ~2.4 GB, Q2_K ~1.9 GB) hits the steep
    small-model quant degradation curve flagged by the [Qwen3
    quantization study](https://arxiv.org/html/2505.02214v1).
 
-**Decision.** Replace `claude -p` (current `src/cleanup.rs` path) with
+**Decision.** Replace `claude -p` (current `src/polish.rs` path) with
 in-process inference via **llama.cpp + Qwen 3.5 2B-Instruct Q4_K_M**.
 
 - **Model:** [`unsloth/Qwen3.5-2B-GGUF`](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF)
@@ -815,7 +815,7 @@ Qwen 3.5 2B beats Gemma 4 E2B on 3/4 size-class benchmarks, fits the
 newer (Feb 2026 vs Gemma 4's earlier 2026 release), and works in the
 shipping `llama-cpp-2` Rust binding today. Gemma 4 wins only on
 multilingual MMMLU — not load-bearing for English-language dictation
-cleanup.
+polish.
 
 **Why llama.cpp, not Candle.** Candle ships neither Qwen 3.5 (new
 hybrid Gated-DeltaNet architecture, `Qwen3_5ForConditionalGeneration`)
@@ -827,7 +827,7 @@ backend on Apple Silicon delivers ~100 tok/s on Qwen 3.5 2B Q4_K_M
 (measured below).
 
 **Measured Phase-0 numbers, M5 Pro 24 GB, 100 iterations
-(`bench/cleanup-backends.csv`):**
+(`bench/polish-backends.csv`):**
 
 | Metric | Mean | p50 | p95 | p99 |
 |---|---|---|---|---|
@@ -837,33 +837,33 @@ backend on Apple Silicon delivers ~100 tok/s on Qwen 3.5 2B Q4_K_M
 | Decode (tokens/sec) | 100.3 | 100.4 | 101.7 | 101.9 |
 
 Cold model load: 229 ms (incurred once per process; the warmup is
-done as part of `App::spawn_llm_setup` in `src/app.rs`, so cleanup
+done as part of `App::spawn_llm_setup` in `src/app.rs`, so polish
 is ready before the user's first hotkey press).
 Output: 55 tokens (one cleaned paragraph) for a 240-character noisy
 input. p99 / p50 = 1.04 — variance is negligible, Metal kernel
 scheduling is steady-state from iteration 1.
 
 **Latency budget consequence.** Projected total post-endpoint latency
-on a 5 s utterance with cleanup:
+on a 5 s utterance with polish:
 
 ```
    362 ms   ASR (§1 measured)
 +  150 ms   VAD hangover (vad.rs:15)
 +   50 ms   paste finalize (latency-plan estimate)
-+  550 ms   cleanup (this bench, p50)
++  550 ms   polish (this bench, p50)
 = 1112 ms   total p50
 ```
 
 That's **~112 ms over the latency-plan §6 acceptance criterion of
-≤ 1.0 s p50 with cleanup**. Three mitigations on the table for the
-§4 cleanup-rewrite work, in order of effort:
+≤ 1.0 s p50 with polish**. Three mitigations on the table for the
+§4 polish-rewrite work, in order of effort:
 
 1. **Stream the paste**: emit cleaned tokens to NSPasteboard + ⌘V
    incrementally as the model generates, rather than buffering until
    end-of-sequence. The user feels latency as "first token visible",
    not "last token visible". Saves ~300–400 ms perceived; the actual
    wall clock to last-token is unchanged.
-2. **Trim output cap**: typical cleanup output for a 30-token input
+2. **Trim output cap**: typical polish output for a 30-token input
    is 20–35 output tokens. Cap at 40 → ~400 ms gen → total ~960 ms p50,
    under budget. Risk: long dictations get truncated; need fallback to
    raw paste if the cap hits.
@@ -886,17 +886,15 @@ tools (Wispr Flow, etc.) deliver their <700 ms feel.
 - **Candle main + gemma4 fp16.** ~10 GB on-disk, blows past the <2 GB
   user constraint, and the loader is not yet quantized.
 - **Direct Anthropic API.** Rejected by project directive (no cloud
-  cleanup). The legacy `cleanup_mode = "anthropic"` serde alias was
-  removed when the API key field was dropped from settings; the
-  in-process llama.cpp path replaces both the API and the prior
-  `claude -p` subprocess approach.
+  polish). The in-process llama.cpp path replaces both the API and the
+  prior `claude -p` subprocess approach.
 - **`mlx-rs` direct.** Same multi-day port story as OminiX-MLX without
   the shared infrastructure crates.
 
 **Open issues (resolved post-§6).**
 
 - ~~The `/no_think` directive leaks into the model's output.~~
-  Resolved — `strip_no_think_tail` in `src/cleanup.rs` handles all
+  Resolved — `strip_no_think_tail` in `src/polish.rs` handles all
   observed variants (`/no_think`, `no_think`, `no think`,
   `No think`, etc., case-insensitive, ignoring trailing punctuation).
 - ~~Streaming-paste is non-trivial against the clipboard+⌘V shape.~~
@@ -905,7 +903,7 @@ tools (Wispr Flow, etc.) deliver their <700 ms feel.
   word-boundary-batched chunk per LLM emission burst. No clipboard,
   no AX, no flicker.
 - **Open: model file management.** ~1.22 GB download on first
-  cleanup-enable, expected at
+  polish-enable, expected at
   `~/Library/Application Support/com.parakeet.rs/llm/qwen3.5-2b-q4_k_m/`.
   In-app download is **not** wired up — `load_llm_blocking` bails
   with a clear error if the file is missing; the user has to fetch
@@ -914,7 +912,7 @@ tools (Wispr Flow, etc.) deliver their <700 ms feel.
 
 **References.**
 
-- `bench/cleanup-backends.csv` — full 100-row Phase-0 data, this M5 Pro.
+- `bench/polish-backends.csv` — full 100-row Phase-0 data, this M5 Pro.
 - `src/bin/bench_llm.rs` — the bench harness.
 - [Welcome Gemma 4 — Hugging Face](https://huggingface.co/blog/gemma4)
 - [unsloth/Qwen3.5-2B-GGUF](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF)
@@ -971,10 +969,10 @@ Paths forward, in increasing cost:
 2026-05-16, M5 Pro 24 GB) puts the 5 s ASR-only p50 at **362 ms**.
 Adding the latency plan's 150 ms VAD hangover + 50 ms paste finalize
 ≈ 562 ms total post-endpoint — already inside the §6 acceptance
-criterion of ≤ 700 ms p50 no-cleanup. The §2 optimization helps
+criterion of ≤ 700 ms p50 no-polish. The §2 optimization helps
 *first-launch* cold start only (where the user feels CoreML's MLProgram
 graph compile cost). That's a real win to grab eventually, but it's
-not gating the ship of §6 (cleanup rewrite + acceptance numbers).
+not gating the ship of §6 (polish rewrite + acceptance numbers).
 
 **Open question.** Empirically verify whether CoreML's own framework-level
 cache at `~/Library/Caches/com.apple.MLModelCompiler/` already short-
@@ -1054,8 +1052,8 @@ posting bypasses some terminals' input pipelines.
 - IDEs: Xcode, JetBrains family
 - Streaming polish: 3-chunk dictation into Ghostty round-tripped in
   861 ms `dur_post_endpoint_ms` end-to-end (audio capture stop →
-  ASR → cleanup polish → keystroke posted → focused-app insertion),
-  with the cleanup pipeline contributing ~550 ms of that.
+  ASR → polish polish → keystroke posted → focused-app insertion),
+  with the polish pipeline contributing ~550 ms of that.
 
 **Rejected alternatives:**
 

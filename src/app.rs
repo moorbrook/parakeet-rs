@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::asr::Asr;
-use crate::cleanup::{self, CleanupBackend, LlamaCleanup};
+use crate::polish::{self, LlamaPolish, PolishBackend};
 use crate::dictation_fsm::{DictationFsm, HoldPressOutcome, TapPressOutcome};
 use crate::hotkey::HotkeyHandle;
 use crate::hud;
@@ -21,7 +21,7 @@ use crate::llm_manager::{FinalizeOutcome, LlmManager, LoadClaim};
 use crate::menubar;
 use crate::model_fetch::{self, Progress};
 use crate::performance::PhaseTimer;
-use crate::settings::{CleanupMode, Settings, SettingsStore, TriggerMode};
+use crate::settings::{PolishMode, Settings, SettingsStore, TriggerMode};
 use crate::streamer::{self, Mode as StreamerMode, Outcome, OutcomeRx};
 use crate::{paste, performance, warmup};
 
@@ -35,7 +35,7 @@ pub struct App {
     pub settings: SettingsStore,
     /// Set once the model is downloaded and the recogniser is warm.
     pub asr: Mutex<Option<Arc<Asr>>>,
-    /// Cleanup-LLM lifecycle: `Disabled` → `Loading` → `Ready` → back
+    /// Polish-LLM lifecycle: `Disabled` → `Loading` → `Ready` → back
     /// to `Disabled` on toggle Off or load failure. See
     /// `crate::llm_manager` for the single-mutex state machine that
     /// replaced the previous `Mutex<Option<...>>` + `Mutex<bool>` pair.
@@ -383,8 +383,8 @@ impl App {
                 handle.rebind(&new.hotkey)?;
             }
         }
-        if prev.cleanup_mode != new.cleanup_mode {
-            self.handle_cleanup_mode_change(new.cleanup_mode);
+        if prev.polish_mode != new.polish_mode {
+            self.handle_polish_mode_change(new.polish_mode);
         }
         self.refresh_menu();
         Ok(())
@@ -465,21 +465,21 @@ impl App {
             }
         }
 
-        // Cleanup LLM loads in a second pass, ONLY if cleanup is
+        // Polish LLM loads in a second pass, ONLY if polish is
         // enabled in settings. Skipping when off means a fresh install
         // doesn't pay 1.2 GB of resident memory for a feature the user
         // hasn't turned on. Settings-UI toggle (Off → On) re-triggers
-        // a load via `apply_settings` → `handle_cleanup_mode_change`.
-        if matches!(self.settings.load().cleanup_mode, CleanupMode::On) {
+        // a load via `apply_settings` → `handle_polish_mode_change`.
+        if matches!(self.settings.load().polish_mode, PolishMode::On) {
             self.clone().spawn_llm_setup().await;
         }
     }
 
-    /// Load + warm the cleanup GGUF off the main thread. Idempotent —
+    /// Load + warm the polish GGUF off the main thread. Idempotent —
     /// returns early if `app.llm` is already populated or another load
     /// is in flight. Called from the boot path
     /// (`spawn_model_setup`) AND from the Settings-UI toggle
-    /// (`apply_settings` → `handle_cleanup_mode_change`).
+    /// (`apply_settings` → `handle_polish_mode_change`).
     ///
     /// Single-flight via `llm_loading: Mutex<bool>` — without that gate
     /// a rapid toggle (boot still loading + user flips Off→On) could
@@ -497,27 +497,27 @@ impl App {
         );
     }
 
-    /// Apply a completed loader result. Reading `cleanup_mode` here
+    /// Apply a completed loader result. Reading `polish_mode` here
     /// (inside the manager's finalize critical section) is what wins
     /// the rapid-toggle race: if the user flipped Off while we were
     /// loading, settings.cache reads `Off` and the manager discards
     /// the freshly-loaded backend.
-    fn finalize_llm_load(&self, result: anyhow::Result<Arc<dyn CleanupBackend>>) {
+    fn finalize_llm_load(&self, result: anyhow::Result<Arc<dyn PolishBackend>>) {
         let keep_if_loaded =
-            matches!(self.settings.load().cleanup_mode, CleanupMode::On);
+            matches!(self.settings.load().polish_mode, PolishMode::On);
         let outcome = self.llm.finalize_load(result, keep_if_loaded);
         let status: Option<String> = match outcome {
-            FinalizeOutcome::Stored => Some("Cleanup ready".to_string()),
+            FinalizeOutcome::Stored => Some("Polish ready".to_string()),
             FinalizeOutcome::DiscardedDisabled => {
                 log::info!(
-                    "cleanup load completed but mode is now Off; discarding loaded model"
+                    "polish load completed but mode is now Off; discarding loaded model"
                 );
                 None
             }
             FinalizeOutcome::Failed(e) => {
-                log::error!("cleanup model setup failed: {e:#}");
+                log::error!("polish model setup failed: {e:#}");
                 if keep_if_loaded {
-                    Some(format!("Cleanup setup failed: {e}"))
+                    Some(format!("Polish setup failed: {e}"))
                 } else {
                     None
                 }
@@ -529,20 +529,20 @@ impl App {
         }
     }
 
-    /// Settings-UI cleanup toggle hook. On→Off drops the loaded model
+    /// Settings-UI polish toggle hook. On→Off drops the loaded model
     /// (releases the 1.2 GB of weights); Off→On spawns a worker thread
     /// to load + warm, guarded by `LlmManager::try_claim_load`. Called
-    /// from `apply_settings` when `cleanup_mode` changes.
-    fn handle_cleanup_mode_change(self: &Arc<Self>, new_mode: CleanupMode) {
+    /// from `apply_settings` when `polish_mode` changes.
+    fn handle_polish_mode_change(self: &Arc<Self>, new_mode: PolishMode) {
         match new_mode {
-            CleanupMode::Off => {
+            PolishMode::Off => {
                 // Drop the Arc; if other threads hold clones (e.g. a
                 // polish-in-flight) the model lives until they're done.
                 self.llm.disable();
-                menubar::set_status_text("Cleanup disabled");
+                menubar::set_status_text("Polish disabled");
                 self.refresh_menu();
             }
-            CleanupMode::On => {
+            PolishMode::On => {
                 if !matches!(self.llm.try_claim_load(), LoadClaim::Claimed) {
                     return;
                 }
@@ -558,7 +558,7 @@ impl App {
                         // toggle can retry. Without this the toggle
                         // would silently no-op forever.
                         app.llm.clear_loading_after_panic();
-                        menubar::set_status_text("Cleanup load crashed — try again");
+                        menubar::set_status_text("Polish load crashed — try again");
                     },
                 );
             }
@@ -566,54 +566,54 @@ impl App {
     }
 }
 
-/// Synchronous cleanup-LLM load. Used by both the boot path (via
+/// Synchronous polish-LLM load. Used by both the boot path (via
 /// `tokio::spawn_blocking`) and the Settings-toggle path (via
 /// `std::thread::spawn`). Updates the menubar status text as it goes
 /// so the user sees progress through the ~250 ms load + ~150 ms warm.
-fn load_llm_blocking(settings: &SettingsStore) -> anyhow::Result<Arc<dyn CleanupBackend>> {
-    let model_path = settings.cleanup_model_path();
-    if !settings.cleanup_model_present() {
+fn load_llm_blocking(settings: &SettingsStore) -> anyhow::Result<Arc<dyn PolishBackend>> {
+    let model_path = settings.polish_model_path();
+    if !settings.polish_model_present() {
         // TODO: extend model_fetch.rs to pull the GGUF on first
         // toggle-on. Today the user has to download the file
         // manually — `bench/README.md` documents the one-liner.
         anyhow::bail!(
-            "cleanup model missing at {} — fetch the GGUF and toggle Cleanup again",
+            "polish model missing at {} — fetch the GGUF and toggle Polish again",
             model_path.display()
         );
     }
-    menubar::set_status_text("Loading cleanup model…");
-    let llm = LlamaCleanup::load(&model_path)?;
-    menubar::set_status_text("Warming cleanup model…");
+    menubar::set_status_text("Loading polish model…");
+    let llm = LlamaPolish::load(&model_path)?;
+    menubar::set_status_text("Warming polish model…");
     llm.warmup()?;
     Ok(Arc::new(llm))
 }
 
 /// Deliver `raw` to the focused app, optionally piping through the
-/// cleanup LLM with streaming-paste. Split out of `transcribe_and_paste`
+/// polish LLM with streaming-paste. Split out of `transcribe_and_paste`
 /// so the streaming-paste choreography (start streamer → push chunks →
 /// finish) stays readable.
 ///
 /// Behaviour matrix:
 ///
-/// | cleanup_mode | LLM loaded? | path |
+/// | polish_mode | LLM loaded? | path |
 /// |---|---|---|
 /// | Off | — | one-shot `paste::deliver(raw)` |
 /// | On  | yes | streaming polish → `paste::Streamer` |
 /// | On  | no  | one-shot paste of `raw`, status text explains |
 ///
-/// Cleanup failures fall back to raw paste — the user always sees their
+/// Polish failures fall back to raw paste — the user always sees their
 /// transcript, never nothing.
 fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<()> {
-    if matches!(settings.cleanup_mode, CleanupMode::Off) {
+    if matches!(settings.polish_mode, PolishMode::Off) {
         return paste::deliver(raw);
     }
     let llm = match app.llm.try_get() {
         Some(l) => l,
         None => {
-            // Cleanup was enabled but the model isn't loaded — pasting
+            // Polish was enabled but the model isn't loaded — pasting
             // raw is the right fallback (better than nothing). Status
             // text already explained the load failure.
-            log::warn!("cleanup enabled but model unavailable; pasting raw");
+            log::warn!("polish enabled but model unavailable; pasting raw");
             return paste::deliver(raw);
         }
     };
@@ -632,7 +632,7 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
             streamer.commit()
         }
         PolishOutcome::Error(e) => {
-            log::error!("cleanup pipeline failed: {e:#}");
+            log::error!("polish pipeline failed: {e:#}");
             // Sample fired-state BEFORE `abort` consumes the streamer.
             // `abort` deliberately does NOT flush the pending tail, so
             // this snapshot won't drift under us the way a `commit`-then-
@@ -641,27 +641,27 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
             streamer.abort();
             if any_streamed {
                 menubar::set_status_text(&format!(
-                    "Cleanup failed mid-stream — partial output kept ({e})"
+                    "Polish failed mid-stream — partial output kept ({e})"
                 ));
                 Ok(())
             } else {
                 menubar::set_status_text(&format!(
-                    "Cleanup failed — using raw transcript ({e})"
+                    "Polish failed — using raw transcript ({e})"
                 ));
                 paste::deliver(raw)
             }
         }
         PolishOutcome::Panicked(msg) => {
-            log::error!("cleanup panic caught: {msg}");
+            log::error!("polish panic caught: {msg}");
             // We leave the model loaded — a single panic doesn't mean
             // the weights are corrupt, and reloading would cost ~250 ms.
             let any_streamed = streamer.has_fired();
             streamer.abort();
             if any_streamed {
-                menubar::set_status_text("Cleanup panicked mid-stream — partial output kept");
+                menubar::set_status_text("Polish panicked mid-stream — partial output kept");
                 Ok(())
             } else {
-                menubar::set_status_text("Cleanup panicked — using raw transcript");
+                menubar::set_status_text("Polish panicked — using raw transcript");
                 paste::deliver(raw)
             }
         }
@@ -681,7 +681,7 @@ enum PolishOutcome {
     Panicked(String),
 }
 
-/// Run the cleanup backend with a `catch_unwind` boundary. `on_chunk`
+/// Run the polish backend with a `catch_unwind` boundary. `on_chunk`
 /// is called from inside the unwind boundary — if it panics, the panic
 /// is caught the same way a polish-internal panic would be.
 ///
@@ -692,7 +692,7 @@ enum PolishOutcome {
 /// underlying llama.cpp C++ — those bypass Rust's unwinding machinery
 /// entirely. The fallback is best-effort, not bulletproof.
 fn run_polish_isolated<F>(
-    backend: &dyn CleanupBackend,
+    backend: &dyn PolishBackend,
     text: &str,
     settings: &Settings,
     mut on_chunk: F,
@@ -701,7 +701,7 @@ where
     F: FnMut(&str) -> anyhow::Result<()>,
 {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cleanup::polish_streaming(backend, text, settings, &mut on_chunk)
+        polish::polish_streaming(backend, text, settings, &mut on_chunk)
     }));
     match result {
         Ok(Ok(())) => PolishOutcome::Ok,
@@ -838,12 +838,12 @@ mod tests {
     fn panic_message_extracts_static_str_payload() {
         // `panic!("literal")` payload comes through as `&'static str`.
         let result: std::thread::Result<()> = std::panic::catch_unwind(|| {
-            panic!("synthetic panic from cleanup");
+            panic!("synthetic panic from polish");
         });
         let payload = result.unwrap_err();
         // `&*payload` derefs the Box so `downcast_ref` sees the inner
         // type (`&'static str`) instead of the Box itself.
-        assert_eq!(panic_message(&*payload), "synthetic panic from cleanup");
+        assert_eq!(panic_message(&*payload), "synthetic panic from polish");
     }
 
     #[test]
@@ -851,11 +851,11 @@ mod tests {
         // `panic!("{}", String::from(...))` payload comes through as
         // owned `String`. Both branches of `panic_message` must work.
         let result: std::thread::Result<()> = std::panic::catch_unwind(|| {
-            let dynamic = String::from("dynamic cleanup error");
+            let dynamic = String::from("dynamic polish error");
             panic!("{}", dynamic);
         });
         let payload = result.unwrap_err();
-        assert_eq!(panic_message(&*payload), "dynamic cleanup error");
+        assert_eq!(panic_message(&*payload), "dynamic polish error");
     }
 
     #[test]
@@ -870,11 +870,11 @@ mod tests {
     }
 
     // Test backends for the §6-7 panic-isolation acceptance criterion.
-    // Real `LlamaCleanup` can't be constructed without a GGUF on disk,
+    // Real `LlamaPolish` can't be constructed without a GGUF on disk,
     // so we drive `run_polish_isolated` through fakes that exercise
     // each `PolishOutcome` arm directly.
     struct OkBackend;
-    impl crate::cleanup::CleanupBackend for OkBackend {
+    impl crate::polish::PolishBackend for OkBackend {
         fn polish_into(
             &self,
             text: &str,
@@ -888,7 +888,7 @@ mod tests {
     }
 
     struct ErroringBackend;
-    impl crate::cleanup::CleanupBackend for ErroringBackend {
+    impl crate::polish::PolishBackend for ErroringBackend {
         fn polish_into(
             &self,
             _text: &str,
@@ -902,7 +902,7 @@ mod tests {
     }
 
     struct PanickingBackend;
-    impl crate::cleanup::CleanupBackend for PanickingBackend {
+    impl crate::polish::PolishBackend for PanickingBackend {
         fn polish_into(
             &self,
             _text: &str,
@@ -919,7 +919,7 @@ mod tests {
     fn run_polish_isolated_returns_ok_when_backend_succeeds() {
         let backend = OkBackend;
         let settings = Settings {
-            cleanup_mode: CleanupMode::On,
+            polish_mode: PolishMode::On,
             ..Settings::default()
         };
         let mut captured = String::new();
@@ -938,7 +938,7 @@ mod tests {
         // still raw, but the user-facing message includes the error.
         let backend = ErroringBackend;
         let settings = Settings {
-            cleanup_mode: CleanupMode::On,
+            polish_mode: PolishMode::On,
             ..Settings::default()
         };
         let mut captured = String::new();
@@ -962,7 +962,7 @@ mod tests {
         // isolation tradeoff.
         let backend = PanickingBackend;
         let settings = Settings {
-            cleanup_mode: CleanupMode::On,
+            polish_mode: PolishMode::On,
             ..Settings::default()
         };
         let mut captured = String::new();
@@ -983,12 +983,12 @@ mod tests {
 
     #[test]
     fn run_polish_isolated_off_mode_bypasses_backend_panic() {
-        // CleanupMode::Off should short-circuit BEFORE reaching the
+        // PolishMode::Off should short-circuit BEFORE reaching the
         // backend — even a PanickingBackend should never be invoked.
         // Caller's `on_chunk` sees the raw text exactly once.
         let backend = PanickingBackend;
         let settings = Settings {
-            cleanup_mode: CleanupMode::Off,
+            polish_mode: PolishMode::Off,
             ..Settings::default()
         };
         let mut captured = String::new();

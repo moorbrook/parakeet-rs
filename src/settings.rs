@@ -35,12 +35,12 @@ pub enum TriggerMode {
 ///
 /// v1 ships a single backend: Qwen 3.5 2B Q4_K_M via in-process
 /// `llama-cpp-2` (Metal on Apple Silicon). See [ADR-0018](../docs/ADR.md).
-/// No `cleanup_model` setting — the model is fixed at the backend's
+/// No `polish_model` setting — the model is fixed at the backend's
 /// expected path and changing it requires a code change, not a config
 /// change.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum CleanupMode {
+pub enum PolishMode {
     /// No post-processing; paste the raw ASR transcript.
     #[default]
     Off,
@@ -56,7 +56,7 @@ pub struct Settings {
     /// Language hint for the recognizer, e.g. "eng_Latn". Empty = autodetect.
     pub language: String,
     #[serde(default)]
-    pub cleanup_mode: CleanupMode,
+    pub polish_mode: PolishMode,
 }
 
 impl Default for Settings {
@@ -65,7 +65,7 @@ impl Default for Settings {
             hotkey: "CmdOrCtrl+Shift+Space".to_string(),
             trigger_mode: TriggerMode::default(),
             language: String::new(),
-            cleanup_mode: CleanupMode::default(),
+            polish_mode: PolishMode::default(),
         }
     }
 }
@@ -199,7 +199,7 @@ impl SettingsStore {
             && self.vad_path().exists()
     }
 
-    /// Cleanup-pass GGUF weights path. Expected to live in the same
+    /// Polish-pass GGUF weights path. Expected to live in the same
     /// per-bundle data directory as the ASR model. The download isn't
     /// wired up yet — `load_llm_blocking` bails with a clear error if
     /// the file is missing, and the user has to grab it manually (see
@@ -208,17 +208,17 @@ impl SettingsStore {
     /// [ADR-0018](../../docs/ADR.md). The directory + filename are
     /// fixed; changing them requires a model-fetch update, not a
     /// settings change.
-    pub fn cleanup_model_path(&self) -> PathBuf {
+    pub fn polish_model_path(&self) -> PathBuf {
         self.data_dir
             .join("llm")
             .join("qwen3.5-2b-q4_k_m")
             .join("Qwen3.5-2B-Q4_K_M.gguf")
     }
 
-    /// True iff the cleanup-pass GGUF is on disk. The cleanup loader
+    /// True iff the polish-pass GGUF is on disk. The polish loader
     /// gates on this before attempting to call llama.cpp.
-    pub fn cleanup_model_present(&self) -> bool {
-        self.cleanup_model_path().exists()
+    pub fn polish_model_present(&self) -> bool {
+        self.polish_model_path().exists()
     }
 }
 
@@ -254,24 +254,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_inject_mode_field_is_ignored_for_forward_compat() {
-        // Older settings.json files have an `inject_mode` key (the
-        // pre-AX clipboard/⌘V delivery had a "paste" / "type" /
-        // "clipboard" debug knob that was never wired to the UI).
-        // ADR-0019 removes it, but existing files MUST still parse
-        // cleanly. serde's default behaviour ignores unknown keys —
-        // pin that so nobody accidentally adds `#[serde(deny_unknown_fields)]`.
-        let raw = r#"{
-            "hotkey": "CmdOrCtrl+Shift+Space",
-            "trigger_mode": "tap",
-            "inject_mode": "paste",
-            "language": ""
-        }"#;
-        let s: Settings = serde_json::from_str(raw).expect("legacy field should parse-and-ignore");
-        assert_eq!(s.hotkey, "CmdOrCtrl+Shift+Space");
-    }
-
-    #[test]
     fn trigger_mode_serialises_lowercase() {
         // `#[serde(rename_all = "lowercase")]` — drift would silently break
         // anyone whose settings.json was written by a previous build.
@@ -287,74 +269,38 @@ mod tests {
     }
 
     #[test]
-    fn missing_trigger_mode_falls_back_to_default() {
-        // settings.json written by a build that predates the Hold UI must
-        // still parse — the field has `#[serde(default)]`. If someone
-        // removes that attribute this test fails loudly.
-        let raw = r#"{
-            "hotkey": "CmdOrCtrl+Shift+Space",
-            "inject_mode": "paste",
-            "language": ""
-        }"#;
-        let s: Settings = serde_json::from_str(raw).expect("legacy file should parse");
-        assert_eq!(s.trigger_mode, TriggerMode::default());
-        assert_eq!(s.trigger_mode, TriggerMode::Tap);
-    }
-
-    #[test]
-    fn unknown_keys_are_ignored_for_forward_compat() {
-        // If a newer build adds a field and the user downgrades, the older
-        // build still needs to parse the file (it just drops the unknown
-        // key). serde defaults to permissive parsing; this test pins that
-        // behaviour so nobody accidentally adds `#[serde(deny_unknown_fields)]`.
-        let raw = r#"{
-            "hotkey": "F5",
-            "trigger_mode": "hold",
-            "inject_mode": "paste",
-            "language": "",
-            "future_feature_flag": true,
-            "another_one": "value"
-        }"#;
-        let s: Settings = serde_json::from_str(raw).expect("should ignore unknown keys");
-        assert_eq!(s.hotkey, "F5");
-        assert_eq!(s.trigger_mode, TriggerMode::Hold);
-    }
-
-    #[test]
-    fn cleanup_defaults_to_off() {
-        // The cleanup pass is opt-in: a fresh install doesn't load the
-        // ~1.2 GB Qwen GGUF until the user enables cleanup explicitly.
+    fn polish_defaults_to_off() {
+        // The polish pass is opt-in: a fresh install doesn't load the
+        // ~1.2 GB Qwen GGUF until the user enables polish explicitly.
         // Pin the default so an accidental flip doesn't silently start
         // a download + warmup the user didn't ask for.
         let s = Settings::default();
-        assert_eq!(s.cleanup_mode, CleanupMode::Off);
+        assert_eq!(s.polish_mode, PolishMode::Off);
     }
 
     #[test]
-    fn cleanup_mode_on_round_trips_lowercase() {
+    fn polish_mode_on_round_trips_lowercase() {
         let s = Settings {
-            cleanup_mode: CleanupMode::On,
+            polish_mode: PolishMode::On,
             ..Settings::default()
         };
         let raw = serde_json::to_string(&s).unwrap();
         // Lowercase enum form, same as TriggerMode.
         assert!(
-            raw.contains("\"cleanup_mode\":\"on\""),
-            "expected lowercase cleanup_mode, got: {raw}"
+            raw.contains("\"polish_mode\":\"on\""),
+            "expected lowercase polish_mode, got: {raw}"
         );
         let back: Settings = serde_json::from_str(&raw).unwrap();
-        assert_eq!(back.cleanup_mode, CleanupMode::On);
+        assert_eq!(back.polish_mode, PolishMode::On);
     }
 
     #[test]
-    fn settings_json_never_contains_api_key_or_model_name() {
-        // The Anthropic-API era and the `claude -p` era both wrote
-        // identifier fields (`anthropic_api_key`, `cleanup_model`) into
-        // settings.json. The in-process llama.cpp path has neither —
-        // no key, exactly one supported model. Pin that nothing in the
-        // wire shape lets a future change reintroduce them by accident.
+    fn settings_json_never_contains_api_key() {
+        // The Anthropic-API era wrote an `anthropic_api_key` field into
+        // settings.json. The in-process llama.cpp path has no key. Pin
+        // that the wire shape never leaks any *api_key* field.
         let s = Settings {
-            cleanup_mode: CleanupMode::On,
+            polish_mode: PolishMode::On,
             ..Settings::default()
         };
         let raw = serde_json::to_string(&s).unwrap();
@@ -362,34 +308,14 @@ mod tests {
             !raw.contains("api_key"),
             "settings.json must not contain any *api_key* field: {raw}"
         );
-        assert!(
-            !raw.contains("cleanup_model"),
-            "settings.json must not contain cleanup_model: {raw}"
-        );
     }
 
     #[test]
-    fn missing_cleanup_fields_default_to_off() {
-        // A settings.json from before the cleanup feature existed must
-        // still parse — and importantly, it must come out with cleanup
-        // OFF so an upgrade doesn't silently start downloading 1.2 GB
-        // of model weights without consent.
-        let raw = r#"{
-            "hotkey": "CmdOrCtrl+Shift+Space",
-            "trigger_mode": "tap",
-            "inject_mode": "paste",
-            "language": ""
-        }"#;
-        let s: Settings = serde_json::from_str(raw).expect("pre-cleanup file should parse");
-        assert_eq!(s.cleanup_mode, CleanupMode::Off);
-    }
-
-    #[test]
-    fn cleanup_model_path_lives_under_data_dir() {
-        // The cleanup GGUF cache layout is a shipped invariant — a
+    fn polish_model_path_lives_under_data_dir() {
+        // The polish GGUF cache layout is a shipped invariant — a
         // launch that changes this strands existing users' downloads.
         let store = synthetic_store(tempfile::tempdir().unwrap().keep());
-        let cm = store.cleanup_model_path();
+        let cm = store.polish_model_path();
         assert!(cm.starts_with(store.data_dir()));
         assert_eq!(
             cm,

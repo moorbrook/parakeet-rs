@@ -1,9 +1,9 @@
-//! Phase-0 LLM bench: cleanup latency on a GGUF model.
+//! Phase-0 LLM bench: polish latency on a GGUF model.
 //!
 //! Loads a GGUF file via llama.cpp (Metal backend on Apple Silicon),
 //! runs N polish iterations against a fixed sample transcript using
 //! the exact `PromptTemplate::prod()` and decode loop from
-//! `src/cleanup.rs`, and emits one `llm_timer` log line per iteration
+//! `src/polish.rs`, and emits one `llm_timer` log line per iteration
 //! to stderr in this shape:
 //!
 //! ```text
@@ -13,12 +13,12 @@
 //! ```
 //!
 //! Sampler, batch sizing, and `GenerateConfig` come from
-//! `cleanup::generate` + `cleanup::PROD_GENERATE_CONFIG`, so any change
+//! `polish::generate` + `polish::PROD_GENERATE_CONFIG`, so any change
 //! to the production decode path shows up here on the next bench run
 //! rather than silently invalidating the CSV.
 //!
 //! `scripts/bench-llm.sh` orchestrates download + run + aggregate into
-//! `bench/cleanup-backends.csv`. See `docs/latency-plan.md` §6.
+//! `bench/polish-backends.csv`. See `docs/latency-plan.md` §6.
 
 use std::path::PathBuf;
 use std::pin::pin;
@@ -30,13 +30,13 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 
-use parakeet_rs::cleanup::{
+use parakeet_rs::polish::{
     self, GenerateOutcome, PromptTemplate, PROD_GENERATE_CONFIG,
 };
 use parakeet_rs::performance::next_session_id;
 
 /// A representative messy dictation transcript — fillers, no punctuation,
-/// the kind of thing the cleanup pass is supposed to fix. Length picked
+/// the kind of thing the polish pass is supposed to fix. Length picked
 /// so the chat-formatted prompt lands around the 200-token mark, matching
 /// the latency plan's "60-token transcript input" intent (the plan's
 /// "60 tokens" referred to the *output*; this is the input).
@@ -114,7 +114,7 @@ fn print_usage() {
          \n\
          Runs N polish iterations of a fixed sample transcript through the GGUF\n\
          at PATH, using the exact `SYSTEM_PROMPT` and decode loop from\n\
-         src/cleanup.rs. Emits one `llm_timer` log line per iteration on stderr.\n\
+         src/polish.rs. Emits one `llm_timer` log line per iteration on stderr.\n\
          \n\
          `--show-output` prints the generated text for the first measured\n\
          iteration only — useful for sanity-checking the prompt/template\n\
@@ -185,7 +185,7 @@ fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// One polish iteration. Drives `cleanup::generate` (same function the
+/// One polish iteration. Drives `polish::generate` (same function the
 /// production polish path uses) and reports timing in the shape the
 /// aggregator expects.
 fn run_one(
@@ -202,7 +202,7 @@ fn run_one(
         out_tokens,
         ttft,
         gen_time,
-    } = cleanup::generate(backend, model, prompt, &PROD_GENERATE_CONFIG, |piece| {
+    } = polish::generate(backend, model, prompt, &PROD_GENERATE_CONFIG, |piece| {
         if show_output {
             output_buf.push_str(piece);
         }

@@ -1,6 +1,6 @@
-//! Single-mutex state machine for the cleanup-LLM lifecycle.
+//! Single-mutex state machine for the polish-LLM lifecycle.
 //!
-//! Replaces the previous `App::llm: Mutex<Option<Arc<dyn CleanupBackend>>>`
+//! Replaces the previous `App::llm: Mutex<Option<Arc<dyn PolishBackend>>>`
 //! and `App::llm_loading: Mutex<bool>` pair. Those two mutexes encoded
 //! one logical state — `{ Disabled, Loading, Ready(Arc) }` — but the
 //! ordering between them had to be re-derived at every call site:
@@ -14,7 +14,7 @@
 //! This module owns the *bookkeeping* — claiming the load slot,
 //! finalising it, racing it against a user-driven `disable()`. It does
 //! NOT own the actual loader (the GGUF mmap + Metal init); the caller
-//! passes a `Result<Arc<dyn CleanupBackend>>` into `finalize_load`.
+//! passes a `Result<Arc<dyn PolishBackend>>` into `finalize_load`.
 //! That keeps the manager testable without a real 1.2 GB model on
 //! disk.
 
@@ -22,20 +22,20 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crate::cleanup::CleanupBackend;
+use crate::polish::PolishBackend;
 
-/// Single source of truth for the cleanup-LLM lifecycle.
+/// Single source of truth for the polish-LLM lifecycle.
 pub struct LlmManager {
     inner: Mutex<LlmState>,
 }
 
 enum LlmState {
-    /// Cleanup mode is `Off`, or we've never tried to load.
+    /// Polish mode is `Off`, or we've never tried to load.
     Disabled,
     /// A load is in flight; another claim must wait.
     Loading,
     /// The model is loaded and `try_get` returns it.
-    Ready(Arc<dyn CleanupBackend>),
+    Ready(Arc<dyn PolishBackend>),
 }
 
 /// Result of [`LlmManager::try_claim_load`]. Names beat booleans —
@@ -57,10 +57,10 @@ pub enum LoadClaim {
 /// drive the menubar status text.
 #[derive(Debug)]
 pub enum FinalizeOutcome {
-    /// Load succeeded AND the user still wants cleanup ON; the
+    /// Load succeeded AND the user still wants polish ON; the
     /// backend is now stored.
     Stored,
-    /// Load succeeded but the user toggled cleanup OFF while we were
+    /// Load succeeded but the user toggled polish OFF while we were
     /// loading — the backend was discarded.
     DiscardedDisabled,
     /// Loader returned an error. State is now `Disabled` so a retry
@@ -76,9 +76,9 @@ impl LlmManager {
     }
 
     /// Returns the loaded backend if one is ready. Used by
-    /// `deliver_cleaned` to decide between cleanup-streaming and raw
+    /// `deliver_cleaned` to decide between polish-streaming and raw
     /// paste fallback.
-    pub fn try_get(&self) -> Option<Arc<dyn CleanupBackend>> {
+    pub fn try_get(&self) -> Option<Arc<dyn PolishBackend>> {
         match &*self.inner.lock() {
             LlmState::Ready(b) => Some(Arc::clone(b)),
             _ => None,
@@ -101,15 +101,15 @@ impl LlmManager {
     }
 
     /// The loader thread is done. `result` is what the loader produced;
-    /// `keep_if_loaded` is the user's *current* cleanup mode at the
-    /// moment we finalise — `true` means "user still wants cleanup on,
+    /// `keep_if_loaded` is the user's *current* polish mode at the
+    /// moment we finalise — `true` means "user still wants polish on,
     /// store the backend"; `false` means "user toggled Off while we
     /// were loading, discard the backend." Reading this *inside* the
     /// critical section closes the race where the Settings toggle
     /// would clear the slot a tick after we wrote it.
     pub fn finalize_load(
         &self,
-        result: anyhow::Result<Arc<dyn CleanupBackend>>,
+        result: anyhow::Result<Arc<dyn PolishBackend>>,
         keep_if_loaded: bool,
     ) -> FinalizeOutcome {
         let mut state = self.inner.lock();
@@ -131,7 +131,7 @@ impl LlmManager {
         }
     }
 
-    /// User toggled cleanup OFF. Drops the loaded backend if any. If
+    /// User toggled polish OFF. Drops the loaded backend if any. If
     /// a load is in flight, the in-flight loader's `finalize_load`
     /// will see `keep_if_loaded == false` (the Settings layer wrote
     /// `Off` before calling `disable`) and discard its result.
@@ -168,7 +168,7 @@ mod tests {
     use anyhow::Result;
 
     struct DummyBackend;
-    impl CleanupBackend for DummyBackend {
+    impl PolishBackend for DummyBackend {
         fn polish_into(
             &self,
             _text: &str,
@@ -181,7 +181,7 @@ mod tests {
         }
     }
 
-    fn backend() -> Arc<dyn CleanupBackend> {
+    fn backend() -> Arc<dyn PolishBackend> {
         Arc::new(DummyBackend)
     }
 
@@ -256,14 +256,14 @@ mod tests {
         let m = LlmManager::new();
         assert_eq!(m.try_claim_load(), LoadClaim::Claimed);
         m.clear_loading_after_panic();
-        // After the panic-cleanup, a new claim succeeds.
+        // After the panic-polish, a new claim succeeds.
         assert_eq!(m.try_claim_load(), LoadClaim::Claimed);
     }
 
     #[test]
     fn clear_loading_after_panic_no_op_when_already_ready() {
         // If by some race the loader managed to store before the
-        // panic handler ran, the panic-cleanup must NOT clear the
+        // panic handler ran, the panic-polish must NOT clear the
         // freshly-loaded model.
         let m = LlmManager::new();
         assert_eq!(m.try_claim_load(), LoadClaim::Claimed);

@@ -9,7 +9,7 @@ hotkey, speak, transcript inserts at your cursor. Fully local — no API
 keys, no network after the first-run model download.
 
 - **ASR**: NVIDIA Parakeet TDT 0.6B v3 int8 via sherpa-onnx + CoreML
-- **Cleanup (optional)**: Qwen 3.5 2B Q4_K_M via llama.cpp + Metal
+- **Polish (optional)**: Qwen 3.5 2B Q4_K_M via llama.cpp + Metal
 - **Shell**: AppKit single binary (no Tauri / Electron)
 - **Text injection**: `CGEventKeyboardSetUnicodeString` keystroke
 
@@ -54,12 +54,14 @@ PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
 3. Press `⌘⇧Space` (default hotkey), speak. **Tap mode** auto-stops at
    end-of-speech; **Hold mode** stops on release.
 
-### Optional cleanup pass
+### Optional polish pass
 
-Flip Cleanup to On in Settings. Fetch the Qwen GGUF (see
+
+
+Flip Polish to On in Settings. Fetch the Qwen GGUF (see
 `bench/README.md` for the one-liner) into
 `~/Library/Application Support/com.parakeet.rs/llm/qwen3.5-2b-q4_k_m/`.
-Cleanup strips fillers, fixes punctuation, honours inline commands
+Polish strips fillers, fixes punctuation, honours inline commands
 ("new paragraph", "scratch that"); adds ~550 ms wall-clock but streams
 to the cursor on word boundaries.
 
@@ -77,12 +79,12 @@ to the cursor on word boundaries.
 ## Layout
 
 App state lives behind two small state machines so the
-session/cleanup-load races stay localised:
+session/polish-load races stay localised:
 
 - `src/app.rs` — orchestration, supervised worker spawns, panic recovery
 - `src/dictation_fsm.rs` — atomic (state, session, pending_terminate)
-- `src/llm_manager.rs` — cleanup-LLM lifecycle (Disabled / Loading / Ready)
-- `src/cleanup.rs` — `CleanupBackend` trait + `PromptTemplate` + decode loop
+- `src/llm_manager.rs` — polish-LLM lifecycle (Disabled / Loading / Ready)
+- `src/polish.rs` — `PolishBackend` trait + `PromptTemplate` + decode loop
 - `src/paste.rs` — `TextSink` trait + word-boundary `Streamer`
 - `src/ax_paste.rs` — `CGEvent` keystroke implementation
 - `src/streamer.rs` — per-session VAD/manual capture
@@ -98,13 +100,13 @@ Architectural rationale lives in [`docs/ADR.md`](docs/ADR.md) (decisions
 
 ```bash
 cargo build --release && scripts/make-app.sh
-cargo test                                       # 81 unit tests
+cargo test                                       # 77 unit tests
 cargo clippy --all-targets --no-deps             # clean
 ```
 
 ## Roadmap
 
-- Auto-download the cleanup GGUF on first toggle-on (currently manual).
+- Auto-download the polish GGUF on first toggle-on (currently manual).
 - Wire keyboard shortcut customization into the Settings UI.
 
 ## License

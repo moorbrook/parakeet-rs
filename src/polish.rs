@@ -1,4 +1,4 @@
-//! In-process LLM cleanup pass.
+//! In-process LLM polish pass.
 //!
 //! Sits between `Asr::recognize()` and `paste::deliver()` in the dictation
 //! pipeline. Takes the raw ASR transcript and (when enabled) cleans it
@@ -10,21 +10,21 @@
 //! - honour inline editing commands (`new paragraph`, `scratch that`).
 //!
 //! **Transport: in-process via `llama-cpp-2` FFI**, replacing the previous
-//! `claude -p` subprocess path. See [ADR-0018](../docs/ADR.md#0018--cleanup-backend-llamacpp--qwen-35-2b-q4_k_m)
+//! `claude -p` subprocess path. See [ADR-0018](../docs/ADR.md#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m)
 //! for the library-selection rationale, measured Phase-0 numbers, and
 //! rejected alternatives.
 //!
 //! Public surface:
 //!
-//! - `trait CleanupBackend` — the seam between [`App`] and the in-process
+//! - `trait PolishBackend` — the seam between [`App`] and the in-process
 //!   inference engine. Lets unit tests swap in a fake backend without
 //!   needing a real GGUF on disk.
 //! - `fn polish_streaming(...)` — front-door function that handles
-//!   empty input, the `CleanupMode::Off` short-circuit, and otherwise
+//!   empty input, the `PolishMode::Off` short-circuit, and otherwise
 //!   delegates to the backend.
-//! - `fn generate(...)` — shared decode loop used by [`LlamaCleanup`] in
+//! - `fn generate(...)` — shared decode loop used by [`LlamaPolish`] in
 //!   production AND by `bin/bench_llm`. Pinning these together is what
-//!   makes the bench numbers in `bench/cleanup-backends.csv` actually
+//!   makes the bench numbers in `bench/polish-backends.csv` actually
 //!   measure the path users hit.
 //!
 //! [`App`]: crate::app::App
@@ -44,9 +44,9 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 use parking_lot::Mutex;
 
-use crate::settings::{CleanupMode, Settings};
+use crate::settings::{PolishMode, Settings};
 
-/// Cleanup-pass system prompt. Private; assemble production-ready
+/// Polish-pass system prompt. Private; assemble production-ready
 /// prompts via [`PromptTemplate::prod`] so callers (bench + production)
 /// can't drift.
 const SYSTEM_PROMPT: &str = "You clean up raw speech-to-text transcriptions for direct insertion into the user's document. Output only the cleaned text. No preamble, no commentary, no quotes around the output, no Markdown formatting.\n\
@@ -62,7 +62,7 @@ Rules:\n\
 8. Do not call any tools. Output text only.";
 
 /// Knob set for [`generate`]. Keep two production-facing instances:
-/// [`PROD_GENERATE_CONFIG`] for the real cleanup path, and (implicitly)
+/// [`PROD_GENERATE_CONFIG`] for the real polish path, and (implicitly)
 /// the same instance reused by `bin/bench_llm` so bench numbers track
 /// production behaviour rather than a bench-only sandbox.
 #[derive(Clone, Copy, Debug)]
@@ -78,7 +78,7 @@ pub struct GenerateConfig {
 
 /// Production knobs. Bench code imports this directly so the two paths
 /// can't drift; a divergent bench would silently invalidate the
-/// `bench/cleanup-backends.csv` numbers cited in ADR-0018.
+/// `bench/polish-backends.csv` numbers cited in ADR-0018.
 pub const PROD_GENERATE_CONFIG: GenerateConfig = GenerateConfig {
     ctx_size: 2048,
     max_output_tokens: 256,
@@ -103,13 +103,13 @@ pub struct GenerateOutcome {
 /// Seam between [`crate::app::App`] and the in-process inference engine.
 ///
 /// Two implementors:
-/// - [`LlamaCleanup`] — production. Holds the loaded GGUF + Metal
+/// - [`LlamaPolish`] — production. Holds the loaded GGUF + Metal
 ///   backend; one instance per process.
-/// - Test-only fakes (see `cleanup::tests`) — let `app::deliver_cleaned`
+/// - Test-only fakes (see `polish::tests`) — let `app::deliver_cleaned`
 ///   be exercised without a real model.
-pub trait CleanupBackend: Send + Sync {
-    /// Run the cleanup transform on `text`. The caller (`polish_streaming`)
-    /// has already filtered out empty input and the `CleanupMode::Off`
+pub trait PolishBackend: Send + Sync {
+    /// Run the polish transform on `text`. The caller (`polish_streaming`)
+    /// has already filtered out empty input and the `PolishMode::Off`
     /// short-circuit, so the implementation only handles the "real work"
     /// case.
     fn polish_into(
@@ -126,8 +126,8 @@ pub trait CleanupBackend: Send + Sync {
 
 /// llama.cpp's static `LlamaBackend` plus the loaded model weights.
 /// One per process; sharable across threads (`LlamaModel` is `Send +
-/// Sync`). Held inside `App::llm` as `Arc<dyn CleanupBackend>`.
-pub struct LlamaCleanup {
+/// Sync`). Held inside `App::llm` as `Arc<dyn PolishBackend>`.
+pub struct LlamaPolish {
     backend: LlamaBackend,
     model: LlamaModel,
     /// Serialises polish calls. llama.cpp contexts themselves aren't
@@ -138,13 +138,13 @@ pub struct LlamaCleanup {
     polish_lock: Mutex<()>,
 }
 
-impl LlamaCleanup {
+impl LlamaPolish {
     /// Load weights + initialise the Metal backend. Expensive (~250 ms
     /// page-touched, plus model file mmap). Call once at app boot.
     pub fn load(model_path: &Path) -> Result<Self> {
         if !model_path.exists() {
             return Err(anyhow!(
-                "cleanup model not present at {}",
+                "polish model not present at {}",
                 model_path.display()
             ));
         }
@@ -157,7 +157,7 @@ impl LlamaCleanup {
         let model_params = LlamaModelParams::default();
         let model_params = pin!(model_params);
         let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
-            .with_context(|| format!("loading cleanup model {}", model_path.display()))?;
+            .with_context(|| format!("loading polish model {}", model_path.display()))?;
         Ok(Self {
             backend,
             model,
@@ -166,14 +166,14 @@ impl LlamaCleanup {
     }
 }
 
-impl CleanupBackend for LlamaCleanup {
+impl PolishBackend for LlamaPolish {
     /// Caller invariant: `on_chunk` must not call back into this
-    /// `LlamaCleanup` (or any other code that needs `polish_lock`).
+    /// `LlamaPolish` (or any other code that needs `polish_lock`).
     /// The lock is held across the entire generation loop including
     /// every `on_chunk` invocation; a re-entrant callback would
     /// deadlock. The only production caller is `paste::Streamer::push`,
     /// which posts CGEvent keystrokes (ADR-0019) but never re-enters
-    /// cleanup. The lock CAN be released around `on_chunk`, but
+    /// polish. The lock CAN be released around `on_chunk`, but
     /// doing so would let two polish calls interleave Metal kernel
     /// invocations, which produces garbled output (see the field's
     /// doc comment). Holding it is the lesser evil.
@@ -206,7 +206,7 @@ impl CleanupBackend for LlamaCleanup {
             on_chunk(final_str)?;
         }
         if outcome.out_tokens == 0 {
-            return Err(anyhow!("cleanup model produced no output"));
+            return Err(anyhow!("polish model produced no output"));
         }
         Ok(())
     }
@@ -220,19 +220,19 @@ impl CleanupBackend for LlamaCleanup {
     }
 }
 
-/// Run the cleanup pass, invoking `on_chunk` for each generated text
+/// Run the polish pass, invoking `on_chunk` for each generated text
 /// chunk. Returns once generation hits the model's end-of-sequence
 /// token or `MAX_OUTPUT_TOKENS`.
 ///
 /// `on_chunk` is called from the polish thread (`transcribe` thread in
 /// production). It should not block — slow chunk handlers stretch
-/// wall-clock cleanup latency.
+/// wall-clock polish latency.
 ///
-/// Returns `Ok(())` even when cleanup is disabled in settings; in that
+/// Returns `Ok(())` even when polish is disabled in settings; in that
 /// case `on_chunk` is invoked exactly once with the original `text` so
 /// streaming-paste callers stay symmetric.
 pub fn polish_streaming<F>(
-    backend: &dyn CleanupBackend,
+    backend: &dyn PolishBackend,
     text: &str,
     settings: &Settings,
     mut on_chunk: F,
@@ -244,19 +244,19 @@ where
         on_chunk(text)?;
         return Ok(());
     }
-    match settings.cleanup_mode {
-        CleanupMode::Off => {
+    match settings.polish_mode {
+        PolishMode::Off => {
             on_chunk(text)?;
             Ok(())
         }
-        CleanupMode::On => backend.polish_into(text, &mut on_chunk),
+        PolishMode::On => backend.polish_into(text, &mut on_chunk),
     }
 }
 
-/// Prompt assembly for the cleanup task. Hides the Qwen-specific
+/// Prompt assembly for the polish task. Hides the Qwen-specific
 /// ChatML / `/no_think` / pre-filled `<think></think>` convention
 /// behind a single render method so production
-/// ([`LlamaCleanup::polish_into`]) and bench (`bin/bench_llm`) can't
+/// ([`LlamaPolish::polish_into`]) and bench (`bin/bench_llm`) can't
 /// reassemble the prompt with subtly different shapes — the bench
 /// claim "measures the production path" depends on both routes going
 /// through the same template.
@@ -266,8 +266,8 @@ pub struct PromptTemplate {
 }
 
 impl PromptTemplate {
-    /// Template used by the production cleanup path. The system prompt
-    /// is fixed in `cleanup.rs`; there's no per-user customisation in
+    /// Template used by the production polish path. The system prompt
+    /// is fixed in `polish.rs`; there's no per-user customisation in
     /// v1.
     pub fn prod() -> Self {
         Self {
@@ -275,12 +275,12 @@ impl PromptTemplate {
         }
     }
 
-    /// Render the cleanup request as a Qwen 3.5 ChatML prompt with two
+    /// Render the polish request as a Qwen 3.5 ChatML prompt with two
     /// tweaks: append `/no_think` to disable the reasoning mode, and
     /// pre-fill an empty `<think></think>` block on the assistant side
     /// so the model jumps straight to the answer. Without these, Qwen
     /// 3.5 emits `<think>` reflection that blows past
-    /// `max_output_tokens` and produces no usable cleanup output.
+    /// `max_output_tokens` and produces no usable polish output.
     pub fn render(&self, user_input: &str) -> String {
         format!(
             "<|im_start|>system\n{system}<|im_end|>\n\
@@ -296,7 +296,7 @@ impl PromptTemplate {
 /// piece through `on_piece` and returns timing+count metadata in
 /// [`GenerateOutcome`].
 ///
-/// Both [`LlamaCleanup::polish_into`] (production) and
+/// Both [`LlamaPolish::polish_into`] (production) and
 /// `bin/bench_llm::run_one` (bench) go through this function. Pinning
 /// them to the same path means a change to sampling strategy, batch
 /// sizing, or context params immediately shows up in the bench numbers
@@ -365,7 +365,7 @@ where
     ctx.decode(&mut batch).context("prefill decode")?;
     let ttft = t_start.elapsed();
 
-    // Greedy sampling: deterministic, repeatable. The cleanup task
+    // Greedy sampling: deterministic, repeatable. The polish task
     // wants exact output, not creative variation; greedy also gives
     // the cleanest tokens/sec since there's no temperature overhead.
     let mut sampler =
@@ -502,13 +502,13 @@ fn flush_safe_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::{CleanupMode, Settings};
+    use crate::settings::{PolishMode, Settings};
     use std::sync::Mutex as StdMutex;
 
     /// Test backend that prefixes input with "[clean] " — distinct
     /// enough that `polish_streaming` either uses it or doesn't.
     struct FakeBackend;
-    impl CleanupBackend for FakeBackend {
+    impl PolishBackend for FakeBackend {
         fn polish_into(
             &self,
             text: &str,
@@ -527,7 +527,7 @@ mod tests {
     struct RecordingBackend {
         seen: StdMutex<Vec<String>>,
     }
-    impl CleanupBackend for RecordingBackend {
+    impl PolishBackend for RecordingBackend {
         fn polish_into(
             &self,
             text: &str,
@@ -655,7 +655,7 @@ mod tests {
     fn polish_streaming_empty_text_emits_raw_without_touching_backend() {
         let backend = RecordingBackend::default();
         let settings = Settings {
-            cleanup_mode: CleanupMode::On,
+            polish_mode: PolishMode::On,
             ..Settings::default()
         };
         let mut captured = String::new();
@@ -675,7 +675,7 @@ mod tests {
     fn polish_streaming_whitespace_text_emits_raw_without_touching_backend() {
         let backend = RecordingBackend::default();
         let settings = Settings {
-            cleanup_mode: CleanupMode::On,
+            polish_mode: PolishMode::On,
             ..Settings::default()
         };
         let mut captured = String::new();
@@ -690,11 +690,11 @@ mod tests {
 
     #[test]
     fn polish_streaming_off_mode_bypasses_backend() {
-        // CleanupMode::Off short-circuits — the FakeBackend prefix
+        // PolishMode::Off short-circuits — the FakeBackend prefix
         // should NOT appear in the output.
         let backend = FakeBackend;
         let settings = Settings {
-            cleanup_mode: CleanupMode::Off,
+            polish_mode: PolishMode::Off,
             ..Settings::default()
         };
         let mut captured = String::new();
@@ -710,7 +710,7 @@ mod tests {
     fn polish_streaming_on_mode_delegates_to_backend() {
         let backend = FakeBackend;
         let settings = Settings {
-            cleanup_mode: CleanupMode::On,
+            polish_mode: PolishMode::On,
             ..Settings::default()
         };
         let mut captured = String::new();
@@ -729,7 +729,7 @@ mod tests {
         // drops `/no_think` or the pre-filled `<think></think>` block
         // makes Qwen 3.5 spew reflection past `max_output_tokens` and
         // silently produce no usable output — the kind of bug that
-        // only surfaces in `bench/cleanup-backends.csv` weeks later.
+        // only surfaces in `bench/polish-backends.csv` weeks later.
         let rendered = PromptTemplate::prod().render("hello world");
         assert_eq!(
             rendered.matches("<|im_start|>system").count(),

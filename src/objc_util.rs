@@ -3,7 +3,7 @@
 //! Every `#[unsafe(method)]` ObjC selector body is wrapped in
 //! [`selector_guard`] so a Rust panic can't unwind across ObjC frames
 //! (Undefined Behaviour). With `panic = "unwind"` in `[profile.release]`
-//! (required by the cleanup-pipeline panic-isolation acceptance
+//! (required by the polish-pipeline panic-isolation acceptance
 //! criterion in `docs/latency-plan.md` §7), the guard catches the panic
 //! in BOTH debug and release builds — it logs the panic via `log::error!`
 //! and returns control to AppKit so the menu-bar app keeps running.

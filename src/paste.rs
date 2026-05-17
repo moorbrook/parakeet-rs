@@ -15,11 +15,11 @@
 //!
 //! Two shapes:
 //!
-//! - **`deliver`** — one-shot. Used when cleanup is OFF (no streaming
-//!   benefit), or as the not-loaded / error fallback when cleanup is
+//! - **`deliver`** — one-shot. Used when polish is OFF (no streaming
+//!   benefit), or as the not-loaded / error fallback when polish is
 //!   ON but couldn't run.
 //! - **`Streamer`** — incremental. Buffers chunks until a word
-//!   boundary, then delivers them one at a time. Used when cleanup
+//!   boundary, then delivers them one at a time. Used when polish
 //!   is ON so the user sees text appear as the LLM generates instead
 //!   of all at once at the end.
 
