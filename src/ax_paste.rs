@@ -1,42 +1,52 @@
-//! Direct text insertion into the focused app via the macOS
-//! Accessibility (AX) API — no clipboard, no `⌘V`, no race.
+//! Direct text insertion into the focused app — no clipboard, no
+//! `⌘V`, no race. Two layered paths:
 //!
-//! Mechanics:
+//! 1. **Accessibility (`AXUIElementSetAttributeValue(AXSelectedText)`).**
+//!    Apple's own Voice Dictation uses this. The standard AX
+//!    semantics: replaces the current selection, or inserts at the
+//!    caret if nothing is selected. The focused app's text engine
+//!    handles the insertion natively. Works in: Safari, Chrome,
+//!    Slack, Notes, TextEdit, Mail, Cursor, VS Code (native text
+//!    fields), and most Cocoa apps.
 //!
-//! 1. `AXUIElementCreateSystemWide` → a system-wide AX handle.
-//! 2. Read `AXFocusedUIElement` → the AX element that currently has
-//!    keyboard focus (a text field, web input, IDE editor, etc.).
-//! 3. Set `AXSelectedText` on that element to our text. The standard
-//!    AX semantics: replaces the current selection, or inserts at
-//!    the caret if nothing is selected. The focused app's text engine
-//!    handles the insertion natively — exactly what happens when a
-//!    user types.
+//! 2. **Synthetic Unicode keystroke
+//!    (`CGEventCreateKeyboardEvent` + `CGEventKeyboardSetUnicodeString`).**
+//!    Fallback when AX fails. Injects a key-down/key-up pair whose
+//!    attached Unicode string IS the text. The focused app's text
+//!    input system sees "user typed this" and processes it. Works in:
+//!    Ghostty, iTerm2, Terminal.app, most Electron apps with custom
+//!    input handlers, and basically anything that supports keyboard
+//!    input at all.
 //!
-//! Compared to the clipboard+⌘V path:
+//! `insert_text` tries (1) then (2); if both fail it surfaces an
+//! error so the caller can show a user-visible status.
+//!
+//! Compared to the old clipboard+⌘V path:
 //!
 //! - **No NSPasteboard writes.** The user's clipboard is untouched;
-//!   there's nothing to save or restore.
-//! - **No ⌘V chord.** Nothing goes through the global event queue,
+//!   nothing to save or restore.
+//! - **No `⌘V` chord.** Nothing goes through the global event queue,
 //!   so the propagation races we hit (write-to-read on the up-side,
 //!   restore-before-read on the down-side) simply don't exist.
-//! - **No `enigo`/`TSM` main-thread requirement.** AX calls cross the
-//!   process boundary via the focused app's `XPC` AX service; they
-//!   work from any thread.
+//! - **No `enigo`/`TSM` main-thread requirement.** Both paths work
+//!   from any thread.
 //!
-//! **What can fail:**
+//! **Real-world failure modes:**
 //!
-//! - The focused element may not advertise `AXSelectedText` (rare on
-//!   native macOS apps; common in some Electron / canvas-based UIs
-//!   with custom input handlers). `insert_text` returns an error in
-//!   that case so the caller can fall back to clipboard+⌘V.
-//! - Password fields intentionally reject programmatic input.
-//! - If the Accessibility permission isn't granted, all AX queries
-//!   fail. `permissions::check_all` already gates startup on this, so
-//!   in normal operation the permission is granted.
+//! - Password fields intentionally reject both AX and synthetic
+//!   keystrokes.
+//! - Apps with very aggressive input filtering (some games, some
+//!   accessibility-blocking apps) may reject both paths.
+//! - If the Accessibility permission isn't granted, AX queries fail
+//!   AND `CGEventPost` is rate-limited. `permissions::check_all`
+//!   gates startup on Accessibility, so in normal operation this
+//!   doesn't happen.
 
 use anyhow::{anyhow, bail, Result};
 use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 use core_foundation::string::{CFString, CFStringRef};
+use core_graphics::event::{CGEvent, CGEventTapLocation};
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 
 // AXUIElement is an opaque CFType; we only ever pass pointers around.
 #[repr(C)]
@@ -64,9 +74,9 @@ unsafe extern "C" {
 }
 
 /// Insert `text` at the focused element's caret (or replace its
-/// current selection). Returns `Ok(())` if the AX insert succeeded;
-/// `Err(...)` otherwise — caller is expected to fall back to a
-/// clipboard+⌘V paste.
+/// current selection). Tries Accessibility first; falls back to a
+/// synthetic Unicode keystroke if AX rejects the focused element
+/// (terminals, custom-input Electron apps).
 ///
 /// Empty input is a no-op success (so it composes cleanly with
 /// streaming chunk callbacks).
@@ -74,6 +84,23 @@ pub fn insert_text(text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    match insert_via_ax(text) {
+        Ok(()) => Ok(()),
+        Err(ax_err) => {
+            log::debug!("AX insert rejected, trying synthetic keystroke: {ax_err:#}");
+            insert_via_keystroke(text).map_err(|ks_err| {
+                anyhow!(
+                    "both delivery paths failed — AX: {ax_err:#}; keystroke: {ks_err:#}"
+                )
+            })
+        }
+    }
+}
+
+/// Accessibility-based insertion via `AXUIElementSetAttributeValue
+/// (focused, AXSelectedText, text)`. The cleanest path for native
+/// Cocoa apps and most browsers.
+fn insert_via_ax(text: &str) -> Result<()> {
     // SAFETY: all AX calls take CFType pointers we own (system-wide
     // handle, focused element) plus CFString refs whose Rust-side
     // lifetime brackets the call. CFRelease balances the Copy-rule
@@ -109,11 +136,42 @@ pub fn insert_text(text: &str) -> Result<()> {
         CFRelease(focused_ref);
         if err != KAX_ERROR_SUCCESS {
             return Err(anyhow!(
-                "AXSelectedText set error {err} ({}) — focused element may not support text replacement",
+                "AXSelectedText set error {err} ({}) — focused element doesn't support text replacement (terminal? canvas UI?)",
                 ax_err_name(err)
             ));
         }
     }
+    Ok(())
+}
+
+/// Synthetic Unicode keystroke via
+/// `CGEventCreateKeyboardEvent` + `CGEventKeyboardSetUnicodeString`.
+/// The focused app sees a key-down/key-up pair whose attached
+/// Unicode string IS the text — its standard text-input pipeline
+/// processes it as user typing. The keycode itself (we use `0`)
+/// doesn't matter because the Unicode string overrides it for
+/// text-aware apps.
+///
+/// This is what makes dictation work in terminals (Ghostty,
+/// iTerm2, Terminal.app) — they don't expose `AXSelectedText` but
+/// they do consume keyboard events normally.
+fn insert_via_keystroke(text: &str) -> Result<()> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|()| anyhow!("CGEventSource::new failed"))?;
+    // Keycode 0 = 'a' on QWERTY, but `set_string` overrides what
+    // text-aware apps actually receive. The key event still needs a
+    // valid keycode so apps that look at it (rare for text input)
+    // don't crash.
+    let keydown = CGEvent::new_keyboard_event(source.clone(), 0, true)
+        .map_err(|()| anyhow!("CGEventCreateKeyboardEvent keydown failed"))?;
+    keydown.set_string(text);
+    keydown.post(CGEventTapLocation::HID);
+    // Matching keyup so the focused app doesn't observe a dangling
+    // key-down. Some apps (and some accessibility tools) care.
+    let keyup = CGEvent::new_keyboard_event(source, 0, false)
+        .map_err(|()| anyhow!("CGEventCreateKeyboardEvent keyup failed"))?;
+    keyup.set_string(text);
+    keyup.post(CGEventTapLocation::HID);
     Ok(())
 }
 
