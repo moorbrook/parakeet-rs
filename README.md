@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icon-readme.png" width="160" alt="parakeet-rs icon" />
+</p>
+
 # parakeet-rs
 
 Native macOS / Apple Silicon dictation menu-bar app. Press a global
