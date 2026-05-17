@@ -437,9 +437,12 @@ mac-26 baseline is acceptable for our users.
 
 ## 0011 — Direct Accessibility text injection (DEFERRED)
 
-**Status:** **Deferred — not v1.** Reconsider for v2 if the clipboard
-clobbering becomes a real user complaint or if we find a target app where
-⌘V paste reliably fails.
+**Status:** **Superseded by [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession).**
+The clipboard clobbering DID become a real user complaint
+(2026-05-17), and so did the AX-silently-drops-the-write case in
+terminals. The shipped path is synthetic Unicode keystrokes — see
+ADR-0019. The text below is the original deferral note from v1, kept
+verbatim for the v2 conversation it was written for.
 
 **Context.** Current paste path: write to `NSPasteboard` → enigo synthesizes
 ⌘ down + V + ⌘ up → target app handles its paste event. Three costs:
@@ -962,6 +965,116 @@ path 2 (vendored fork) becomes the right move.
   rollup.
 - Bench harness from §1 is already in place to measure the win when
   the binding option lands.
+
+---
+
+## 0019 — Paste delivery: synthetic Unicode keystroke (AnnotatedSession)
+
+**Status:** **Accepted — shipped.** Supersedes [ADR-0011](#0011--direct-accessibility-text-injection-deferred)
+(deferred AX path).
+
+**Context.** Delivery of the transcribed (and optionally LLM-cleaned)
+text into the focused app was the source of a long bug tail through
+2026-05-15/16/17. Each round of fixes exposed the next layer:
+
+1. **Clipboard + `enigo` ⌘V chord** (original): `Enigo::new()` calls
+   `TSMGetInputSourceProperty` which asserts main-thread on macOS 26+.
+   Our paste runs on the `transcribe` worker thread →
+   `EXC_BREAKPOINT`/`SIGTRAP` on every dictation. Bucket A of the
+   crash audit (3 reports in one day).
+2. **Clipboard + raw `CGEvent` ⌘V chord:** TSM crash fixed, but
+   exposed two paste-vs-clipboard races. (a) Write-to-read: the
+   `pasteboardd` propagation of `copy_to_clipboard` hadn't reached
+   the focused app before our `CGEventPost(⌘V)` did, so the app
+   pasted the PREVIOUS dictation's clipboard contents. (b)
+   Restore-before-read: `Streamer::commit`'s `restore_clipboard(saved)`
+   overwrote the just-written chunk before the focused app dequeued
+   the queued ⌘V, causing the same wrong-content-pasted symptom on
+   the LAST chunk. Required tunable settle delays before AND after
+   each chord (35 ms / 120 ms).
+3. **Accessibility-first (`AXUIElementSetAttributeValue(AXSelectedText)`)**:
+   the path Apple's own Voice Dictation uses. Worked cleanly for
+   Safari, Chrome, Slack, Cursor, TextEdit, Notes. Discovered that
+   Ghostty exposes an `AXTextArea` for its rendered scrollback view
+   and accepts `AXSelectedText` writes WITHOUT ERROR — but silently
+   never routes them to the PTY input pipe. AX success codes are
+   therefore unreliable for terminals (and presumably anything else
+   with a render-only AX surface). Without out-of-band verification,
+   the AX → keystroke fallback chain never fires.
+
+**Decision.** **Synthetic Unicode keystroke only**, posted at the
+`AnnotatedSession` event-tap layer:
+
+```rust
+let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)?;
+let keydown = CGEvent::new_keyboard_event(source.clone(), 0, true)?;
+keydown.set_string(text);  // CGEventKeyboardSetUnicodeString
+keydown.post(CGEventTapLocation::AnnotatedSession);
+let keyup = CGEvent::new_keyboard_event(source, 0, false)?;
+keyup.set_string(text);
+keyup.post(CGEventTapLocation::AnnotatedSession);
+```
+
+The keycode (`0`) is irrelevant because the attached Unicode string
+overrides it for text-aware apps. `AnnotatedSession` (rather than
+`HID`) is the standard layer text-input frameworks /
+`NSResponder` / WebView / PTY-bridge code consumes; HID-level
+posting bypasses some terminals' input pipelines.
+
+**Verified working on macOS 26.4.1:**
+
+- Terminals: **Ghostty**, iTerm2, Terminal.app
+- Browsers: Safari, Chrome (URL bar + page inputs)
+- Native Cocoa: TextEdit, Notes, Mail, Messages
+- Electron: Slack, Discord, VS Code, Cursor
+- IDEs: Xcode, JetBrains family
+- Streaming polish: 3-chunk dictation into Ghostty round-tripped in
+  861 ms `dur_post_endpoint_ms` end-to-end (audio capture stop →
+  ASR → cleanup polish → keystroke posted → focused-app insertion),
+  with the cleanup pipeline contributing ~550 ms of that.
+
+**Rejected alternatives:**
+
+- **Clipboard + ⌘V** — race-prone and `enigo`-dependent (TSM crash).
+  Settle delays mitigated but didn't fully close the race; a single
+  paste path costs ~155 ms of forced sleeps (35 ms ×N flushes plus
+  120 ms restore).
+- **AX-first with keystroke fallback** — Ghostty's silent-success
+  case means the fallback never fires and the user sees nothing.
+  Out-of-band verification (read-back `AXValue` or
+  `AXNumberOfCharactersAttribute` after the set) is slow,
+  race-prone, and many AX elements don't expose character counts.
+- **Per-app allowlist (use keystroke for known terminals, AX
+  otherwise)** — maintenance burden never ends; new terminals /
+  Electron apps with custom input handlers keep appearing. Codex
+  pass 8's "drop the fallback entirely" recommendation captured
+  the right instinct.
+
+**Out-of-scope failure modes:** password fields (intentionally
+reject programmatic input), apps with aggressive input filtering
+(some games, accessibility-blocking utilities). We surface
+`recover_from_panic` status in the menubar rather than silently
+dropping.
+
+**Removed by this ADR:**
+
+- `arboard` and `enigo` direct dependencies (~700 lines of paste
+  machinery, settle delays, save/restore, clipboard-dirty
+  bookkeeping).
+- `Settings::inject_mode` field (was the unused "paste" / "type" /
+  "clipboard" debug knob from the clipboard era; serde-unknown-field
+  tolerance keeps legacy `settings.json` files parsing cleanly).
+- The AX FFI machinery in `ax_paste.rs` (focused-element lookup,
+  role/subrole telemetry).
+- `Streamer::last_push_at` / `MIN_PASTE_INTERVAL` (the throttle
+  was an artifact of ⌘V chord rate-limiting; `CGEventPost` of a
+  Unicode keystroke doesn't need it).
+
+**Dependent costs paid:** Accessibility permission preflight still
+required (for `CGEventPost`), already checked at startup in
+`permissions.rs`. No clipboard mutation means no `RESTORE_SETTLE_DELAY`,
+no `PASTEBOARD_SETTLE_DELAY`, and the user's clipboard is left
+exactly as they had it.
 
 ---
 

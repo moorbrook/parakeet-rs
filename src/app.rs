@@ -438,7 +438,8 @@ impl App {
     /// Force-recover after a worker thread panic. The three spawned
     /// worker threads (`session-starter`, `session-watcher`,
     /// `transcribe`) can panic at any FFI boundary (sherpa-onnx, cpal,
-    /// llama.cpp, enigo, arboard). Without this recovery, a panic in
+    /// llama.cpp, the `CGEventPost` keystroke synthesis in
+    /// `ax_paste`). Without this recovery, a panic in
     /// any of them would leave the app stuck in `Listening` /
     /// `Transcribing` / `Polishing` forever — hotkey presses gated
     /// on `Idle` would be silently ignored and the user would have to
@@ -774,7 +775,7 @@ fn load_llm_blocking(settings: &SettingsStore) -> anyhow::Result<Arc<dyn Cleanup
 /// transcript, never nothing.
 fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<()> {
     if matches!(settings.cleanup_mode, CleanupMode::Off) {
-        return paste::deliver(raw, &settings.inject_mode);
+        return paste::deliver(raw);
     }
     let llm = match app.llm.lock().clone() {
         Some(l) => l,
@@ -783,7 +784,7 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
             // raw is the right fallback (better than nothing). Status
             // text already explained the load failure.
             log::warn!("cleanup enabled but model unavailable; pasting raw");
-            return paste::deliver(raw, &settings.inject_mode);
+            return paste::deliver(raw);
         }
     };
     app.set_state(DictationState::Polishing);
@@ -817,7 +818,7 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
                 menubar::set_status_text(&format!(
                     "Cleanup failed — using raw transcript ({e})"
                 ));
-                paste::deliver(raw, &settings.inject_mode)
+                paste::deliver(raw)
             }
         }
         PolishOutcome::Panicked(msg) => {
@@ -831,7 +832,7 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
                 Ok(())
             } else {
                 menubar::set_status_text("Cleanup panicked — using raw transcript");
-                paste::deliver(raw, &settings.inject_mode)
+                paste::deliver(raw)
             }
         }
     }

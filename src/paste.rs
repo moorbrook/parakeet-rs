@@ -1,32 +1,24 @@
-//! Deliver a transcript to the focused window via the macOS
-//! Accessibility API (`AXUIElementSetAttributeValue(AXSelectedText)`).
-//!
-//! This module used to manage clipboard save/restore + a synthetic
-//! `⌘V` chord, with a tail of races we kept chasing (write-to-read
-//! propagation, restore-before-read in the target app's keyDown
-//! handler, the `enigo`→TSM main-thread crash). All of that is gone —
-//! AX writes straight to the focused element's text engine, the same
-//! way Apple's own Voice Dictation works.
+//! Deliver a transcript to the focused window. Hands every chunk to
+//! [`crate::ax_paste::insert_text`], which posts a synthetic Unicode
+//! keystroke via `CGEventKeyboardSetUnicodeString` at the
+//! `AnnotatedSession` event-tap layer. See `ax_paste.rs` for the why,
+//! and [ADR-0019](../docs/ADR.md#0019--paste-delivery-synthetic-unicode-keystroke)
+//! for the path-not-taken history (clipboard+⌘V → races, AX-first →
+//! Ghostty silently swallowed the write).
 //!
 //! Two shapes:
 //!
-//! - **`deliver`** — one-shot. Hands `text` to AX. Used when cleanup
-//!   is OFF (no streaming benefit), or as the not-loaded / error
-//!   fallback when cleanup is ON but couldn't run.
+//! - **`deliver`** — one-shot. Used when cleanup is OFF (no streaming
+//!   benefit), or as the not-loaded / error fallback when cleanup is
+//!   ON but couldn't run.
 //! - **`Streamer`** — incremental. Buffers chunks until a word
-//!   boundary, then hands them to AX one at a time. Used when cleanup
+//!   boundary, then delivers them one at a time. Used when cleanup
 //!   is ON so the user sees text appear as the LLM generates instead
 //!   of all at once at the end.
-//!
-//! `inject_mode` in settings is accepted for forward compatibility
-//! with older settings.json files but ignored — there's only one
-//! delivery path now.
-
-use std::time::Instant;
 
 use anyhow::Result;
 
-pub fn deliver(text: &str, _inject_mode: &str) -> Result<()> {
+pub fn deliver(text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
@@ -34,13 +26,12 @@ pub fn deliver(text: &str, _inject_mode: &str) -> Result<()> {
 }
 
 /// Incremental paste sink. Each `push` appends to an internal tail
-/// buffer and flushes to the focused app via `ax_paste::insert_text`
-/// when the buffer ends on a word boundary. Word-boundary batching
-/// reduces the number of AX XPC roundtrips without adding visible
-/// latency — the LLM emits tokens faster than the user can read
-/// them, so chunking to whole words is invisible.
+/// buffer and flushes to the focused app when the buffer ends on a
+/// word boundary. Word-boundary batching reduces the number of
+/// `CGEventPost` roundtrips without adding visible latency — the
+/// LLM emits tokens faster than the user can read them, so chunking
+/// to whole words is invisible.
 pub struct Streamer {
-    last_push_at: Option<Instant>,
     /// Tail buffer for tokens that haven't been flushed yet because
     /// they don't end on a word boundary. Avoids pasting fragments
     /// like "thi" then "s is the" — one cohesive insert per word.
@@ -54,11 +45,10 @@ pub struct Streamer {
 }
 
 impl Streamer {
-    /// Construct a fresh streamer. No I/O — the AX path doesn't need
-    /// any pre-stream setup.
+    /// Construct a fresh streamer. No I/O — the keystroke path needs
+    /// no pre-stream setup.
     pub fn start() -> Result<Self> {
         Ok(Self {
-            last_push_at: None,
             pending: String::new(),
             fired: false,
         })
@@ -126,7 +116,6 @@ impl Streamer {
     fn flush_now(&mut self) -> Result<()> {
         let chunk: String = std::mem::take(&mut self.pending);
         crate::ax_paste::insert_text(&chunk)?;
-        self.last_push_at = Some(Instant::now());
         self.fired = true;
         Ok(())
     }

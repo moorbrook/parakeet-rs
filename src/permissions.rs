@@ -8,8 +8,9 @@
 //! Three permissions matter:
 //!
 //! - **Microphone** (`kTCCServiceMicrophone`) — for `cpal` to capture audio.
-//! - **Accessibility** (`kTCCServiceAccessibility`) — so `enigo` can post
-//!   the synthetic ⌘V paste chord into the focused app.
+//! - **Accessibility** (`kTCCServiceAccessibility`) — so `CGEventPost`
+//!   in `ax_paste.rs` can inject synthetic Unicode keystrokes into
+//!   the focused app (ADR-0019).
 //! - **Input Monitoring** (`kTCCServiceListenEvent`) — so the global
 //!   `CGEventTap` in `hotkey.rs` actually receives keyboard events.
 //!   `CGEventTapCreate` silently returns a valid-looking mach port even

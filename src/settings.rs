@@ -53,7 +53,6 @@ pub struct Settings {
     pub hotkey: String,
     #[serde(default)]
     pub trigger_mode: TriggerMode,
-    pub inject_mode: String,
     /// Language hint for the recognizer, e.g. "eng_Latn". Empty = autodetect.
     pub language: String,
     #[serde(default)]
@@ -65,7 +64,6 @@ impl Default for Settings {
         Self {
             hotkey: "CmdOrCtrl+Shift+Space".to_string(),
             trigger_mode: TriggerMode::default(),
-            inject_mode: "paste".to_string(),
             language: String::new(),
             cleanup_mode: CleanupMode::default(),
         }
@@ -248,9 +246,26 @@ mod tests {
         let raw = serde_json::to_string(&s).expect("serialise");
         let back: Settings = serde_json::from_str(&raw).expect("parse default round-trip");
         assert_eq!(back.hotkey, s.hotkey);
-        assert_eq!(back.inject_mode, s.inject_mode);
         assert_eq!(back.language, s.language);
         assert_eq!(back.trigger_mode, s.trigger_mode);
+    }
+
+    #[test]
+    fn legacy_inject_mode_field_is_ignored_for_forward_compat() {
+        // Older settings.json files have an `inject_mode` key (the
+        // pre-AX clipboard/⌘V delivery had a "paste" / "type" /
+        // "clipboard" debug knob that was never wired to the UI).
+        // ADR-0019 removes it, but existing files MUST still parse
+        // cleanly. serde's default behaviour ignores unknown keys —
+        // pin that so nobody accidentally adds `#[serde(deny_unknown_fields)]`.
+        let raw = r#"{
+            "hotkey": "CmdOrCtrl+Shift+Space",
+            "trigger_mode": "tap",
+            "inject_mode": "paste",
+            "language": ""
+        }"#;
+        let s: Settings = serde_json::from_str(raw).expect("legacy field should parse-and-ignore");
+        assert_eq!(s.hotkey, "CmdOrCtrl+Shift+Space");
     }
 
     #[test]
