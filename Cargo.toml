@@ -137,10 +137,10 @@ core-graphics = "0.24"
 # NSMenuItem mutation is actually legal.
 dispatch2 = "0.3"
 
-# Paste delivery uses the Accessibility API directly via
-# `AXUIElementSetAttributeValue(AXSelectedText)` — see `src/ax_paste.rs`.
-# No clipboard write, no synthetic ⌘V chord, no `arboard` or `enigo`
-# dependency. Apple's own Voice Dictation uses the same path.
+# Paste delivery posts a synthetic Unicode keystroke via
+# `CGEventKeyboardSetUnicodeString` at the `AnnotatedSession` event-tap
+# layer — see `src/ax_paste.rs` and ADR-0019. No clipboard write, no
+# synthetic ⌘V chord, no `arboard` or `enigo` dependency.
 
 # AppKit bindings: NSApplication run loop, NSStatusBar / NSStatusItem /
 # NSMenu for the menu-bar app, NSImage for SF Symbol rendering. Pin to the

@@ -46,8 +46,10 @@ use parking_lot::Mutex;
 
 use crate::settings::{CleanupMode, Settings};
 
-/// Cleanup-pass system prompt.
-pub const SYSTEM_PROMPT: &str = "You clean up raw speech-to-text transcriptions for direct insertion into the user's document. Output only the cleaned text. No preamble, no commentary, no quotes around the output, no Markdown formatting.\n\
+/// Cleanup-pass system prompt. Private; assemble production-ready
+/// prompts via [`PromptTemplate::prod`] so callers (bench + production)
+/// can't drift.
+const SYSTEM_PROMPT: &str = "You clean up raw speech-to-text transcriptions for direct insertion into the user's document. Output only the cleaned text. No preamble, no commentary, no quotes around the output, no Markdown formatting.\n\
 \n\
 Rules:\n\
 1. Remove filler words: um, uh, er, ah, like, you know, sort of, kind of, I mean (when used as filler).\n\
@@ -103,8 +105,8 @@ pub struct GenerateOutcome {
 /// Two implementors:
 /// - [`LlamaCleanup`] — production. Holds the loaded GGUF + Metal
 ///   backend; one instance per process.
-/// - Test-only fakes (see `cleanup::tests`) — let
-///   [`crate::app::deliver_cleaned`] be exercised without a real model.
+/// - Test-only fakes (see `cleanup::tests`) — let `app::deliver_cleaned`
+///   be exercised without a real model.
 pub trait CleanupBackend: Send + Sync {
     /// Run the cleanup transform on `text`. The caller (`polish_streaming`)
     /// has already filtered out empty input and the `CleanupMode::Off`
@@ -181,7 +183,7 @@ impl CleanupBackend for LlamaCleanup {
         on_chunk: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<()> {
         let _guard = self.polish_lock.lock();
-        let prompt = format_chat(SYSTEM_PROMPT, text);
+        let prompt = PromptTemplate::prod().render(text);
         // Look-back buffer: Qwen 3.5 sometimes echoes the `/no_think`
         // directive at the very end of its output — and the model
         // even "cleans" it on the way out, so we've seen both the
@@ -251,18 +253,42 @@ where
     }
 }
 
-/// Format the cleanup request as a Qwen 3.5 ChatML prompt with two
-/// tweaks: append `/no_think` to disable the reasoning mode, and
-/// pre-fill an empty `<think></think>` block on the assistant side so
-/// the model jumps straight to the answer. Without these, Qwen 3.5
-/// emits `<think>` reflection that blows past `MAX_OUTPUT_TOKENS` and
-/// produces no usable cleanup output.
-pub fn format_chat(system_prompt: &str, user_input: &str) -> String {
-    format!(
-        "<|im_start|>system\n{system_prompt}<|im_end|>\n\
-         <|im_start|>user\n{user_input} /no_think<|im_end|>\n\
-         <|im_start|>assistant\n<think>\n\n</think>\n\n"
-    )
+/// Prompt assembly for the cleanup task. Hides the Qwen-specific
+/// ChatML / `/no_think` / pre-filled `<think></think>` convention
+/// behind a single render method so production
+/// ([`LlamaCleanup::polish_into`]) and bench (`bin/bench_llm`) can't
+/// reassemble the prompt with subtly different shapes — the bench
+/// claim "measures the production path" depends on both routes going
+/// through the same template.
+#[derive(Clone, Copy, Debug)]
+pub struct PromptTemplate {
+    system_prompt: &'static str,
+}
+
+impl PromptTemplate {
+    /// Template used by the production cleanup path. The system prompt
+    /// is fixed in `cleanup.rs`; there's no per-user customisation in
+    /// v1.
+    pub fn prod() -> Self {
+        Self {
+            system_prompt: SYSTEM_PROMPT,
+        }
+    }
+
+    /// Render the cleanup request as a Qwen 3.5 ChatML prompt with two
+    /// tweaks: append `/no_think` to disable the reasoning mode, and
+    /// pre-fill an empty `<think></think>` block on the assistant side
+    /// so the model jumps straight to the answer. Without these, Qwen
+    /// 3.5 emits `<think>` reflection that blows past
+    /// `max_output_tokens` and produces no usable cleanup output.
+    pub fn render(&self, user_input: &str) -> String {
+        format!(
+            "<|im_start|>system\n{system}<|im_end|>\n\
+             <|im_start|>user\n{user_input} /no_think<|im_end|>\n\
+             <|im_start|>assistant\n<think>\n\n</think>\n\n",
+            system = self.system_prompt,
+        )
+    }
 }
 
 /// Shared llama.cpp decode loop. Owns context creation, tokenisation,
@@ -694,6 +720,51 @@ mod tests {
         })
         .unwrap();
         assert_eq!(captured, "[clean] hello world");
+    }
+
+    #[test]
+    fn prompt_template_prod_renders_canonical_chatml_with_no_think() {
+        // Mutation-survivable: every load-bearing token of the
+        // production template appears exactly once. A regression that
+        // drops `/no_think` or the pre-filled `<think></think>` block
+        // makes Qwen 3.5 spew reflection past `max_output_tokens` and
+        // silently produce no usable output — the kind of bug that
+        // only surfaces in `bench/cleanup-backends.csv` weeks later.
+        let rendered = PromptTemplate::prod().render("hello world");
+        assert_eq!(
+            rendered.matches("<|im_start|>system").count(),
+            1,
+            "system role boundary should appear exactly once"
+        );
+        assert_eq!(
+            rendered.matches("<|im_start|>user").count(),
+            1,
+            "user role boundary should appear exactly once"
+        );
+        assert_eq!(
+            rendered.matches("<|im_start|>assistant").count(),
+            1,
+            "assistant role boundary should appear exactly once"
+        );
+        assert_eq!(
+            rendered.matches("/no_think").count(),
+            1,
+            "/no_think directive should appear exactly once"
+        );
+        assert!(
+            rendered.contains("<think>\n\n</think>"),
+            "assistant turn must pre-fill an empty <think></think> block"
+        );
+        assert!(
+            rendered.contains("hello world"),
+            "user input must round-trip into the prompt"
+        );
+        // System prompt content survives — sample a load-bearing phrase
+        // so a future edit that accidentally strips it fails loudly.
+        assert!(
+            rendered.contains("Remove filler words"),
+            "system prompt must reach the rendered output"
+        );
     }
 
     #[test]

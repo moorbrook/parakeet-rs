@@ -2,9 +2,9 @@
 //!
 //! Loads a GGUF file via llama.cpp (Metal backend on Apple Silicon),
 //! runs N polish iterations against a fixed sample transcript using
-//! the exact `SYSTEM_PROMPT` and decode loop from `src/cleanup.rs`,
-//! and emits one `llm_timer` log line per iteration to stderr in this
-//! shape:
+//! the exact `PromptTemplate::prod()` and decode loop from
+//! `src/cleanup.rs`, and emits one `llm_timer` log line per iteration
+//! to stderr in this shape:
 //!
 //! ```text
 //! llm_timer session_id=bench-qwen3.5-2b-r042-... model=qwen3.5-2b-q4_k_m \
@@ -31,7 +31,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 
 use parakeet_rs::cleanup::{
-    self, format_chat, GenerateOutcome, PROD_GENERATE_CONFIG, SYSTEM_PROMPT,
+    self, GenerateOutcome, PromptTemplate, PROD_GENERATE_CONFIG,
 };
 use parakeet_rs::performance::next_session_id;
 
@@ -163,11 +163,10 @@ fn run(args: &Args) -> Result<()> {
         args.model_path.display()
     );
 
-    let chat_prompt = format_chat(SYSTEM_PROMPT, SAMPLE_INPUT);
+    let chat_prompt = PromptTemplate::prod().render(SAMPLE_INPUT);
     log::info!(
-        "chat prompt: {} chars (system={} chars + sample input={} chars + template)",
+        "chat prompt: {} chars (sample input={} chars + template)",
         chat_prompt.len(),
-        SYSTEM_PROMPT.len(),
         SAMPLE_INPUT.len()
     );
 

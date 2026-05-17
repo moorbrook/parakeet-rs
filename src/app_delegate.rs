@@ -117,8 +117,9 @@ define_class!(
                     // Drop the session if one is in flight. Dropping the
                     // Session sends Signal::Cancel through the watcher
                     // channel and joins the audio thread — see
-                    // `streamer::Session::Drop`.
-                    let _ = app.session.lock().take();
+                    // `streamer::Session::Drop`. `recover` clears the
+                    // session slot atomically.
+                    app.fsm.recover(crate::app::DictationState::Idle);
                 }
                 log::info!("parakeet-rs terminating");
             });

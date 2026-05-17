@@ -45,7 +45,7 @@ define_class!(
             // it, recording near-zero audio.
             crate::objc_util::selector_guard("toggleDictation:", || {
                 if let Some(app) = AppHandle::get() {
-                    let state = *app.current_state.lock();
+                    let state = app.fsm.state();
                     // `effective_trigger_mode` applies the Caps Lock
                     // override — stored Tap becomes runtime Hold for
                     // a Caps Lock binding. Using raw `trigger_mode`
