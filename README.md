@@ -13,28 +13,44 @@ keys, no network after the first-run model download.
 - **Shell**: AppKit single binary (no Tauri / Electron)
 - **Text injection**: `CGEventKeyboardSetUnicodeString` keystroke
 
-## Running
+## Install from source
 
-Apple Silicon Mac, macOS 11.0+, Rust 1.77+.
+No prebuilt releases — build it yourself. Apple Silicon Mac, macOS 11.0+.
 
-```bash
-cargo run --release                 # dev build
-scripts/make-app.sh                 # production .app → /Applications
-```
+1. **Install prerequisites** (skip what you already have):
+   ```bash
+   xcode-select --install                                            # codesign, cc, install_name_tool
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh    # Rust 1.77+
+   ```
+2. **Clone, build, install**:
+   ```bash
+   git clone https://github.com/moorbrook/parakeet-rs && cd parakeet-rs
+   scripts/make-app.sh                                               # ~60 s cold
+   cp -R target/release/bundle/osx/Parakeet.app /Applications/
+   open /Applications/Parakeet.app
+   ```
+3. **Gatekeeper bypass**: macOS may refuse the first launch with "Apple
+   cannot verify this app is free of malware" because the bundle is
+   ad-hoc signed (not from a Developer ID). Right-click the app in
+   Finder → Open → Open Anyway. One-time confirmation.
 
-For stable TCC permissions across rebuilds, create a self-signed
-"Parakeet Local Dev" cert in Keychain Access, then:
+For stable TCC permissions across rebuilds (so macOS doesn't treat each
+build as a new app and re-prompt for Microphone / Accessibility / Input
+Monitoring), generate a self-signed "Parakeet Local Dev" cert in
+Keychain Access, then:
 
 ```bash
 PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
 ```
 
-First launch:
+## First launch
 
 1. macOS prompts for **Microphone**, **Accessibility**, and **Input
-   Monitoring**. All three are required.
+   Monitoring** in System Settings → Privacy & Security. All three are
+   required.
 2. ~640 MB of model files download to
-   `~/Library/Application Support/com.parakeet.rs/models/`.
+   `~/Library/Application Support/com.parakeet.rs/models/`. Menu bar
+   status text shows progress.
 3. Press `⌘⇧Space` (default hotkey), speak. **Tap mode** auto-stops at
    end-of-speech; **Hold mode** stops on release.
 
