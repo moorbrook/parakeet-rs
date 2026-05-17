@@ -70,8 +70,8 @@ get React/Tailwind ergonomics, hand-write vanilla TS — fine for two windows.
 **Status:** Accepted
 
 **Context.** OpenWhispr ships on Mac, Win, Linux, AppImage, deb, rpm. Most of
-its complexity is per-OS native helpers. Roger's hardware is M5 Pro, his
-target users are mac-first.
+its complexity is per-OS native helpers. The development hardware here is
+M5 Pro and the target users are mac-first.
 
 **Decision.** Apple Silicon macOS only (Intel deprecated). No `#[cfg]` arms
 for other OSes, no cross-platform abstractions.
