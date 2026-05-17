@@ -80,26 +80,71 @@ unsafe extern "C" {
 ///
 /// Empty input is a no-op success (so it composes cleanly with
 /// streaming chunk callbacks).
+///
+/// Every call logs which path was tried and the outcome at INFO
+/// level so the path Ghostty / iTerm2 / VS Code / etc. actually
+/// take is visible in `log stream`.
 pub fn insert_text(text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    let preview = text_preview(text);
     match insert_via_ax(text) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            log::info!("ax_paste: AX insert OK ({} chars: {preview})", text.len());
+            Ok(())
+        }
         Err(ax_err) => {
-            log::debug!("AX insert rejected, trying synthetic keystroke: {ax_err:#}");
-            insert_via_keystroke(text).map_err(|ks_err| {
-                anyhow!(
-                    "both delivery paths failed — AX: {ax_err:#}; keystroke: {ks_err:#}"
-                )
-            })
+            log::info!("ax_paste: AX rejected ({ax_err:#}); trying CGEvent keystroke");
+            insert_via_keystroke(text)
+                .map(|()| {
+                    log::info!(
+                        "ax_paste: CGEvent keystroke OK ({} chars: {preview})",
+                        text.len()
+                    );
+                })
+                .map_err(|ks_err| {
+                    log::error!(
+                        "ax_paste: BOTH paths failed ({} chars: {preview}) — AX: {ax_err:#}; keystroke: {ks_err:#}",
+                        text.len()
+                    );
+                    anyhow!(
+                        "both delivery paths failed — AX: {ax_err:#}; keystroke: {ks_err:#}"
+                    )
+                })
         }
     }
 }
 
+/// Short, log-safe preview of `text` — first ~32 chars, no newlines.
+fn text_preview(text: &str) -> String {
+    const MAX: usize = 32;
+    let mut out = String::with_capacity(MAX + 4);
+    out.push('"');
+    let mut count = 0;
+    for ch in text.chars() {
+        if count >= MAX {
+            out.push_str("…");
+            break;
+        }
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push('?'),
+            c => out.push(c),
+        }
+        count += 1;
+    }
+    out.push('"');
+    out
+}
+
 /// Accessibility-based insertion via `AXUIElementSetAttributeValue
 /// (focused, AXSelectedText, text)`. The cleanest path for native
-/// Cocoa apps and most browsers.
+/// Cocoa apps and most browsers. Logs focused-element diagnostics
+/// (role, subrole, parent app pid) before the set so failures are
+/// debuggable.
 fn insert_via_ax(text: &str) -> Result<()> {
     // SAFETY: all AX calls take CFType pointers we own (system-wide
     // handle, focused element) plus CFString refs whose Rust-side
@@ -126,6 +171,14 @@ fn insert_via_ax(text: &str) -> Result<()> {
             bail!("no focused UI element (nothing has keyboard focus?)");
         }
 
+        // Telemetry: what does AX think is focused? Helps diagnose
+        // apps where insertion silently doesn't land.
+        let role = read_string_attr(focused_ref as AXUIElementRef, "AXRole")
+            .unwrap_or_else(|| "?".into());
+        let subrole = read_string_attr(focused_ref as AXUIElementRef, "AXSubrole")
+            .unwrap_or_else(|| "-".into());
+        log::info!("ax_paste: focused element role={role} subrole={subrole}");
+
         let selected_attr = CFString::new("AXSelectedText");
         let value = CFString::new(text);
         let err = AXUIElementSetAttributeValue(
@@ -136,12 +189,37 @@ fn insert_via_ax(text: &str) -> Result<()> {
         CFRelease(focused_ref);
         if err != KAX_ERROR_SUCCESS {
             return Err(anyhow!(
-                "AXSelectedText set error {err} ({}) — focused element doesn't support text replacement (terminal? canvas UI?)",
+                "AXSelectedText set error {err} ({}) on role={role} subrole={subrole}",
                 ax_err_name(err)
             ));
         }
     }
     Ok(())
+}
+
+/// Read a string AX attribute on `element`, returning `None` on any
+/// error or non-string value. Used for telemetry only — failures
+/// here are non-fatal.
+///
+/// SAFETY: caller must pass a valid `AXUIElementRef`. CFString
+/// wrap-under-create-rule consumes the +1 retain returned by
+/// `AXUIElementCopyAttributeValue`, so no manual `CFRelease`.
+unsafe fn read_string_attr(element: AXUIElementRef, attr: &str) -> Option<String> {
+    let attr_cf = CFString::new(attr);
+    let mut value_ref: CFTypeRef = std::ptr::null();
+    // SAFETY: `element` is the caller's valid AXUIElementRef;
+    // `attr_cf` outlives the call; `value_ref` is initialised here.
+    let err = unsafe {
+        AXUIElementCopyAttributeValue(element, attr_cf.as_concrete_TypeRef(), &mut value_ref)
+    };
+    if err != KAX_ERROR_SUCCESS || value_ref.is_null() {
+        return None;
+    }
+    // SAFETY: AX returned a +1 retained CFStringRef; wrap-under-
+    // create-rule transfers ownership to the Rust wrapper which
+    // CFReleases on drop.
+    let cf_str = unsafe { CFString::wrap_under_create_rule(value_ref as CFStringRef) };
+    Some(cf_str.to_string())
 }
 
 /// Synthetic Unicode keystroke via
@@ -151,6 +229,12 @@ fn insert_via_ax(text: &str) -> Result<()> {
 /// processes it as user typing. The keycode itself (we use `0`)
 /// doesn't matter because the Unicode string overrides it for
 /// text-aware apps.
+///
+/// Posts to `AnnotatedSession` (not `HID`) because some terminals
+/// (Ghostty included) tap HID-level events to implement their own
+/// keymap and may not see the unicode string the way text-input
+/// frameworks at the session layer do. AnnotatedSession is what
+/// text-replacement / dictation APIs use under the hood.
 ///
 /// This is what makes dictation work in terminals (Ghostty,
 /// iTerm2, Terminal.app) — they don't expose `AXSelectedText` but
@@ -165,13 +249,15 @@ fn insert_via_keystroke(text: &str) -> Result<()> {
     let keydown = CGEvent::new_keyboard_event(source.clone(), 0, true)
         .map_err(|()| anyhow!("CGEventCreateKeyboardEvent keydown failed"))?;
     keydown.set_string(text);
-    keydown.post(CGEventTapLocation::HID);
+    keydown.post(CGEventTapLocation::AnnotatedSession);
+    log::info!("ax_paste: keydown posted to AnnotatedSession");
     // Matching keyup so the focused app doesn't observe a dangling
     // key-down. Some apps (and some accessibility tools) care.
     let keyup = CGEvent::new_keyboard_event(source, 0, false)
         .map_err(|()| anyhow!("CGEventCreateKeyboardEvent keyup failed"))?;
     keyup.set_string(text);
-    keyup.post(CGEventTapLocation::HID);
+    keyup.post(CGEventTapLocation::AnnotatedSession);
+    log::info!("ax_paste: keyup posted to AnnotatedSession");
     Ok(())
 }
 
