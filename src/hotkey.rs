@@ -10,9 +10,11 @@
 //!
 //! **Permissions.** macOS 10.15+ requires the **Input Monitoring** TCC
 //! permission for HID-level taps *and* global NSEvent monitors. The
-//! Accessibility permission we already grab for the ⌘V paste chord is *not*
-//! sufficient. On first launch the user is prompted to allow Parakeet in
-//! System Settings → Privacy & Security → Input Monitoring.
+//! Accessibility permission we already grab for the CGEvent keystroke
+//! paste path (`src/ax_paste.rs`, ADR-0019) is *not* sufficient — Input
+//! Monitoring is a separate TCC bucket. On first launch the user is
+//! prompted to allow Parakeet in System Settings → Privacy & Security
+//! → Input Monitoring.
 
 use std::cell::Cell;
 use std::ptr::NonNull;

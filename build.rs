@@ -44,7 +44,7 @@ fn check_coreml_ep() -> Result<(), String> {
     let lib = match locate_libonnxruntime() {
         Some(p) => p,
         None => {
-            warn("libonnxruntime.a not in sherpa-onnx prebuilt cache yet; skipping CoreML EP check (will run after the next cargo build)");
+            warn("libonnxruntime.{dylib,a} not in sherpa-onnx prebuilt cache yet; skipping CoreML EP check (will run after the next cargo build)");
             return Ok(());
         }
     };

@@ -589,8 +589,8 @@ impl App {
         // Cleanup LLM loads in a second pass, ONLY if cleanup is
         // enabled in settings. Skipping when off means a fresh install
         // doesn't pay 1.2 GB of resident memory for a feature the user
-        // hasn't turned on. The Settings UI toggle should re-trigger
-        // this load when flipped to On (TODO: wire that hook).
+        // hasn't turned on. Settings-UI toggle (Off → On) re-triggers
+        // a load via `apply_settings` → `handle_cleanup_mode_change`.
         if matches!(self.settings.load().cleanup_mode, CleanupMode::On) {
             self.clone().spawn_llm_setup().await;
         }
@@ -743,9 +743,9 @@ impl App {
 fn load_llm_blocking(settings: &SettingsStore) -> anyhow::Result<Arc<dyn CleanupBackend>> {
     let model_path = settings.cleanup_model_path();
     if !settings.cleanup_model_present() {
-        // TODO: extend model_fetch.rs to pull the GGUF. For v1
-        // the user runs `scripts/fetch-cleanup-model.sh` or
-        // bench_llm's curl one-liner.
+        // TODO: extend model_fetch.rs to pull the GGUF on first
+        // toggle-on. Today the user has to download the file
+        // manually — `bench/README.md` documents the one-liner.
         anyhow::bail!(
             "cleanup model missing at {} — fetch the GGUF and toggle Cleanup again",
             model_path.display()
@@ -798,7 +798,7 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
     match outcome {
         PolishOutcome::Ok => {
             // Success: flush the unbroken-boundary tail (often the
-            // model's last fragment) and restore the clipboard.
+            // model's last fragment without a trailing space).
             streamer.commit()
         }
         PolishOutcome::Error(e) => {
@@ -842,8 +842,8 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
 ///
 /// Splitting the success / typed-error / panic-payload triplet into a
 /// concrete enum lets us unit-test the panic-isolation seam without
-/// dragging `paste::Streamer` (which touches the system clipboard)
-/// into the test.
+/// dragging `paste::Streamer` (which talks to the focused app via the
+/// CGEvent keystroke pipeline; see ADR-0019) into the test.
 #[derive(Debug)]
 enum PolishOutcome {
     Ok,

@@ -453,7 +453,8 @@ pub fn open(mtm: MainThreadMarker) {
         "Cleanup removes filler words, fixes punctuation, and honours\n\
          commands like \"new paragraph\" and \"scratch that\". Runs\n\
          in-process via llama.cpp + Metal on Apple Silicon — no cloud,\n\
-         no API key. First-time enable downloads ~1.2 GB of weights.",
+         no API key. Requires the Qwen 3.5 2B Q4_K_M GGUF (~1.2 GB)\n\
+         in the data dir; see bench/README.md for the fetch command.",
         PAD,
         row5_y - 50.0,
         WINDOW_W - PAD * 2.0,

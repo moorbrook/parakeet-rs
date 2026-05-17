@@ -170,9 +170,9 @@ impl CleanupBackend for LlamaCleanup {
     /// The lock is held across the entire generation loop including
     /// every `on_chunk` invocation; a re-entrant callback would
     /// deadlock. The only production caller is `paste::Streamer::push`,
-    /// which touches the OS pasteboard and key-event APIs but never
-    /// re-enters cleanup. The lock CAN be released around `on_chunk`,
-    /// but doing so would let two polish calls interleave Metal kernel
+    /// which posts CGEvent keystrokes (ADR-0019) but never re-enters
+    /// cleanup. The lock CAN be released around `on_chunk`, but
+    /// doing so would let two polish calls interleave Metal kernel
     /// invocations, which produces garbled output (see the field's
     /// doc comment). Holding it is the lesser evil.
     fn polish_into(

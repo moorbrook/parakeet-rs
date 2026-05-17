@@ -199,9 +199,12 @@ impl SettingsStore {
             && self.vad_path().exists()
     }
 
-    /// Cleanup-pass GGUF weights, downloaded on first cleanup-enabled
-    /// launch into the same per-bundle data directory as the ASR model.
-    /// v1 ships exactly one supported model (Qwen 3.5 2B Q4_K_M) — see
+    /// Cleanup-pass GGUF weights path. Expected to live in the same
+    /// per-bundle data directory as the ASR model. The download isn't
+    /// wired up yet — `load_llm_blocking` bails with a clear error if
+    /// the file is missing, and the user has to grab it manually (see
+    /// `bench/README.md` for the one-liner). v1 ships exactly one
+    /// supported model (Qwen 3.5 2B Q4_K_M) — see
     /// [ADR-0018](../../docs/ADR.md). The directory + filename are
     /// fixed; changing them requires a model-fetch update, not a
     /// settings change.

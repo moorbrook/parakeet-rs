@@ -45,12 +45,12 @@ copyright = "Copyright (c) 2026 parakeet-rs"
 category = "Productivity"
 short_description = "Voice-to-text dictation, fully local, Apple Silicon."
 long_description = """
-Press a global hotkey, speak, and Parakeet pastes the transcript at your
-cursor. Powered by NVIDIA Parakeet TDT 0.6B v3 running locally on the
-Apple Neural Engine via sherpa-onnx + CoreML. Optional LLM cleanup pass
-(via your Anthropic API key) removes filler words and fixes punctuation;
-ASR itself is fully local with no network calls after the first-run
-model download.
+Press a global hotkey, speak, and Parakeet inserts the transcript at
+your cursor. Powered by NVIDIA Parakeet TDT 0.6B v3 running locally
+on the Apple Neural Engine via sherpa-onnx + CoreML. Optional LLM
+cleanup pass (Qwen 3.5 2B Q4_K_M, llama.cpp + Metal, in-process)
+removes filler words and fixes punctuation. Fully local — no API
+keys, no network calls after the first-run model download.
 """
 osx_minimum_system_version = "11.0"
 # cargo-bundle's `osx_info_plist_exts` concatenates rather than merges, which
