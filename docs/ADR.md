@@ -18,11 +18,11 @@ ADRs target. Update whenever the code lands or a measurement is taken.
 |---|---|---|---|
 | End-of-speech → text appears | **press-once + Silero VAD auto-stop** wired (`streamer.rs`); 16 kHz resample inline; offline encoder runs at 7.8x RTFx on M5 Pro, so a 5 s utterance finalizes in ~640 ms after EoS | **<1 s p50 with WER ≤ 2% (revised)** — was <200 ms but retired after streaming-Parakeet survey found no viable substitute (see ADR-0009) | nothing for the revised target |
 | Recognition acceleration | **CoreML EP linked AND engaged.** `sherpa-onnx-sys` set to `shared` linkage; `libonnxruntime.1.24.4.dylib` exports `OrtSessionOptionsAppendExecutionProvider_CoreML` (verified by `nm -gU`); `build.rs` symbol check is green; the **2 s warmup decode runs at 7.8x real time**, well above the 2x CoreML floor that signals CPU fallback. ANE/GPU is in use. | CoreML EP routes ops to ANE / Metal / CPU per-op | **none — ADR-0012 + ADR-0015 fully shipped.** |
-| Resident set | ~1.0 GB (640 MB mmap'd model + ~300 MB Tauri/WebKit + ORT arenas + audio buffers) + ~30 MB bundled dylibs | ≤1.2 GB steady state | [ADR-0014](#0014-tray-only-headless-ux) (lazy settings webview) |
-| Settings window | `visible: false` at launch (`tauri.conf.json:18`); opened from tray "Settings…" | hidden by default; show on tray click | none — ADR-0014 shipped |
-| Tray UX | SF Symbols (`mic` / `mic.fill` / `arrow.down.circle`) via `objc2_app_kit::NSImage`; state-reflective menu labels ("Start Dictation ⌘⇧Space" / "Stop Dictation ⌘⇧Space") | HIG-conformant template image with state | none — shipped |
-| Paste path | Clipboard write + ⌘V chord via `enigo` | Same (clipboard + ⌘V is good enough for v1) | None — [ADR-0011](#0011-direct-accessibility-text-injection) deferred |
-| Smart formatting | None — raw Parakeet output with native punctuation/capitalization | Optional local LLM post-pass | [ADR-0010](#0010-local-llm-post-processing-for-smart-formatting) |
+| Resident set | ~800 MB (640 MB mmap'd ASR model + ORT arenas + audio buffers); +~1.6 GB when cleanup is On (Qwen 3.5 2B Q4 weights + KV cache); ~50 MB bundled dylibs | ≤2.5 GB steady state with cleanup On | none — ADR-0016 + ADR-0018 shipped |
+| Settings window | Native `NSWindow` opened from menubar "Settings…" (`src/settings_ui.rs`); `orderFrontRegardless` so it surfaces above other apps | native, on-demand | none — shipped |
+| Menubar UX | SF Symbols (`mic` / `mic.fill` / `arrow.down.circle`) via `objc2_app_kit::NSImage`; state-reflective menu labels | HIG-conformant template image with state | none — shipped |
+| Paste path | `CGEventKeyboardSetUnicodeString` synthetic keystroke at `AnnotatedSession` tap layer (`src/ax_paste.rs`) | no clipboard mutation; works in terminals, browsers, native, Electron, IDEs | none — [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) shipped, supersedes ADR-0011 |
+| Smart formatting | In-process LLM cleanup pass: Qwen 3.5 2B Q4_K_M via llama-cpp-2 + Metal (`src/cleanup.rs`); opt-in via Settings → Cleanup → On | optional local cleanup, streaming output to cursor on word boundaries | none — [ADR-0018](#0018--cleanup-backend-llamacpp--qwen-35-2b-q4_k_m) shipped |
 
 **Foundational dependency cleared.** The CoreML EP blocker that gated
 almost every other ADR was resolved by the [ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage)
@@ -35,7 +35,12 @@ where the warmup decode reports **7.8x real-time on this M5 Pro**.
 
 ## 0001 — Tauri 2 + Rust shell (replacing Electron)
 
-**Status:** Accepted
+**Status:** **Superseded.** The Tauri shell was dropped in favour of
+a single native AppKit binary (`objc2` + per-class `objc2-app-kit`
+features) — see [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation)
+for the spike-was-revisited-and-flipped trail. ADR-0001's text below
+records the original Electron → Tauri decision; the codebase no
+longer ships any Tauri / WebView code.
 
 **Context.** OpenWhispr ships ~100 MB of Electron + Node + Swift / C / C++
 helpers per OS, with ten compiled native side-binaries (`globe-listener`,
@@ -279,21 +284,26 @@ something below pushes p99 over 300 ms, it doesn't ship.
 
 ## 0008 — Hotkey press-to-toggle + clipboard paste
 
-**Status:** **Partly Accepted (clipboard paste stays for v1), partly Superseded
-by [ADR-0009](#0009-streaming-recognition--vad-auto-stop)** (one-press +
-VAD-auto-stop will replace press-twice).
+**Status:** **Both halves superseded.** Press-twice was replaced by
+hotkey-press → talk → VAD-auto-stop per
+[ADR-0009](#0009-streaming-recognition--vad-auto-stop). Clipboard +
+⌘V was replaced by `CGEventKeyboardSetUnicodeString` synthetic
+keystrokes per [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession).
+Original v0.1 framing preserved below.
 
-**Context.** v0.1 UX: press hotkey to start, press again to stop. Transcript
-written to clipboard, ⌘V synthesized via enigo.
+**Context (v0.1).** Press hotkey to start, press again to stop.
+Transcript written to clipboard, ⌘V synthesized via enigo.
 
-**Decision (v1).** Keep clipboard + ⌘V as the paste path; the 15–50 ms cost
-and clipboard pollution are tolerable in the first ship and the breadth of
-app compatibility is hard to beat. AX injection
-([ADR-0011](#0011-direct-accessibility-text-injection)) deferred to v2.
+**Decision (v1, at the time).** Keep clipboard + ⌘V as the paste
+path; the 15-50 ms cost and clipboard pollution were judged
+tolerable in exchange for breadth of app compatibility. AX injection
+([ADR-0011](#0011--direct-accessibility-text-injection-deferred))
+deferred to v2.
 
-The press-twice UX is being replaced by hotkey-press → talk → VAD-auto-stop
-in [ADR-0009](#0009-streaming-recognition--vad-auto-stop) because press-twice
-adds a user-input delay on top of inference latency.
+The press-twice UX was replaced by hotkey-press → talk →
+VAD-auto-stop in [ADR-0009](#0009-streaming-recognition--vad-auto-stop)
+because press-twice adds a user-input delay on top of inference
+latency.
 
 ---
 
@@ -663,11 +673,18 @@ the user asks for it. Matches OpenWhispr's `LSUIElement` mode.
 
 ## 0016 — Tauri + Rust shell vs SwiftUI native (re-evaluation)
 
-**Status:** Accepted (with explicit pivot trigger). Re-evaluates
-[ADR-0001](#0001--tauri-2--rust-shell-replacing-electron) in light of
-[ADR-0002](#0002--macos-only) (macOS-only) and the realised cost of
-[ADR-0012](#0012-self-built-sherpa-onnx-with-coreml-ep) (vendor + build
-sherpa-onnx ourselves to get CoreML EP).
+**Status:** **Superseded — outcome reversed.** The spike landed
+"stay on Tauri+Rust", but during the subsequent code-architecture +
+adversarial review rounds we dropped the Tauri shell entirely and
+moved to a single native AppKit binary via `objc2` + per-class
+`objc2-app-kit` features. Reason: with Tauri out, the WebView /
+WebKit / `tauri-conf.json` / `bun`-frontend surface contributed no
+value (Settings UI fits in native `NSWindow` + `NSTextField` +
+`NSPopUpButton` cleanly), and removing it cut ~200 MB resident, the
+entire frontend toolchain, and a class of focus-stealing bugs.
+ADR-0019 (CGEvent paste) and the streaming HUD bar work depended on
+direct AppKit access anyway. Original spike rationale preserved
+below.
 
 **Context.** ADR-0001 chose Tauri to escape Electron. Two of the implicit
 motivations for *Tauri specifically* over *native Cocoa / SwiftUI* were:
@@ -819,8 +836,9 @@ backend on Apple Silicon delivers ~100 tok/s on Qwen 3.5 2B Q4_K_M
 | **Total per polish (ms)** | **551** | **550** | **560** | **570** |
 | Decode (tokens/sec) | 100.3 | 100.4 | 101.7 | 101.9 |
 
-Cold model load: 229 ms (incurred once per process; cleanup ready
-before the user's first hotkey press if loaded in `llm_warmup.rs`).
+Cold model load: 229 ms (incurred once per process; the warmup is
+done as part of `App::spawn_llm_setup` in `src/app.rs`, so cleanup
+is ready before the user's first hotkey press).
 Output: 55 tokens (one cleaned paragraph) for a 240-character noisy
 input. p99 / p50 = 1.04 — variance is negligible, Metal kernel
 scheduling is steady-state from iteration 1.
@@ -867,26 +885,32 @@ tools (Wispr Flow, etc.) deliver their <700 ms feel.
   if the measured llama.cpp number ever misses a tightened budget.
 - **Candle main + gemma4 fp16.** ~10 GB on-disk, blows past the <2 GB
   user constraint, and the loader is not yet quantized.
-- **Direct Anthropic API.** Rejected by project directive (see
-  [`feedback_no_anthropic_api`](../README.md) in agent memory and the
-  `cleanup_mode` `#[serde(alias = "anthropic")]` in `src/settings.rs`).
+- **Direct Anthropic API.** Rejected by project directive (no cloud
+  cleanup). The legacy `cleanup_mode = "anthropic"` serde alias was
+  removed when the API key field was dropped from settings; the
+  in-process llama.cpp path replaces both the API and the prior
+  `claude -p` subprocess approach.
 - **`mlx-rs` direct.** Same multi-day port story as OminiX-MLX without
   the shared infrastructure crates.
 
-**Open issues to handle in §4 cleanup rewrite.**
+**Open issues (resolved post-§6).**
 
-- The `/no_think` directive currently leaks into the model's output as
-  trailing text (Qwen 3.5 echoes it). Strip the trailing token in
-  post-processing.
-- Streaming-paste is non-trivial against `paste::deliver`'s current
-  "single clipboard write + ⌘V chord" shape. Either re-architect to
-  stream-and-overwrite (accessibility-API territory; see
-  [ADR-0011](#0011-direct-accessibility-text-injection) deferred) or
-  buffer-and-paste-all-at-once with a visual streaming indicator in
-  the HUD.
-- Model file management: ~1.22 GB download on first cleanup-enabled
-  launch, cached at `~/Library/Application Support/com.parakeet.rs/llm/qwen3.5-2b-q4_k_m/`.
-  Reuse the `model_fetch.rs` pattern from Parakeet's first-run flow.
+- ~~The `/no_think` directive leaks into the model's output.~~
+  Resolved — `strip_no_think_tail` in `src/cleanup.rs` handles all
+  observed variants (`/no_think`, `no_think`, `no think`,
+  `No think`, etc., case-insensitive, ignoring trailing punctuation).
+- ~~Streaming-paste is non-trivial against the clipboard+⌘V shape.~~
+  Resolved — `paste::Streamer` streams to the focused app via
+  `CGEventKeyboardSetUnicodeString` keystrokes (ADR-0019), one
+  word-boundary-batched chunk per LLM emission burst. No clipboard,
+  no AX, no flicker.
+- **Open: model file management.** ~1.22 GB download on first
+  cleanup-enable, expected at
+  `~/Library/Application Support/com.parakeet.rs/llm/qwen3.5-2b-q4_k_m/`.
+  In-app download is **not** wired up — `load_llm_blocking` bails
+  with a clear error if the file is missing; the user has to fetch
+  manually (`bench/README.md` has the one-liner). Re-use the
+  `model_fetch.rs` pattern from Parakeet's first-run flow.
 
 **References.**
 

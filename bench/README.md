@@ -26,11 +26,13 @@ It **does not** exercise:
 
 - `cpal` mic-capture callback latency
 - the Silero VAD endpoint hangover (~150 ms per `src/vad.rs:15`)
-- the `arboard` + `enigo` paste step (~50 ms per the latency plan)
+- the `CGEventKeyboardSetUnicodeString` keystroke insertion step
+  (sub-ms per chord — see ADR-0019)
 
 So the bench number is **ASR-only**. Real end-to-end is the bench number
-plus ~200 ms (VAD + paste), captured separately by the in-app PhaseTimer
-that emits the same `phase_timer` log line during live dictation.
+plus ~150 ms (VAD hangover; keystroke insertion is negligible), captured
+separately by the in-app PhaseTimer that emits the same `phase_timer`
+log line during live dictation.
 
 ## Baseline: M5 Pro 24 GB (2026-05-16, pre-§2 CoreML cache)
 
@@ -48,8 +50,8 @@ updates and/or that the bench uses clean TTS speech. Worth folding into
 the §6 ADR once §2 numbers land.
 
 **Implied total post-endpoint latency on 5 s (pre-cache):**
-362 ms ASR + 150 ms VAD + 50 ms paste ≈ **562 ms** — already under the
-700 ms acceptance target before any optimization. §2 should still cut
+362 ms ASR + 150 ms VAD ≈ **512 ms** — under the 700 ms acceptance
+target before any optimization. §2 should still cut
 **first-dictation-after-launch** cold-start, which is what the user
 actually feels on app open; warm steady-state may not budge much.
 
@@ -83,7 +85,7 @@ Background and library-selection rationale: [ADR-0018](../docs/ADR.md#0018--clea
 
 | Path                         | Purpose                                          |
 |------------------------------|--------------------------------------------------|
-| `audio/{1,3,5,10,20}s.wav`   | Generated fixtures (gitignored).                 |
+| `audio/{1,3,5,10,20}s_*.wav` | Generated fixtures (gitignored). Filename includes sample rate (e.g. `5s_16000.wav`). |
 | `raw.log`                    | All `phase_timer` lines from the last ASR run.   |
 | `llm-raw.log`                | All `llm_timer` lines from the last LLM run.     |
 | `baseline.csv`               | Aggregated ASR baseline (pre-CoreML-cache).      |
