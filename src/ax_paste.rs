@@ -93,8 +93,7 @@ fn text_preview(text: &str) -> String {
     const MAX: usize = 32;
     let mut out = String::with_capacity(MAX + 4);
     out.push('"');
-    let mut count = 0;
-    for ch in text.chars() {
+    for (count, ch) in text.chars().enumerate() {
         if count >= MAX {
             out.push('…');
             break;
@@ -106,7 +105,6 @@ fn text_preview(text: &str) -> String {
             c if c.is_control() => out.push('?'),
             c => out.push(c),
         }
-        count += 1;
     }
     out.push('"');
     out

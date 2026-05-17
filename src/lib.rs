@@ -21,24 +21,33 @@
 #![allow(unused_unsafe)]
 #![allow(clippy::undocumented_unsafe_blocks)]
 
+// Public modules — reachable from `src/main.rs` (the bundled binary
+// target) and the benches under `src/bin/`. Both link this crate by
+// name, so they need `pub` for the items they use.
 pub mod app;
 pub mod app_delegate;
 pub mod asr;
-pub mod audio;
-pub mod ax_paste;
 pub mod cleanup;
-pub mod hotkey;
-pub mod hud;
-pub mod menubar;
-pub mod model_fetch;
 pub mod objc_util;
-pub mod paste;
 pub mod performance;
 pub mod permissions;
-pub mod qos;
 pub mod settings;
-pub mod settings_ui;
-pub mod sf_symbol;
-pub mod streamer;
-pub mod vad;
 pub mod warmup;
+
+// Internal modules — only referenced from inside the lib (the public
+// modules above use them via `crate::*`). Keeping them private tightens
+// the API surface and makes it obvious at a glance which modules are
+// in the "stable" set vs. the implementation-detail set. If a new bin
+// or main.rs callsite needs one of these, promote it to `pub mod`.
+mod audio;
+mod ax_paste;
+mod hotkey;
+mod hud;
+mod menubar;
+mod model_fetch;
+mod paste;
+mod qos;
+mod settings_ui;
+mod sf_symbol;
+mod streamer;
+mod vad;

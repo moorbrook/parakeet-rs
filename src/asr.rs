@@ -106,7 +106,7 @@ impl Asr {
         Ok(decoded.text)
     }
 
-    pub fn recognize_with_timing(
+    fn recognize_with_timing(
         &self,
         samples: &[f32],
         sample_rate: u32,
