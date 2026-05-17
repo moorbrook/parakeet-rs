@@ -121,11 +121,3 @@ impl Streamer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    // Streamer behaviour is exercised via integration: see
-    // `polish_streaming_*` tests in `cleanup.rs` plus the manual
-    // smoke described in `docs/latency-plan.md`. AX itself isn't
-    // testable without a real focused element on a live macOS
-    // session, so we don't try.
-}

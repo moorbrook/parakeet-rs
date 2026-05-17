@@ -128,12 +128,16 @@ pub fn start(vad_model: &Path, mode: Mode) -> Result<(Session, OutcomeRx)> {
             Mode::Manual => "hold-watcher".into(),
         })
         .spawn(move || {
-            let outcome = match (mode, vad) {
-                (Mode::VadAutoStop, Some(vad)) => {
-                    run_vad(capture, vad, sample_rate, tap_rx, signal_rx, timer)
-                }
-                (Mode::Manual, _) => run_manual(capture, sample_rate, tap_rx, signal_rx, timer),
-                _ => Outcome::Error(anyhow!("invalid mode/vad combination")),
+            // VAD-mode-requires-Some-vad and Manual-mode-ignores-vad
+            // are both invariant by construction above. The two-arm
+            // match here is exhaustive on `mode`; the prior "invalid
+            // combination" arm was unreachable.
+            let outcome = match mode {
+                Mode::VadAutoStop => match vad {
+                    Some(vad) => run_vad(capture, vad, sample_rate, tap_rx, signal_rx, timer),
+                    None => Outcome::Error(anyhow!("VadAutoStop spawned without a VAD model")),
+                },
+                Mode::Manual => run_manual(capture, tap_rx, signal_rx, timer),
             };
             let _ = outcome_tx.send(outcome);
         })
@@ -238,7 +242,6 @@ fn finish_at_vad_endpoint(capture: AudioCapture, mut timer: PhaseTimer) -> Outco
 
 fn run_manual(
     capture: AudioCapture,
-    _sample_rate: u32,
     tap_rx: Receiver<Vec<f32>>,
     signal_rx: Receiver<Signal>,
     mut timer: PhaseTimer,

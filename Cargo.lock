@@ -1398,7 +1398,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "block2",
- "bytes",
  "core-foundation",
  "core-graphics",
  "cpal",
@@ -1414,14 +1413,12 @@ dependencies = [
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
- "once_cell",
  "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
  "sherpa-onnx",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
 ]
 
