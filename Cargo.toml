@@ -140,12 +140,10 @@ core-graphics = "0.24"
 # NSMenuItem mutation is actually legal.
 dispatch2 = "0.3"
 
-# Clipboard via NSPasteboard.
-arboard = "3"
-
-# ⌘V keystroke chord for the paste step (NSPasteboard writes the text,
-# enigo synthesises the keypress in the focused app).
-enigo = "0.3"
+# Paste delivery uses the Accessibility API directly via
+# `AXUIElementSetAttributeValue(AXSelectedText)` — see `src/ax_paste.rs`.
+# No clipboard write, no synthetic ⌘V chord, no `arboard` or `enigo`
+# dependency. Apple's own Voice Dictation uses the same path.
 
 # AppKit bindings: NSApplication run loop, NSStatusBar / NSStatusItem /
 # NSMenu for the menu-bar app, NSImage for SF Symbol rendering. Pin to the
