@@ -98,24 +98,31 @@ parakeet-rs/
 └── src/
     ├── main.rs             entry: permissions preflight, NSApplication setup
     ├── lib.rs              module declarations + crate-wide lint policy
-    ├── app.rs              App state, session lifecycle, hotkey dispatch,
-    │                       LLM toggle, panic recovery
+    ├── app.rs              App orchestration, supervised worker spawns,
+    │                       deliver_cleaned pipeline, panic recovery
     ├── app_delegate.rs     NSApplicationDelegate (didFinishLaunching, reopen)
     ├── asr.rs              sherpa-onnx OfflineRecognizer wrapper
     ├── audio.rs            cpal capture, mono fold, audio-level publish
     ├── ax_paste.rs         CGEvent keystroke text insertion (ADR-0019)
-    ├── cleanup.rs          CleanupBackend trait, LlamaCleanup, generate loop
+    ├── cleanup.rs          CleanupBackend trait, LlamaCleanup,
+    │                       PromptTemplate, generate loop
+    ├── dictation_fsm.rs    atomic state machine for state/session/
+    │                       pending_terminate transitions
     ├── hotkey.rs           CGEventTap + NSEvent media-key monitor
     ├── hud.rs              recording-state HUD panel + waveform bars
+    ├── llm_manager.rs      single-mutex cleanup-LLM lifecycle
+    │                       (Disabled / Loading / Ready)
     ├── menubar.rs          NSStatusItem + menu actions
     ├── model_fetch.rs      first-run HF model downloader
     ├── objc_util.rs        selector_guard panic boundary
-    ├── paste.rs            Streamer (word-boundary buffered ax_paste)
+    ├── paste.rs            TextSink trait + AxKeystrokeSink + Streamer
+    │                       (word-boundary buffered delivery)
     ├── performance.rs      PhaseTimer, P-core count, session_id
     ├── permissions.rs      mic + accessibility + input-monitoring preflight
     ├── qos.rs              pthread_set_qos_class_self_np
     ├── settings.rs         JSON store (atomic save), model paths
     ├── settings_ui.rs      Settings window
+    ├── sf_symbol.rs        SF Symbol → NSImage loader
     ├── streamer.rs         per-session VAD/manual capture orchestration
     ├── vad.rs              Silero VAD wrapper
     ├── warmup.rs           page_touch + dummy_decode
@@ -203,7 +210,7 @@ word boundaries (perceived latency much lower).
 
 ```bash
 cargo build --release && scripts/make-app.sh    # ~60 s cold, then <5 s incremental
-cargo test                                       # 52 unit tests
+cargo test                                       # 81 unit tests
 cargo clippy --all-targets --no-deps             # clean
 ```
 
