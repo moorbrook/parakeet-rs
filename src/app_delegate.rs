@@ -139,6 +139,13 @@ fn install_runtime_state(mtm: MainThreadMarker) -> anyhow::Result<()> {
 
     menubar::install(mtm).context("install menu bar")?;
     hud::install(mtm);
+    // Debug hook: `PARAKEET_HUD_PREVIEW=1` shows the Listening HUD at
+    // launch without starting a dictation session — lets the HUD's
+    // chrome be screenshotted / design-reviewed without speaking into
+    // the mic. No audio tap runs, so the bars sit at minimum height.
+    if std::env::var_os("PARAKEET_HUD_PREVIEW").is_some() {
+        hud::show_state(crate::app::DictationState::Listening);
+    }
 
     // Hotkey: press/release edges call App::on_hotkey_press / on_hotkey_release.
     // In Tap mode only press matters; in Hold mode release is the commit edge.
