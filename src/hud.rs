@@ -35,12 +35,20 @@ use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSi
 
 use crate::app::DictationState;
 
-const HUD_W: f64 = 220.0;
-const HUD_H: f64 = 44.0;
+/// Global HUD scale. The base geometry (220×44 pill, 13 pt label) was
+/// sized for a laptop display and is illegibly small on a 43" 4K
+/// desktop monitor — every dimension below derives from this one knob.
+const SCALE: f64 = 5.0;
+const HUD_W: f64 = 220.0 * SCALE;
+const HUD_H: f64 = 44.0 * SCALE;
+const LABEL_X: f64 = 14.0 * SCALE;
+const LABEL_FONT_SIZE: f64 = 13.0 * SCALE;
 /// Gap between the bottom of the screen and the bottom of the HUD. The
 /// Dock is auto-hidden for many users; 80px clears it comfortably for
-/// "always visible" Dock setups too.
-const BOTTOM_OFFSET: f64 = 80.0;
+/// "always visible" Dock setups too. Deliberately NOT multiplied by
+/// the full SCALE — the HUD should stay anchored near the bottom
+/// edge, not drift toward mid-screen.
+const BOTTOM_OFFSET: f64 = 120.0;
 /// Capsule corner radius (half the HUD height). Liquid Glass favours
 /// capsule shapes for small floating elements — "rounded shapes that
 /// are concentric to their containers" per the Adopting Liquid Glass
@@ -60,14 +68,14 @@ const CORNER_RADIUS: f64 = HUD_H / 2.0;
 // one.
 
 const BARS_COUNT: usize = 7;
-const BAR_WIDTH: f64 = 6.0;
-const BAR_GAP: f64 = 5.0;
-const BAR_HEIGHT_MIN: f64 = 8.0;
-const BAR_HEIGHT_MAX: f64 = 36.0;
-/// Left edge of the leftmost bar inside the HUD's content view.
-/// `HUD_W = 220`; label area is x ∈ [14, 126], bars area is
-/// x ∈ [130, 202] (7*6 + 6*5 = 72 px wide). 18 px right margin.
-const BARS_ORIGIN_X: f64 = 130.0;
+const BAR_WIDTH: f64 = 6.0 * SCALE;
+const BAR_GAP: f64 = 5.0 * SCALE;
+const BAR_HEIGHT_MIN: f64 = 8.0 * SCALE;
+const BAR_HEIGHT_MAX: f64 = 36.0 * SCALE;
+/// Left edge of the leftmost bar inside the HUD's content view. In
+/// base (SCALE=1) units: HUD_W = 220, label area x ∈ [14, 126], bars
+/// area x ∈ [130, 202] (7*6 + 6*5 = 72 wide), 18 right margin.
+const BARS_ORIGIN_X: f64 = 130.0 * SCALE;
 /// Empirical gain applied to the raw mic peak before the compressive
 /// curve. A typical conversational voice peaks at ~0.2-0.4 on a
 /// MacBook built-in mic; whispering / late-night peaks at ~0.05-0.10.
@@ -189,10 +197,11 @@ pub fn install(mtm: MainThreadMarker) {
         // the Adopting Liquid Glass guide ("Limit these effects to the
         // most important functional elements" — this floating status
         // pill is the app's one custom overlay). Capsule corner radius,
-        // default Regular style, no tint (tint is for prominent
-        // interactive elements, not passive status chrome). The glass
-        // material handles light/dark adaptation, Reduce Transparency,
-        // and Increase Contrast system-side.
+        // Clear style (see the comment at the setStyle call), no tint
+        // (tint is for prominent interactive elements, not passive
+        // status chrome). The glass material handles light/dark
+        // adaptation, Reduce Transparency, and Increase Contrast
+        // system-side.
         //
         // Fallback on macOS < 26 (class absent at runtime): the
         // pre-Tahoe `NSVisualEffectView` HUDWindow material with the
@@ -208,6 +217,14 @@ pub fn install(mtm: MainThreadMarker) {
             };
             unsafe {
                 glass.setCornerRadius(CORNER_RADIUS);
+                // Clear, not Regular. Apple nominally reserves Clear
+                // for media-rich backdrops, but Regular's Dark Mode
+                // rendering on a 44 pt pill is nearly indistinguishable
+                // from the legacy HUDWindow blur — the user picked
+                // Clear from a side-by-side render (2026-06-11). The
+                // pill is transient (~2 s per dictation), so the
+                // legibility trade-off is acceptable.
+                glass.setStyle(objc2_app_kit::NSGlassEffectViewStyle::Clear);
                 glass.setContentView(Some(&container));
                 panel.setContentView(Some(&glass));
             }
@@ -235,10 +252,10 @@ pub fn install(mtm: MainThreadMarker) {
         // Label takes the left portion of the HUD; bars go in the right
         // portion. The label is left-aligned (was Center) so the
         // "● Listening…" text doesn't visually drift away from the bars.
-        // BARS_ORIGIN_X is 130; label area is x ∈ [14, 126].
+        // In base units: BARS_ORIGIN_X is 130; label area x ∈ [14, 126].
         let label_frame = NSRect::new(
-            NSPoint::new(14.0, 0.0),
-            NSSize::new(BARS_ORIGIN_X - 18.0, HUD_H),
+            NSPoint::new(LABEL_X, 0.0),
+            NSSize::new(BARS_ORIGIN_X - LABEL_X - 4.0 * SCALE, HUD_H),
         );
         let label =
             unsafe { NSTextField::labelWithString(&NSString::from_str("Listening…"), mtm) };
@@ -249,7 +266,7 @@ pub fn install(mtm: MainThreadMarker) {
             // white on the dark one. Keeps the text legible whichever
             // appearance variant macOS gave us for the chrome.
             label.setTextColor(Some(&NSColor::labelColor()));
-            let font = NSFont::systemFontOfSize(13.0);
+            let font = NSFont::systemFontOfSize(LABEL_FONT_SIZE);
             label.setFont(Some(&font));
             label.setDrawsBackground(false);
             label.setBordered(false);
