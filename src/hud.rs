@@ -39,6 +39,9 @@ use crate::app::DictationState;
 /// sized for a laptop display and is illegibly small on a 43" 4K
 /// desktop monitor — every dimension below derives from this one knob.
 const SCALE: f64 = 5.0;
+/// Whole-panel opacity. Applied via `NSWindow.alphaValue` because the
+/// glass material itself exposes no opacity knob; 1.0 = opaque.
+const HUD_ALPHA: f64 = 0.70;
 const HUD_W: f64 = 220.0 * SCALE;
 const HUD_H: f64 = 44.0 * SCALE;
 const LABEL_X: f64 = 14.0 * SCALE;
@@ -180,6 +183,13 @@ pub fn install(mtm: MainThreadMarker) {
                     | NSWindowCollectionBehavior::IgnoresCycle,
             );
             panel.setReleasedWhenClosed(false);
+            // Whole-window opacity. NSGlassEffectView has no direct
+            // "glass opacity" knob, but compositing the entire panel
+            // at 70% lets the backdrop read through the pill — the
+            // user picked 70% from an on-screen alpha ladder
+            // (30–80%, 2026-06-11) as the legibility/transparency
+            // balance for a 43" 4K display.
+            panel.setAlphaValue(HUD_ALPHA);
         }
 
         // Content container: a plain transparent NSView holding the
