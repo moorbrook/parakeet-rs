@@ -117,7 +117,7 @@ define_class!(
 
         /// Polish-mode popup changed. Selector kept as a no-op so the
         /// UI sender wiring stays valid; the actual toggle effect is
-        /// applied on Save (we don't load the 1.2 GB Qwen GGUF on every
+        /// applied on Save (we don't load the 3.5 GB Qwen GGUF on every
         /// dropdown flip).
         #[unsafe(method(polishModeChanged:))]
         fn polish_mode_changed(&self, _sender: *mut NSObject) {
@@ -429,7 +429,7 @@ pub fn open(mtm: MainThreadMarker) {
         mtm,
         &[
             "Off — paste raw transcript",
-            "On — Qwen 3.5 2B local (≈1.2 GB)",
+            "On — Qwen 3.5 4B local (≈3.5 GB)",
         ],
         match settings.as_ref().map(|s| s.polish_mode) {
             Some(PolishMode::On) => 1,
@@ -453,8 +453,8 @@ pub fn open(mtm: MainThreadMarker) {
         "Polish removes filler words, fixes punctuation, and honours\n\
          commands like \"new paragraph\" and \"scratch that\". Runs\n\
          in-process via llama.cpp + Metal on Apple Silicon — no cloud,\n\
-         no API key. Requires the Qwen 3.5 2B Q4_K_M GGUF (~1.2 GB)\n\
-         in the data dir; see bench/README.md for the fetch command.",
+         no API key. Uses the Qwen 3.5 4B Q6_K GGUF (~3.5 GB),\n\
+         downloaded automatically the first time Polish is enabled.",
         PAD,
         row5_y - 50.0,
         WINDOW_W - PAD * 2.0,

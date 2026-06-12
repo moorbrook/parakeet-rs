@@ -9,7 +9,7 @@ hotkey, speak, transcript inserts at your cursor. Fully local — no API
 keys, no network after the first-run model download.
 
 - **ASR**: NVIDIA Parakeet TDT 0.6B v3 int8 via sherpa-onnx + CoreML
-- **Polish (optional)**: Qwen 3.5 2B Q4_K_M via llama.cpp + Metal
+- **Polish (optional)**: Qwen 3.5 4B Q6_K via llama.cpp + Metal
 - **Shell**: AppKit single binary (no Tauri / Electron)
 - **Text injection**: `CGEventKeyboardSetUnicodeString` keystroke
 
@@ -58,12 +58,11 @@ PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
 
 
 
-Flip Polish to On in Settings. Fetch the Qwen GGUF (see
-`bench/README.md` for the one-liner) into
-`~/Library/Application Support/com.parakeet.rs/llm/qwen3.5-2b-q4_k_m/`.
-Polish strips fillers, fixes punctuation, honours inline commands
-("new paragraph", "scratch that"); adds ~550 ms wall-clock but streams
-to the cursor on word boundaries.
+Flip Polish to On in Settings; the Qwen GGUF (3.5 GB) downloads
+automatically on first enable. Polish strips fillers, fixes
+punctuation, honours inline commands ("new paragraph", "scratch
+that"); adds wall-clock latency but streams to the cursor on word
+boundaries.
 
 ## Caveats
 
@@ -100,13 +99,12 @@ Architectural rationale lives in [`docs/ADR.md`](docs/ADR.md) (decisions
 
 ```bash
 cargo build --release && scripts/make-app.sh
-cargo test                                       # 77 unit tests
+cargo test                                       # 79 unit tests
 cargo clippy --all-targets --no-deps             # clean
 ```
 
 ## Roadmap
 
-- Auto-download the polish GGUF on first toggle-on (currently manual).
 - Wire keyboard shortcut customization into the Settings UI.
 
 ## License
@@ -115,4 +113,4 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
 at your option (Rust ecosystem convention).
 
 Runtime-downloaded models ship under their own licenses: Parakeet TDT
-0.6B v3 (NVIDIA), Silero VAD (MIT), Qwen 3.5 2B Instruct (Apache-2.0).
+0.6B v3 (NVIDIA), Silero VAD (MIT), Qwen 3.5 4B Instruct (Apache-2.0).

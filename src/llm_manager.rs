@@ -15,7 +15,7 @@
 //! finalising it, racing it against a user-driven `disable()`. It does
 //! NOT own the actual loader (the GGUF mmap + Metal init); the caller
 //! passes a `Result<Arc<dyn PolishBackend>>` into `finalize_load`.
-//! That keeps the manager testable without a real 1.2 GB model on
+//! That keeps the manager testable without a real 3.5 GB model on
 //! disk.
 
 use std::sync::Arc;

@@ -397,22 +397,7 @@ impl App {
         let model_dir = self.settings.model_dir();
         let vad_path = self.settings.vad_path();
 
-        let on_progress: model_fetch::ProgressFn = Arc::new(|p| match p {
-            Progress::Status(s) => menubar::set_status_text(&s),
-            Progress::Chunk {
-                file,
-                bytes,
-                total,
-                fraction,
-            } => {
-                let pct = (fraction * 100.0) as u32;
-                menubar::set_status_text(&format!(
-                    "{file}: {} / {} ({pct}%)",
-                    fmt_bytes(bytes),
-                    fmt_bytes(total)
-                ));
-            }
-        });
+        let on_progress: model_fetch::ProgressFn = Arc::new(fetch_progress_to_menubar);
 
         if !self.settings.model_present() {
             if let Err(e) =
@@ -467,7 +452,7 @@ impl App {
 
         // Polish LLM loads in a second pass, ONLY if polish is
         // enabled in settings. Skipping when off means a fresh install
-        // doesn't pay 1.2 GB of resident memory for a feature the user
+        // doesn't pay 3.5 GB of resident memory for a feature the user
         // hasn't turned on. Settings-UI toggle (Off → On) re-triggers
         // a load via `apply_settings` → `handle_polish_mode_change`.
         if matches!(self.settings.load().polish_mode, PolishMode::On) {
@@ -484,7 +469,7 @@ impl App {
     /// Single-flight via `llm_loading: Mutex<bool>` — without that gate
     /// a rapid toggle (boot still loading + user flips Off→On) could
     /// fire two concurrent loads racing to write `llm`, each holding
-    /// 1.2 GB of GGUF weights resident.
+    /// 3.5 GB of GGUF weights resident.
     pub async fn spawn_llm_setup(self: Arc<Self>) {
         if !matches!(self.llm.try_claim_load(), LoadClaim::Claimed) {
             return;
@@ -530,7 +515,7 @@ impl App {
     }
 
     /// Settings-UI polish toggle hook. On→Off drops the loaded model
-    /// (releases the 1.2 GB of weights); Off→On spawns a worker thread
+    /// (releases the 3.5 GB of weights); Off→On spawns a worker thread
     /// to load + warm, guarded by `LlmManager::try_claim_load`. Called
     /// from `apply_settings` when `polish_mode` changes.
     fn handle_polish_mode_change(self: &Arc<Self>, new_mode: PolishMode) {
@@ -573,13 +558,25 @@ impl App {
 fn load_llm_blocking(settings: &SettingsStore) -> anyhow::Result<Arc<dyn PolishBackend>> {
     let model_path = settings.polish_model_path();
     if !settings.polish_model_present() {
-        // TODO: extend model_fetch.rs to pull the GGUF on first
-        // toggle-on. Today the user has to download the file
-        // manually — `bench/README.md` documents the one-liner.
-        anyhow::bail!(
-            "polish model missing at {} — fetch the GGUF and toggle Polish again",
-            model_path.display()
-        );
+        // First enable: auto-fetch the GGUF (~3.5 GB). Both callers run
+        // on a dedicated blocking thread (`tokio::spawn_blocking` on the
+        // boot path, supervised `std::thread` on the toggle path), so
+        // driving the async downloader with a throwaway current-thread
+        // runtime here is safe and keeps a single wiring point for both.
+        // The caller's load-slot claim means toggle-spam can't start two
+        // concurrent downloads; on failure the slot finalizes as Failed
+        // and a later toggle retries (the .part cleanup in `download_to`
+        // guarantees no corrupt leftover).
+        use anyhow::Context as _;
+        let on_progress: model_fetch::ProgressFn = Arc::new(fetch_progress_to_menubar);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("building polish-download runtime")?
+            .block_on(model_fetch::ensure_polish_model(&model_path, on_progress))
+            .with_context(|| {
+                format!("auto-downloading polish model to {}", model_path.display())
+            })?;
     }
     menubar::set_status_text("Loading polish model…");
     let llm = LlamaPolish::load(&model_path)?;
@@ -814,6 +811,28 @@ pub fn effective_trigger_mode(s: &Settings) -> TriggerMode {
         TriggerMode::Hold
     } else {
         s.trigger_mode
+    }
+}
+
+/// Shared download-progress sink: routes `model_fetch::Progress` events
+/// (ASR first-run fetch AND polish first-enable fetch) to the menubar
+/// status text.
+fn fetch_progress_to_menubar(p: Progress) {
+    match p {
+        Progress::Status(s) => menubar::set_status_text(&s),
+        Progress::Chunk {
+            file,
+            bytes,
+            total,
+            fraction,
+        } => {
+            let pct = (fraction * 100.0) as u32;
+            menubar::set_status_text(&format!(
+                "{file}: {} / {} ({pct}%)",
+                fmt_bytes(bytes),
+                fmt_bytes(total)
+            ));
+        }
     }
 }
 

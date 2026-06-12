@@ -18,11 +18,11 @@ ADRs target. Update whenever the code lands or a measurement is taken.
 |---|---|---|---|
 | End-of-speech → text appears | **press-once + Silero VAD auto-stop** wired (`streamer.rs`); 16 kHz resample inline; offline encoder runs at 7.8x RTFx on M5 Pro, so a 5 s utterance finalizes in ~640 ms after EoS | **<1 s p50 with WER ≤ 2% (revised)** — was <200 ms but retired after streaming-Parakeet survey found no viable substitute (see ADR-0009) | nothing for the revised target |
 | Recognition acceleration | **CoreML EP linked AND engaged.** `sherpa-onnx-sys` set to `shared` linkage; `libonnxruntime.1.24.4.dylib` exports `OrtSessionOptionsAppendExecutionProvider_CoreML` (verified by `nm -gU`); `build.rs` symbol check is green; the **2 s warmup decode runs at 7.8x real time**, well above the 2x CoreML floor that signals CPU fallback. ANE/GPU is in use. | CoreML EP routes ops to ANE / Metal / CPU per-op | **none — ADR-0012 + ADR-0015 fully shipped.** |
-| Resident set | ~800 MB (640 MB mmap'd ASR model + ORT arenas + audio buffers); +~1.6 GB when polish is On (Qwen 3.5 2B Q4 weights + KV cache); ~50 MB bundled dylibs | ≤2.5 GB steady state with polish On | none — ADR-0016 + ADR-0018 shipped |
+| Resident set | ~800 MB (640 MB mmap'd ASR model + ORT arenas + audio buffers); +~4 GB when polish is On (Qwen 3.5 4B Q6_K weights + KV cache); ~50 MB bundled dylibs | ≤5 GB steady state with polish On (revised with the 4B bump, ADR-0018 amendment) | none — ADR-0016 + ADR-0018 shipped |
 | Settings window | Native `NSWindow` opened from menubar "Settings…" (`src/settings_ui.rs`); `orderFrontRegardless` so it surfaces above other apps | native, on-demand | none — shipped |
 | Menubar UX | SF Symbols (`mic` / `mic.fill` / `arrow.down.circle`) via `objc2_app_kit::NSImage`; state-reflective menu labels | HIG-conformant template image with state | none — shipped |
 | Paste path | `CGEventKeyboardSetUnicodeString` synthetic keystroke at `AnnotatedSession` tap layer (`src/ax_paste.rs`) | no clipboard mutation; works in terminals, browsers, native, Electron, IDEs | none — [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) shipped, supersedes ADR-0011 |
-| Smart formatting | In-process LLM polish pass: Qwen 3.5 2B Q4_K_M via llama-cpp-2 + Metal (`src/polish.rs`); opt-in via Settings → Polish → On | optional local polish, streaming output to cursor on word boundaries | none — [ADR-0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) shipped |
+| Smart formatting | In-process LLM polish pass: Qwen 3.5 4B Q6_K via llama-cpp-2 + Metal (`src/polish.rs`); opt-in via Settings → Polish → On | optional local polish, streaming output to cursor on word boundaries | none — [ADR-0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) shipped + amended (4B bump) |
 
 **Foundational dependency cleared.** The CoreML EP blocker that gated
 almost every other ADR was resolved by the [ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage)
@@ -902,13 +902,12 @@ tools (Wispr Flow, etc.) deliver their <700 ms feel.
   `CGEventKeyboardSetUnicodeString` keystrokes (ADR-0019), one
   word-boundary-batched chunk per LLM emission burst. No clipboard,
   no AX, no flicker.
-- **Open: model file management.** ~1.22 GB download on first
-  polish-enable, expected at
-  `~/Library/Application Support/com.parakeet.rs/llm/qwen3.5-2b-q4_k_m/`.
-  In-app download is **not** wired up — `load_llm_blocking` bails
-  with a clear error if the file is missing; the user has to fetch
-  manually (`bench/README.md` has the one-liner). Re-use the
-  `model_fetch.rs` pattern from Parakeet's first-run flow.
+- ~~Open: model file management.~~ Resolved 2026-06-11 alongside the
+  4B bump — `model_fetch::ensure_polish_model` auto-downloads the
+  GGUF on first polish-enable (same `.part`-validate-rename flow as
+  the ASR first-run fetch), wired into `load_llm_blocking` so the
+  boot and Settings-toggle paths share it. A settings-test pins the
+  download URL's filename to `Settings::polish_model_path`.
 
 **References.**
 
@@ -919,6 +918,39 @@ tools (Wispr Flow, etc.) deliver their <700 ms feel.
 - [llama-cpp-2 crate](https://crates.io/crates/llama-cpp-2)
 - [Qwen 3.5 vs Gemma 4 size-matched benchmarks — Maniac](https://www.maniac.ai/blog/qwen-3-5-vs-gemma-4-benchmarks-by-size)
 - [Qwen3 quantization empirical study (arxiv)](https://arxiv.org/html/2505.02214v1)
+
+**Amendment (2026-06-11): model bumped to Qwen 3.5 4B Q6_K.**
+
+The shipped 2B's instruction-following misses were the polish pass's
+dominant quality complaint: paraphrasing, over-deleting legitimate
+"like", fumbling `scratch that`. With the disk budget relaxed from
+<2 GB to ≤5 GB, the swap went to
+[`unsloth/Qwen3.5-4B-GGUF`](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF)
+→ `Qwen3.5-4B-Q6_K.gguf` (3.53 GB). Same family ⇒ the ChatML +
+`/no_think` template, tail-strip, and `PolishBackend` plumbing carry
+over unchanged; only `Settings::polish_model_path` moved.
+
+Why 4B Q6_K and not the alternatives:
+
+- **9B**: every 4-bit quant exceeds 5 GB (Q4_K_S 5.39 GB); only Q3
+  fits, which re-enters the small-model quant-degradation curve this
+  ADR already rejected. Decode would also drop to ~30 tok/s.
+- **4B at Q4_K_M (2.74 GB)**: fits easily, but the relaxed budget
+  buys Q6_K's negligible-loss quant for free.
+- **Other families (Llama 3.3 8B, Phi-4-mini, Mistral)**: nothing
+  at ≤5 GB clearly beats Qwen3.5-4B on instruction following, and
+  all cost chat-template migration + no-think revalidation.
+- **Apple Foundation Models (WWDC26 AFM 3)**: zero-download wildcard;
+  Swift-only API needs an `@objc` shim dylib. Tracked as a possible
+  second `PolishBackend`, not a blocker for this bump.
+
+Measured on the same harness (`bench/README.md` §6 follow-up):
+total p50 550 ms → 1225 ms, decode 100 → 43 tok/s, TTFT 29 ms.
+Streaming paste (ADR-0019) keeps perceived latency at
+time-to-first-words, so the 2.2× wall-clock cost lands after the
+user already sees text flowing. Resident memory with polish On rises
+~1.6 GB → ~4 GB (weights + KV); the steady-state budget row at the
+top of this file is updated accordingly.
 
 ---
 

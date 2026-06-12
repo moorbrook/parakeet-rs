@@ -202,6 +202,7 @@ fn run_one(
         out_tokens,
         ttft,
         gen_time,
+        truncated,
     } = polish::generate(backend, model, prompt, &PROD_GENERATE_CONFIG, |piece| {
         if show_output {
             output_buf.push_str(piece);
@@ -226,7 +227,7 @@ fn run_one(
     log::info!(
         "llm_timer session_id={sid} model={model_tag} prompt_tokens={prompt_tokens} \
          out_tokens={out_tokens} ttft_ms={ttft_ms} gen_ms={gen_ms} \
-         total_ms={total_ms} tokens_per_s={tokens_per_s:.1}"
+         total_ms={total_ms} tokens_per_s={tokens_per_s:.1} truncated={truncated}"
     );
 
     if show_output {

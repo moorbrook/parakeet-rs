@@ -17,6 +17,11 @@ const HF_REPO: &str =
     "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main";
 const SILERO_VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
+/// Polish-pass GGUF (ADR-0018, amended to the 4B). MUST stay in sync
+/// with `Settings::polish_model_path` — the filename at the end of
+/// this URL is the filename the loader expects on disk.
+pub(crate) const POLISH_GGUF_URL: &str =
+    "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q6_K.gguf";
 
 /// Parakeet TDT triplet + tokens, all relative to the per-model dir.
 /// `pub(crate)` so `settings.rs`'s tests can cross-check that this list
@@ -83,6 +88,28 @@ pub async fn ensure_model(
     }
 
     on_progress(Progress::Status("Model ready.".to_string()));
+    Ok(())
+}
+
+/// First-toggle-on download of the polish GGUF (~3.5 GB) to the path
+/// `Settings::polish_model_path` expects. No-op if already on disk.
+/// Shares `download_to`'s .part-then-rename + length-validation flow,
+/// so a killed download or short read redownloads cleanly next time
+/// instead of leaving a corrupt GGUF the loader chokes on.
+pub async fn ensure_polish_model(dest: &Path, on_progress: ProgressFn) -> Result<()> {
+    if dest.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    on_progress(Progress::Status(
+        "Downloading polish model (~3.5 GB, first enable only)…".to_string(),
+    ));
+    download_to("Qwen3.5-4B-Q6_K.gguf", POLISH_GGUF_URL, dest, &on_progress)
+        .await
+        .context("downloading polish GGUF")?;
+    on_progress(Progress::Status("Polish model ready.".to_string()));
     Ok(())
 }
 
@@ -176,6 +203,20 @@ mod tests {
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
         );
     }
+
+    #[test]
+    fn polish_gguf_url_is_the_unsloth_q6_k_upload() {
+        // Changing this URL silently changes what every user's first
+        // toggle-on downloads — 3.5 GB. Catch it in review.
+        assert_eq!(
+            POLISH_GGUF_URL,
+            "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q6_K.gguf"
+        );
+    }
+
+    // The URL-filename ↔ `polish_model_path` filename cross-check lives
+    // in `settings::tests` (next to the equivalent ASR_FILES check) so
+    // it can build a synthetic `SettingsStore` without a real `$HOME`.
 
     #[test]
     fn asr_files_list_has_no_duplicates() {

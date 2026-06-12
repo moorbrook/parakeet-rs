@@ -33,7 +33,7 @@ pub enum TriggerMode {
 /// strip filler words, fix punctuation, and honour inline editing commands
 /// (e.g. "new paragraph", "scratch that").
 ///
-/// v1 ships a single backend: Qwen 3.5 2B Q4_K_M via in-process
+/// Ships a single backend: Qwen 3.5 4B Q6_K via in-process
 /// `llama-cpp-2` (Metal on Apple Silicon). See [ADR-0018](../docs/ADR.md).
 /// No `polish_model` setting — the model is fixed at the backend's
 /// expected path and changing it requires a code change, not a config
@@ -44,7 +44,7 @@ pub enum PolishMode {
     /// No post-processing; paste the raw ASR transcript.
     #[default]
     Off,
-    /// In-process Qwen 3.5 2B Q4_K_M via `llama-cpp-2` Metal backend.
+    /// In-process Qwen 3.5 4B Q6_K via `llama-cpp-2` Metal backend.
     On,
 }
 
@@ -200,19 +200,19 @@ impl SettingsStore {
     }
 
     /// Polish-pass GGUF weights path. Expected to live in the same
-    /// per-bundle data directory as the ASR model. The download isn't
-    /// wired up yet — `load_llm_blocking` bails with a clear error if
-    /// the file is missing, and the user has to grab it manually (see
-    /// `bench/README.md` for the one-liner). v1 ships exactly one
-    /// supported model (Qwen 3.5 2B Q4_K_M) — see
-    /// [ADR-0018](../../docs/ADR.md). The directory + filename are
-    /// fixed; changing them requires a model-fetch update, not a
-    /// settings change.
+    /// per-bundle data directory as the ASR model. Auto-downloaded by
+    /// `model_fetch::ensure_polish_model` on first polish-enable (the
+    /// `polish_gguf_url_filename_matches_polish_model_path` test pins
+    /// URL ↔ path sync). Exactly one model is supported (Qwen 3.5 4B
+    /// Q6_K, 3.53 GB; chosen over the original 2B Q4_K_M for
+    /// instruction-following quality) — see [ADR-0018](../../docs/ADR.md).
+    /// The directory + filename are fixed; changing them requires a
+    /// model-fetch update, not a settings change.
     pub fn polish_model_path(&self) -> PathBuf {
         self.data_dir
             .join("llm")
-            .join("qwen3.5-2b-q4_k_m")
-            .join("Qwen3.5-2B-Q4_K_M.gguf")
+            .join("qwen3.5-4b-q6_k")
+            .join("Qwen3.5-4B-Q6_K.gguf")
     }
 
     /// True iff the polish-pass GGUF is on disk. The polish loader
@@ -311,6 +311,22 @@ mod tests {
     }
 
     #[test]
+    fn polish_gguf_url_filename_matches_polish_model_path() {
+        // The auto-downloader (`model_fetch::ensure_polish_model`) writes
+        // to `polish_model_path`; if the URL's trailing filename drifts
+        // from this path's filename, the fetch succeeds but the loader
+        // still reports "model missing" — a 3.5 GB download to nowhere.
+        let url_file = crate::model_fetch::POLISH_GGUF_URL
+            .rsplit('/')
+            .next()
+            .unwrap();
+        let store = synthetic_store(tempfile::tempdir().unwrap().keep());
+        let path = store.polish_model_path();
+        let path_file = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(url_file, path_file);
+    }
+
+    #[test]
     fn polish_model_path_lives_under_data_dir() {
         // The polish GGUF cache layout is a shipped invariant — a
         // launch that changes this strands existing users' downloads.
@@ -322,8 +338,8 @@ mod tests {
             store
                 .data_dir()
                 .join("llm")
-                .join("qwen3.5-2b-q4_k_m")
-                .join("Qwen3.5-2B-Q4_K_M.gguf")
+                .join("qwen3.5-4b-q6_k")
+                .join("Qwen3.5-4B-Q6_K.gguf")
         );
     }
 

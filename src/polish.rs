@@ -2,7 +2,7 @@
 //!
 //! Sits between `Asr::recognize()` and `paste::deliver()` in the dictation
 //! pipeline. Takes the raw ASR transcript and (when enabled) cleans it
-//! through a local Qwen 3.5 2B Q4_K_M model running on llama.cpp's Metal
+//! through a local Qwen 3.5 4B Q6_K model running on llama.cpp's Metal
 //! backend to:
 //!
 //! - strip filler words (`um`, `uh`, `you know`, `like`),
@@ -68,11 +68,14 @@ Rules:\n\
 #[derive(Clone, Copy, Debug)]
 pub struct GenerateConfig {
     /// KV-cache context size in tokens. Prompt + max output must fit.
-    /// System prompt (~250 tokens) + a 30 s dictation transcript
-    /// (~500 tokens) + `max_output_tokens` ≈ 1024.
+    /// System prompt (~250 tokens) + up to ~1 minute of dictation
+    /// (~1000 tokens) + `max_output_tokens` ≤ 2048.
     pub ctx_size: u32,
     /// Hard cap on generated tokens. Bounds worst-case latency and acts
-    /// as a safety brake against runaway generation.
+    /// as a safety brake against runaway generation. Polish output is
+    /// roughly the same length as its input, so this must comfortably
+    /// exceed the longest supported transcript — a cap below the input
+    /// size silently truncates the user's dictation mid-sentence.
     pub max_output_tokens: i32,
 }
 
@@ -81,7 +84,11 @@ pub struct GenerateConfig {
 /// `bench/polish-backends.csv` numbers cited in ADR-0018.
 pub const PROD_GENERATE_CONFIG: GenerateConfig = GenerateConfig {
     ctx_size: 2048,
-    max_output_tokens: 256,
+    // 768 covers ~45 s of dictation output (output ≈ input length).
+    // The old 256 cap truncated anything past ~20 s of speech with no
+    // error — the generate loop just stopped and the truncated text
+    // pasted as if complete.
+    max_output_tokens: 768,
 };
 
 /// Timing + token counts from one [`generate`] call. Bench code emits
@@ -98,6 +105,11 @@ pub struct GenerateOutcome {
     pub ttft: Duration,
     /// Wall-clock spent in the sampler/decode loop (post-prefill).
     pub gen_time: Duration,
+    /// Generation stopped because it hit `max_output_tokens` rather
+    /// than the model's end-of-sequence token. The emitted text is
+    /// almost certainly cut off mid-sentence; callers must surface
+    /// this rather than present the output as complete.
+    pub truncated: bool,
 }
 
 /// Seam between [`crate::app::App`] and the in-process inference engine.
@@ -207,6 +219,17 @@ impl PolishBackend for LlamaPolish {
         }
         if outcome.out_tokens == 0 {
             return Err(anyhow!("polish model produced no output"));
+        }
+        // Flush first (the tail is still valid text), THEN report the
+        // truncation. `deliver_cleaned` keeps already-streamed output
+        // on error and tells the user via status text — far better
+        // than pasting a mid-sentence cutoff as if it were complete.
+        if outcome.truncated {
+            return Err(anyhow!(
+                "polish output truncated at {} tokens (no end-of-sequence); \
+                 transcript may be longer than the polish output cap",
+                outcome.out_tokens
+            ));
         }
         Ok(())
     }
@@ -368,8 +391,10 @@ where
     // Greedy sampling: deterministic, repeatable. The polish task
     // wants exact output, not creative variation; greedy also gives
     // the cleanest tokens/sec since there's no temperature overhead.
-    let mut sampler =
-        LlamaSampler::chain_simple([LlamaSampler::dist(1234), LlamaSampler::greedy()]);
+    // No `dist` in the chain — a trailing greedy selector overrides
+    // whatever an earlier `dist` picked, so chaining both is just a
+    // misleading no-op.
+    let mut sampler = LlamaSampler::greedy();
 
     let mut decoder = encoding_rs::UTF_8.new_decoder();
     let mut n_cur = batch.n_tokens();
@@ -389,10 +414,12 @@ where
     // iterations and the last `batch.add(token, n_cur, ...)` writes at
     // `n_cur == prompt_tokens + max_output_tokens` — at the maximum
     // config that's `ctx_size`, one past the last valid KV slot.
+    let mut hit_eog = false;
     while n_cur < max_total {
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
         if model.is_eog_token(token) {
+            hit_eog = true;
             break;
         }
         let piece = model
@@ -413,6 +440,7 @@ where
         out_tokens: n_decode,
         ttft,
         gen_time,
+        truncated: !hit_eog,
     })
 }
 
@@ -421,14 +449,17 @@ where
 /// trace; pre-filling `<think></think>` empty on the assistant side
 /// usually suffices, but the model occasionally echoes the directive
 /// — sometimes literally as `/no_think`, sometimes "cleaned" into
-/// natural-language variants like `No think.` or `no think`. Tail
-/// strip is case-insensitive and chews through trailing punctuation
-/// in both directions (before and after the matched suffix).
+/// natural-language variants like `No think.` or `no think`. Matching
+/// is case-insensitive and looks past trailing punctuation, but the
+/// punctuation the SPEAKER's sentence ends with is preserved: only
+/// the directive echo and its own surrounding separators are removed.
+/// Without a directive match, the output passes through with just
+/// trailing whitespace trimmed — eagerly eating terminal punctuation
+/// here used to delete the final period of every single dictation.
 fn strip_no_think_tail(s: &str) -> &str {
     const TERMINAL: &[char] = &[
         ' ', '\t', '\n', '\r', '.', '!', '?', ',', ';', ':',
     ];
-    let trimmed = s.trim_end_matches(TERMINAL);
     const SUFFIXES: &[&str] = &[
         "/no_think",
         "/no think",
@@ -437,12 +468,16 @@ fn strip_no_think_tail(s: &str) -> &str {
         "/nothink",
         "nothink",
     ];
+    let match_zone = s.trim_end_matches(TERMINAL);
     for suffix in SUFFIXES {
-        if let Some(stripped) = strip_suffix_ascii_ci(trimmed, suffix) {
-            return stripped.trim_end_matches(TERMINAL);
+        if let Some(stripped) = strip_suffix_ascii_ci(match_zone, suffix) {
+            // Trim only whitespace before the matched directive — the
+            // char preceding it may be the sentence's legitimate
+            // terminal punctuation ("Hello, world. /no_think").
+            return stripped.trim_end();
         }
     }
-    trimmed
+    s.trim_end()
 }
 
 /// ASCII case-insensitive suffix strip. Returns `Some(prefix)` if
@@ -545,11 +580,12 @@ mod tests {
     fn strip_no_think_tail_handles_directive_variants() {
         // The Qwen `/no_think` directive bleeds into the model's
         // output in several shapes. All must be stripped from the
-        // tail; the prefix must survive intact.
-        assert_eq!(strip_no_think_tail("Hello, world. /no_think"), "Hello, world");
-        assert_eq!(strip_no_think_tail("Hello. /no_think."), "Hello");
+        // tail; the prefix — INCLUDING its terminal punctuation —
+        // must survive intact.
+        assert_eq!(strip_no_think_tail("Hello, world. /no_think"), "Hello, world.");
+        assert_eq!(strip_no_think_tail("Hello. /no_think."), "Hello.");
         assert_eq!(strip_no_think_tail("Hello no_think"), "Hello");
-        assert_eq!(strip_no_think_tail("Hello. No think."), "Hello");
+        assert_eq!(strip_no_think_tail("Hello. No think."), "Hello.");
         assert_eq!(strip_no_think_tail("Hello no think"), "Hello");
         assert_eq!(strip_no_think_tail("Hello nothink"), "Hello");
         assert_eq!(strip_no_think_tail("Hello /nothink"), "Hello");
@@ -557,12 +593,19 @@ mod tests {
         assert_eq!(strip_no_think_tail("Hello NO_THINK"), "Hello");
         assert_eq!(strip_no_think_tail("Hello /No_Think."), "Hello");
         // Stripping doesn't consume legitimate content
-        assert_eq!(strip_no_think_tail("Don't think about it."), "Don't think about it");
+        assert_eq!(
+            strip_no_think_tail("Don't think about it."),
+            "Don't think about it."
+        );
         // Multi-byte chars in the prefix don't trip char-boundary checks
         assert_eq!(strip_no_think_tail("héllo /no_think"), "héllo");
-        // Empty / no-match passes through (with trailing punct trimmed)
+        // No directive: output passes through untouched except trailing
+        // whitespace. Eating the final period here was a real bug —
+        // every dictation lost its terminal punctuation.
         assert_eq!(strip_no_think_tail(""), "");
-        assert_eq!(strip_no_think_tail("Hello."), "Hello");
+        assert_eq!(strip_no_think_tail("Hello."), "Hello.");
+        assert_eq!(strip_no_think_tail("Did it work?"), "Did it work?");
+        assert_eq!(strip_no_think_tail("Hello.\n"), "Hello.");
     }
 
     #[test]
@@ -769,9 +812,12 @@ mod tests {
 
     #[test]
     fn prod_generate_config_constants_match_documented_budget() {
-        // The latency-plan §6 acceptance numbers assume these exact
-        // values. A drift here invalidates the bench/ADR-0018 evidence.
+        // ctx_size 2048 matches the latency-plan §6 / ADR-0018 bench
+        // setup. max_output_tokens was raised 256 → 768 after the cap
+        // was found to silently truncate dictations past ~20 s (polish
+        // output ≈ input length, and a 30 s transcript alone is ~500
+        // tokens).
         assert_eq!(PROD_GENERATE_CONFIG.ctx_size, 2048);
-        assert_eq!(PROD_GENERATE_CONFIG.max_output_tokens, 256);
+        assert_eq!(PROD_GENERATE_CONFIG.max_output_tokens, 768);
     }
 }

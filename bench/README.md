@@ -81,6 +81,43 @@ Replay:
 
 Background and library-selection rationale: [ADR-0018](../docs/ADR.md#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m).
 
+## §6 follow-up: Qwen 3.5 4B Q6_K (2026-06-11, M5 Pro 24 GB) — shipped
+
+The 2B's instruction-following misses (paraphrasing, over-deleted
+"like", fumbled `scratch that`) motivated a bump to **Qwen3.5-4B at
+Q6_K** (3.53 GB) — same family, so the ChatML + `/no_think` template
+carries over unchanged. See the ADR-0018 amendment.
+
+Fetch one-liner:
+
+```bash
+mkdir -p ~/Library/Application\ Support/com.parakeet.rs/llm/qwen3.5-4b-q6_k && \
+curl -L -o ~/Library/Application\ Support/com.parakeet.rs/llm/qwen3.5-4b-q6_k/Qwen3.5-4B-Q6_K.gguf \
+  https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q6_K.gguf
+```
+
+30 reps, same 240-char sample transcript, same `bench_llm` harness:
+
+| Metric | Mean | p50 | p95 |
+|--------|------|-----|-----|
+| TTFT (ms) | 40 | 29 | 33 |
+| Generation (ms) | 1200 | 1197 | 1231 |
+| Total per polish (ms) | 1240 | **1225** | 1262 |
+| Decode (tokens/sec) | 43.3 | 43.4 | 43.8 |
+
+vs the 2B: total p50 550 ms → 1225 ms (2.2×), decode 100 → 43 tok/s.
+Streaming paste (ADR-0019) absorbs the difference — perceived latency
+is time-to-first-words (TTFT 29 ms + first chunks), not last-token.
+No truncations at the 768-token output cap across the run.
+
+Replay:
+
+```bash
+./target/release/bench_llm \
+    --model ~/Library/Application\ Support/com.parakeet.rs/llm/qwen3.5-4b-q6_k/Qwen3.5-4B-Q6_K.gguf \
+    --reps 30 --warmup-reps 3 2> bench/llm-4b-raw.log
+```
+
 ## Files
 
 | Path                         | Purpose                                          |
