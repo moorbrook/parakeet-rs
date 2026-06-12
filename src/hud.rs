@@ -285,41 +285,19 @@ pub fn install(mtm: MainThreadMarker) {
 
         // 7 pill-shaped white bars to the right of the label. Each
         // starts at the minimum height (idle look); the bar tick
-        // animates them while Listening.
+        // animates them while Listening. Each bar is a pastel
+        // iridescent capsule (soap-bubble gradient with a slow
+        // shimmer) — picked over plain glass / labelColor pills from
+        // an animated on-screen comparison (2026-06-11): system glass
+        // bars at this size sample the dark backdrop and read as
+        // shadows, not glass.
         let mut bars: Vec<Retained<NSView>> = Vec::with_capacity(BARS_COUNT);
         for i in 0..BARS_COUNT {
             let x = BARS_ORIGIN_X + (i as f64) * (BAR_WIDTH + BAR_GAP);
             let y = (HUD_H - BAR_HEIGHT_MIN) / 2.0;
             let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_WIDTH, BAR_HEIGHT_MIN));
-            let view: Retained<NSView> = unsafe {
-                let alloc = NSView::alloc(mtm);
-                NSView::initWithFrame(alloc, frame)
-            };
-            unsafe {
-                view.setWantsLayer(true);
-                if let Some(layer) = view.layer() {
-                    // Semantic pill colour — black on light, white on
-                    // dark — at 85% opacity. Reads as "active
-                    // indicator" without overpowering the rest of
-                    // the chrome, whichever appearance the system
-                    // gave the visual-effect material.
-                    //
-                    // The `as *mut c_void` cast is to bypass an
-                    // objc2-version mismatch between
-                    // objc2-app-kit's `Retained<CGColor>` (newer
-                    // objc2) and core-graphics 0.24's `CGColor`
-                    // (older objc2) — both encode as the same C ABI
-                    // pointer, but the Rust types don't unify. The
-                    // runtime only sees the pointer.
-                    let pill_cg = NSColor::labelColor()
-                        .colorWithAlphaComponent(0.85)
-                        .CGColor();
-                    let cg_ptr = Retained::as_ptr(&pill_cg) as *mut std::ffi::c_void;
-                    let _: () = msg_send![&*layer, setBackgroundColor: cg_ptr];
-                    let _: () = msg_send![&*layer, setCornerRadius: BAR_WIDTH / 2.0];
-                }
-                container.addSubview(&view);
-            }
+            let view = make_iridescent_bar(mtm, frame);
+            unsafe { container.addSubview(&view) };
             bars.push(view);
         }
 
@@ -484,6 +462,114 @@ fn reset_bar_heights(hud: Option<&mut Hud>) {
                 NSSize::new(BAR_WIDTH, BAR_HEIGHT_MIN),
             ));
         }
+    }
+}
+
+/// Pastel hue stops for the iridescent bar gradient — a soap-bubble
+/// sweep (cyan → violet → pink → amber → green → cyan) at low
+/// saturation so the bars read as "mother of pearl", not a rainbow
+/// flag. `(hue, saturation)` pairs; brightness 1.0, alpha 0.9.
+const BAR_GRADIENT_STOPS: &[(f64, f64)] = &[
+    (0.55, 0.35),
+    (0.75, 0.30),
+    (0.95, 0.30),
+    (0.12, 0.30),
+    (0.30, 0.30),
+    (0.55, 0.35),
+];
+/// One shimmer sweep duration (autoreversing, repeats forever).
+const BAR_SHIMMER_SECS: f64 = 2.2;
+
+/// Build one waveform bar: a layer-backed capsule filled with a
+/// pastel iridescent `CAGradientLayer`, plus a slow autoreversing
+/// shimmer animating the gradient axis. The gradient layer is sized
+/// to the bar's MAXIMUM height and clipped by the capsule mask, so
+/// the per-tick frame animation in `bar_tick` needs no layer
+/// bookkeeping — growing the bar just reveals more of the gradient.
+///
+/// Respects Reduce Motion: the shimmer animation is skipped (static
+/// pastel gradient) when the accessibility setting is on.
+fn make_iridescent_bar(mtm: MainThreadMarker, frame: NSRect) -> Retained<NSView> {
+    let view: Retained<NSView> = unsafe {
+        let alloc = NSView::alloc(mtm);
+        NSView::initWithFrame(alloc, frame)
+    };
+    unsafe {
+        view.setWantsLayer(true);
+        let Some(root) = view.layer() else {
+            return view;
+        };
+        let _: () = msg_send![&*root, setCornerRadius: BAR_WIDTH / 2.0];
+        let _: () = msg_send![&*root, setMasksToBounds: true];
+
+        // CAGradientLayer with the pastel stops. QuartzCore classes
+        // are looked up at runtime (AppKit links QuartzCore for layer
+        // backing, so they're always present).
+        let grad: Retained<objc2::runtime::NSObject> =
+            msg_send![objc2::class!(CAGradientLayer), layer];
+        let grad_frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(BAR_WIDTH, BAR_HEIGHT_MAX),
+        );
+        let _: () = msg_send![&*grad, setFrame: grad_frame];
+        // colors: NSArray of CGColorRef. Built via NSMutableArray +
+        // raw CGColor pointers — same objc2-version-bridging trick as
+        // the old labelColor pill (the runtime only sees pointers).
+        let colors: Retained<objc2::runtime::NSObject> =
+            msg_send![objc2::class!(NSMutableArray), array];
+        for &(hue, sat) in BAR_GRADIENT_STOPS {
+            let ns = NSColor::colorWithHue_saturation_brightness_alpha(hue, sat, 1.0, 0.9);
+            let cg = ns.CGColor();
+            let cg_ptr = Retained::as_ptr(&cg) as *mut std::ffi::c_void;
+            let _: () = msg_send![&*colors, addObject: cg_ptr];
+        }
+        let _: () = msg_send![&*grad, setColors: &*colors];
+        let _: () = msg_send![&*grad, setStartPoint: NSPoint::new(0.0, 0.0)];
+        let _: () = msg_send![&*grad, setEndPoint: NSPoint::new(1.0, 1.0)];
+        let _: () = msg_send![&*root, addSublayer: &*grad];
+
+        let reduce_motion: bool = msg_send![
+            &*objc2_app_kit::NSWorkspace::sharedWorkspace(),
+            accessibilityDisplayShouldReduceMotion
+        ];
+        if !reduce_motion {
+            add_shimmer(&grad, "startPoint", (0.0, 0.0), (1.0, 0.6), "shimStart");
+            add_shimmer(&grad, "endPoint", (1.0, 1.0), (0.0, 0.4), "shimEnd");
+        }
+    }
+    view
+}
+
+/// Attach an infinite autoreversing CGPoint animation to `layer`,
+/// sweeping `key_path` between `from` and `to` over
+/// [`BAR_SHIMMER_SECS`]. CABasicAnimation runs entirely on the render
+/// server — zero per-frame work on our side.
+fn add_shimmer(
+    layer: &objc2::runtime::NSObject,
+    key_path: &str,
+    from: (f64, f64),
+    to: (f64, f64),
+    key: &str,
+) {
+    unsafe {
+        let anim: Retained<objc2::runtime::NSObject> = msg_send![
+            objc2::class!(CABasicAnimation),
+            animationWithKeyPath: &*NSString::from_str(key_path)
+        ];
+        let from_v: Retained<objc2::runtime::NSObject> = msg_send![
+            objc2::class!(NSValue),
+            valueWithPoint: NSPoint::new(from.0, from.1)
+        ];
+        let to_v: Retained<objc2::runtime::NSObject> = msg_send![
+            objc2::class!(NSValue),
+            valueWithPoint: NSPoint::new(to.0, to.1)
+        ];
+        let _: () = msg_send![&*anim, setFromValue: &*from_v];
+        let _: () = msg_send![&*anim, setToValue: &*to_v];
+        let _: () = msg_send![&*anim, setDuration: BAR_SHIMMER_SECS];
+        let _: () = msg_send![&*anim, setAutoreverses: true];
+        let _: () = msg_send![&*anim, setRepeatCount: f32::INFINITY];
+        let _: () = msg_send![layer, addAnimation: &*anim, forKey: &*NSString::from_str(key)];
     }
 }
 
