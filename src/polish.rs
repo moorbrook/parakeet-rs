@@ -813,4 +813,57 @@ mod tests {
         assert_eq!(PROD_GENERATE_CONFIG.ctx_size, 2048);
         assert_eq!(PROD_GENERATE_CONFIG.max_output_tokens, 768);
     }
+
+    // ── Property tests ──────────────────────────────────────────────
+    //
+    // The example tests above each pin ONE instance of a char-boundary
+    // or tail-strip bug; these properties pin the whole class across
+    // arbitrary unicode input. `\PC*` = any sequence of non-control
+    // chars (multi-byte included).
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Splitting never loses or duplicates bytes: what was emitted
+        /// plus what's still pending is exactly the original string —
+        /// and the function never panics on a mid-codepoint split.
+        #[test]
+        fn flush_safe_prefix_is_lossless(s in "\\PC*", hold in 0usize..32) {
+            let mut pending = s.clone();
+            let mut emitted = String::new();
+            flush_safe_prefix(&mut pending, hold, &mut |c| {
+                emitted.push_str(c);
+                Ok(())
+            })
+            .unwrap();
+            prop_assert_eq!(format!("{emitted}{pending}"), s);
+        }
+
+        /// The look-back contract: after a flush the tail keeps at
+        /// least `hold` bytes (or the whole string when it's shorter),
+        /// so a directive marker arriving in pieces can't slip out.
+        #[test]
+        fn flush_safe_prefix_retains_hold(s in "\\PC*", hold in 0usize..32) {
+            let mut pending = s.clone();
+            flush_safe_prefix(&mut pending, hold, &mut |_| Ok(())).unwrap();
+            prop_assert!(pending.len() >= hold.min(s.len()));
+        }
+
+        /// Tail-stripping only ever removes from the END: the output is
+        /// always a prefix of the input, on a char boundary, no panics.
+        #[test]
+        fn strip_no_think_tail_returns_prefix(s in "\\PC*") {
+            let out = strip_no_think_tail(&s);
+            prop_assert!(s.starts_with(out));
+        }
+
+        /// Inputs that cannot end in a directive variant (forced 'x'
+        /// terminator, no trailing whitespace/punctuation) pass through
+        /// completely untouched — the eager-trim regression fixed in
+        /// 2026-06 stays fixed for every input, not just "Hello.".
+        #[test]
+        fn strip_no_think_tail_no_directive_is_identity(s in "[a-zA-Z0-9 .,!?']*") {
+            let input = format!("{s}x");
+            prop_assert_eq!(strip_no_think_tail(&input), input.as_str());
+        }
+    }
 }

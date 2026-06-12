@@ -218,3 +218,8 @@ encoding_rs = "0.8"
 # Isolated per-test data dirs for SettingsStore tests, so parallel
 # `cargo test` runs don't race on a shared `/tmp/parakeet-test` path.
 tempfile = "3"
+# Property tests for the pure text helpers on the polish path
+# (`flush_safe_prefix`, `strip_no_think_tail`) — the char-boundary and
+# tail-strip logic has a history of off-by-one/punctuation bugs that
+# example tests only catch one instance of at a time.
+proptest = "1"
