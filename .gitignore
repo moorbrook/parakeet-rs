@@ -36,3 +36,4 @@ target/
 
 # Local agent-runtime metadata
 .claude/
+.gstack/

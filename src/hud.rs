@@ -27,9 +27,9 @@ use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSFont, NSPanel, NSScreen, NSTextAlignment, NSTextField, NSView,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSFont, NSGlassEffectView, NSPanel, NSScreen, NSTextAlignment,
+    NSTextField, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+    NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -41,7 +41,12 @@ const HUD_H: f64 = 44.0;
 /// Dock is auto-hidden for many users; 80px clears it comfortably for
 /// "always visible" Dock setups too.
 const BOTTOM_OFFSET: f64 = 80.0;
-const CORNER_RADIUS: f64 = 12.0;
+/// Capsule corner radius (half the HUD height). Liquid Glass favours
+/// capsule shapes for small floating elements — "rounded shapes that
+/// are concentric to their containers" per the Adopting Liquid Glass
+/// guide. The fallback NSVisualEffectView chrome uses the same radius
+/// so the silhouette is identical on macOS < 26.
+const CORNER_RADIUS: f64 = HUD_H / 2.0;
 
 // --- Waveform bars (Listening-state only) ---
 //
@@ -169,41 +174,62 @@ pub fn install(mtm: MainThreadMarker) {
             panel.setReleasedWhenClosed(false);
         }
 
-        // Content chrome: `NSVisualEffectView` with the HUD material.
-        // Auto-adapts to light / dark mode, respects Increase Contrast
-        // and Reduce Transparency in System Settings → Accessibility.
-        // Replaces the previous hand-rolled CALayer setBackgroundColor
-        // approach (hardcoded RGB, ignored every accessibility pref).
-        //
-        // Material note: `HUDWindow` used to render its dark variant
-        // in both system appearances on older macOS; recent releases
-        // surface the *light* HUDWindow variant when the system is in
-        // Light mode. Label text and bar pills below therefore use
-        // `NSColor::labelColor()` (semantic) instead of `whiteColor()`
-        // — `labelColor` is black on light backgrounds and white on
-        // dark, so the HUD stays legible whichever variant macOS
-        // picks for the material.
-        let effect_view: Retained<NSVisualEffectView> = unsafe {
-            let alloc = NSVisualEffectView::alloc(mtm);
-            NSVisualEffectView::initWithFrame(
-                alloc,
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(HUD_W, HUD_H)),
-            )
+        // Content container: a plain transparent NSView holding the
+        // label + bars. Kept separate from the chrome because
+        // `NSGlassEffectView` only guarantees correct z-order for its
+        // `contentView` property — arbitrary subviews added directly
+        // to the glass view get no placement guarantees.
+        let hud_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(HUD_W, HUD_H));
+        let container: Retained<NSView> = unsafe {
+            let alloc = NSView::alloc(mtm);
+            NSView::initWithFrame(alloc, hud_rect)
         };
-        unsafe {
-            effect_view.setMaterial(NSVisualEffectMaterial::HUDWindow);
-            effect_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
-            effect_view.setState(NSVisualEffectState::Active);
-            // Rounded corners on the effect view's own layer. AppKit
-            // gives `NSVisualEffectView` a backing layer for free
-            // (wantsLayer = true is implicit for this class).
-            if let Some(layer) = effect_view.layer() {
-                let _: () = msg_send![&*layer, setCornerRadius: CORNER_RADIUS];
-                let _: () = msg_send![&*layer, setMasksToBounds: true];
+
+        // Chrome: Liquid Glass (`NSGlassEffectView`) on macOS 26+, per
+        // the Adopting Liquid Glass guide ("Limit these effects to the
+        // most important functional elements" — this floating status
+        // pill is the app's one custom overlay). Capsule corner radius,
+        // default Regular style, no tint (tint is for prominent
+        // interactive elements, not passive status chrome). The glass
+        // material handles light/dark adaptation, Reduce Transparency,
+        // and Increase Contrast system-side.
+        //
+        // Fallback on macOS < 26 (class absent at runtime): the
+        // pre-Tahoe `NSVisualEffectView` HUDWindow material with the
+        // same capsule silhouette. Label text and bar pills use
+        // `NSColor::labelColor()` (semantic) in both paths — black on
+        // light chrome, white on dark — so legibility holds whichever
+        // variant the system renders.
+        let glass_available = objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some();
+        if glass_available {
+            let glass: Retained<NSGlassEffectView> = {
+                let alloc = NSGlassEffectView::alloc(mtm);
+                NSGlassEffectView::initWithFrame(alloc, hud_rect)
+            };
+            unsafe {
+                glass.setCornerRadius(CORNER_RADIUS);
+                glass.setContentView(Some(&container));
+                panel.setContentView(Some(&glass));
             }
-            // Use the effect view as the panel's content. The label
-            // becomes its only subview.
-            panel.setContentView(Some(&effect_view));
+        } else {
+            let effect_view: Retained<NSVisualEffectView> = unsafe {
+                let alloc = NSVisualEffectView::alloc(mtm);
+                NSVisualEffectView::initWithFrame(alloc, hud_rect)
+            };
+            unsafe {
+                effect_view.setMaterial(NSVisualEffectMaterial::HUDWindow);
+                effect_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+                effect_view.setState(NSVisualEffectState::Active);
+                // Rounded corners on the effect view's own layer. AppKit
+                // gives `NSVisualEffectView` a backing layer for free
+                // (wantsLayer = true is implicit for this class).
+                if let Some(layer) = effect_view.layer() {
+                    let _: () = msg_send![&*layer, setCornerRadius: CORNER_RADIUS];
+                    let _: () = msg_send![&*layer, setMasksToBounds: true];
+                }
+                effect_view.addSubview(&container);
+                panel.setContentView(Some(&effect_view));
+            }
         }
 
         // Label takes the left portion of the HUD; bars go in the right
@@ -227,7 +253,7 @@ pub fn install(mtm: MainThreadMarker) {
             label.setFont(Some(&font));
             label.setDrawsBackground(false);
             label.setBordered(false);
-            effect_view.addSubview(&label);
+            container.addSubview(&label);
         }
 
         // 7 pill-shaped white bars to the right of the label. Each
@@ -265,7 +291,7 @@ pub fn install(mtm: MainThreadMarker) {
                     let _: () = msg_send![&*layer, setBackgroundColor: cg_ptr];
                     let _: () = msg_send![&*layer, setCornerRadius: BAR_WIDTH / 2.0];
                 }
-                effect_view.addSubview(&view);
+                container.addSubview(&view);
             }
             bars.push(view);
         }

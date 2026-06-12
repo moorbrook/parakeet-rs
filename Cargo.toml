@@ -190,7 +190,8 @@ objc2-app-kit = { version = "0.3", features = [
     "NSColor",                 # Label colors, panel chrome
     "NSFont",                  # Settings hint text
     "NSText",                  # NSTextAlignment
-    "NSVisualEffectView",      # HUD chrome (replaces hand-rolled CALayer bg)
+    "NSVisualEffectView",      # HUD chrome fallback on macOS < 26
+    "NSGlassEffectView",       # HUD chrome: Liquid Glass on macOS 26+
     "NSAlert",                 # NSAlertStyle, permissions UI
     "NSWorkspace",
     "block2",
