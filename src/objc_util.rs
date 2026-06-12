@@ -70,3 +70,92 @@ pub fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
         dispatch2::DispatchQueue::main().exec_async(f);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Lint-as-test: architectural invariants the compiler can't see.
+
+    /// Every `#[unsafe(method...)]` ObjC selector body must route
+    /// through [`super::selector_guard`]. A Rust panic unwinding across
+    /// ObjC frames is Undefined Behaviour, and this is the kind of rule
+    /// that erodes silently — a new selector added without the guard
+    /// compiles and works fine until the first panic. Walk the source
+    /// and fail the build listing any offender.
+    #[test]
+    fn every_objc_selector_is_panic_guarded() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        // Needle assembled at runtime so this test's own source (and
+        // doc comments quoting the attribute) can't match themselves.
+        let needle = ["#[unsafe(", "method"].concat();
+        for entry in walk_rs_files(&src_dir) {
+            // Strip comment lines: doc comments legitimately mention
+            // the attribute when documenting this very invariant.
+            let text: String = std::fs::read_to_string(&entry)
+                .unwrap()
+                .lines()
+                .map(|l| {
+                    if l.trim_start().starts_with("//") {
+                        ""
+                    } else {
+                        l
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut search_from = 0;
+            while let Some(rel) = text[search_from..].find(&needle) {
+                let attr_at = search_from + rel;
+                let fn_at = text[attr_at..]
+                    .find("fn ")
+                    .map(|i| attr_at + i)
+                    .expect("selector attribute not followed by a fn");
+                let body = fn_body(&text, fn_at);
+                if !body.contains("selector_guard") {
+                    let line = text[..attr_at].matches('\n').count() + 1;
+                    offenders.push(format!("{}:{line}", entry.display()));
+                }
+                search_from = fn_at + 3;
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "ObjC selectors without a selector_guard panic boundary \
+             (panic across ObjC frames is UB):\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// Return the brace-matched body of the fn whose `fn` keyword
+    /// starts at `fn_at`.
+    fn fn_body(text: &str, fn_at: usize) -> &str {
+        let open = text[fn_at..].find('{').map(|i| fn_at + i).unwrap();
+        let mut depth = 0usize;
+        for (i, c) in text[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &text[open..=open + i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        &text[open..]
+    }
+
+    fn walk_rs_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                out.extend(walk_rs_files(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+        out
+    }
+}
