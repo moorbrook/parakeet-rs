@@ -27,12 +27,12 @@
 pub mod app;
 pub mod app_delegate;
 pub mod asr;
-pub mod polish;
 pub mod dictation_fsm;
 pub mod llm_manager;
 pub mod objc_util;
 pub mod performance;
 pub mod permissions;
+pub mod polish;
 pub mod settings;
 pub mod warmup;
 

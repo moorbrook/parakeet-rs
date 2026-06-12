@@ -154,10 +154,7 @@ async fn download_to(label: &str, url: &str, dest: &Path, on_progress: &Progress
     // startup with a corrupt model that no UI path retries. Failed
     // validation removes the .part so the next launch redownloads.
     if total > 0 {
-        let part_size = tokio::fs::metadata(&tmp)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let part_size = tokio::fs::metadata(&tmp).await.map_or(0, |m| m.len());
         if part_size != total {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(anyhow!(

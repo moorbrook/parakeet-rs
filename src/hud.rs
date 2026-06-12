@@ -27,9 +27,9 @@ use dispatch2::{DispatchQueue, DispatchTime};
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSColor, NSFont, NSPanel, NSScreen, NSTextAlignment, NSTextField,
-    NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSBackingStoreType, NSColor, NSFont, NSPanel, NSScreen, NSTextAlignment, NSTextField, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_foundation::{MainThreadMarker, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -210,8 +210,10 @@ pub fn install(mtm: MainThreadMarker) {
         // portion. The label is left-aligned (was Center) so the
         // "● Listening…" text doesn't visually drift away from the bars.
         // BARS_ORIGIN_X is 130; label area is x ∈ [14, 126].
-        let label_frame =
-            NSRect::new(NSPoint::new(14.0, 0.0), NSSize::new(BARS_ORIGIN_X - 18.0, HUD_H));
+        let label_frame = NSRect::new(
+            NSPoint::new(14.0, 0.0),
+            NSSize::new(BARS_ORIGIN_X - 18.0, HUD_H),
+        );
         let label =
             unsafe { NSTextField::labelWithString(&NSString::from_str("Listening…"), mtm) };
         unsafe {
@@ -235,10 +237,7 @@ pub fn install(mtm: MainThreadMarker) {
         for i in 0..BARS_COUNT {
             let x = BARS_ORIGIN_X + (i as f64) * (BAR_WIDTH + BAR_GAP);
             let y = (HUD_H - BAR_HEIGHT_MIN) / 2.0;
-            let frame = NSRect::new(
-                NSPoint::new(x, y),
-                NSSize::new(BAR_WIDTH, BAR_HEIGHT_MIN),
-            );
+            let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_WIDTH, BAR_HEIGHT_MIN));
             let view: Retained<NSView> = unsafe {
                 let alloc = NSView::alloc(mtm);
                 NSView::initWithFrame(alloc, frame)
@@ -259,7 +258,9 @@ pub fn install(mtm: MainThreadMarker) {
                     // (older objc2) — both encode as the same C ABI
                     // pointer, but the Rust types don't unify. The
                     // runtime only sees the pointer.
-                    let pill_cg = NSColor::labelColor().colorWithAlphaComponent(0.85).CGColor();
+                    let pill_cg = NSColor::labelColor()
+                        .colorWithAlphaComponent(0.85)
+                        .CGColor();
                     let cg_ptr = Retained::as_ptr(&pill_cg) as *mut std::ffi::c_void;
                     let _: () = msg_send![&*layer, setBackgroundColor: cg_ptr];
                     let _: () = msg_send![&*layer, setCornerRadius: BAR_WIDTH / 2.0];
@@ -398,8 +399,8 @@ fn bar_tick(my_gen: u64) {
             let centre = (BARS_COUNT - 1) as f32 / 2.0;
             let dist = (i as f32 - centre).abs() / centre;
             let profile = 1.0 - 0.15 * dist;
-            let target =
-                (BAR_HEIGHT_MIN as f32) + (BAR_HEIGHT_MAX - BAR_HEIGHT_MIN) as f32 * level * profile;
+            let target = (BAR_HEIGHT_MIN as f32)
+                + (BAR_HEIGHT_MAX - BAR_HEIGHT_MIN) as f32 * level * profile;
             // Lerp toward target; clamp to [MIN, MAX].
             let smoothed = hud.bar_heights[i] + (target - hud.bar_heights[i]) * BAR_LERP;
             let h = smoothed.clamp(BAR_HEIGHT_MIN as f32, BAR_HEIGHT_MAX as f32);
@@ -450,9 +451,8 @@ pub fn reposition_on_screen(mtm: MainThreadMarker) {
 /// from the bottom. NSScreen returns the visible frame in screen-space
 /// coordinates (bottom-left origin), so we just compute the rect.
 fn position_on_screen(mtm: MainThreadMarker, panel: &HudPanel) {
-    let screen = match NSScreen::mainScreen(mtm) {
-        Some(s) => s,
-        None => return,
+    let Some(screen) = NSScreen::mainScreen(mtm) else {
+        return;
     };
     let visible = screen.visibleFrame();
     let x = visible.origin.x + (visible.size.width - HUD_W) / 2.0;

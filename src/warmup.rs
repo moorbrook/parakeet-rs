@@ -28,7 +28,7 @@ pub fn page_touch(model_path: &Path) -> Result<u64> {
     let mut i = 0;
     while i < bytes.len() {
         // `std::hint::black_box` keeps LLVM from optimising the read away.
-        acc = acc.wrapping_add(std::hint::black_box(bytes[i]) as u64);
+        acc = acc.wrapping_add(u64::from(std::hint::black_box(bytes[i])));
         i += STRIDE;
     }
     Ok(acc)

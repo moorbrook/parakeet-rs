@@ -354,15 +354,9 @@ mod tests {
     fn hold_release_outside_listening_is_ignored() {
         let fsm = DictationFsm::new();
         fsm.set_state(DictationState::Idle);
-        assert!(matches!(
-            fsm.on_release_hold(),
-            HoldReleaseOutcome::Ignored
-        ));
+        assert!(matches!(fsm.on_release_hold(), HoldReleaseOutcome::Ignored));
         fsm.set_state(DictationState::Transcribing);
-        assert!(matches!(
-            fsm.on_release_hold(),
-            HoldReleaseOutcome::Ignored
-        ));
+        assert!(matches!(fsm.on_release_hold(), HoldReleaseOutcome::Ignored));
     }
 
     #[test]

@@ -32,10 +32,12 @@ pub fn performance_core_count() -> i32 {
     }
 }
 
+// The closure can't become `NonZero::get` (what the lint wants): that
+// path form is only stable since 1.79 and MSRV is 1.77 — the lint and
+// `clippy::incompatible_msrv` are in direct conflict here.
+#[allow(clippy::redundant_closure_for_method_calls)]
 fn num_cpus_total() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+    std::thread::available_parallelism().map_or(4, |n| n.get())
 }
 
 /// Tag used at the start of every PhaseTimer log line — the aggregator
@@ -112,7 +114,7 @@ impl PhaseTimer {
 
     fn elapsed_ms(&self) -> u32 {
         // 49 days saturates a u32 ms; we'll never get close on a dictation.
-        self.t0.elapsed().as_millis().min(u32::MAX as u128) as u32
+        self.t0.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
     }
 
     /// Capture-end: AudioCapture buffer was just collected. `audio_s` is
@@ -215,15 +217,13 @@ pub fn next_session_id() -> String {
         // PIDs (common in CI) still diverge.
         let rand = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0);
+            .map_or(0, |d| d.subsec_nanos());
         pid ^ rand
     });
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     format!("{ts:x}-{nonce:x}-{n:04x}")
 }
 

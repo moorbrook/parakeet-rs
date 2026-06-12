@@ -124,11 +124,7 @@ pub trait PolishBackend: Send + Sync {
     /// has already filtered out empty input and the `PolishMode::Off`
     /// short-circuit, so the implementation only handles the "real work"
     /// case.
-    fn polish_into(
-        &self,
-        text: &str,
-        on_chunk: &mut dyn FnMut(&str) -> Result<()>,
-    ) -> Result<()>;
+    fn polish_into(&self, text: &str, on_chunk: &mut dyn FnMut(&str) -> Result<()>) -> Result<()>;
 
     /// Throwaway run to JIT compile kernels and warm caches. Called once
     /// at boot from [`crate::app::App::spawn_llm_setup`]; cost is paid
@@ -189,11 +185,7 @@ impl PolishBackend for LlamaPolish {
     /// doing so would let two polish calls interleave Metal kernel
     /// invocations, which produces garbled output (see the field's
     /// doc comment). Holding it is the lesser evil.
-    fn polish_into(
-        &self,
-        text: &str,
-        on_chunk: &mut dyn FnMut(&str) -> Result<()>,
-    ) -> Result<()> {
+    fn polish_into(&self, text: &str, on_chunk: &mut dyn FnMut(&str) -> Result<()>) -> Result<()> {
         let _guard = self.polish_lock.lock();
         let prompt = PromptTemplate::prod().render(text);
         // Look-back buffer: Qwen 3.5 sometimes echoes the `/no_think`
@@ -457,9 +449,7 @@ where
 /// trailing whitespace trimmed — eagerly eating terminal punctuation
 /// here used to delete the final period of every single dictation.
 fn strip_no_think_tail(s: &str) -> &str {
-    const TERMINAL: &[char] = &[
-        ' ', '\t', '\n', '\r', '.', '!', '?', ',', ';', ':',
-    ];
+    const TERMINAL: &[char] = &[' ', '\t', '\n', '\r', '.', '!', '?', ',', ';', ':'];
     const SUFFIXES: &[&str] = &[
         "/no_think",
         "/no think",
@@ -582,7 +572,10 @@ mod tests {
         // output in several shapes. All must be stripped from the
         // tail; the prefix — INCLUDING its terminal punctuation —
         // must survive intact.
-        assert_eq!(strip_no_think_tail("Hello, world. /no_think"), "Hello, world.");
+        assert_eq!(
+            strip_no_think_tail("Hello, world. /no_think"),
+            "Hello, world."
+        );
         assert_eq!(strip_no_think_tail("Hello. /no_think."), "Hello.");
         assert_eq!(strip_no_think_tail("Hello no_think"), "Hello");
         assert_eq!(strip_no_think_tail("Hello. No think."), "Hello.");

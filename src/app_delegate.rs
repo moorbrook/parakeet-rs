@@ -48,12 +48,9 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn application_did_finish_launching(&self, _notification: &NSNotification) {
             crate::objc_util::selector_guard("applicationDidFinishLaunching:", || {
-                let mtm = match MainThreadMarker::new() {
-                    Some(m) => m,
-                    None => {
-                        log::error!("delegate fired off main thread (impossible)");
-                        return;
-                    }
+                let Some(mtm) = MainThreadMarker::new() else {
+                    log::error!("delegate fired off main thread (impossible)");
+                    return;
                 };
                 if let Err(e) = install_runtime_state(mtm) {
                     log::error!("applicationDidFinishLaunching install failed: {e:#}");

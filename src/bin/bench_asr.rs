@@ -20,9 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use parakeet_rs::asr::Asr;
-use parakeet_rs::performance::{
-    self, next_session_id, PhaseTimer, PhaseTimerMode,
-};
+use parakeet_rs::performance::{self, next_session_id, PhaseTimer, PhaseTimerMode};
 use parakeet_rs::settings::SettingsStore;
 use parakeet_rs::warmup;
 
@@ -148,18 +146,29 @@ fn run(args: &Args) -> anyhow::Result<()> {
     let stem = args
         .wav
         .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".into());
+        .map_or_else(|| "unknown".into(), |s| s.to_string_lossy().to_string());
 
     // Warmup reps: emit phase_timer lines but tagged so the aggregator
     // can drop them. Using session_id with a `warmup-` prefix keeps the
     // log file self-describing.
     for i in 0..args.warmup_reps {
-        run_one(&asr, &samples, sample_rate, audio_s, &format!("warmup-{stem}-r{i:03}"))?;
+        run_one(
+            &asr,
+            &samples,
+            sample_rate,
+            audio_s,
+            &format!("warmup-{stem}-r{i:03}"),
+        )?;
     }
     // Measured reps. session_id has no `warmup-` prefix → aggregator counts it.
     for i in 0..args.reps {
-        run_one(&asr, &samples, sample_rate, audio_s, &format!("bench-{stem}-r{i:03}"))?;
+        run_one(
+            &asr,
+            &samples,
+            sample_rate,
+            audio_s,
+            &format!("bench-{stem}-r{i:03}"),
+        )?;
     }
     Ok(())
 }
@@ -194,8 +203,7 @@ fn run_one(
 /// -d LEI16@... -c 1` (single-channel little-endian 16-bit).
 fn read_wav_mono(path: &Path) -> anyhow::Result<(Vec<f32>, u32)> {
     use std::io::Read;
-    let file = File::open(path)
-        .map_err(|e| anyhow::anyhow!("opening {}: {e}", path.display()))?;
+    let file = File::open(path).map_err(|e| anyhow::anyhow!("opening {}: {e}", path.display()))?;
     let mut r = BufReader::new(file);
 
     let mut header = [0u8; 12];
@@ -221,7 +229,8 @@ fn read_wav_mono(path: &Path) -> anyhow::Result<(Vec<f32>, u32)> {
             Err(e) => return Err(e.into()),
         }
         let id = &chunk_hdr[0..4];
-        let size = u32::from_le_bytes([chunk_hdr[4], chunk_hdr[5], chunk_hdr[6], chunk_hdr[7]]) as usize;
+        let size =
+            u32::from_le_bytes([chunk_hdr[4], chunk_hdr[5], chunk_hdr[6], chunk_hdr[7]]) as usize;
         if size > MAX_CHUNK_BYTES {
             anyhow::bail!(
                 "WAV chunk size {size} exceeds {MAX_CHUNK_BYTES} byte cap (corrupt header?)"
@@ -265,11 +274,11 @@ fn read_wav_mono(path: &Path) -> anyhow::Result<(Vec<f32>, u32)> {
         let frame = &data[i * frame_bytes..(i + 1) * frame_bytes];
         let mut sum = 0i32;
         for c in 0..channels as usize {
-            let s = i16::from_le_bytes([frame[2 * c], frame[2 * c + 1]]) as i32;
+            let s = i32::from(i16::from_le_bytes([frame[2 * c], frame[2 * c + 1]]));
             sum += s;
         }
-        let avg = sum as f32 / channels as f32;
-        out.push(avg / i16::MAX as f32);
+        let avg = sum as f32 / f32::from(channels);
+        out.push(avg / f32::from(i16::MAX));
     }
     Ok((out, sample_rate))
 }

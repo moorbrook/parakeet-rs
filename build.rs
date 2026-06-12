@@ -29,7 +29,8 @@ fn main() {
         // bare `cargo run` works without first copying dylibs alongside
         // the binary. Used as a fallback only — production .app bundles
         // ship the dylibs in Contents/Frameworks.
-        if let Some(dir) = locate_libonnxruntime().and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        if let Some(dir) =
+            locate_libonnxruntime().and_then(|p| p.parent().map(std::path::Path::to_path_buf))
         {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
         }
@@ -41,12 +42,9 @@ fn main() {
 fn check_coreml_ep() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=PARAKEET_REQUIRE_COREML");
 
-    let lib = match locate_libonnxruntime() {
-        Some(p) => p,
-        None => {
-            warn("libonnxruntime.{dylib,a} not in sherpa-onnx prebuilt cache yet; skipping CoreML EP check (will run after the next cargo build)");
-            return Ok(());
-        }
+    let Some(lib) = locate_libonnxruntime() else {
+        warn("libonnxruntime.{dylib,a} not in sherpa-onnx prebuilt cache yet; skipping CoreML EP check (will run after the next cargo build)");
+        return Ok(());
     };
     println!("cargo:rerun-if-changed={}", lib.display());
 

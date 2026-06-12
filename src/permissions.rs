@@ -284,4 +284,3 @@ pub fn present_missing_alert_blocking(
         return;
     }
 }
-

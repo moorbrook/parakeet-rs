@@ -113,12 +113,10 @@ impl Streamer {
         // and then get extended (less visual noise than chunk-by-
         // chunk, even though the keystroke path doesn't flicker the
         // way ⌘V did).
-        let has_boundary = self
-            .pending
-            .chars()
-            .last()
-            .map(|c| c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '!' | '?'))
-            .unwrap_or(false);
+        let has_boundary =
+            self.pending.chars().last().is_some_and(|c| {
+                c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '!' | '?')
+            });
         if !has_boundary {
             return Ok(());
         }

@@ -13,7 +13,6 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::asr::Asr;
-use crate::polish::{self, LlamaPolish, PolishBackend};
 use crate::dictation_fsm::{DictationFsm, HoldPressOutcome, TapPressOutcome};
 use crate::hotkey::HotkeyHandle;
 use crate::hud;
@@ -21,6 +20,7 @@ use crate::llm_manager::{FinalizeOutcome, LlmManager, LoadClaim};
 use crate::menubar;
 use crate::model_fetch::{self, Progress};
 use crate::performance::PhaseTimer;
+use crate::polish::{self, LlamaPolish, PolishBackend};
 use crate::settings::{PolishMode, Settings, SettingsStore, TriggerMode};
 use crate::streamer::{self, Mode as StreamerMode, Outcome, OutcomeRx};
 use crate::{paste, performance, warmup};
@@ -82,8 +82,7 @@ impl App {
                     self.announce_state(DictationState::Listening);
                     self.start_session(StreamerMode::VadAutoStop);
                 }
-                TapPressOutcome::CancelledLive
-                | TapPressOutcome::QueuedCancel => {
+                TapPressOutcome::CancelledLive | TapPressOutcome::QueuedCancel => {
                     // The FSM already routed the cancel; nothing
                     // further to do. The session-watcher (live case)
                     // or starter (gap case) will resolve state.
@@ -218,7 +217,6 @@ impl App {
             }
         });
     }
-
 
     fn transcribe_and_paste(
         self: &Arc<Self>,
@@ -475,11 +473,8 @@ impl App {
             return;
         }
         let app = Arc::clone(&self);
-        let result =
-            tokio::task::spawn_blocking(move || load_llm_blocking(&app.settings)).await;
-        self.finalize_llm_load(
-            result.unwrap_or_else(|e| Err(anyhow::anyhow!("task panic: {e}"))),
-        );
+        let result = tokio::task::spawn_blocking(move || load_llm_blocking(&app.settings)).await;
+        self.finalize_llm_load(result.unwrap_or_else(|e| Err(anyhow::anyhow!("task panic: {e}"))));
     }
 
     /// Apply a completed loader result. Reading `polish_mode` here
@@ -488,15 +483,12 @@ impl App {
     /// loading, settings.cache reads `Off` and the manager discards
     /// the freshly-loaded backend.
     fn finalize_llm_load(&self, result: anyhow::Result<Arc<dyn PolishBackend>>) {
-        let keep_if_loaded =
-            matches!(self.settings.load().polish_mode, PolishMode::On);
+        let keep_if_loaded = matches!(self.settings.load().polish_mode, PolishMode::On);
         let outcome = self.llm.finalize_load(result, keep_if_loaded);
         let status: Option<String> = match outcome {
             FinalizeOutcome::Stored => Some("Polish ready".to_string()),
             FinalizeOutcome::DiscardedDisabled => {
-                log::info!(
-                    "polish load completed but mode is now Off; discarding loaded model"
-                );
+                log::info!("polish load completed but mode is now Off; discarding loaded model");
                 None
             }
             FinalizeOutcome::Failed(e) => {
@@ -604,15 +596,12 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
     if matches!(settings.polish_mode, PolishMode::Off) {
         return paste::deliver(raw);
     }
-    let llm = match app.llm.try_get() {
-        Some(l) => l,
-        None => {
-            // Polish was enabled but the model isn't loaded — pasting
-            // raw is the right fallback (better than nothing). Status
-            // text already explained the load failure.
-            log::warn!("polish enabled but model unavailable; pasting raw");
-            return paste::deliver(raw);
-        }
+    let Some(llm) = app.llm.try_get() else {
+        // Polish was enabled but the model isn't loaded — pasting
+        // raw is the right fallback (better than nothing). Status
+        // text already explained the load failure.
+        log::warn!("polish enabled but model unavailable; pasting raw");
+        return paste::deliver(raw);
     };
     app.set_state(DictationState::Polishing);
 
@@ -642,9 +631,7 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
                 ));
                 Ok(())
             } else {
-                menubar::set_status_text(&format!(
-                    "Polish failed — using raw transcript ({e})"
-                ));
+                menubar::set_status_text(&format!("Polish failed — using raw transcript ({e})"));
                 paste::deliver(raw)
             }
         }
@@ -760,7 +747,7 @@ pub fn glyphs_for_shortcut(token: &str) -> String {
     for part in trimmed.split('+').map(str::trim) {
         match part.to_ascii_lowercase().as_str() {
             "cmd" | "command" | "cmdorctrl" | "commandorcontrol" | "super" | "meta" => {
-                has_cmd = true
+                has_cmd = true;
             }
             "ctrl" | "control" => has_ctrl = true,
             "alt" | "option" => has_alt = true,

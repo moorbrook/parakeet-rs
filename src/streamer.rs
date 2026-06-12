@@ -160,14 +160,11 @@ fn run_vad(
     signal_rx: Receiver<Signal>,
     timer: PhaseTimer,
 ) -> Outcome {
-    let resampler = match LinearResampler::create(sample_rate as i32, VAD_SAMPLE_RATE) {
-        Some(r) => r,
-        None => {
-            let _ = capture.stop();
-            return Outcome::Error(anyhow!(
-                "could not build {sample_rate}->{VAD_SAMPLE_RATE} resampler"
-            ));
-        }
+    let Some(resampler) = LinearResampler::create(sample_rate as i32, VAD_SAMPLE_RATE) else {
+        let _ = capture.stop();
+        return Outcome::Error(anyhow!(
+            "could not build {sample_rate}->{VAD_SAMPLE_RATE} resampler"
+        ));
     };
 
     let mut window_buf: Vec<f32> = Vec::with_capacity(WINDOW_SIZE as usize * 4);

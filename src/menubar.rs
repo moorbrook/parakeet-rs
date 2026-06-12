@@ -315,7 +315,7 @@ fn refresh_on_main(
         }
         unsafe {
             bar.status_header
-                .setTitle(&NSString::from_str(&header_label))
+                .setTitle(&NSString::from_str(&header_label));
         };
         unsafe { bar.mode_item.setTitle(&NSString::from_str(&mode_label)) };
         unsafe { bar.toggle_item.setTitle(&NSString::from_str(&toggle_label)) };

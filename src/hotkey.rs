@@ -270,25 +270,19 @@ fn run_tap(binding: Arc<Mutex<Binding>>, on_press: EventFn, on_release: EventFn)
         },
     );
 
-    let tap = match tap {
-        Ok(t) => t,
-        Err(_) => {
-            log::error!(
-                "CGEventTap::new failed — usually means the Input Monitoring \
-                 permission hasn't been granted. Open System Settings → \
-                 Privacy & Security → Input Monitoring and enable Parakeet, \
-                 then relaunch."
-            );
-            return;
-        }
+    let Ok(tap) = tap else {
+        log::error!(
+            "CGEventTap::new failed — usually means the Input Monitoring \
+             permission hasn't been granted. Open System Settings → \
+             Privacy & Security → Input Monitoring and enable Parakeet, \
+             then relaunch."
+        );
+        return;
     };
 
-    let loop_source = match tap.mach_port.create_runloop_source(0) {
-        Ok(s) => s,
-        Err(_) => {
-            log::error!("create_runloop_source failed; hotkey detector inactive");
-            return;
-        }
+    let Ok(loop_source) = tap.mach_port.create_runloop_source(0) else {
+        log::error!("create_runloop_source failed; hotkey detector inactive");
+        return;
     };
     let current = CFRunLoop::get_current();
     unsafe { current.add_source(&loop_source, kCFRunLoopCommonModes) };
@@ -376,7 +370,10 @@ fn install_media_key_monitor(
     // this was `std::mem::forget(handle)` — clean from a leak-tools
     // perspective today, but blocks any future "rebind the media-key
     // monitor without process restart" use case.
-    if MEDIA_KEY_MONITOR.set(MediaKeyMonitor { token: handle }).is_err() {
+    if MEDIA_KEY_MONITOR
+        .set(MediaKeyMonitor { token: handle })
+        .is_err()
+    {
         log::warn!("media-key monitor already installed — ignoring duplicate install");
     } else {
         log::info!("media-key monitor active (NSEvent global, system-defined)");
@@ -444,7 +441,7 @@ pub fn parse(spec: &str) -> Result<Binding> {
     for raw in trimmed.split('+').map(str::trim) {
         match raw.to_ascii_lowercase().as_str() {
             "cmd" | "command" | "cmdorctrl" | "commandorcontrol" | "super" | "meta" => {
-                required_mods |= CGEventFlags::CGEventFlagCommand
+                required_mods |= CGEventFlags::CGEventFlagCommand;
             }
             "ctrl" | "control" => required_mods |= CGEventFlags::CGEventFlagControl,
             "alt" | "option" => required_mods |= CGEventFlags::CGEventFlagAlternate,

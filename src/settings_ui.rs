@@ -368,8 +368,7 @@ pub fn open(mtm: MainThreadMarker) {
 
     let shortcut_initial = settings
         .as_ref()
-        .map(|s| glyphs_for_shortcut(&s.hotkey))
-        .unwrap_or_else(|| "⌘⇧Space".to_string());
+        .map_or_else(|| "⌘⇧Space".to_string(), |s| glyphs_for_shortcut(&s.hotkey));
     let shortcut_btn = make_button(
         mtm,
         &shortcut_initial,

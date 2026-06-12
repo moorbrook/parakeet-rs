@@ -30,10 +30,8 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 
-use parakeet_rs::polish::{
-    self, GenerateOutcome, PromptTemplate, PROD_GENERATE_CONFIG,
-};
 use parakeet_rs::performance::next_session_id;
+use parakeet_rs::polish::{self, GenerateOutcome, PromptTemplate, PROD_GENERATE_CONFIG};
 
 /// A representative messy dictation transcript — fillers, no punctuation,
 /// the kind of thing the polish pass is supposed to fix. Length picked
@@ -70,25 +68,25 @@ fn parse_args() -> anyhow::Result<Args> {
             "--model" => {
                 model_path = Some(PathBuf::from(
                     it.next().ok_or_else(|| anyhow!("--model needs PATH"))?,
-                ))
+                ));
             }
             "--reps" => {
                 reps = it
                     .next()
                     .ok_or_else(|| anyhow!("--reps needs N"))?
                     .parse()
-                    .context("--reps")?
+                    .context("--reps")?;
             }
             "--warmup-reps" => {
                 warmup_reps = it
                     .next()
                     .ok_or_else(|| anyhow!("--warmup-reps needs N"))?
                     .parse()
-                    .context("--warmup-reps")?
+                    .context("--warmup-reps")?;
             }
             "--show-output" => show_output = true,
             "--tag" => {
-                model_tag = Some(it.next().ok_or_else(|| anyhow!("--tag needs STRING"))?)
+                model_tag = Some(it.next().ok_or_else(|| anyhow!("--tag needs STRING"))?);
             }
             "-h" | "--help" => {
                 print_usage();
@@ -111,8 +109,7 @@ fn default_tag(model_path: &std::path::Path) -> String {
     model_path
         .file_stem()
         .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| "unknown-model".to_string())
+        .map_or_else(|| "unknown-model".to_string(), str::to_ascii_lowercase)
 }
 
 fn print_usage() {

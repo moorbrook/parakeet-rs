@@ -150,7 +150,6 @@ fn build_stream(
         out
     };
 
-
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
             let cfg: cpal::StreamConfig = config.into();
@@ -178,8 +177,10 @@ fn build_stream(
                     let buffer = buffer.clone();
                     let tap = tap.clone();
                     move |data: &[i16], _| {
-                        let floats: Vec<f32> =
-                            data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                        let floats: Vec<f32> = data
+                            .iter()
+                            .map(|&s| f32::from(s) / f32::from(i16::MAX))
+                            .collect();
                         buffer.lock().extend_from_slice(&floats);
                         let mono = to_mono(&floats, channels);
                         crate::hud::set_audio_level(peak_amplitude(&mono));
@@ -201,8 +202,8 @@ fn build_stream(
                         let floats: Vec<f32> = data
                             .iter()
                             .map(|&s| {
-                                let centered = s as f32 - i16::MAX as f32 - 1.0;
-                                centered / (i16::MAX as f32 + 1.0)
+                                let centered = f32::from(s) - f32::from(i16::MAX) - 1.0;
+                                centered / (f32::from(i16::MAX) + 1.0)
                             })
                             .collect();
                         buffer.lock().extend_from_slice(&floats);
