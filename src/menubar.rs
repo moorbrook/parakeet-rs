@@ -11,7 +11,6 @@
 
 use std::cell::RefCell;
 
-use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, sel, MainThreadOnly};
 use objc2_app_kit::{
@@ -131,15 +130,7 @@ thread_local! {
     static MENU_BAR: RefCell<Option<MenuBar>> = const { RefCell::new(None) };
 }
 
-/// Run `f` on the main thread, either immediately (if we're already on
-/// main) or by enqueueing onto the main dispatch queue.
-fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
-    if MainThreadMarker::new().is_some() {
-        f();
-    } else {
-        DispatchQueue::main().exec_async(f);
-    }
-}
+use crate::objc_util::dispatch_to_main;
 
 /// Run `f` on the main thread with a usable `MainThreadMarker`. The
 /// argument-taking variant avoids the impl-Trait dance for callers that

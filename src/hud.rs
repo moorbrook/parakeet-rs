@@ -461,10 +461,4 @@ fn position_on_screen(mtm: MainThreadMarker, panel: &HudPanel) {
     unsafe { panel.setFrame_display(frame, false) };
 }
 
-fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
-    if MainThreadMarker::new().is_some() {
-        f();
-    } else {
-        DispatchQueue::main().exec_async(f);
-    }
-}
+use crate::objc_util::dispatch_to_main;

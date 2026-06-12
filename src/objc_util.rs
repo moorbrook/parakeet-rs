@@ -58,3 +58,15 @@ pub fn install_panic_hook() {
         default(info);
     }));
 }
+
+/// Run `f` on the main thread — immediately when already there,
+/// otherwise enqueued onto the main dispatch queue. Shared by the HUD
+/// and menubar paths (both mutate AppKit state that is only legal to
+/// touch on main).
+pub fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
+    if objc2_foundation::MainThreadMarker::new().is_some() {
+        f();
+    } else {
+        dispatch2::DispatchQueue::main().exec_async(f);
+    }
+}

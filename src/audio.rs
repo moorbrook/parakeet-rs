@@ -119,6 +119,38 @@ impl AudioCapture {
     }
 }
 
+/// Fold multi-channel input down to mono so the tap is mono. Keeps the
+/// VAD math 1:1 and saves the resampler from doing it after the fact.
+fn to_mono(data: &[f32], channels: u16) -> Vec<f32> {
+    if channels <= 1 {
+        return data.to_vec();
+    }
+    let ch = channels as usize;
+    let n = data.len() / ch;
+    let mut out = Vec::with_capacity(n);
+    for frame in data.chunks_exact(ch) {
+        let sum: f32 = frame.iter().sum();
+        out.push(sum / ch as f32);
+    }
+    out
+}
+
+/// Shared tail of every sample-format callback: append to the capture
+/// buffer, fold to mono, drive the HUD level meter, feed the VAD tap.
+/// The three `build_input_stream` closures differ only in how they
+/// convert their native sample type to f32.
+fn forward_samples(
+    buffer: &Mutex<Vec<f32>>,
+    tap: &Sender<Vec<f32>>,
+    channels: u16,
+    floats: &[f32],
+) {
+    buffer.lock().extend_from_slice(floats);
+    let mono = to_mono(floats, channels);
+    crate::hud::set_audio_level(peak_amplitude(&mono));
+    let _ = tap.send(mono);
+}
+
 fn build_stream(
     buffer: Arc<Mutex<Vec<f32>>>,
     tap: Sender<Vec<f32>>,
@@ -134,22 +166,6 @@ fn build_stream(
     let channels = config.channels();
     let err_fn = |err| log::error!("audio stream error: {err}");
 
-    // Fold multi-channel input down to mono inline so the tap is mono. Keeps
-    // the VAD math 1:1 and saves the resampler from doing it after the fact.
-    let to_mono = move |data: &[f32], channels: u16| -> Vec<f32> {
-        if channels <= 1 {
-            return data.to_vec();
-        }
-        let ch = channels as usize;
-        let n = data.len() / ch;
-        let mut out = Vec::with_capacity(n);
-        for frame in data.chunks_exact(ch) {
-            let sum: f32 = frame.iter().sum();
-            out.push(sum / ch as f32);
-        }
-        out
-    };
-
     let stream = match config.sample_format() {
         SampleFormat::F32 => {
             let cfg: cpal::StreamConfig = config.into();
@@ -158,12 +174,7 @@ fn build_stream(
                 {
                     let buffer = buffer.clone();
                     let tap = tap.clone();
-                    move |data: &[f32], _| {
-                        buffer.lock().extend_from_slice(data);
-                        let mono = to_mono(data, channels);
-                        crate::hud::set_audio_level(peak_amplitude(&mono));
-                        let _ = tap.send(mono);
-                    }
+                    move |data: &[f32], _| forward_samples(&buffer, &tap, channels, data)
                 },
                 err_fn,
                 None,
@@ -181,10 +192,7 @@ fn build_stream(
                             .iter()
                             .map(|&s| f32::from(s) / f32::from(i16::MAX))
                             .collect();
-                        buffer.lock().extend_from_slice(&floats);
-                        let mono = to_mono(&floats, channels);
-                        crate::hud::set_audio_level(peak_amplitude(&mono));
-                        let _ = tap.send(mono);
+                        forward_samples(&buffer, &tap, channels, &floats);
                     }
                 },
                 err_fn,
@@ -206,10 +214,7 @@ fn build_stream(
                                 centered / (f32::from(i16::MAX) + 1.0)
                             })
                             .collect();
-                        buffer.lock().extend_from_slice(&floats);
-                        let mono = to_mono(&floats, channels);
-                        crate::hud::set_audio_level(peak_amplitude(&mono));
-                        let _ = tap.send(mono);
+                        forward_samples(&buffer, &tap, channels, &floats);
                     }
                 },
                 err_fn,
