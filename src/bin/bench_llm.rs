@@ -57,7 +57,8 @@ struct Args {
     model_tag: Option<String>,
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args() -> anyhow::Result<Args> {
+    use anyhow::{anyhow, bail, Context};
     let mut model_path: Option<PathBuf> = None;
     let mut reps: usize = 100;
     let mut warmup_reps: usize = 3;
@@ -66,32 +67,38 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--model" => model_path = Some(PathBuf::from(it.next().ok_or("--model needs PATH")?)),
+            "--model" => {
+                model_path = Some(PathBuf::from(
+                    it.next().ok_or_else(|| anyhow!("--model needs PATH"))?,
+                ))
+            }
             "--reps" => {
                 reps = it
                     .next()
-                    .ok_or("--reps needs N")?
+                    .ok_or_else(|| anyhow!("--reps needs N"))?
                     .parse()
-                    .map_err(|e| format!("--reps: {e}"))?
+                    .context("--reps")?
             }
             "--warmup-reps" => {
                 warmup_reps = it
                     .next()
-                    .ok_or("--warmup-reps needs N")?
+                    .ok_or_else(|| anyhow!("--warmup-reps needs N"))?
                     .parse()
-                    .map_err(|e| format!("--warmup-reps: {e}"))?
+                    .context("--warmup-reps")?
             }
             "--show-output" => show_output = true,
-            "--tag" => model_tag = Some(it.next().ok_or("--tag needs STRING")?),
+            "--tag" => {
+                model_tag = Some(it.next().ok_or_else(|| anyhow!("--tag needs STRING"))?)
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
             }
-            other => return Err(format!("unknown arg: {other}")),
+            other => bail!("unknown arg: {other}"),
         }
     }
     Ok(Args {
-        model_path: model_path.ok_or("--model is required")?,
+        model_path: model_path.ok_or_else(|| anyhow!("--model is required"))?,
         reps,
         warmup_reps,
         show_output,
@@ -130,7 +137,7 @@ fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {e:#}");
             print_usage();
             return ExitCode::from(2);
         }

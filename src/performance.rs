@@ -14,7 +14,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub fn performance_core_count() -> i32 {
     let mut value: i32 = 0;
     let mut size = std::mem::size_of::<i32>();
-    let name = CString::new("hw.perflevel0.logicalcpu").unwrap();
+    let name = CString::new("hw.perflevel0.logicalcpu")
+        .expect("static sysctl name contains no interior NUL");
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),

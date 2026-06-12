@@ -35,7 +35,8 @@ struct Args {
     warmup_reps: usize,
 }
 
-fn parse_args() -> Result<Args, String> {
+fn parse_args() -> anyhow::Result<Args> {
+    use anyhow::{anyhow, bail, Context};
     let mut wav: Option<PathBuf> = None;
     let mut reps: usize = DEFAULT_REPS;
     let mut warmup_reps: usize = DEFAULT_WARMUP_REPS;
@@ -45,31 +46,31 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--wav" => {
                 wav = Some(PathBuf::from(
-                    it.next().ok_or("--wav needs a path")?,
+                    it.next().ok_or_else(|| anyhow!("--wav needs a path"))?,
                 ));
             }
             "--reps" => {
                 reps = it
                     .next()
-                    .ok_or("--reps needs a number")?
+                    .ok_or_else(|| anyhow!("--reps needs a number"))?
                     .parse()
-                    .map_err(|e| format!("--reps: {e}"))?;
+                    .context("--reps")?;
             }
             "--warmup-reps" => {
                 warmup_reps = it
                     .next()
-                    .ok_or("--warmup-reps needs a number")?
+                    .ok_or_else(|| anyhow!("--warmup-reps needs a number"))?
                     .parse()
-                    .map_err(|e| format!("--warmup-reps: {e}"))?;
+                    .context("--warmup-reps")?;
             }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
             }
-            other => return Err(format!("unknown arg: {other}")),
+            other => bail!("unknown arg: {other}"),
         }
     }
-    let wav = wav.ok_or("--wav is required")?;
+    let wav = wav.ok_or_else(|| anyhow!("--wav is required"))?;
     Ok(Args {
         wav,
         reps,
@@ -97,7 +98,7 @@ fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprintln!("error: {e:#}");
             print_usage();
             return ExitCode::from(2);
         }

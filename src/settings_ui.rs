@@ -699,7 +699,10 @@ fn ns_event_to_token(event: &NSEvent) -> Option<String> {
         "\u{f715}" => "F18".to_string(),
         "\u{f716}" => "F19".to_string(),
         other if other.chars().count() == 1 => {
-            let c = other.chars().next().unwrap();
+            let c = other
+                .chars()
+                .next()
+                .expect("match guard ensures exactly one char");
             if c.is_ascii_alphanumeric() {
                 c.to_ascii_uppercase().to_string()
             } else {
