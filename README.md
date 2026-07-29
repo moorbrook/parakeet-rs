@@ -54,6 +54,20 @@ PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
 3. Press `⌘⇧Space` (default hotkey), speak. **Tap mode** auto-stops at
    end-of-speech; **Hold mode** stops on release.
 
+While listening, a large-display HUD shows an animated pastel-iridescent
+waveform on a 70%-alpha glass panel. macOS 26 and later use
+`NSGlassEffectView`; older supported releases fall back to
+`NSVisualEffectView`.
+
+For HUD-only development, launch a debug build with the preview hook:
+
+```bash
+PARAKEET_HUD_PREVIEW=1 cargo run
+```
+
+The app opens directly into the Listening HUD without starting a dictation
+session.
+
 ### Optional polish pass
 
 
@@ -93,7 +107,9 @@ Two headless benches under `src/bin/`: `bench_asr` and `bench_llm`.
 
 Architectural rationale lives in [`docs/ADR.md`](docs/ADR.md) (decisions
 0001-0019); latency targets and measurements in
-[`docs/latency-plan.md`](docs/latency-plan.md).
+[`docs/latency-plan.md`](docs/latency-plan.md). The deferred
+Developer-ID/notarization shipping procedure is captured in
+[`docs/notarized-distribution.md`](docs/notarized-distribution.md).
 
 ## Verification
 
