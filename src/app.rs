@@ -43,6 +43,52 @@ pub struct App {
     /// Lives for the program's lifetime; held here so the Settings UI can
     /// rebind it after the user records a new hotkey combo.
     pub hotkey: Mutex<Option<HotkeyHandle>>,
+    /// What the **currently loaded** recogniser was actually built
+    /// against. `None` until the first successful build.
+    ///
+    /// Recording what was loaded (rather than what settings said at
+    /// Save time) is what makes staleness detection self-correcting: a
+    /// failed or superseded build simply doesn't update this, so the
+    /// next check still sees a mismatch and retries.
+    loaded_biasing: Mutex<Option<Biasing>>,
+    /// Set when a rebuild was needed but the app was busy. Drained by
+    /// `on_session_finished`. Without it a vocabulary edit saved during
+    /// a dictation stayed unapplied until the *next* Settings Save.
+    reload_pending: std::sync::atomic::AtomicBool,
+}
+
+/// The biasing inputs a recogniser was built from. Two recognisers with
+/// equal `Biasing` decode identically, which is the whole point — it's
+/// the comparison that decides whether a rebuild is needed.
+#[derive(Clone, Debug, PartialEq)]
+struct Biasing {
+    /// (len, mtime) of `vocabulary.txt`, or `None` when absent.
+    ///
+    /// Not a content hash: the file is hand-edited in a text editor, so
+    /// any real edit moves one of them. The residual blind spot is a
+    /// same-length edit with a preserved mtime (`touch -r`), which no
+    /// realistic editing workflow produces.
+    vocab: Option<(u64, std::time::SystemTime)>,
+    score: f32,
+}
+
+impl Biasing {
+    /// Sample the current on-disk vocabulary + configured score.
+    ///
+    /// Callers must sample this **before** building, never after: the
+    /// user can edit `vocabulary.txt` while a build is in flight, and
+    /// recording the post-build state would mark a newer vocabulary as
+    /// loaded when it wasn't — permanently, since the mismatch that
+    /// would have triggered a retry is exactly what got erased.
+    fn sample(settings: &SettingsStore) -> Self {
+        let vocab = std::fs::metadata(settings.vocabulary_path())
+            .ok()
+            .and_then(|m| Some((m.len(), m.modified().ok()?)));
+        Self {
+            vocab,
+            score: settings.load().hotword_score,
+        }
+    }
 }
 
 impl App {
@@ -53,6 +99,8 @@ impl App {
             asr: Mutex::new(None),
             llm: LlmManager::new(),
             hotkey: Mutex::new(None),
+            loaded_biasing: Mutex::new(None),
+            reload_pending: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -247,8 +295,11 @@ impl App {
             // first-chunk latency is much lower. See ADR-0018.
             timer.mark_paste_done();
             timer.emit();
-            if let Err(e) = result {
-                log::error!("deliver failed: {e:#}");
+            if let Err(failure) = result {
+                rescue_to_clipboard(
+                    &failure,
+                    "Paste blocked — transcript on clipboard (⌘V)",
+                );
             }
             app.on_session_finished();
         });
@@ -256,6 +307,15 @@ impl App {
 
     fn on_session_finished(self: &Arc<Self>) {
         self.set_state(self.resting_state());
+        // Drain a rebuild that arrived while we were busy. Without this
+        // a vocabulary edit saved mid-dictation stayed unapplied until
+        // the user happened to open Settings and Save again.
+        if self
+            .reload_pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.reload_asr_if_stale();
+        }
     }
 
     /// Force-recover after a worker thread panic. The three spawned
@@ -384,8 +444,91 @@ impl App {
         if prev.polish_mode != new.polish_mode {
             self.handle_polish_mode_change(new.polish_mode);
         }
+        // Contextual biasing is baked into the recogniser at
+        // construction time, so a changed vocabulary (or boost) only
+        // takes effect after a rebuild. Users edit `vocabulary.txt` in
+        // an external editor and come back to Settings, so Save is the
+        // natural place to notice.
+        //
+        // Compared against what's actually LOADED, not against `prev`:
+        // if an earlier rebuild failed, `prev == new` but the running
+        // recogniser is still stale, and a `prev`-based check would
+        // never retry it.
+        let _ = prev;
+        self.reload_asr_if_stale();
         self.refresh_menu();
         Ok(())
+    }
+
+    /// Rebuild the recogniser if the on-disk vocabulary or configured
+    /// score differs from what the loaded one was built against.
+    fn reload_asr_if_stale(self: &Arc<Self>) {
+        let loaded = self.loaded_biasing.lock().clone();
+        let Some(loaded) = loaded else {
+            // Boot hasn't produced a recogniser yet; it will read the
+            // current vocabulary itself when it builds one.
+            return;
+        };
+        if loaded == Biasing::sample(&self.settings) {
+            return;
+        }
+        self.reload_asr();
+    }
+
+    /// Rebuild the recogniser in the background so a vocabulary edit
+    /// applies without relaunching.
+    ///
+    /// Deferred (not dropped) when the app is busy: mid-session or
+    /// mid-transcribe the in-flight worker holds an `Arc<Asr>` clone,
+    /// and swapping the slot would neither help it nor be safe to
+    /// interleave with. `on_session_finished` drains the flag, so the
+    /// edit lands as soon as the app is idle rather than waiting for
+    /// another Settings Save.
+    fn reload_asr(self: &Arc<Self>) {
+        if self.asr.lock().is_none() {
+            return;
+        }
+        if !self.fsm.try_claim_model_reload() {
+            log::info!("biasing changed but app is busy; reload deferred");
+            self.reload_pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            menubar::set_status_text("Vocabulary saved — applies after the current dictation");
+            return;
+        }
+        // Claimed: this reload is happening, so any previously deferred
+        // request is subsumed by it.
+        self.reload_pending
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.announce_state(DictationState::ModelLoading);
+        self.spawn_supervised("asr-reload", move |app| {
+            // `warm = false`: the CoreML graph was compiled by the boot
+            // load and is cached per-process, so the dummy decode would
+            // cost ~400 ms for nothing here.
+            match load_asr_blocking(&app.settings, /* warm = */ false) {
+                Ok((asr, biasing)) => {
+                    *app.asr.lock() = Some(asr);
+                    // Record what this build actually read, sampled
+                    // before it started. An edit that landed mid-build
+                    // therefore still compares unequal and gets picked
+                    // up by the staleness re-check below.
+                    *app.loaded_biasing.lock() = Some(biasing);
+                    menubar::set_status_text("Vocabulary applied");
+                }
+                Err(e) => {
+                    // The previous recogniser is still in `app.asr` and
+                    // still works — we only ever replace it on success,
+                    // so a bad vocabulary can't leave the user unable
+                    // to dictate. `loaded_biasing` is deliberately NOT
+                    // updated, so the retry path still sees a mismatch.
+                    log::error!("recogniser reload failed, keeping the previous one: {e:#}");
+                    menubar::set_status_text("Vocabulary reload failed — previous model kept");
+                }
+            }
+            app.set_state(app.resting_state());
+            // The vocabulary may have changed again while we were
+            // building. Re-check rather than assuming we're current.
+            app.reload_asr_if_stale();
+        });
     }
 
     /// Run the first-run model download + page-touch + recogniser load +
@@ -407,35 +550,15 @@ impl App {
             }
         }
 
-        let encoder_path = self.settings.encoder_path();
-        let decoder_path = self.settings.decoder_path();
-        let joiner_path = self.settings.joiner_path();
-        let tokens_path = self.settings.tokens_path();
-
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<Asr>> {
-            menubar::set_status_text("Warming page cache…");
-            let _ = warmup::page_touch(&encoder_path)?;
-
-            menubar::set_status_text("Loading recogniser (CoreML)…");
-            let threads = performance::performance_core_count();
-            log::info!("OfflineRecognizer: {threads} threads, provider=coreml");
-            let asr = Asr::load(
-                &encoder_path,
-                &decoder_path,
-                &joiner_path,
-                &tokens_path,
-                threads,
-            )?;
-
-            menubar::set_status_text("Pre-warming graph…");
-            warmup::dummy_decode(&asr)?;
-            Ok(Arc::new(asr))
-        })
-        .await;
+        let settings = self.settings.clone();
+        let result =
+            tokio::task::spawn_blocking(move || load_asr_blocking(&settings, /* warm = */ true))
+                .await;
 
         match result {
-            Ok(Ok(asr)) => {
+            Ok(Ok((asr, biasing))) => {
                 *self.asr.lock() = Some(asr);
+                *self.loaded_biasing.lock() = Some(biasing);
                 self.set_state(DictationState::Idle);
             }
             Ok(Err(e)) => {
@@ -543,6 +666,63 @@ impl App {
     }
 }
 
+/// Build + warm the recogniser, applying the user's vocabulary as
+/// contextual biasing. Shared by the boot path and the vocabulary
+/// reload path so both can't drift on which decoding method or hotword
+/// score they use.
+///
+/// A vocabulary that fails to translate is **not** fatal: we log and
+/// fall back to unbiased greedy decoding, because a malformed
+/// `vocabulary.txt` should cost the user their custom terms, not their
+/// ability to dictate at all.
+fn load_asr_blocking(
+    settings: &SettingsStore,
+    warm: bool,
+) -> anyhow::Result<(Arc<Asr>, Biasing)> {
+    let encoder_path = settings.encoder_path();
+
+    // Sample BEFORE reading the vocabulary, so the recorded fingerprint
+    // can never be newer than the bytes this build actually consumed.
+    let biasing = Biasing::sample(settings);
+
+    menubar::set_status_text("Warming page cache…");
+    let _ = warmup::page_touch(&encoder_path)?;
+
+    let hotwords = match crate::vocabulary::prepare(
+        &settings.vocabulary_path(),
+        &settings.hotwords_path(),
+        Some(&settings.tokens_path()),
+    ) {
+        Ok(path) => path,
+        Err(e) => {
+            log::error!("vocabulary unusable, decoding without biasing: {e:#}");
+            menubar::set_status_text("Vocabulary unreadable — biasing off");
+            None
+        }
+    };
+
+    menubar::set_status_text("Loading recogniser (CoreML)…");
+    let threads = performance::performance_core_count();
+    log::info!("OfflineRecognizer: {threads} threads, provider=coreml");
+    let asr = Asr::load(&crate::asr::AsrConfig {
+        encoder: &encoder_path,
+        decoder: &settings.decoder_path(),
+        joiner: &settings.joiner_path(),
+        tokens: &settings.tokens_path(),
+        num_threads: threads,
+        hotwords: hotwords.as_deref(),
+        // The sampled score, not a fresh read — otherwise the recogniser
+        // could be built with a score we never record as loaded.
+        hotwords_score: biasing.score,
+    })?;
+
+    if warm {
+        menubar::set_status_text("Pre-warming graph…");
+        warmup::dummy_decode(&asr)?;
+    }
+    Ok((Arc::new(asr), biasing))
+}
+
 /// Synchronous polish-LLM load. Used by both the boot path (via
 /// `tokio::spawn_blocking`) and the Settings-toggle path (via
 /// `std::thread::spawn`). Updates the menubar status text as it goes
@@ -592,20 +772,21 @@ fn load_llm_blocking(settings: &SettingsStore) -> anyhow::Result<Arc<dyn PolishB
 ///
 /// Polish failures fall back to raw paste — the user always sees their
 /// transcript, never nothing.
-fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<()> {
+fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> Result<(), DeliveryFailure> {
     if matches!(settings.polish_mode, PolishMode::Off) {
-        return paste::deliver(raw);
+        return paste::deliver(raw).map_err(|e| DeliveryFailure::unsent(e, raw));
     }
     let Some(llm) = app.llm.try_get() else {
         // Polish was enabled but the model isn't loaded — pasting
         // raw is the right fallback (better than nothing). Status
         // text already explained the load failure.
         log::warn!("polish enabled but model unavailable; pasting raw");
-        return paste::deliver(raw);
+        return paste::deliver(raw).map_err(|e| DeliveryFailure::unsent(e, raw));
     };
     app.set_state(DictationState::Polishing);
 
-    let mut streamer = paste::Streamer::start()?;
+    let mut streamer =
+        paste::Streamer::start().map_err(|e| DeliveryFailure::unsent(e, raw))?;
     let outcome = run_polish_isolated(llm.as_ref(), raw, settings, |chunk| {
         streamer
             .push(chunk)
@@ -614,8 +795,13 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
     match outcome {
         PolishOutcome::Ok => {
             // Success: flush the unbroken-boundary tail (often the
-            // model's last fragment without a trailing space).
-            streamer.commit()
+            // model's last fragment without a trailing space). If that
+            // last insert fails, only the tail is unsent — everything
+            // up to the previous word boundary already landed, so
+            // rescuing `raw` here would duplicate most of it.
+            streamer
+                .commit()
+                .map_err(|(e, tail)| DeliveryFailure::unsent(e, &tail))
         }
         PolishOutcome::Error(e) => {
             log::error!("polish pipeline failed: {e:#}");
@@ -626,13 +812,25 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
             let any_streamed = streamer.has_fired();
             streamer.abort();
             if any_streamed {
-                menubar::set_status_text(&format!(
-                    "Polish failed mid-stream — partial output kept ({e})"
-                ));
+                // Partial polished text is on screen and the LLM stopped
+                // producing, so the rest of the transcript is gone from
+                // the visible output. Re-pasting `raw` would duplicate
+                // the part that landed, so put it on the CLIPBOARD
+                // instead: nothing duplicates on screen, and the user
+                // can recover the full transcript if the partial isn't
+                // enough. Before this, the tail plus everything the LLM
+                // hadn't emitted yet was simply lost.
+                rescue_to_clipboard(
+                    &DeliveryFailure::unsent(
+                        anyhow::anyhow!("polish failed mid-stream: {e}"),
+                        raw,
+                    ),
+                    "Polish failed mid-stream — partial kept, full transcript on clipboard",
+                );
                 Ok(())
             } else {
                 menubar::set_status_text(&format!("Polish failed — using raw transcript ({e})"));
-                paste::deliver(raw)
+                paste::deliver(raw).map_err(|e| DeliveryFailure::unsent(e, raw))
             }
         }
         PolishOutcome::Panicked(msg) => {
@@ -642,12 +840,72 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> anyhow::Result<
             let any_streamed = streamer.has_fired();
             streamer.abort();
             if any_streamed {
-                menubar::set_status_text("Polish panicked mid-stream — partial output kept");
+                // Same reasoning as the error branch above: keep the
+                // partial on screen, put the complete raw transcript on
+                // the clipboard rather than losing it.
+                rescue_to_clipboard(
+                    &DeliveryFailure::unsent(
+                        anyhow::anyhow!("polish panicked mid-stream: {msg}"),
+                        raw,
+                    ),
+                    "Polish panicked mid-stream — partial kept, full transcript on clipboard",
+                );
                 Ok(())
             } else {
                 menubar::set_status_text("Polish panicked — using raw transcript");
-                paste::deliver(raw)
+                paste::deliver(raw).map_err(|e| DeliveryFailure::unsent(e, raw))
             }
+        }
+    }
+}
+
+/// A delivery attempt that failed, carrying **the text that never
+/// reached the focused app** alongside the error.
+///
+/// The `unsent` field is the whole point: `ax_paste::insert_text` can
+/// fail (Accessibility revoked mid-session, `CGEventSource::new`
+/// refused, the event tap disabled by timeout), and until this existed
+/// the failure path just logged and dropped the transcript on the
+/// floor. The user had spoken, seen nothing appear, and had no way to
+/// recover the words. Now the caller puts `unsent` on the clipboard.
+///
+/// Which text lands here depends on how far delivery got — the raw
+/// transcript when nothing was inserted, or just the trailing fragment
+/// when streaming already committed the earlier words. Rescuing more
+/// than was actually lost would make the clipboard paste duplicate
+/// what's already on screen.
+struct DeliveryFailure {
+    err: anyhow::Error,
+    unsent: String,
+}
+
+impl DeliveryFailure {
+    fn unsent(err: anyhow::Error, text: &str) -> Self {
+        Self {
+            err,
+            unsent: text.to_string(),
+        }
+    }
+}
+
+/// Put text that never made it to the focused app on the clipboard, and
+/// say so in the menu bar. Best-effort: if the pasteboard write ALSO
+/// fails there is nowhere left to put the transcript, and the status
+/// text says that plainly rather than implying a recovery that didn't
+/// happen.
+fn rescue_to_clipboard(failure: &DeliveryFailure, ok_status: &str) {
+    log::error!("deliver failed: {:#}", failure.err);
+    if failure.unsent.is_empty() {
+        // Nothing was lost (empty transcript); no rescue to perform.
+        return;
+    }
+    match crate::clipboard::put(&failure.unsent) {
+        Ok(()) => {
+            menubar::set_status_text(ok_status);
+        }
+        Err(e) => {
+            log::error!("clipboard rescue also failed: {e:#}");
+            menubar::set_status_text("Paste failed and clipboard write failed — transcript lost");
         }
     }
 }

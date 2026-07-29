@@ -68,16 +68,25 @@ pub fn insert_text(text: &str) -> Result<()> {
     // `CGEventKeyboardSetUnicodeString` under `CGEvent::set_string`),
     // not the keycode. The key event still needs a valid keycode so
     // apps that look at the raw keycode don't crash on `nil`.
+    // Build BOTH events before posting EITHER.
+    //
+    // The previous order posted the keydown (which carries the text and
+    // is what actually inserts it) and only then constructed the keyup.
+    // A keyup construction failure therefore returned `Err` *after* the
+    // text had already been delivered — and the caller's clipboard
+    // rescue would then copy a chunk that was on screen, so pasting it
+    // duplicated the text. Constructing first makes the failure atomic:
+    // if we return `Err`, nothing was posted.
     let keydown = CGEvent::new_keyboard_event(source.clone(), 0, true)
         .map_err(|()| anyhow!("CGEventCreateKeyboardEvent keydown failed"))?;
-    keydown.set_string(text);
-    keydown.post(CGEventTapLocation::AnnotatedSession);
-
     // Matching keyup so the focused app doesn't observe a dangling
     // key-down (some apps and accessibility tools track key state).
     let keyup = CGEvent::new_keyboard_event(source, 0, false)
         .map_err(|()| anyhow!("CGEventCreateKeyboardEvent keyup failed"))?;
+    keydown.set_string(text);
     keyup.set_string(text);
+
+    keydown.post(CGEventTapLocation::AnnotatedSession);
     keyup.post(CGEventTapLocation::AnnotatedSession);
 
     log::info!(

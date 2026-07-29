@@ -57,6 +57,22 @@ pub struct Settings {
     pub language: String,
     #[serde(default)]
     pub polish_mode: PolishMode,
+    /// Contextual-biasing boost applied to every term in
+    /// `vocabulary.txt`. Ignored when the vocabulary is empty.
+    ///
+    /// Measured against `parakeet-tdt-0.6b-v3-int8` on the bench
+    /// fixtures: 1.0–6.0 leaves clean speech untouched, 10.0 starts
+    /// injecting hotwords into audio that doesn't contain them, and
+    /// 50.0 replaces the transcript with them outright. 2.0 is the
+    /// conservative default; raise it only if a term is still being
+    /// missed, and re-check with `asr_diff` that nothing else moved.
+    #[serde(default = "default_hotword_score")]
+    pub hotword_score: f32,
+}
+
+/// Default contextual-biasing boost. See [`Settings::hotword_score`].
+fn default_hotword_score() -> f32 {
+    2.0
 }
 
 impl Default for Settings {
@@ -66,6 +82,7 @@ impl Default for Settings {
             trigger_mode: TriggerMode::default(),
             language: String::new(),
             polish_mode: PolishMode::default(),
+            hotword_score: default_hotword_score(),
         }
     }
 }
@@ -184,6 +201,25 @@ impl SettingsStore {
 
     pub fn tokens_path(&self) -> PathBuf {
         self.model_dir().join("tokens.txt")
+    }
+
+    /// User-editable vocabulary list — one term or phrase per line,
+    /// written naturally. Opened by the Settings UI's "Edit
+    /// Vocabulary…" button and translated into sherpa's hotwords
+    /// format by `crate::vocabulary`.
+    ///
+    /// Lives directly in the data dir (not under `models/`) because
+    /// it's user content, not a downloaded artefact — a user clearing
+    /// out `models/` to force a re-download must not lose it.
+    pub fn vocabulary_path(&self) -> PathBuf {
+        self.data_dir.join("vocabulary.txt")
+    }
+
+    /// Machine-generated sherpa hotwords file, derived from
+    /// [`Self::vocabulary_path`] at recogniser-load time. Regenerated
+    /// from scratch on every load, so it's safe to delete.
+    pub fn hotwords_path(&self) -> PathBuf {
+        self.data_dir.join("hotwords.generated.txt")
     }
 
     /// Silero VAD ONNX model — drives the press-once / auto-stop flow.

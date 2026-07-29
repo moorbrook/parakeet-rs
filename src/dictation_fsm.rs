@@ -149,6 +149,24 @@ impl DictationFsm {
         self.inner.lock().state = new_state;
     }
 
+    /// Atomically take the app out of `Idle` and into `ModelLoading` so
+    /// the recogniser can be swapped (vocabulary change → rebuild with
+    /// new contextual biasing).
+    ///
+    /// Returns `false` — and changes nothing — from any other state.
+    /// The claim has to be atomic against `on_press_tap` /
+    /// `on_press_hold`, which both gate on `state == Idle`: a
+    /// check-then-set would let a hotkey press start a session against
+    /// the recogniser we're about to drop.
+    pub fn try_claim_model_reload(&self) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.state != DictationState::Idle {
+            return false;
+        }
+        inner.state = DictationState::ModelLoading;
+        true
+    }
+
     /// Tap-mode press handler. Atomically observes both `session` and
     /// `state` so the cancel-vs-claim decision can't race with the
     /// watcher clearing the slot.

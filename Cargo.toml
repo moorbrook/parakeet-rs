@@ -193,12 +193,14 @@ objc2-app-kit = { version = "0.3", features = [
     "NSVisualEffectView",      # HUD chrome fallback on macOS < 26
     "NSGlassEffectView",       # HUD chrome: Liquid Glass on macOS 26+
     "NSAlert",                 # NSAlertStyle, permissions UI
+    "NSPasteboard",            # Clipboard rescue when keystroke delivery fails
     "NSWorkspace",
     "block2",
     "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3", features = [
     "NSString",
+    "NSURL",                   # "Edit Vocabulary…" hands a file URL to NSWorkspace
     "NSGeometry",
     "NSDictionary",
     "NSData",

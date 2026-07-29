@@ -41,19 +41,63 @@ impl Decoded {
     }
 }
 
+/// Everything needed to construct the recogniser. A struct rather than
+/// a positional argument list because the biasing fields only make
+/// sense together, and `load(a, b, c, d, 8, None, 0.0)` at the call
+/// site says nothing about which `0.0` that is.
+pub struct AsrConfig<'a> {
+    pub encoder: &'a Path,
+    pub decoder: &'a Path,
+    pub joiner: &'a Path,
+    pub tokens: &'a Path,
+    pub num_threads: i32,
+    /// Generated sherpa hotwords file (see `crate::vocabulary`).
+    ///
+    /// `None` selects greedy decoding. `Some` selects modified beam
+    /// search, which is the **only** decoding method sherpa accepts
+    /// alongside a hotwords file — passing one with greedy makes
+    /// `OfflineRecognizer::create` fail outright — and which measured
+    /// ~13% slower on the 5 s bench fixture. See ADR-0020.
+    pub hotwords: Option<&'a Path>,
+    /// Boost applied to biased terms. Only read when `hotwords` is
+    /// `Some`. See [`crate::settings::Settings::hotword_score`] for the
+    /// measured safe range.
+    pub hotwords_score: f32,
+}
+
 impl Asr {
-    pub fn load(
-        encoder: &Path,
-        decoder: &Path,
-        joiner: &Path,
-        tokens: &Path,
-        num_threads: i32,
-    ) -> Result<Self> {
+    pub fn load(cfg: &AsrConfig<'_>) -> Result<Self> {
+        let AsrConfig {
+            encoder,
+            decoder,
+            joiner,
+            tokens,
+            num_threads,
+            hotwords,
+            hotwords_score,
+        } = *cfg;
         for p in [encoder, decoder, joiner, tokens] {
             if !p.exists() {
                 return Err(anyhow!("missing model file: {}", p.display()));
             }
         }
+
+        // Greedy unless the user actually has vocabulary terms — beam
+        // search is a real cost to pay for a feature nobody enabled.
+        let (decoding_method, hotwords_file, hotwords_score) = match hotwords {
+            Some(path) => {
+                log::info!(
+                    "ASR contextual biasing ON (score {hotwords_score}): {}",
+                    path.display()
+                );
+                (
+                    "modified_beam_search",
+                    Some(path.to_string_lossy().into_owned()),
+                    hotwords_score,
+                )
+            }
+            None => ("greedy_search", None, 0.0),
+        };
 
         // ADR-0015 layer 2: log what we *asked* for and what build.rs
         // (layer 1) detected in the static lib. sherpa-onnx's Rust surface
@@ -82,6 +126,9 @@ impl Asr {
                 model_type: Some("nemo_transducer".to_string()),
                 ..Default::default()
             },
+            decoding_method: Some(decoding_method.to_string()),
+            hotwords_file,
+            hotwords_score,
             ..Default::default()
         };
 

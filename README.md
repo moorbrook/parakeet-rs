@@ -78,6 +78,33 @@ punctuation, honours inline commands ("new paragraph", "scratch
 that"); adds wall-clock latency but streams to the cursor on word
 boundaries.
 
+### Custom vocabulary
+
+Settings → **Edit Vocabulary…** opens a plain text file in your editor.
+One term or phrase per line, spelled the way you want it transcribed:
+
+```
+Kubernetes
+Ghostty
+New York
+```
+
+Those words get boosted during recognition, which is the fix for names,
+jargon, and product names Parakeet mishears. Click Save in Settings
+afterwards — the recogniser rebuilds in the background (or as soon as
+the current dictation finishes).
+
+Terms are validated against the model's token inventory, so a word the
+model can't represent (emoji, unusual scripts) is reported in the log
+and skipped rather than silently doing nothing.
+
+An empty list costs nothing. A non-empty one switches the decoder from
+greedy to beam search, measured at **+13%** decode time
+([ADR-0020](docs/ADR.md#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list)).
+The boost strength is `hotword_score` in `settings.json`, default 2.0;
+values above ~6 start injecting your terms into audio that doesn't
+contain them, so re-check with `asr_diff` if you raise it.
+
 ## Caveats
 
 - **Apple Silicon only.** No plans for a universal binary
@@ -85,7 +112,10 @@ boundaries.
 - **Text injection** works in terminals (Ghostty, iTerm2, Terminal.app),
   browsers, native Cocoa, Electron (Slack/VS Code/etc.), JetBrains,
   Xcode. Doesn't reach password fields or apps with aggressive input
-  filtering.
+  filtering. When injection fails *observably*, the transcript goes to
+  the clipboard and the menu bar says so. `CGEventPost` gives no
+  delivery receipt, so an app that accepts the keystroke and discards it
+  still looks like success — see [`PRIVACY.md`](PRIVACY.md#clipboard).
 - **Build size**: ~7 MB binary + ~50 MB bundled dylibs (mostly
   onnxruntime and llama-cpp).
 
@@ -101,12 +131,18 @@ session/polish-load races stay localised:
 - `src/paste.rs` — `TextSink` trait + word-boundary `Streamer`
 - `src/ax_paste.rs` — `CGEvent` keystroke implementation
 - `src/streamer.rs` — per-session VAD/manual capture
+- `src/vocabulary.rs` — `vocabulary.txt` → sherpa hotwords encoding
+- `src/clipboard.rs` — rescue copy when keystroke delivery fails
 - `src/{audio,asr,vad,hud,hotkey,menubar,settings,settings_ui,…}.rs`
 
-Two headless benches under `src/bin/`: `bench_asr` and `bench_llm`.
+Three headless harnesses under `src/bin/`: `bench_asr` and `bench_llm`
+(latency), and `asr_diff` (transcript regressions — see below).
+
+Privacy behaviour — what each permission does, what touches the network,
+what lands on disk — is documented in [`PRIVACY.md`](PRIVACY.md).
 
 Architectural rationale lives in [`docs/ADR.md`](docs/ADR.md) (decisions
-0001-0019); latency targets and measurements in
+0001-0021); latency targets and measurements in
 [`docs/latency-plan.md`](docs/latency-plan.md). The deferred
 Developer-ID/notarization shipping procedure is captured in
 [`docs/notarized-distribution.md`](docs/notarized-distribution.md).
@@ -115,8 +151,19 @@ Developer-ID/notarization shipping procedure is captured in
 
 ```bash
 cargo build --release && scripts/make-app.sh
-cargo test                                       # 79 unit tests
+cargo test                                       # 118 unit tests
 cargo clippy --all-targets --no-deps             # clean
+```
+
+Anything that could change what the recogniser *says* — model weights,
+execution provider, vocabulary, hotword score — should also be checked
+against recorded transcripts, not just latency:
+
+```bash
+scripts/bench-latency.sh                 # generates bench/audio/ fixtures
+./target/release/asr_diff --record       # baseline (machine-local)
+# ...make the change...
+./target/release/asr_diff                # exits 1 on any transcript drift
 ```
 
 ## Roadmap

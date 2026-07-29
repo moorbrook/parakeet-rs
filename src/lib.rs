@@ -34,7 +34,9 @@ pub mod performance;
 pub mod permissions;
 pub mod polish;
 pub mod settings;
+pub mod vocabulary;
 pub mod warmup;
+pub mod wav;
 
 // Internal modules — only referenced from inside the lib (the public
 // modules above use them via `crate::*`). Keeping them private tightens
@@ -43,6 +45,7 @@ pub mod warmup;
 // or main.rs callsite needs one of these, promote it to `pub mod`.
 mod audio;
 mod ax_paste;
+mod clipboard;
 mod hotkey;
 mod hud;
 mod menubar;

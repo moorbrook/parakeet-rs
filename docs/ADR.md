@@ -1132,6 +1132,164 @@ exactly as they had it.
 
 ---
 
+## 0020 — Vocabulary: sherpa contextual biasing, generated from a plain-text list
+
+**Status:** **Accepted — shipped.**
+
+**Context.** Dictation fails predictably on the same class of words:
+proper nouns, product names, trade jargon, colleagues' surnames. The
+recognizer is fixed and small; nothing in the pipeline let a user tell
+it "this word exists". sherpa-onnx supports contextual biasing
+(hotwords) for offline transducers, so the capability was already in
+the tree — but three properties of it had to be measured against
+`parakeet-tdt-0.6b-v3-int8` before it could be exposed, because getting
+any of them wrong produces a feature that silently does nothing.
+
+**Measurements** (M5 Pro, `bench/audio/5s.wav`, int8 + CoreML):
+
+1. **Greedy decoding rejects a hotwords file outright.**
+   `OfflineRecognizer::create` returns `None` with
+   `Please use --decoding-method=modified_beam_search if you provide
+   --hotwords-file`. Biasing therefore forces beam search — it is not
+   an opt-in refinement on top of the existing decode path.
+
+2. **Beam search costs ~13%.** 396 ms → 448 ms per 5 s decode
+   (greedy vs `modified_beam_search`, `max_active_paths=4`). Real but
+   affordable, and only paid when the user has terms.
+
+3. **A plain word does nothing — silently.** The model ships no
+   `bpe.model` (the HF repo contains only the three ONNX files and
+   `tokens.txt`), so sherpa falls back to `modeling_unit="cjkchar"` and
+   looks up each whitespace-separated piece as a single token.
+   `Kubernetes` is not a token, so it fails to encode and the decode is
+   unchanged **even at `hotwords_score=50`**. This is the trap: the
+   naive implementation ships, appears to work, and does nothing.
+
+   The tokens are SentencePiece pieces, so the correct encoding is
+   per-character with `▁` (U+2581) marking word-initial position:
+
+   | vocabulary.txt | encoded | decode at score 50 |
+   |---|---|---|
+   | `Kubernetes` | `Kubernetes` | *(unchanged — no effect)* |
+   | `Kubernetes` | `K u b e r n e t e s` | `KubernetesKubernetes…` (glued) |
+   | `Kubernetes` | `▁K u b e r n e t e s` | `Kubernetes Kubernetes …` ✓ |
+   | `New York` | `▁N e w ▁Y o r k` | `New York New York …` ✓ |
+
+4. **Safe boost range.** With a realistic 3-term vocabulary, scores
+   1.0–6.0 left all five bench fixtures byte-identical to the greedy
+   baseline. 10.0 began injecting hotwords into audio that did not
+   contain them; 50.0 replaced the transcript with them entirely.
+   **Default: 2.0.**
+
+**Decision.**
+
+- The user edits `vocabulary.txt` — one term or phrase per line, `#`
+  comments, written naturally. `crate::vocabulary` owns the translation
+  into sherpa's format. The raw format is not exposed; measurement 3 is
+  precisely why asking a user to write it themselves would be a bug
+  farm.
+- **Every encoded piece is validated against `tokens.txt` before the
+  hotwords file is written.** Measurement 3's failure mode is not
+  limited to whole words: any character with no token (emoji, `Ω`, a
+  decomposed `é`, smart punctuation) makes sherpa drop that hotword
+  with a stderr log the bundled app discards. Validating up front turns
+  "your term silently does nothing" into a named warning identifying
+  the term and the offending piece. If validation rejects everything,
+  we fall back to greedy rather than paying beam-search cost for an
+  empty context graph.
+- A plain file opened via `NSWorkspace`, not an in-window text view.
+  This is a list people paste into, sort, and keep in dotfiles;
+  `NSTextView` would be a worse editor than the one they already have.
+- Greedy stays the default. `AsrConfig.hotwords: Option<&Path>` selects
+  the decoding method, so an empty or absent vocabulary costs nothing —
+  no beam search, no behaviour change, byte-identical transcripts.
+- Biasing is baked in at recognizer construction, so a vocabulary edit
+  requires a rebuild. Settings-Save rebuilds in the background via
+  `DictationFsm::try_claim_model_reload`, which atomically takes the
+  app out of `Idle` so a hotkey press can't start a session against a
+  recognizer that is about to be dropped. The previous recognizer is
+  replaced only on success — a malformed vocabulary costs the user
+  their custom terms, never their ability to dictate.
+
+**Staleness tracking (`App::loaded_biasing`).** Three bugs here were
+caught in adversarial review, and all three share one root cause:
+comparing against *what settings said* rather than *what was loaded*.
+
+  1. Comparing `prev` vs `new` settings meant a **failed** rebuild
+     never retried — the second Save saw `prev == new` and did nothing,
+     leaving a recognizer that didn't match the config indefinitely.
+  2. Fingerprinting the vocabulary file *after* the build recorded a
+     newer file than was actually read if the user edited mid-build.
+     That erased the very mismatch that would have triggered the retry,
+     so it was permanent.
+  3. A rebuild requested while the app was busy printed "applies after
+     the current dictation" and was then dropped — nothing drained it.
+
+The fix is one type: `Biasing { vocab: Option<(len, mtime)>, score }`,
+sampled **before** the build, returned by `load_asr_blocking`, and
+stored only on success. Staleness is `loaded != Biasing::sample(...)`.
+Failure leaves the old value, so the mismatch persists and the retry
+happens; a mid-build edit compares unequal to the pre-build sample and
+gets picked up by the re-check the worker runs on completion; and a
+busy app sets `reload_pending`, drained by `on_session_finished`.
+
+**Consequences.** Verified by `asr_diff` (ADR-0021): the default
+vocabulary + score is transparent on all five fixtures, and the
+harness catches the drift at score 20 with 100% divergence.
+
+---
+
+## 0021 — `asr_diff`: transcript regression harness
+
+**Status:** **Accepted — shipped.**
+
+**Context.** `bench_asr` measures how *fast* the recognizer is. Nothing
+measured what it *says*. Changes with direct transcription consequences
+— int8 weights, CoreML silently falling back to CPU (which ADR-0015
+detects only via an RTFx heuristic), contextual biasing, a hotword
+score — were landing on the strength of "it still runs and the latency
+looks fine". The comparison point is qwen-scribe, which ships a
+`compare_models.py` for exactly this and warns to "validate names and
+numbers on representative recordings before relying on a quantized
+model"; we had int8 weights and no such check.
+
+**Decision.** `src/bin/asr_diff.rs` decodes every `*.wav` in a fixture
+directory and either records the transcripts (`--record`) or diffs
+against a recorded set, reporting word-level Levenshtein distance per
+fixture plus an aggregate divergence percentage. Non-zero exit on any
+change, so it can gate.
+
+- Reuses `crate::vocabulary::prepare` rather than reimplementing the
+  encoding — a harness that validated a *different* encoding than the
+  app ships would be worse than none.
+- `read_wav_mono` moved from `bench_asr` into `crate::wav` so both
+  harnesses agree on stereo folding; two subtly different parsers would
+  manufacture phantom regressions.
+- The baseline is gitignored. Fixtures come from macOS `say`, so the
+  transcripts depend on the local TTS voice and OS version — a
+  committed baseline would fail for everyone except its author.
+
+Three gate holes were closed after adversarial review, all of the same
+shape — a difference the harness saw but didn't count:
+
+- **Fixtures not in the baseline** were printed and ignored. An empty
+  baseline therefore passed against any number of decoded fixtures: the
+  gate exited 0 having verified nothing.
+- **Whitespace-only drift** passed, because the comparison was word
+  edit distance over `split_whitespace`. Pass/fail is now exact string
+  equality; edit distance only sizes the change.
+- **Missing fixtures** counted as changed but contributed zero edits, so
+  a run where nothing decoded reported "0.00% divergence". A missing
+  fixture now costs its full baseline word count, and a zero
+  denominator prints "divergence undefined" rather than `0.00%`.
+
+**Consequences.** Accuracy-affecting changes now have a check that
+fails loudly. The harness was validated against known-bad
+configurations — ADR-0020 measurement 4, an added fixture, and an
+unencodable vocabulary term — rather than only against the happy path.
+
+---
+
 ## Index of open decisions vs targets
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |

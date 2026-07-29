@@ -34,7 +34,7 @@ use crate::app::{glyphs_for_shortcut, is_capslock_token, AppHandle};
 use crate::settings::{PolishMode, TriggerMode};
 
 const WINDOW_W: f64 = 480.0;
-const WINDOW_H: f64 = 400.0;
+const WINDOW_H: f64 = 560.0;
 const ROW_H: f64 = 26.0;
 const LABEL_W: f64 = 130.0;
 const PAD: f64 = 20.0;
@@ -122,6 +122,38 @@ define_class!(
         #[unsafe(method(polishModeChanged:))]
         fn polish_mode_changed(&self, _sender: *mut NSObject) {
             crate::objc_util::selector_guard("polishModeChanged:", || {});
+        }
+
+        /// "Edit Vocabulary…" — hand `vocabulary.txt` to whatever the
+        /// user's default editor for .txt is.
+        ///
+        /// A plain text file beats an in-window text view here: the
+        /// list is something people paste into, sort, diff, and keep in
+        /// their dotfiles, and NSTextView would give us a worse editor
+        /// than the one they already have. The tradeoff is that edits
+        /// land out-of-band, which is why Save re-fingerprints the file
+        /// and rebuilds the recogniser (see `App::apply_settings`).
+        #[unsafe(method(editVocabulary:))]
+        fn edit_vocabulary(&self, _sender: *mut NSObject) {
+            crate::objc_util::selector_guard("editVocabulary:", || {
+                let Some(app) = AppHandle::get() else { return };
+                let path = app.settings.vocabulary_path();
+                // Seed the starter file so the editor never opens on a
+                // blank buffer with no hint about the format.
+                if let Err(e) = crate::vocabulary::ensure_template(&path) {
+                    log::error!("creating vocabulary template: {e:#}");
+                    return;
+                }
+                let url = unsafe {
+                    objc2_foundation::NSURL::fileURLWithPath(&NSString::from_str(
+                        &path.to_string_lossy(),
+                    ))
+                };
+                let ws = unsafe { objc2_app_kit::NSWorkspace::sharedWorkspace() };
+                if !unsafe { ws.openURL(&url) } {
+                    log::error!("NSWorkspace refused to open {}", path.display());
+                }
+            });
         }
 
         #[unsafe(method(cancel:))]
@@ -460,7 +492,39 @@ pub fn open(mtm: MainThreadMarker) {
         60.0,
     );
 
-    // --- Row 7: Buttons (bottom-right) ------------------------------------
+    // --- Section divider: Vocabulary --------------------------------------
+    let vocab_section_y = row5_y - 80.0;
+    add_section_label(mtm, &content, "Vocabulary", PAD, vocab_section_y);
+
+    // --- Row 6: Edit-vocabulary button ------------------------------------
+    let row6_y = vocab_section_y - ROW_H - 10.0;
+    add_label(mtm, &content, "Custom terms", PAD, row6_y);
+    let vocab_btn = make_button(
+        mtm,
+        "Edit Vocabulary…",
+        &controller,
+        sel!(editVocabulary:),
+        NSPoint::new(PAD + LABEL_W, row6_y - 4.0),
+        NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
+    );
+    unsafe { content.addSubview(&vocab_btn) };
+
+    // --- Row 7: Vocabulary hint -------------------------------------------
+    let row7_y = row6_y - 30.0;
+    add_hint(
+        mtm,
+        &content,
+        "Names, jargon, and product names Parakeet mishears. One per\n\
+         line, spelled how you want them transcribed. Opens in your\n\
+         text editor; click Save here afterwards to apply. A non-empty\n\
+         list makes recognition about 13% slower.",
+        PAD,
+        row7_y - 50.0,
+        WINDOW_W - PAD * 2.0,
+        60.0,
+    );
+
+    // --- Row 8: Buttons (bottom-right) ------------------------------------
     let btn_w = 90.0;
     let btn_h = 28.0;
     let btn_y = PAD;

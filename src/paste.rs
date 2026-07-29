@@ -132,11 +132,22 @@ impl Streamer {
     /// output AND allow the caller's error branch to additionally
     /// paste raw, producing a `partial + raw` mess. Use `abort`
     /// instead.
-    pub fn commit(mut self) -> Result<()> {
-        if !self.pending.is_empty() {
-            self.flush_now()?;
+    ///
+    /// On sink failure the error is returned **together with the tail
+    /// that never reached the focused app**, so the caller can put
+    /// exactly that text on the clipboard rather than guessing. Only
+    /// the tail is unsent here — everything before the last word
+    /// boundary already landed.
+    pub fn commit(mut self) -> std::result::Result<(), (anyhow::Error, String)> {
+        if self.pending.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        match self.flush_now() {
+            Ok(()) => Ok(()),
+            // `flush_now` restores `pending` on failure, so this is the
+            // exact text the sink refused.
+            Err(e) => Err((e, std::mem::take(&mut self.pending))),
+        }
     }
 
     /// Aborted end-of-stream. Discards the pending tail (does NOT
@@ -151,9 +162,19 @@ impl Streamer {
         // Pending is dropped; that's the entire abort action.
     }
 
+    /// Hand the buffered tail to the sink.
+    ///
+    /// On failure the chunk is put **back** into `pending` rather than
+    /// dropped. Without that, a failed insert silently destroyed the
+    /// text — there was no longer anything for the caller to rescue to
+    /// the clipboard. `abort` still discards `pending` explicitly,
+    /// which is the only path that should lose it.
     fn flush_now(&mut self) -> Result<()> {
         let chunk: String = std::mem::take(&mut self.pending);
-        self.sink.insert(&chunk)?;
+        if let Err(e) = self.sink.insert(&chunk) {
+            self.pending = chunk;
+            return Err(e);
+        }
         self.fired = true;
         Ok(())
     }
@@ -300,6 +321,48 @@ mod tests {
             "expected sink error to surface, got: {err}"
         );
         assert!(s.has_fired(), "fired flag must survive the error");
+    }
+
+    #[test]
+    fn commit_returns_the_unsent_tail_when_the_sink_fails() {
+        // The clipboard-rescue path in `app.rs` can only save text it
+        // is handed. If `commit` swallowed the tail on failure (as it
+        // did before), the user's last word was gone with no way to
+        // recover it. Pin that the exact unsent text comes back out.
+        let sink = RecordingSink::default();
+        sink.inner.lock().unwrap().fail_on_call = Some(1);
+        let mut s = Streamer::with_sink(sink.boxed()).unwrap();
+        s.push("dangling").unwrap(); // buffered, no boundary → no insert yet
+        let (err, unsent) = s.commit().unwrap_err();
+        assert!(err.to_string().contains("synthetic sink failure"));
+        assert_eq!(unsent, "dangling");
+    }
+
+    #[test]
+    fn failed_flush_leaves_the_chunk_buffered_for_retry() {
+        // `flush_now` restores `pending` on error. A transient sink
+        // failure mid-stream therefore doesn't destroy the words —
+        // the next successful boundary flush carries them through.
+        let sink = RecordingSink::default();
+        sink.inner.lock().unwrap().fail_on_call = Some(1);
+        let mut s = Streamer::with_sink(sink.boxed()).unwrap();
+        s.push("lost ").unwrap_err();
+        assert!(!s.has_fired(), "the failed insert must not count as fired");
+        // Second push succeeds and carries BOTH words.
+        s.push("and found ").unwrap();
+        assert_eq!(sink.calls(), vec!["lost ", "lost and found "]);
+    }
+
+    #[test]
+    fn abort_is_the_only_path_that_discards_buffered_text() {
+        // Mirror of the test above: `abort` must still drop the tail,
+        // otherwise the polish-failure fallback would paste raw on top
+        // of a tail that also got delivered.
+        let sink = RecordingSink::default();
+        let mut s = Streamer::with_sink(sink.boxed()).unwrap();
+        s.push("discard me").unwrap();
+        s.abort();
+        assert!(sink.calls().is_empty());
     }
 
     #[test]
