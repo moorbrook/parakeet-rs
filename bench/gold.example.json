@@ -1,8 +1,12 @@
 {
-  "version": 1,
+  "version": 2,
   "thresholds": {
     "max_wer_percent": 4.0,
-    "max_cer_percent": 3.0
+    "max_cer_percent": 3.0,
+    "baseline_wer_percent": 0.0,
+    "baseline_cer_percent": 0.0,
+    "max_wer_regression_percent": 4.0,
+    "max_cer_regression_percent": 3.0
   },
   "fixtures": [
     {

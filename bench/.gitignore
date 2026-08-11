@@ -1,4 +1,6 @@
 audio/
+!gold/audio/
+!gold/audio/*.wav
 raw.log
 # `asr_diff` baseline. Machine-local: the fixtures come from macOS `say`,
 # so the transcripts depend on the local TTS voice and OS version.

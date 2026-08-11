@@ -4,6 +4,7 @@
 
 use std::ffi::CString;
 use std::fmt;
+use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -12,24 +13,123 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// Apple Silicon (M1+). Falls back to half of total logicals if the sysctl
 /// is missing — non-Apple-Silicon Macs, hypothetically.
 pub fn performance_core_count() -> i32 {
-    let mut value: i32 = 0;
-    let mut size = std::mem::size_of::<i32>();
-    let name = CString::new("hw.perflevel0.logicalcpu")
-        .expect("static sysctl name contains no interior NUL");
-    let rc = unsafe {
+    if let Ok(value) = sysctl_i32("hw.perflevel0.logicalcpu") {
+        if value > 0 {
+            return value;
+        }
+    }
+    (num_cpus_total() / 2).max(2) as i32
+}
+
+fn sysctl_i32(name: &str) -> io::Result<i32> {
+    sysctl_number(name)
+}
+
+/// Read an unsigned 64-bit macOS sysctl without spawning a subprocess.
+pub fn sysctl_u64(name: &str) -> io::Result<u64> {
+    sysctl_number(name)
+}
+
+fn sysctl_number<T: Copy + Default>(name: &str) -> io::Result<T> {
+    let name =
+        CString::new(name).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let mut value = T::default();
+    let mut size = std::mem::size_of::<T>();
+    let result = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
-            &mut value as *mut _ as *mut libc::c_void,
+            &mut value as *mut T as *mut libc::c_void,
             &mut size,
             std::ptr::null_mut(),
             0,
         )
     };
-    if rc == 0 && value > 0 {
-        value
+    if result == 0 && size == std::mem::size_of::<T>() {
+        Ok(value)
     } else {
-        (num_cpus_total() / 2).max(2) as i32
+        Err(if result == 0 {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sysctl value had unexpected size",
+            )
+        } else {
+            io::Error::last_os_error()
+        })
     }
+}
+
+/// Read a NUL-terminated macOS string sysctl without spawning a subprocess.
+pub fn sysctl_string(name: &str) -> io::Result<String> {
+    let name =
+        CString::new(name).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let mut size = 0usize;
+    let size_result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut bytes = vec![0_u8; size];
+    let read_result = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read_result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    bytes.truncate(size);
+    if bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Peak resident set for this process. macOS reports `ru_maxrss` in bytes.
+pub fn peak_resident_bytes() -> io::Result<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let resident = unsafe { usage.assume_init() }.ru_maxrss;
+    u64::try_from(resident)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative peak resident set"))
+}
+
+/// Current resident set for a process visible to this user.
+pub fn resident_bytes(pid: u32) -> io::Result<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
+    let expected_size = std::mem::size_of::<libc::proc_taskinfo>();
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected_size as libc::c_int,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if result as usize != expected_size {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "proc_pidinfo returned an incomplete task record",
+        ));
+    }
+    Ok(unsafe { info.assume_init() }.pti_resident_size)
 }
 
 // The closure can't become `NonZero::get` (what the lint wants): that
@@ -351,5 +451,15 @@ mod tests {
         assert_eq!(OptU32(Some(42)).to_string(), "42");
         assert_eq!(OptF32(None).to_string(), "-");
         assert_eq!(OptF32(Some(4.83)).to_string(), "4.830");
+    }
+
+    #[test]
+    fn hardware_provenance_is_available_in_process() {
+        assert!(!sysctl_string("machdep.cpu.brand_string")
+            .unwrap()
+            .is_empty());
+        assert!(sysctl_u64("hw.memsize").unwrap() > 0);
+        assert!(peak_resident_bytes().unwrap() > 0);
+        assert!(resident_bytes(std::process::id()).unwrap() > 0);
     }
 }

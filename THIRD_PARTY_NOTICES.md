@@ -33,3 +33,18 @@ They are test assets only and are not bundled in Parakeet.app.
 - Source utterance IDs: `6930-75918-0000`, `6930-75918-0001`
 - License: Creative Commons Attribution 4.0 International
   (<https://creativecommons.org/licenses/by/4.0/>)
+
+## SLURP gold-corpus fixtures
+
+The five human-speech WAV files whose names begin with `slurp-` under
+`bench/gold/audio/` come from the real-audio train split of SLURP by Emanuele
+Bastianelli, Andrea Vanzo, Pawel Swietojanski, and Verena Rieser. They are test
+assets only and are not bundled in Parakeet.app.
+
+- Corpus: <https://github.com/pswietojanski/slurp>
+- Official annotation revision: <https://github.com/pswietojanski/slurp/tree/8eb16545762be97ace75334109d73824217311f1>
+- Audio mirror and exact revision: <https://huggingface.co/datasets/qmeeus/slurp/tree/91b0abfee2e735282967ee00d631d6d5f0fb7ff9>
+- Source IDs, row numbers, capture types, and hashes: `bench/gold/sources.json`
+- Text license: Creative Commons Attribution 4.0 International
+- Audio license: Creative Commons Attribution-NonCommercial 4.0 International
+  (<https://creativecommons.org/licenses/by-nc/4.0/>)
