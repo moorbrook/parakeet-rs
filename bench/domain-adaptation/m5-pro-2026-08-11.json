@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "issue": 6,
+  "measured_at": "2026-08-11",
+  "hardware": {
+    "chip": "Apple M5 Pro",
+    "memory_bytes": 25769803776,
+    "logical_cpus": 15,
+    "operating_system": "macOS 26.5.1",
+    "architecture": "aarch64"
+  },
+  "measurement_contract": {
+    "build": "cargo build --release --locked --bin asr_diff",
+    "repetitions": 10,
+    "warmup": "one page-touch and one dummy decode per process",
+    "execution": "serial process-cold candidates with filesystem cache warm",
+    "corpus_seconds": 34.05,
+    "reference_words": 92,
+    "reference_characters": 476,
+    "report_schema_version": 3
+  },
+  "inputs": {
+    "gold_manifest": {
+      "path": "bench/gold/manifest.json",
+      "bytes": 2003,
+      "sha256": "899857a4972bebe428835dd9d4aee4c4975e099e3c6f7a5408ce18d5b01c1435"
+    },
+    "gold_sources": {
+      "path": "bench/gold/sources.json",
+      "bytes": 3526,
+      "sha256": "a0a5f1fb4cc373375ba0f42dfefd7e3546a4234686548cba372c4fb176768126"
+    },
+    "vocabulary": {
+      "path": "bench/gold/vocabulary.txt",
+      "bytes": 17,
+      "sha256": "2d7e18bdeaef551a5e032eaba95a5db540e0a903fde73d7691ca1e56f349c8eb",
+      "terms": [
+        "IBM",
+        "Olly",
+        "Tactics"
+      ],
+      "generated_hotwords_sha256": "9b67a39cf1c29929766e3daf6790c03e8c96cdd7a0fb9c6581ff00780eba8fe0"
+    },
+    "shipping_quality_baseline": {
+      "path": "bench/qwen3-asr/shipping-coreml-baseline.json",
+      "bytes": 1041,
+      "sha256": "640a148b49b6c3a814813beba7e77c1eff46251e16460f05f2bd02f5d74ab63a"
+    }
+  },
+  "evaluator_sources": {
+    "Cargo.lock": "415ada5170ff18765fc8b73c736da5602e4db33254b37c3aa10e24be6c43cd5d",
+    "src/asr_eval.rs": "a699a615aac561d1e204702822d5ced7664307c519a33254c88e779bd26349b0",
+    "src/bin/asr_diff.rs": "25bd24e4b2397ace401459e3a490c56127a56c3502e31b4c7c80d9b6fa8ec78a",
+    "src/bin/tune_asr.rs": "7bed493fdf4822b49749ff3e51f6f4e566d2ab37efe926db51bb9c860557ccc1",
+    "src/vocabulary.rs": "9df0eab40ad6e9698706158b6daa7db508bbd3b8b05f0570476cdce0d71054f1",
+    "scripts/qwen3_asr_eval_common.py": "8cea355b2aea129314fd98ef7eb826b2bc4c7308e092c1d4a020b78708917d3d"
+  },
+  "candidates": [
+    {
+      "name": "greedy",
+      "report": "bench/domain-adaptation/raw/sherpa-greedy.json",
+      "report_sha256": "7fdd45298cdf7f85a3c7a30fd2d885930f8805e96fa1b4e3af589b9e6562e021",
+      "method": "greedy_search",
+      "hotword_score": null,
+      "wer_percent": 10.869565217391305,
+      "cer_percent": 5.46218487394958,
+      "custom_vocabulary_wer_percent": 54.54545454545455,
+      "custom_vocabulary_cer_percent": 12.5,
+      "corpus_decode_seconds_p50": 2.842647209763527,
+      "corpus_decode_seconds_p95": 2.9229389429092407,
+      "corpus_rtfx_p50": 11.978117725658013,
+      "peak_rss_bytes": 4572348416,
+      "latency_regression_vs_greedy_percent": 0.0,
+      "nondeterministic_outputs": 0,
+      "passed_shipping_gate": false
+    },
+    {
+      "name": "score-0",
+      "report": "bench/domain-adaptation/raw/sherpa-score-0.json",
+      "report_sha256": "fd2df6d6f75504e0432911ba7c1d8edda711cac1948a8773e5866dfbe3e25db4",
+      "method": "modified_beam_search",
+      "hotword_score": 0.0,
+      "wer_percent": 10.869565217391305,
+      "cer_percent": 5.46218487394958,
+      "custom_vocabulary_wer_percent": 54.54545454545455,
+      "custom_vocabulary_cer_percent": 12.5,
+      "corpus_decode_seconds_p50": 3.219275414943695,
+      "corpus_decode_seconds_p95": 3.248514160513878,
+      "corpus_rtfx_p50": 10.576778480338973,
+      "peak_rss_bytes": 4587110400,
+      "latency_regression_vs_greedy_percent": 13.249206721346862,
+      "nondeterministic_outputs": 0,
+      "passed_shipping_gate": false
+    },
+    {
+      "name": "score-2",
+      "report": "bench/domain-adaptation/raw/sherpa-score-2.json",
+      "report_sha256": "0e32afd89b52564ae758bb4052a23d3e4b02e634591766a18d81c4175e4e9099",
+      "method": "modified_beam_search",
+      "hotword_score": 2.0,
+      "wer_percent": 10.869565217391305,
+      "cer_percent": 5.46218487394958,
+      "custom_vocabulary_wer_percent": 54.54545454545455,
+      "custom_vocabulary_cer_percent": 12.5,
+      "corpus_decode_seconds_p50": 3.2365978062152863,
+      "corpus_decode_seconds_p95": 3.287199780344963,
+      "corpus_rtfx_p50": 10.520171170379871,
+      "peak_rss_bytes": 4586242048,
+      "latency_regression_vs_greedy_percent": 13.85858206740087,
+      "nondeterministic_outputs": 0,
+      "passed_shipping_gate": false
+    },
+    {
+      "name": "score-2.75",
+      "report": "bench/domain-adaptation/raw/sherpa-score-2.75.json",
+      "report_sha256": "64c201244e532f1e72c9479c83431113bed13390bc19510ae8ddd028f84c970f",
+      "method": "modified_beam_search",
+      "hotword_score": 2.75,
+      "wer_percent": 8.695652173913043,
+      "cer_percent": 6.092436974789916,
+      "custom_vocabulary_wer_percent": 27.272727272727273,
+      "custom_vocabulary_cer_percent": 12.5,
+      "corpus_decode_seconds_p50": 3.245119124650955,
+      "corpus_decode_seconds_p95": 3.314075544476509,
+      "corpus_rtfx_p50": 10.492546382168069,
+      "peak_rss_bytes": 4569759744,
+      "latency_regression_vs_greedy_percent": 14.158349073535192,
+      "nondeterministic_outputs": 0,
+      "passed_shipping_gate": false
+    },
+    {
+      "name": "score-4.5",
+      "report": "bench/domain-adaptation/raw/sherpa-score-4.5.json",
+      "report_sha256": "26eec1a99a4854a23890651430b4bd9d963db40afa7e8d568c1cedd05a32cc32",
+      "method": "modified_beam_search",
+      "hotword_score": 4.5,
+      "wer_percent": 11.956521739130435,
+      "cer_percent": 8.403361344537815,
+      "custom_vocabulary_wer_percent": 36.36363636363637,
+      "custom_vocabulary_cer_percent": 23.214285714285715,
+      "corpus_decode_seconds_p50": 3.2607538998126984,
+      "corpus_decode_seconds_p95": 3.3088281750679016,
+      "corpus_rtfx_p50": 10.442236359210254,
+      "peak_rss_bytes": 4579409920,
+      "latency_regression_vs_greedy_percent": 14.708356654779987,
+      "nondeterministic_outputs": 0,
+      "passed_shipping_gate": false
+    },
+    {
+      "name": "score-6",
+      "report": "bench/domain-adaptation/raw/sherpa-score-6.json",
+      "report_sha256": "b95fe75c22f10843c30e0d943fdd1f0560b3b4006e74cb93b3b208ae2011976b",
+      "method": "modified_beam_search",
+      "hotword_score": 6.0,
+      "wer_percent": 42.391304347826086,
+      "cer_percent": 33.8235294117647,
+      "custom_vocabulary_wer_percent": 45.45454545454545,
+      "custom_vocabulary_cer_percent": 28.571428571428573,
+      "corpus_decode_seconds_p50": 3.3243207037448883,
+      "corpus_decode_seconds_p95": 3.387214571237564,
+      "corpus_rtfx_p50": 10.242562606159971,
+      "peak_rss_bytes": 4584849408,
+      "latency_regression_vs_greedy_percent": 16.944540016326215,
+      "nondeterministic_outputs": 0,
+      "passed_shipping_gate": false
+    }
+  ],
+  "first_effect_category_delta_points_vs_greedy": {
+    "candidate": "score-2.75",
+    "commands": {"wer": -4.878048780487806, "cer": 1.5},
+    "custom-vocabulary": {"wer": -27.272727272727273, "cer": 0.0},
+    "general": {"wer": 0.0, "cer": 0.0},
+    "long": {"wer": 0.0, "cer": 0.0},
+    "noisy": {"wer": 9.090909090909092, "cer": 5.555555555555557},
+    "numbers": {"wer": 3.333333333333334, "cer": 2.083333333333334},
+    "proper-nouns": {"wer": -2.3809523809523814, "cer": 0.6818181818181817},
+    "punctuation": {"wer": -2.1739130434782616, "cer": 0.6302521008403357}
+  },
+  "exploratory_sweep": {
+    "repetitions_per_point": 1,
+    "scores": [0.0, 0.5, 1.0, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 4.25, 4.5, 4.75, 5.0, 5.25, 5.5, 5.75, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 30.0, 50.0],
+    "observations": [
+      "Scores 0 through 2.5 were transcript-identical to greedy.",
+      "Scores 2.75 through 4.25 shared the first-effect transcript: IBM improved while noisy Amy changed to 80.",
+      "Score 4.5 first produced Olly but injected IBM into unrelated speech.",
+      "Score 6 and above caused broad vocabulary injection; scores 8 through 50 measured 96.74% to 119.57% WER."
+    ],
+    "authority": "exploratory only; the six checked raw reports are the repeated evidence"
+  },
+  "decision": {
+    "selected": "retain the generic Core ML model and collect no training data",
+    "training_authorized": false,
+    "qat_or_distillation_performed": false,
+    "global_hotword_score_change": false,
+    "reason": "No score improves a repeated custom-vocabulary class without a category or CER regression, every sherpa candidate fails the shipping quality gate, and the seven diagnostic fixtures are too small and heterogeneous to justify SFT, distillation, or QAT.",
+    "smallest_future_intervention": "A constrained vocabulary or lexical-rescoring layer on the native Core ML path, evaluated on newly split data, before any learned adapter."
+  },
+  "adapter_scope": {
+    "generic_base": "global and immutable",
+    "domain_adapter": "global or organization/domain-specific; not hardware-specific",
+    "personal_adapter": "user-specific; not hardware-specific",
+    "qat_distilled_export": "hardware-family deployment artifact, never a user identity layer",
+    "runtime_plan": "exact chip/OS-specific and already handled independently by the Core ML tuner"
+  }
+}

@@ -28,21 +28,34 @@ own unfused runtime. The currently pinned publisher did not ship such an
 exporter/reference route, so this closeout truthfully gates transcript WER/CER,
 repeatability, exact artifact identity, and backend timing instead.
 
-## Contextual vocabulary did not improve this corpus — 2026-08-11
+## No global contextual-vocabulary score is safe — 2026-08-11
 
 Sherpa's shipping vocabulary preparation was evaluated with `IBM`, `Olly`, and
-`Tactics`, hotword score 2, and modified beam search. Across ten repeats it
-produced the same hypotheses as greedy sherpa: 10.87% WER and 5.46% CER. Corpus
-decode p50 regressed from 2.764 s to 3.126 s (13.1%) and both rows failed the
-8% / 5% absolute gate. Do not cite vocabulary support as the stronger quality
-baseline for these fixtures unless the tokenization or scoring policy changes.
+`Tactics`. A 27-point exploration covered score 0 through 50, including 0.25
+steps across the transition region; six boundary rows were then repeated ten
+times. Scores through 2.5 were transcript-identical to greedy. Modified beam
+search alone cost 13.2% at score 0, and the default score 2 cost 13.9%.
+
+At the first effect, score 2.75, `IBM` improves but noisy `Amy` becomes `80`:
+WER moves 10.87% → 8.70% while CER worsens 5.46% → 6.09%, noisy and numbers
+both regress, and p50 costs 14.2%. Score 4.5 produces `Olly` but injects `IBM`
+into unrelated speech. Score 6 is broadly destructive at 42.39% WER; scores
+8–50 measured 96.74–119.57% WER. All repeated rows were deterministic.
+
+Do not raise the global score, claim contextual biasing is a quality win, or
+start adapter/QAT/distillation work from this corpus. The seven fixtures were
+used to locate score transitions and are no longer a blind test of future
+adaptation. Full results and reopen gates are in
+[`DOMAIN_ADAPTATION.md`](DOMAIN_ADAPTATION.md).
 
 ## Parent-only RSS is invalid for the Core ML backend — 2026-08-11
 
 The first harness pass sampled only `getrusage(RUSAGE_SELF)`, which excluded the
 resident FluidAudio worker and reported roughly 0.02 GiB. That result was
-discarded. Report schema v2 samples the Rust process plus the backend's child
-worker through `proc_pidinfo`; the repeated published row is 0.10 GiB.
+discarded. Report schema v2 introduced sampling of the Rust process plus the
+backend's child worker through `proc_pidinfo`; the repeated published row is
+0.10 GiB. Schema v3 retains that accounting and adds exact decoding/vocabulary
+provenance.
 
 ## Core ML compute-unit labels are candidates, not speed claims — 2026-08-11
 

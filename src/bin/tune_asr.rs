@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use parakeet_rs::asr::{Asr, Decoded};
-use parakeet_rs::asr_eval::{self, GoldManifest, RunMetadata};
+use parakeet_rs::asr_eval::{self, DecodeMetadata, GoldManifest, RunMetadata};
 use parakeet_rs::asr_tuning::{
     self, CandidateMeasurement, CandidateStatus, CategoryQuality, HardwareFingerprint,
     QualityMeasurement, RegimeMeasurement, TuningProfile,
@@ -336,6 +336,15 @@ fn tune_candidate(
         RunMetadata {
             application_version: env!("CARGO_PKG_VERSION").to_string(),
             backend: asr.backend_metadata().clone(),
+            decoding: DecodeMetadata {
+                method: "coreml_unified_greedy".to_string(),
+                contextual_vocabulary_requested: false,
+                contextual_vocabulary_active: false,
+                hotword_score: None,
+                vocabulary_terms_requested: 0,
+                vocabulary_sha256: None,
+                generated_hotwords_sha256: None,
+            },
             operating_system: format!("macOS {}", hardware.macos_version),
             architecture: hardware.architecture.clone(),
             chip: hardware.chip.clone(),
