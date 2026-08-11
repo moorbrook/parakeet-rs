@@ -15,7 +15,7 @@ use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 use crate::asr::{AsrBackendMetadata, Decoded};
 
 pub const GOLD_MANIFEST_VERSION: u32 = 2;
-pub const QUALITY_REPORT_VERSION: u32 = 2;
+pub const QUALITY_REPORT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -137,9 +137,21 @@ fn validate_percent(label: &str, value: f64) -> Result<()> {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DecodeMetadata {
+    pub method: String,
+    pub contextual_vocabulary_requested: bool,
+    pub contextual_vocabulary_active: bool,
+    pub hotword_score: Option<f32>,
+    pub vocabulary_terms_requested: usize,
+    pub vocabulary_sha256: Option<String>,
+    pub generated_hotwords_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RunMetadata {
     pub application_version: String,
     pub backend: AsrBackendMetadata,
+    pub decoding: DecodeMetadata,
     pub operating_system: String,
     pub architecture: String,
     pub chip: String,
@@ -702,6 +714,15 @@ mod tests {
                 quantization: "none".to_string(),
                 execution_provider: "cpu".to_string(),
             },
+            decoding: DecodeMetadata {
+                method: "greedy_search".to_string(),
+                contextual_vocabulary_requested: false,
+                contextual_vocabulary_active: false,
+                hotword_score: None,
+                vocabulary_terms_requested: 0,
+                vocabulary_sha256: None,
+                generated_hotwords_sha256: None,
+            },
             operating_system: "test".to_string(),
             architecture: "test".to_string(),
             chip: "test".to_string(),
@@ -814,6 +835,26 @@ mod tests {
         assert_eq!(report.overall.cer_percent, Some(0.0));
         assert_eq!(report.overall.exact_match_percent, Some(0.0));
         assert_eq!(report.overall.lexical_match_percent, Some(100.0));
+    }
+
+    #[test]
+    fn quality_report_serializes_decode_provenance() {
+        let report = evaluate(
+            &manifest("hello world", 0.0, 0.0),
+            &decoded("hello world"),
+            metadata(),
+        )
+        .unwrap();
+        let json = serde_json::to_value(report).unwrap();
+
+        assert_eq!(json["schema_version"], QUALITY_REPORT_VERSION);
+        assert_eq!(json["metadata"]["decoding"]["method"], "greedy_search");
+        assert_eq!(
+            json["metadata"]["decoding"]["contextual_vocabulary_active"],
+            false
+        );
+        assert!(json["metadata"]["decoding"]["hotword_score"].is_null());
+        assert!(json["metadata"]["decoding"]["vocabulary_sha256"].is_null());
     }
 
     #[test]

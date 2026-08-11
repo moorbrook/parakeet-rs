@@ -27,12 +27,13 @@ use std::process::{Command, ExitCode};
 use std::time::Instant;
 
 use parakeet_rs::asr::{Asr, AsrBackendMetadata, AsrConfig, Decoded};
-use parakeet_rs::asr_eval::{self, GoldManifest, QualityReport, RunMetadata};
+use parakeet_rs::asr_eval::{self, DecodeMetadata, GoldManifest, QualityReport, RunMetadata};
 use parakeet_rs::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
 use parakeet_rs::performance;
 use parakeet_rs::settings::SettingsStore;
 use parakeet_rs::wav::read_wav_mono;
 use parakeet_rs::{vocabulary, warmup};
+use sha2::{Digest, Sha256};
 
 const DEFAULT_AUDIO_DIR: &str = "bench/audio";
 const DEFAULT_BASELINE: &str = "bench/transcripts.json";
@@ -161,6 +162,7 @@ fn parse_args() -> anyhow::Result<Args> {
     if repetitions != 1 && gold.is_none() {
         bail!("--repetitions is supported only with --gold");
     }
+    validate_hotword_score(hotword_score)?;
     Ok(Args {
         audio_dir,
         baseline,
@@ -174,6 +176,13 @@ fn parse_args() -> anyhow::Result<Args> {
         model_dir,
         repetitions,
     })
+}
+
+fn validate_hotword_score(score: f32) -> anyhow::Result<()> {
+    if !score.is_finite() || score < 0.0 {
+        anyhow::bail!("--hotword-score must be a finite, non-negative number");
+    }
+    Ok(())
 }
 
 fn print_usage() {
@@ -264,6 +273,7 @@ fn run(args: &Args) -> anyhow::Result<bool> {
         Some(v) => vocabulary::prepare(v, &generated, Some(&store.tokens_path()))?,
         None => None,
     };
+    let decoding = decoding_metadata(args, hotwords.as_deref())?;
     // Removed on every exit path below via this guard.
     let _cleanup = TempFileGuard(generated.clone());
     match &hotwords {
@@ -373,6 +383,7 @@ fn run(args: &Args) -> anyhow::Result<bool> {
             &decoded,
             run_metadata(
                 asr.backend_metadata().clone(),
+                decoding,
                 model_load_seconds,
                 warmup_seconds,
                 first_result_seconds
@@ -545,6 +556,7 @@ fn format_percent(value: Option<f64>) -> String {
 
 fn run_metadata(
     backend: AsrBackendMetadata,
+    decoding: DecodeMetadata,
     model_load_seconds: f64,
     warmup_seconds: f64,
     first_result_seconds: f64,
@@ -561,6 +573,7 @@ fn run_metadata(
     Ok(RunMetadata {
         application_version: env!("CARGO_PKG_VERSION").to_string(),
         backend,
+        decoding,
         operating_system,
         architecture: std::env::consts::ARCH.to_string(),
         chip: performance::sysctl_string("machdep.cpu.brand_string")
@@ -575,6 +588,38 @@ fn run_metadata(
         first_result_seconds,
         peak_resident_bytes,
     })
+}
+
+fn decoding_metadata(args: &Args, hotwords: Option<&Path>) -> anyhow::Result<DecodeMetadata> {
+    let vocabulary_requested = args.vocabulary.is_some();
+    let vocabulary_raw = args.vocabulary.as_deref().map(std::fs::read).transpose()?;
+    let vocabulary_terms_requested = vocabulary_raw
+        .as_deref()
+        .map(|raw| String::from_utf8_lossy(raw))
+        .map_or(0, |raw| vocabulary::parse_terms(&raw).len());
+    Ok(DecodeMetadata {
+        method: if hotwords.is_some() {
+            "modified_beam_search".to_string()
+        } else if args.backend == Backend::CoreMlUnified {
+            "coreml_unified_greedy".to_string()
+        } else {
+            "greedy_search".to_string()
+        },
+        contextual_vocabulary_requested: vocabulary_requested,
+        contextual_vocabulary_active: hotwords.is_some(),
+        hotword_score: hotwords.map(|_| args.hotword_score),
+        vocabulary_terms_requested,
+        vocabulary_sha256: vocabulary_raw.as_deref().map(sha256_bytes),
+        generated_hotwords_sha256: hotwords.map(sha256_file).transpose()?,
+    })
+}
+
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    Ok(sha256_bytes(&std::fs::read(path)?))
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn process_tree_resident_bytes(asr: &Asr) -> anyhow::Result<u64> {
@@ -814,5 +859,14 @@ mod tests {
         assert_eq!(ratio_opt(0, 0), None);
         assert_eq!(ratio_opt(5, 0), None);
         assert_eq!(ratio_opt(1, 4), Some(25.0));
+    }
+
+    #[test]
+    fn hotword_score_must_be_finite_and_non_negative() {
+        assert!(validate_hotword_score(0.0).is_ok());
+        assert!(validate_hotword_score(2.75).is_ok());
+        assert!(validate_hotword_score(-0.01).is_err());
+        assert!(validate_hotword_score(f32::NAN).is_err());
+        assert!(validate_hotword_score(f32::INFINITY).is_err());
     }
 }

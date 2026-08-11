@@ -7,6 +7,9 @@ and covers names, spoken numbers, an acronym, and custom-vocabulary terms.
 Although SLURP names its upstream partition `train`, these exact selected rows
 are evaluation-only in this project and must not enter fine-tuning, calibration,
 quantization-aware training, prompt selection, or threshold-tuning data.
+Issue #6's vocabulary-score sweep also used them to locate decoder transition
+points, so they are diagnostic/development evidence for that setting and are
+not a fresh blind test for any future adaptation candidate.
 
 The manifest references are human-reviewed display text. Lexical WER/CER
 ignores case and punctuation according to `asr_eval::normalize_lexical`; raw

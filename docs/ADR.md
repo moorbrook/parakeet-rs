@@ -1653,6 +1653,71 @@ fail. Full evidence and the reopen conditions are in
 
 ---
 
+## 0028 — Generic ASR base with evidence-gated domain and user adaptation
+
+**Status:** **Accepted architecture; training rejected on current evidence.**
+
+**Context.** A generic model can be specialized along two independent axes:
+semantic behavior for a domain or speaker, and deployment/runtime behavior for
+hardware. Calling both “fine-tuning for the Mac” risks training on too little
+user data, binding personal identity to a chip artifact, or using QAT to solve a
+vocabulary problem. The product already has the cheapest semantic mechanism:
+sherpa contextual vocabulary with a configurable score.
+
+The frozen shipping Core ML baseline has one repeated lexical class in this
+seven-fixture corpus: three word edits across two custom-vocabulary fixtures.
+The other lexical failure is a single spoken-number-form example. That is
+enough to test the existing vocabulary mechanism, not enough to estimate a
+trainable error distribution.
+
+**Decision.** Retain the immutable generic int8 Parakeet Unified Core ML model
+and its CPU+ANE default. Do not collect training data, train an adapter,
+distill, run QAT, or raise the global hotword score from current evidence.
+Before learned weights, attempt a constrained native vocabulary/lexical-
+rescoring layer when newly separated data proves a repeated target class.
+
+Keep specialization layers distinct:
+
+- a domain adapter is global/organization-specific and portable across Macs;
+- a personal adapter is user-specific, local, removable, and also portable;
+- a QAT/distilled export may target an Apple hardware family but never encodes
+  user ownership;
+- the existing runtime profile remains keyed to exact chip, OS, model digest,
+  and workload, with CPU+ANE fallback.
+
+Any future collection must preregister consent/retention, speaker- or session-
+disjoint train/development/blind-test splits, category thresholds, and artifact
+identity. The current seven fixtures were used to locate vocabulary-score
+transitions, so they are diagnostic rather than a fresh blind test for future
+adaptation and remain prohibited from training/calibration/QAT/distillation.
+
+**Evidence.** A 27-point score exploration from 0 through 50 was narrowed to
+six ten-repeat boundary rows on M5 Pro. Score 0 and the default score 2 were
+transcript-identical to greedy while costing 13.2% and 13.9% p50. The first
+effect at 2.75 improved custom-vocabulary WER from 54.55% to 27.27%, but changed
+noisy `Amy` to `80`, worsened CER from 5.46% to 6.09%, regressed noisy and
+numbers categories, and cost 14.2% p50. Score 4.5 began producing `Olly` while
+injecting `IBM` into unrelated audio. Score 6 reached 42.39% WER; scores 8–50
+measured 96.74–119.57% WER. All repeated outputs were deterministic, and no
+sherpa row cleared the frozen shipping Core ML overall/per-category gate.
+
+Report schema v3 now embeds decoder method, requested/active vocabulary state,
+score, term count, source vocabulary digest, and generated-hotword digest. The
+raw reports, compact summary, and PEP 723/`uv` verifier live under
+`bench/domain-adaptation/`.
+
+**Consequences.** The architecture supports the requested generic-base-plus-
+specialization design without manufacturing a training project. A future
+adapter has explicit ownership, deletion, blind-test, accuracy, repeatability,
+latency, memory, and fallback gates before collection begins. Any QAT or
+distillation result must report compiled artifact bytes, process-tree RSS,
+load/first-result/p50/p95 latency, and overall/per-category quality, and must
+reduce a targeted deployment resource by at least 10% without quality loss.
+Full thresholds and reopen conditions are in
+[`docs/asr/DOMAIN_ADAPTATION.md`](asr/DOMAIN_ADAPTATION.md).
+
+---
+
 ## Index of open decisions vs targets
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -1664,7 +1729,7 @@ fail. Full evidence and the reopen conditions are in
 | ≤1.2 GB resident set | [0014](#0014-tray-only-headless-ux) + [ADR-0006](#0006-apple-silicon-optimization-plan-ds4-playbook-applied) mmap | Tray-only shipped, mmap shipped; lazy webview still Proposed | nothing |
 | Smart formatting parity with Wispr Flow | [0010](#0010-local-llm-post-processing-for-smart-formatting) | Proposed | nothing |
 | Clipboard not clobbered | [0011](#0011-direct-accessibility-text-injection) | **Deferred to v2** | not in v1 scope |
-| Custom vocabulary | [0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped** — non-empty vocabulary selects the sherpa biasing backend | native Unified biasing remains future work |
+| Custom vocabulary | [0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0028](#0028--generic-asr-base-with-evidence-gated-domain-and-user-adaptation) | **Shipped + bounded** — non-empty vocabulary selects sherpa; no measured global score clears the quality gate | constrained native Unified biasing requires new separated evidence |
 
 **Completed path to the ADR-0007 latency claim:**
 1. **Spike: [ADR-0012](#0012-self-built-sherpa-onnx-with-coreml-ep)** —
@@ -1682,6 +1747,12 @@ fail. Full evidence and the reopen conditions are in
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-08-11** — [ADR-0028](#0028--generic-asr-base-with-evidence-gated-domain-and-user-adaptation)
+  added: a 27-point vocabulary sweep with six repeated boundary reports, a
+  measured no-training decision, explicit global/domain/personal/hardware
+  ownership, pre-collection split/privacy gates, and report-schema-v3 decoding
+  provenance.
 
 - **2026-08-11** — [ADR-0027](#0027--qwen3-asr-q8-apple-silicon-challenger)
   added: pinned q8/q4/fp16 offline evidence, actual mid-chunk streaming

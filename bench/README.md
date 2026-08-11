@@ -20,13 +20,15 @@ REPETITIONS=10 scripts/bench-gold.sh
 `bench/gold/manifest.json` contains independent absolute and baseline-regression
 WER/CER limits. `asr_diff` applies them to the worst repeated result, prints
 per-fixture and per-category summaries, exits non-zero when either threshold
-fails, and writes schema-v2 machine reports with:
+fails, and writes schema-v3 machine reports with:
 
 - normalized lexical WER/CER, exact formatting matches, and separate insertion,
   deletion, and substitution counts;
 - categories such as names, commands, numbers, punctuation, and vocabulary;
 - repeat-run transcript/WER/CER spread, p50/p95 decode time, and real-time factor;
 - backend/model/quantization/provider labels;
+- decoder method plus requested/active vocabulary state, score, term count,
+  and source/generated-hotword SHA-256 identities;
 - app version, macOS version, chip, memory, CPU count, model-load time, and
   warmup, first-result, and full-process-tree peak-resident memory.
 
@@ -48,6 +50,10 @@ The developer-only Qwen3-ASR challenger uses pinned PEP 723/`uv` oracle scripts
 and does not affect the shipping dependency graph. Its immutable artifact
 summary and no-go evidence are under `bench/qwen3-asr/`; the full interpretation
 is in `docs/asr/QWEN3_ASR_EVALUATION.md`.
+
+The measured vocabulary-score sweep and no-training decision are under
+`bench/domain-adaptation/`; interpretation and future adapter/data gates are in
+`docs/asr/DOMAIN_ADAPTATION.md`.
 
 ## Quick start
 

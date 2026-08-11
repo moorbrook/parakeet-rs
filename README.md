@@ -136,8 +136,10 @@ An empty list costs nothing. A non-empty one switches the decoder from
 greedy to beam search, measured at **+13%** decode time
 ([ADR-0020](docs/ADR.md#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list)).
 The boost strength is `hotword_score` in `settings.json`, default 2.0;
-values above ~6 start injecting your terms into audio that doesn't
-contain them, so re-check with `asr_diff` if you raise it.
+the measured sweep saw the first unrelated-term injection at 4.5 and broad
+corruption at 6, so re-check with `asr_diff` if you raise it. No safe global
+increase was found; see
+[`docs/asr/DOMAIN_ADAPTATION.md`](docs/asr/DOMAIN_ADAPTATION.md).
 
 ## Caveats
 
@@ -178,7 +180,7 @@ Privacy behaviour — what each permission does, what touches the network,
 what lands on disk — is documented in [`PRIVACY.md`](PRIVACY.md).
 
 Architectural rationale lives in [`docs/ADR.md`](docs/ADR.md) (decisions
-0001-0021); latency targets and measurements in
+0001-0028); latency targets and measurements in
 [`docs/latency-plan.md`](docs/latency-plan.md). The deferred
 Developer-ID/notarization shipping procedure is captured in
 [`docs/notarized-distribution.md`](docs/notarized-distribution.md).
