@@ -45,12 +45,15 @@ pub fn put(text: &str) -> Result<()> {
         return Ok(());
     }
     autoreleasepool(|_| {
-        let pb = unsafe { NSPasteboard::generalPasteboard() };
+        let pb = NSPasteboard::generalPasteboard();
         // `clearContents` is mandatory before `setString:forType:` —
         // AppKit rejects writes to a pasteboard whose change count wasn't
         // bumped by the current owner, and the failure is a silent `false`
         // return rather than an exception.
-        unsafe { pb.clearContents() };
+        pb.clearContents();
+        // SAFETY: both arguments are valid retained Objective-C objects for
+        // the duration of this synchronous call; the pasteboard type is the
+        // framework's public string constant.
         let ok = unsafe { pb.setString_forType(&NSString::from_str(text), NSPasteboardTypeString) };
         if ok {
             log::info!("clipboard: wrote {} chars as rescue copy", text.len());

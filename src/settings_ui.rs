@@ -144,13 +144,11 @@ define_class!(
                     log::error!("creating vocabulary template: {e:#}");
                     return;
                 }
-                let url = unsafe {
-                    objc2_foundation::NSURL::fileURLWithPath(&NSString::from_str(
-                        &path.to_string_lossy(),
-                    ))
-                };
-                let ws = unsafe { objc2_app_kit::NSWorkspace::sharedWorkspace() };
-                if !unsafe { ws.openURL(&url) } {
+                let url = objc2_foundation::NSURL::fileURLWithPath(&NSString::from_str(
+                    &path.to_string_lossy(),
+                ));
+                let ws = objc2_app_kit::NSWorkspace::sharedWorkspace();
+                if !ws.openURL(&url) {
                     log::error!("NSWorkspace refused to open {}", path.display());
                 }
             });
@@ -169,7 +167,7 @@ define_class!(
             crate::objc_util::selector_guard("beginRecording:", || {
                 *self.ivars().recording_token.borrow_mut() = Some(String::new());
                 if let Some(btn) = self.ivars().shortcut_button.borrow().as_ref() {
-                    unsafe { btn.setTitle(&NSString::from_str("Press a key combination…")) };
+                    btn.setTitle(&NSString::from_str("Press a key combination…"));
                 }
             });
         }
@@ -192,7 +190,7 @@ define_class!(
                     let glyphs = glyphs_for_shortcut(&token);
                     *self.ivars().recording_token.borrow_mut() = Some(token.clone());
                     if let Some(btn) = self.ivars().shortcut_button.borrow().as_ref() {
-                        unsafe { btn.setTitle(&NSString::from_str(&glyphs)) };
+                        btn.setTitle(&NSString::from_str(&glyphs));
                     }
                     // Recording a Caps Lock binding flips us into the
                     // locked-Hold UI state so the user understands
@@ -228,14 +226,14 @@ impl SettingsController {
             }
         }
         if let Some(popup) = self.ivars().mode_popup.borrow().as_ref() {
-            new.trigger_mode = match unsafe { popup.indexOfSelectedItem() } {
+            new.trigger_mode = match popup.indexOfSelectedItem() {
                 1 => TriggerMode::TapFast,
                 2 => TriggerMode::Hold,
                 _ => TriggerMode::Tap,
             };
         }
         if let Some(popup) = self.ivars().polish_popup.borrow().as_ref() {
-            new.polish_mode = match unsafe { popup.indexOfSelectedItem() } {
+            new.polish_mode = match popup.indexOfSelectedItem() {
                 1 => PolishMode::On,
                 _ => PolishMode::Off,
             };
@@ -251,6 +249,8 @@ impl SettingsController {
 impl SettingsController {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(Ivars::default());
+        // SAFETY: `this` is freshly allocated with initialized Rust ivars;
+        // NSResponder's `init` is the designated superclass initializer.
         unsafe { msg_send![super(this), init] }
     }
 
@@ -263,12 +263,10 @@ impl SettingsController {
             return;
         };
         if is_capslock_token(token) {
-            unsafe {
-                popup.selectItemAtIndex(2); // 2 = Hold
-                popup.setEnabled(false);
-            }
+            popup.selectItemAtIndex(2); // 2 = Hold
+            popup.setEnabled(false);
         } else {
-            unsafe { popup.setEnabled(true) };
+            popup.setEnabled(true);
         }
     }
 
@@ -291,7 +289,7 @@ impl SettingsController {
             // empty that re-entry short-circuits.
             let live = LIVE_SETTINGS.with(|slot| slot.borrow_mut().take());
             if let Some(live) = live {
-                unsafe { live.window.close() };
+                live.window.close();
                 // `live` drops here; the controller + window both
                 // deallocate at this point.
             }
@@ -330,7 +328,7 @@ define_class!(
         #[unsafe(method(flagsChanged:))]
         fn flags_changed(&self, event: &NSEvent) {
             crate::objc_util::selector_guard("RecordingWindow.flagsChanged:", || {
-                let keycode = unsafe { event.keyCode() };
+                let keycode = event.keyCode();
                 if keycode == 57 {
                     forward_to_live_controller(event);
                 }
@@ -344,8 +342,13 @@ fn forward_to_live_controller(event: &NSEvent) {
     // without a manual pointer cast — the runtime glue marshalls it
     // as an ObjC `id`. The previous `obj as *mut NSObject` cast
     // bypassed retain tracking for no benefit.
-    let _ = with_live_controller(|c| unsafe {
-        let _: () = msg_send![c, captureKey: event];
+    let _ = with_live_controller(|c| {
+        // SAFETY: `c` is the live main-thread controller retained in
+        // LIVE_SETTINGS, `event` is valid for this synchronous dispatch, and
+        // captureKey: is declared with the matching NSEvent argument type.
+        unsafe {
+            let _: () = msg_send![c, captureKey: event];
+        }
     });
 }
 
@@ -363,7 +366,7 @@ pub fn open(mtm: MainThreadMarker) {
         ns_app.activate();
         existing.makeKeyAndOrderFront(None);
         // See `orderFrontRegardless` rationale in the create path below.
-        unsafe { existing.orderFrontRegardless() };
+        existing.orderFrontRegardless();
         return;
     }
 
@@ -373,6 +376,9 @@ pub fn open(mtm: MainThreadMarker) {
     let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, WINDOW_H));
     let mask =
         NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable;
+    // SAFETY: `alloc` is consumed exactly once after its Rust ivars are set;
+    // the selector and typed arguments match NSWindow's designated frame
+    // initializer and `mtm` proves main-thread execution.
     let window: Retained<RecordingWindow> = unsafe {
         let alloc = RecordingWindow::alloc(mtm).set_ivars(());
         msg_send![
@@ -383,6 +389,9 @@ pub fn open(mtm: MainThreadMarker) {
             defer: false,
         ]
     };
+    // SAFETY: `window` is fully initialized and main-thread confined. Keeping
+    // AppKit from releasing it on close is required because LIVE_SETTINGS owns
+    // the corresponding retained Rust handle.
     unsafe { window.setReleasedWhenClosed(false) };
     window.setTitle(&NSString::from_str("Parakeet Settings"));
     // State restoration: AppKit autosaves the frame (position + size)
@@ -410,7 +419,7 @@ pub fn open(mtm: MainThreadMarker) {
         NSPoint::new(PAD + LABEL_W, row1_y - 4.0),
         NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
     );
-    unsafe { content.addSubview(&shortcut_btn) };
+    content.addSubview(&shortcut_btn);
     *controller.ivars().shortcut_button.borrow_mut() = Some(shortcut_btn);
 
     // --- Row 2: Trigger mode ----------------------------------------------
@@ -432,7 +441,7 @@ pub fn open(mtm: MainThreadMarker) {
         NSPoint::new(PAD + LABEL_W, row2_y - 4.0),
         NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
     );
-    unsafe { content.addSubview(&popup) };
+    content.addSubview(&popup);
     *controller.ivars().mode_popup.borrow_mut() = Some(popup);
 
     // If the persisted binding is Caps Lock, the trigger-mode popup starts
@@ -476,11 +485,14 @@ pub fn open(mtm: MainThreadMarker) {
         NSPoint::new(PAD + LABEL_W, row4_y - 4.0),
         NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
     );
+    // SAFETY: LIVE_SETTINGS retains `controller` for at least as long as this
+    // popup, and polishModeChanged: is declared on SettingsController with the
+    // target/action ABI expected by AppKit.
     unsafe {
         polish_popup.setTarget(Some(controller.as_ref()));
         polish_popup.setAction(Some(sel!(polishModeChanged:)));
-        content.addSubview(&polish_popup);
     }
+    content.addSubview(&polish_popup);
     *controller.ivars().polish_popup.borrow_mut() = Some(polish_popup);
 
     // --- Row 5: Polish hint ----------------------------------------------
@@ -514,7 +526,7 @@ pub fn open(mtm: MainThreadMarker) {
         NSPoint::new(PAD + LABEL_W, row6_y - 4.0),
         NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
     );
-    unsafe { content.addSubview(&vocab_btn) };
+    content.addSubview(&vocab_btn);
 
     // --- Row 7: Vocabulary hint -------------------------------------------
     let row7_y = row6_y - 30.0;
@@ -543,7 +555,7 @@ pub fn open(mtm: MainThreadMarker) {
         NSPoint::new(WINDOW_W - PAD - btn_w, btn_y),
         NSSize::new(btn_w, btn_h),
     );
-    unsafe { save_btn.setKeyEquivalent(&NSString::from_str("\r")) }; // Return
+    save_btn.setKeyEquivalent(&NSString::from_str("\r")); // Return
     let cancel_btn = make_button(
         mtm,
         "Cancel",
@@ -552,11 +564,9 @@ pub fn open(mtm: MainThreadMarker) {
         NSPoint::new(WINDOW_W - PAD * 2.0 - btn_w * 2.0 + 10.0, btn_y),
         NSSize::new(btn_w, btn_h),
     );
-    unsafe { cancel_btn.setKeyEquivalent(&NSString::from_str("\u{1b}")) }; // Escape
-    unsafe {
-        content.addSubview(&save_btn);
-        content.addSubview(&cancel_btn);
-    }
+    cancel_btn.setKeyEquivalent(&NSString::from_str("\u{1b}")); // Escape
+    content.addSubview(&save_btn);
+    content.addSubview(&cancel_btn);
 
     // Wire the window delegate and store both halves in the singleton
     // slot. No back-pointer from the window to the controller — that was
@@ -588,14 +598,14 @@ pub fn open(mtm: MainThreadMarker) {
     // The window still doesn't become key in another app's space,
     // but the user can see it and click to focus, which is the
     // important part.
-    unsafe { window.orderFrontRegardless() };
+    window.orderFrontRegardless();
 }
 
 /// Center `window` on whichever `NSScreen` currently contains the
 /// mouse cursor. Falls back to the main screen if no screen contains
 /// the cursor (rare; happens during display reconfiguration).
 fn center_on_cursor_screen(mtm: MainThreadMarker, window: &RecordingWindow) {
-    let mouse = unsafe { NSEvent::mouseLocation() };
+    let mouse = NSEvent::mouseLocation();
     let screen = NSScreen::screens(mtm)
         .iter()
         .find(|s| {
@@ -615,7 +625,7 @@ fn center_on_cursor_screen(mtm: MainThreadMarker, window: &RecordingWindow) {
     let x = visible.origin.x + (visible.size.width - win_frame.size.width) / 2.0;
     let y = visible.origin.y + (visible.size.height - win_frame.size.height) / 2.0;
     let target = NSRect::new(NSPoint::new(x, y), win_frame.size);
-    unsafe { window.setFrame_display(target, true) };
+    window.setFrame_display(target, true);
 }
 
 // -----------------------------------------------------------------------
@@ -623,40 +633,34 @@ fn center_on_cursor_screen(mtm: MainThreadMarker, window: &RecordingWindow) {
 // -----------------------------------------------------------------------
 
 fn add_label(mtm: MainThreadMarker, parent: &NSView, text: &str, x: f64, y: f64) {
-    let label = unsafe { NSTextField::labelWithString(&NSString::from_str(text), mtm) };
-    unsafe {
-        label.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(LABEL_W, ROW_H)));
-        label.setTextColor(Some(&NSColor::labelColor()));
-        parent.addSubview(&label);
-    }
+    let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+    label.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(LABEL_W, ROW_H)));
+    label.setTextColor(Some(&NSColor::labelColor()));
+    parent.addSubview(&label);
 }
 
 fn add_hint(mtm: MainThreadMarker, parent: &NSView, text: &str, x: f64, y: f64, w: f64, h: f64) {
-    let label = unsafe { NSTextField::labelWithString(&NSString::from_str(text), mtm) };
-    unsafe {
-        label.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)));
-        label.setTextColor(Some(&NSColor::secondaryLabelColor()));
-        // 11pt secondary text for the description; the system label colour
-        // gives appropriate contrast in light and dark.
-        parent.addSubview(&label);
-    }
+    let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+    label.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)));
+    label.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    // 11pt secondary text for the description; the system label colour gives
+    // appropriate contrast in light and dark.
+    parent.addSubview(&label);
 }
 
 /// Bold section heading, full-width above its rows. Used to break the
 /// window up into Hotkey / Post-processing groups.
 fn add_section_label(mtm: MainThreadMarker, parent: &NSView, text: &str, x: f64, y: f64) {
-    let label = unsafe { NSTextField::labelWithString(&NSString::from_str(text), mtm) };
-    unsafe {
-        label.setFrame(NSRect::new(
-            NSPoint::new(x, y),
-            NSSize::new(WINDOW_W - PAD * 2.0, ROW_H),
-        ));
-        label.setTextColor(Some(&NSColor::labelColor()));
-        // System font, bold, slightly larger than the row labels.
-        let font = objc2_app_kit::NSFont::boldSystemFontOfSize(13.0);
-        label.setFont(Some(&font));
-        parent.addSubview(&label);
-    }
+    let label = NSTextField::labelWithString(&NSString::from_str(text), mtm);
+    label.setFrame(NSRect::new(
+        NSPoint::new(x, y),
+        NSSize::new(WINDOW_W - PAD * 2.0, ROW_H),
+    ));
+    label.setTextColor(Some(&NSColor::labelColor()));
+    // System font, bold, slightly larger than the row labels.
+    let font = objc2_app_kit::NSFont::boldSystemFontOfSize(13.0);
+    label.setFont(Some(&font));
+    parent.addSubview(&label);
 }
 
 fn make_button(
@@ -667,17 +671,20 @@ fn make_button(
     origin: NSPoint,
     size: NSSize,
 ) -> Retained<NSButton> {
-    let btn = unsafe { NSButton::new(mtm) };
+    let btn = NSButton::new(mtm);
+    btn.setTitle(&NSString::from_str(title));
+    btn.setFrame(NSRect::new(origin, size));
+    // SAFETY: LIVE_SETTINGS retains the target while its controls are live,
+    // and each caller supplies a selector declared on SettingsController with
+    // the standard single-sender action ABI.
     unsafe {
-        btn.setTitle(&NSString::from_str(title));
-        btn.setFrame(NSRect::new(origin, size));
         btn.setTarget(Some(target.as_ref()));
         btn.setAction(Some(action));
-        // System rounded button (Rounded is the modern alias of the
-        // older "Rounded" bezel style; the deprecation note is just
-        // about naming, the visual is unchanged).
-        btn.setBezelStyle(objc2_app_kit::NSBezelStyle::Push);
     }
+    // System rounded button (Rounded is the modern alias of the older
+    // "Rounded" bezel style; the deprecation note is just about naming, the
+    // visual is unchanged).
+    btn.setBezelStyle(objc2_app_kit::NSBezelStyle::Push);
     btn
 }
 
@@ -689,6 +696,9 @@ fn make_popup(
     size: NSSize,
 ) -> Retained<NSPopUpButton> {
     let frame = NSRect::new(origin, size);
+    // SAFETY: the allocated object is consumed once by NSPopUpButton's public
+    // designated initializer with matching NSRect and BOOL encodings; `mtm`
+    // proves main-thread construction.
     let popup: Retained<NSPopUpButton> = unsafe {
         msg_send![
             NSPopUpButton::alloc(mtm),
@@ -697,10 +707,10 @@ fn make_popup(
         ]
     };
     for item in items {
-        unsafe { popup.addItemWithTitle(&NSString::from_str(item)) };
+        popup.addItemWithTitle(&NSString::from_str(item));
     }
     if selected >= 0 && (selected as usize) < items.len() {
-        unsafe { popup.selectItemAtIndex(selected) };
+        popup.selectItemAtIndex(selected);
     }
     popup
 }
@@ -712,10 +722,10 @@ fn make_popup(
 /// Returns None for modifier-only `KeyDown` events (so holding Shift
 /// during recording doesn't commit a half-recorded combo).
 fn ns_event_to_token(event: &NSEvent) -> Option<String> {
-    let event_type = unsafe { event.r#type() };
+    let event_type = event.r#type();
     // Caps Lock arrives as a FlagsChanged event with keyCode 57.
     if event_type == NSEventType::FlagsChanged {
-        if unsafe { event.keyCode() } == 57 {
+        if event.keyCode() == 57 {
             return Some("CapsLock".to_string());
         }
         return None;
@@ -723,7 +733,7 @@ fn ns_event_to_token(event: &NSEvent) -> Option<String> {
     if event_type != NSEventType::KeyDown {
         return None;
     }
-    let flags = unsafe { event.modifierFlags() };
+    let flags = event.modifierFlags();
     let mut parts: Vec<String> = Vec::new();
     if flags.contains(NSEventModifierFlags::Command) {
         parts.push("CmdOrCtrl".to_string());
@@ -740,7 +750,7 @@ fn ns_event_to_token(event: &NSEvent) -> Option<String> {
         parts.push("Ctrl".to_string());
     }
 
-    let chars: Retained<NSString> = unsafe { event.charactersIgnoringModifiers() }?;
+    let chars: Retained<NSString> = event.charactersIgnoringModifiers()?;
     let key_string = chars.to_string();
     let key: String = match key_string.as_str() {
         " " => "Space".to_string(),

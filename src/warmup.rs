@@ -19,6 +19,9 @@ use crate::asr::Asr;
 pub fn page_touch(model_path: &Path) -> Result<u64> {
     let file = std::fs::File::open(model_path)
         .with_context(|| format!("opening {} for warmup", model_path.display()))?;
+    // SAFETY: model artifacts are immutable after verified installation, the
+    // file stays alive while the read-only map is created, and this function
+    // never writes through or aliases the mapping mutably.
     let map = unsafe { Mmap::map(&file).context("mmap model file")? };
 
     // 16 KiB matches macOS' default page size on Apple Silicon.

@@ -25,16 +25,6 @@ use std::thread;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 
-// Public CoreGraphics APIs (macOS 10.15+) for checking and requesting
-// the Input Monitoring permission. Not exposed by the `core-graphics`
-// crate, so we declare them directly.
-unsafe extern "C" {
-    /// Returns true if the calling process is allowed to listen to events
-    /// via `CGEventTap`. Equivalent to checking the Input Monitoring TCC
-    /// permission.
-    fn CGPreflightListenEventAccess() -> bool;
-}
-
 use anyhow::{anyhow, Context, Result};
 use block2::RcBlock;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
@@ -124,7 +114,7 @@ pub fn register(
     // front so we can surface a clear log line instead of failing silently.
     // Permission requests belong to the dashboard, where the user first sees
     // what the permission enables and has a clear recovery path.
-    let granted = unsafe { CGPreflightListenEventAccess() };
+    let granted = crate::permissions::input_monitoring_granted();
     if !granted {
         log::warn!(
             "Input Monitoring permission not yet granted; global hotkey \
@@ -291,12 +281,15 @@ fn run_tap(binding: Arc<Mutex<Binding>>, on_press: EventFn, on_release: EventFn)
         return;
     };
     let current = CFRunLoop::get_current();
+    // SAFETY: `loop_source` is a live source created from `tap` and both stay
+    // in scope while the current run loop runs below; the common-modes pointer
+    // is a framework-owned process-lifetime constant.
     unsafe { current.add_source(&loop_source, kCFRunLoopCommonModes) };
     tap.enable();
     // Re-check Input Monitoring here so the line we log reflects whether the
     // tap will ACTUALLY deliver events, not just whether create() succeeded
     // (which it does even without permission).
-    if unsafe { CGPreflightListenEventAccess() } {
+    if crate::permissions::input_monitoring_granted() {
         log::info!("hotkey tap active (CGEventTap at HID level, Input Monitoring granted)");
     } else {
         log::warn!(
@@ -320,17 +313,19 @@ fn install_media_key_monitor(
 
     let media_held_for_block = media_held.clone();
     let block = RcBlock::new(move |event: NonNull<NSEvent>| {
+        // SAFETY: AppKit invokes the block with a non-null NSEvent that stays
+        // alive for the duration of this synchronous callback.
         let event: &NSEvent = unsafe { event.as_ref() };
-        if unsafe { event.r#type() } != NSEventType::SystemDefined {
+        if event.r#type() != NSEventType::SystemDefined {
             return;
         }
         // Subtype 8 (= NSEventSubtype::ScreenChanged numerically; the same
         // integer value is `NX_SUBTYPE_AUX_CONTROL_BUTTONS` when the event
         // is SystemDefined — Apple's constants are overloaded by integer).
-        if unsafe { event.subtype() } != NSEventSubtype::ScreenChanged {
+        if event.subtype() != NSEventSubtype::ScreenChanged {
             return;
         }
-        let data1 = unsafe { event.data1() };
+        let data1 = event.data1();
         let keytype = ((data1 & 0xFFFF_0000) >> 16) as i32;
         let keystate = ((data1 & 0xFF00) >> 8) as i32;
         let is_down = keystate == 0x0A; // NX_KEYDOWN
@@ -355,13 +350,12 @@ fn install_media_key_monitor(
         }
     });
 
-    // SAFETY: The block is `'static` (closure captures only owned `Arc`s).
+    // LIFETIME: The block is `'static` (closure captures only owned `Arc`s).
     // AppKit retains the block internally, so it lives as long as the
     // monitor is registered. We hold the returned handle to keep the
     // monitor alive for the program's life.
-    let handle = unsafe {
-        NSEvent::addGlobalMonitorForEventsMatchingMask_handler(NSEventMask::SystemDefined, &block)
-    };
+    let handle =
+        NSEvent::addGlobalMonitorForEventsMatchingMask_handler(NSEventMask::SystemDefined, &block);
     let Some(handle) = handle else {
         log::warn!(
             "NSEvent global monitor install returned nil — Input Monitoring \
@@ -400,6 +394,8 @@ impl Drop for MediaKeyMonitor {
         // `NSEvent::removeMonitor` returns void and takes an `id` —
         // safe to call with our retained token. AppKit handles its
         // own internal teardown of the block at this point.
+        // SAFETY: `token` is the retained object returned by the matching
+        // addGlobalMonitor call, so it satisfies removeMonitor:'s contract.
         unsafe {
             NSEvent::removeMonitor(&self.token);
         }
@@ -415,6 +411,8 @@ impl Drop for MediaKeyMonitor {
 // the program's life), and is never aliased or mutated thereafter.
 // `removeMonitor:` itself is documented as thread-safe.
 unsafe impl Send for MediaKeyMonitor {}
+// SAFETY: as above, no thread observes or mutates the token after the one-time
+// main-thread installation, and static teardown never runs during execution.
 unsafe impl Sync for MediaKeyMonitor {}
 
 static MEDIA_KEY_MONITOR: std::sync::OnceLock<MediaKeyMonitor> = std::sync::OnceLock::new();

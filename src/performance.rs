@@ -25,29 +25,33 @@ pub fn performance_core_count() -> i32 {
 
 /// Read a signed 32-bit macOS sysctl without spawning a subprocess.
 pub fn sysctl_i32(name: &str) -> io::Result<i32> {
-    sysctl_number(name)
+    sysctl_bytes(name).map(i32::from_ne_bytes)
 }
 
 /// Read an unsigned 64-bit macOS sysctl without spawning a subprocess.
 pub fn sysctl_u64(name: &str) -> io::Result<u64> {
-    sysctl_number(name)
+    sysctl_bytes(name).map(u64::from_ne_bytes)
 }
 
-fn sysctl_number<T: Copy + Default>(name: &str) -> io::Result<T> {
+fn sysctl_bytes<const N: usize>(name: &str) -> io::Result<[u8; N]> {
     let name =
         CString::new(name).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let mut value = T::default();
-    let mut size = std::mem::size_of::<T>();
+    let mut value = [0_u8; N];
+    let mut size = N;
+    // SAFETY: `name` is NUL-terminated, `value` is writable for `N`
+    // bytes, `size` describes that buffer, and null new-value pointers make
+    // this a read-only sysctl query. Reading into bytes avoids creating an
+    // invalid bit pattern for a generic Rust type.
     let result = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
-            &mut value as *mut T as *mut libc::c_void,
+            value.as_mut_ptr().cast(),
             &mut size,
             std::ptr::null_mut(),
             0,
         )
     };
-    if result == 0 && size == std::mem::size_of::<T>() {
+    if result == 0 && size == N {
         Ok(value)
     } else {
         Err(if result == 0 {
@@ -66,6 +70,8 @@ pub fn sysctl_string(name: &str) -> io::Result<String> {
     let name =
         CString::new(name).map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let mut size = 0usize;
+    // SAFETY: `name` is NUL-terminated, `size` is a valid out pointer, and
+    // a null output buffer is the documented size-query form of sysctlbyname.
     let size_result = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -79,6 +85,10 @@ pub fn sysctl_string(name: &str) -> io::Result<String> {
         return Err(io::Error::last_os_error());
     }
     let mut bytes = vec![0_u8; size];
+    // SAFETY: `bytes` is writable for the capacity reported by the first
+    // query and `size` carries that capacity into the call. The kernel
+    // reports an error rather than writing past the supplied length if the
+    // value grows between queries.
     let read_result = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -101,10 +111,13 @@ pub fn sysctl_string(name: &str) -> io::Result<String> {
 /// Peak resident set for this process. macOS reports `ru_maxrss` in bytes.
 pub fn peak_resident_bytes() -> io::Result<u64> {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `usage` points to writable storage of exactly `rusage` size;
+    // getrusage initializes it completely when it returns zero.
     let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
     if result != 0 {
         return Err(io::Error::last_os_error());
     }
+    // SAFETY: the successful return above guarantees `usage` is initialized.
     let resident = unsafe { usage.assume_init() }.ru_maxrss;
     u64::try_from(resident)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative peak resident set"))
@@ -114,13 +127,24 @@ pub fn peak_resident_bytes() -> io::Result<u64> {
 pub fn resident_bytes(pid: u32) -> io::Result<u64> {
     let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::uninit();
     let expected_size = std::mem::size_of::<libc::proc_taskinfo>();
+    let pid = libc::c_int::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "PID exceeds c_int"))?;
+    let expected_size_c_int = libc::c_int::try_from(expected_size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "proc_taskinfo size exceeds c_int",
+        )
+    })?;
+    // SAFETY: `info` is writable for `expected_size` bytes, the flavor
+    // requests exactly a `proc_taskinfo`, and both integer arguments were
+    // checked for the C ABI's range.
     let result = unsafe {
         libc::proc_pidinfo(
-            pid as libc::c_int,
+            pid,
             libc::PROC_PIDTASKINFO,
             0,
             info.as_mut_ptr().cast(),
-            expected_size as libc::c_int,
+            expected_size_c_int,
         )
     };
     if result < 0 {
@@ -132,6 +156,8 @@ pub fn resident_bytes(pid: u32) -> io::Result<u64> {
             "proc_pidinfo returned an incomplete task record",
         ));
     }
+    // SAFETY: an exact-size successful return guarantees the task record was
+    // fully initialized.
     Ok(unsafe { info.assume_init() }.pti_resident_size)
 }
 
@@ -464,5 +490,11 @@ mod tests {
         assert!(sysctl_u64("hw.memsize").unwrap() > 0);
         assert!(peak_resident_bytes().unwrap() > 0);
         assert!(resident_bytes(std::process::id()).unwrap() > 0);
+    }
+
+    #[test]
+    fn resident_bytes_rejects_pid_outside_the_c_abi_range() {
+        let error = resident_bytes(u32::MAX).expect_err("u32::MAX must not wrap to a C PID");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

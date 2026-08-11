@@ -20,6 +20,9 @@ unsafe extern "C" {
 
 /// Pin the calling thread to performance cores by raising its QoS class.
 pub fn set_user_interactive() {
+    // SAFETY: the function takes no pointers; UserInteractive is Apple's
+    // public QOS_CLASS_USER_INTERACTIVE value and zero is the documented
+    // relative priority for the class.
     let rc = unsafe { pthread_set_qos_class_self_np(QosClass::UserInteractive as libc::c_int, 0) };
     if rc != 0 {
         log::warn!("pthread_set_qos_class_self_np returned {rc}");

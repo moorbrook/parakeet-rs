@@ -158,6 +158,9 @@ pub fn install(mtm: MainThreadMarker) {
         // assertions, so use a sensible non-zero default.
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(HUD_W, HUD_H));
         let style = NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel;
+        // SAFETY: `alloc` is consumed exactly once after Rust ivars are
+        // initialized, and the selector/arguments match NSPanel's designated
+        // frame initializer. `mtm` proves this runs on AppKit's main thread.
         let panel: Retained<HudPanel> = unsafe {
             let alloc = HudPanel::alloc(mtm).set_ivars(());
             msg_send![
@@ -168,6 +171,8 @@ pub fn install(mtm: MainThreadMarker) {
                 defer: false,
             ]
         };
+        // SAFETY: `panel` is a fully initialized, main-thread-only NSPanel and
+        // every enum/level value comes from AppKit's typed constants.
         unsafe {
             panel.setOpaque(false);
             panel.setHasShadow(true);
@@ -198,7 +203,7 @@ pub fn install(mtm: MainThreadMarker) {
         // `contentView` property — arbitrary subviews added directly
         // to the glass view get no placement guarantees.
         let hud_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(HUD_W, HUD_H));
-        let container: Retained<NSView> = unsafe {
+        let container: Retained<NSView> = {
             let alloc = NSView::alloc(mtm);
             NSView::initWithFrame(alloc, hud_rect)
         };
@@ -225,24 +230,25 @@ pub fn install(mtm: MainThreadMarker) {
                 let alloc = NSGlassEffectView::alloc(mtm);
                 NSGlassEffectView::initWithFrame(alloc, hud_rect)
             };
-            unsafe {
-                glass.setCornerRadius(CORNER_RADIUS);
-                // Clear, not Regular. Apple nominally reserves Clear
-                // for media-rich backdrops, but Regular's Dark Mode
-                // rendering on a 44 pt pill is nearly indistinguishable
-                // from the legacy HUDWindow blur — the user picked
-                // Clear from a side-by-side render (2026-06-11). The
-                // pill is transient (~2 s per dictation), so the
-                // legibility trade-off is acceptable.
-                glass.setStyle(objc2_app_kit::NSGlassEffectViewStyle::Clear);
-                glass.setContentView(Some(&container));
-                panel.setContentView(Some(&glass));
-            }
+            glass.setCornerRadius(CORNER_RADIUS);
+            // Clear, not Regular. Apple nominally reserves Clear
+            // for media-rich backdrops, but Regular's Dark Mode
+            // rendering on a 44 pt pill is nearly indistinguishable
+            // from the legacy HUDWindow blur — the user picked
+            // Clear from a side-by-side render (2026-06-11). The
+            // pill is transient (~2 s per dictation), so the
+            // legibility trade-off is acceptable.
+            glass.setStyle(objc2_app_kit::NSGlassEffectViewStyle::Clear);
+            glass.setContentView(Some(&container));
+            panel.setContentView(Some(&glass));
         } else {
-            let effect_view: Retained<NSVisualEffectView> = unsafe {
+            let effect_view: Retained<NSVisualEffectView> = {
                 let alloc = NSVisualEffectView::alloc(mtm);
                 NSVisualEffectView::initWithFrame(alloc, hud_rect)
             };
+            // SAFETY: the retained AppKit objects are main-thread confined;
+            // CALayer implements both typed selectors with the encoded f64 and
+            // BOOL arguments used here on every supported macOS version.
             unsafe {
                 effect_view.setMaterial(NSVisualEffectMaterial::HUDWindow);
                 effect_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
@@ -267,21 +273,18 @@ pub fn install(mtm: MainThreadMarker) {
             NSPoint::new(LABEL_X, 0.0),
             NSSize::new(BARS_ORIGIN_X - LABEL_X - 4.0 * SCALE, HUD_H),
         );
-        let label =
-            unsafe { NSTextField::labelWithString(&NSString::from_str("Listening…"), mtm) };
-        unsafe {
-            label.setFrame(label_frame);
-            label.setAlignment(NSTextAlignment::Left);
-            // Semantic label colour — black on the light HUD material,
-            // white on the dark one. Keeps the text legible whichever
-            // appearance variant macOS gave us for the chrome.
-            label.setTextColor(Some(&NSColor::labelColor()));
-            let font = NSFont::systemFontOfSize(LABEL_FONT_SIZE);
-            label.setFont(Some(&font));
-            label.setDrawsBackground(false);
-            label.setBordered(false);
-            container.addSubview(&label);
-        }
+        let label = NSTextField::labelWithString(&NSString::from_str("Listening…"), mtm);
+        label.setFrame(label_frame);
+        label.setAlignment(NSTextAlignment::Left);
+        // Semantic label colour — black on the light HUD material,
+        // white on the dark one. Keeps the text legible whichever
+        // appearance variant macOS gave us for the chrome.
+        label.setTextColor(Some(&NSColor::labelColor()));
+        let font = NSFont::systemFontOfSize(LABEL_FONT_SIZE);
+        label.setFont(Some(&font));
+        label.setDrawsBackground(false);
+        label.setBordered(false);
+        container.addSubview(&label);
 
         // 7 pill-shaped white bars to the right of the label. Each
         // starts at the minimum height (idle look); the bar tick
@@ -297,7 +300,7 @@ pub fn install(mtm: MainThreadMarker) {
             let y = (HUD_H - BAR_HEIGHT_MIN) / 2.0;
             let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(BAR_WIDTH, BAR_HEIGHT_MIN));
             let view = make_iridescent_bar(mtm, frame);
-            unsafe { container.addSubview(&view) };
+            container.addSubview(&view);
             bars.push(view);
         }
 
@@ -341,12 +344,12 @@ fn show_state_main(state: DictationState) {
         let want_animation = matches!(state, DictationState::Listening);
         let want_bars_visible = label.is_some();
         for bar in &hud.bars {
-            unsafe { bar.setHidden(!want_bars_visible) };
+            bar.setHidden(!want_bars_visible);
         }
 
         match label {
             Some(text) => {
-                unsafe { hud.label.setStringValue(&NSString::from_str(text)) };
+                hud.label.setStringValue(&NSString::from_str(text));
                 if !hud.visible {
                     // Re-position before showing in case the user moved
                     // their main display since install (e.g. unplugged
@@ -354,13 +357,13 @@ fn show_state_main(state: DictationState) {
                     if let Some(mtm) = MainThreadMarker::new() {
                         position_on_screen(mtm, &hud.panel);
                     }
-                    unsafe { hud.panel.orderFrontRegardless() };
+                    hud.panel.orderFrontRegardless();
                     hud.visible = true;
                 }
             }
             None => {
                 if hud.visible {
-                    unsafe { hud.panel.orderOut(None) };
+                    hud.panel.orderOut(None);
                     hud.visible = false;
                 }
             }
@@ -439,12 +442,10 @@ fn bar_tick(my_gen: u64) {
             let h_f64 = f64::from(h);
             let x = BARS_ORIGIN_X + (i as f64) * (BAR_WIDTH + BAR_GAP);
             let y = (HUD_H - h_f64) / 2.0;
-            unsafe {
-                bar.setFrame(NSRect::new(
-                    NSPoint::new(x, y),
-                    NSSize::new(BAR_WIDTH, h_f64),
-                ));
-            }
+            bar.setFrame(NSRect::new(
+                NSPoint::new(x, y),
+                NSSize::new(BAR_WIDTH, h_f64),
+            ));
         }
     });
     schedule_bar_tick(my_gen);
@@ -456,12 +457,10 @@ fn reset_bar_heights(hud: Option<&mut Hud>) {
         hud.bar_heights[i] = BAR_HEIGHT_MIN as f32;
         let x = BARS_ORIGIN_X + (i as f64) * (BAR_WIDTH + BAR_GAP);
         let y = (HUD_H - BAR_HEIGHT_MIN) / 2.0;
-        unsafe {
-            bar.setFrame(NSRect::new(
-                NSPoint::new(x, y),
-                NSSize::new(BAR_WIDTH, BAR_HEIGHT_MIN),
-            ));
-        }
+        bar.setFrame(NSRect::new(
+            NSPoint::new(x, y),
+            NSSize::new(BAR_WIDTH, BAR_HEIGHT_MIN),
+        ));
     }
 }
 
@@ -490,10 +489,14 @@ const BAR_SHIMMER_SECS: f64 = 2.2;
 /// Respects Reduce Motion: the shimmer animation is skipped (static
 /// pastel gradient) when the accessibility setting is on.
 fn make_iridescent_bar(mtm: MainThreadMarker, frame: NSRect) -> Retained<NSView> {
-    let view: Retained<NSView> = unsafe {
+    let view: Retained<NSView> = {
         let alloc = NSView::alloc(mtm);
         NSView::initWithFrame(alloc, frame)
     };
+    // SAFETY: this runs on the main thread with retained AppKit objects. The
+    // QuartzCore/Foundation classes and selectors are public on all supported
+    // macOS versions and their argument encodings match the values below.
+    // NSMutableArray retains each valid CGColor object passed to addObject:.
     unsafe {
         view.setWantsLayer(true);
         let Some(root) = view.layer() else {
@@ -551,6 +554,9 @@ fn add_shimmer(
     to: (f64, f64),
     key: &str,
 ) {
+    // SAFETY: `layer` is a live retained QuartzCore object created by the
+    // caller; CABasicAnimation/NSValue and all selectors below are public and
+    // use the encoded object, CGPoint, f64, BOOL, and f32 argument types shown.
     unsafe {
         let anim: Retained<objc2::runtime::NSObject> = msg_send![
             objc2::class!(CABasicAnimation),
@@ -597,7 +603,7 @@ fn position_on_screen(mtm: MainThreadMarker, panel: &HudPanel) {
     let x = visible.origin.x + (visible.size.width - HUD_W) / 2.0;
     let y = visible.origin.y + BOTTOM_OFFSET;
     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(HUD_W, HUD_H));
-    unsafe { panel.setFrame_display(frame, false) };
+    panel.setFrame_display(frame, false);
 }
 
 use crate::objc_util::dispatch_to_main;

@@ -5,11 +5,6 @@
 //! AppKit installation — see `src/app_delegate.rs`), and runs the
 //! AppKit event loop forever.
 
-// Same TEMPORARY allows as `lib.rs` — remove when the per-site
-// audit completes (see `lib.rs` module doc).
-#![allow(unused_unsafe)]
-#![allow(clippy::undocumented_unsafe_blocks)]
-
 use std::sync::Arc;
 
 use anyhow::{Context, Result};

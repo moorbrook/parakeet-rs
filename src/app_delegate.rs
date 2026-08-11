@@ -142,6 +142,9 @@ define_class!(
 impl AppDelegate {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: `this` is a freshly allocated AppDelegate whose Rust ivars
+        // were initialized exactly once; NSObject's `init` is its designated
+        // superclass initializer and returns ownership at +1.
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -212,8 +215,6 @@ fn install_runtime_state(mtm: MainThreadMarker) -> anyhow::Result<()> {
 pub fn install(ns_app: &NSApplication, mtm: MainThreadMarker) -> Retained<AppDelegate> {
     let delegate = AppDelegate::new(mtm);
     let proto = ProtocolObject::from_ref(&*delegate);
-    unsafe {
-        ns_app.setDelegate(Some(proto));
-    }
+    ns_app.setDelegate(Some(proto));
     delegate
 }

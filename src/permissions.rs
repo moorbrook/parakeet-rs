@@ -143,7 +143,7 @@ pub struct SystemPermissionService;
 impl PermissionService for SystemPermissionService {
     fn current_state(&self) -> PermissionState {
         PermissionState {
-            input_monitoring: if unsafe { CGPreflightListenEventAccess() } {
+            input_monitoring: if input_monitoring_granted() {
                 PermissionStatus::Granted
             } else {
                 PermissionStatus::NotGranted
@@ -405,30 +405,28 @@ fn present_dashboard(mtm: MainThreadMarker, scope: DashboardScope) {
         .with(|slot| slot.borrow().input_missing_at_install && state.input_monitoring.is_granted());
     let model = dashboard_model(scope, state, input_needs_relaunch);
 
-    let alert = unsafe { NSAlert::new(mtm) };
-    unsafe {
-        alert.setMessageText(&NSString::from_str("Parakeet Permissions"));
-        alert.setInformativeText(&NSString::from_str(&model.detail));
-        alert.setAlertStyle(NSAlertStyle::Informational);
-        let _ = alert.addButtonWithTitle(&NSString::from_str("Done"));
-        for permission in &model.permissions {
-            let permission = *permission;
-            let title = button_title(permission, state.status(permission));
-            let _ = alert.addButtonWithTitle(&NSString::from_str(&title));
-        }
-        // NSAlert may otherwise collapse to roughly 260 points and wrap every
-        // sentence into a tall, hard-to-scan column. A transparent standard
-        // accessory view gives AppKit a stable native minimum width without
-        // replacing the alert's layout or controls.
-        let spacer = NSView::initWithFrame(
-            NSView::alloc(mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(480.0, 1.0)),
-        );
-        alert.setAccessoryView(Some(&spacer));
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Parakeet Permissions"));
+    alert.setInformativeText(&NSString::from_str(&model.detail));
+    alert.setAlertStyle(NSAlertStyle::Informational);
+    let _ = alert.addButtonWithTitle(&NSString::from_str("Done"));
+    for permission in &model.permissions {
+        let permission = *permission;
+        let title = button_title(permission, state.status(permission));
+        let _ = alert.addButtonWithTitle(&NSString::from_str(&title));
     }
+    // NSAlert may otherwise collapse to roughly 260 points and wrap every
+    // sentence into a tall, hard-to-scan column. A transparent standard
+    // accessory view gives AppKit a stable native minimum width without
+    // replacing the alert's layout or controls.
+    let spacer = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(480.0, 1.0)),
+    );
+    alert.setAccessoryView(Some(&spacer));
     let ns_app = NSApplication::sharedApplication(mtm);
     ns_app.activate();
-    let response = unsafe { alert.runModal() };
+    let response = alert.runModal();
 
     UI_STATE.with(|slot| {
         let mut ui = slot.borrow_mut();
@@ -470,7 +468,7 @@ fn perform_action(permission: Permission, status: PermissionStatus, scope: Dashb
             }
             Permission::InputMonitoring => {
                 arm_refresh_when_active(scope);
-                if unsafe { CGRequestListenEventAccess() } {
+                if request_input_monitoring() {
                     schedule_dashboard(scope);
                 }
             }
@@ -489,6 +487,9 @@ fn arm_refresh_when_active(scope: DashboardScope) {
 fn microphone_status() -> PermissionStatus {
     // `[AVCaptureDevice authorizationStatusForMediaType:@"soun"]`:
     // 0 = not determined, 1 = restricted, 2 = denied, 3 = authorized.
+    // SAFETY: `AVCaptureDevice` and `authorizationStatusForMediaType:` are
+    // available on every supported macOS version; the selector takes an
+    // NSString and returns the documented integer AVAuthorizationStatus.
     let raw: i32 = unsafe {
         let cls = class!(AVCaptureDevice);
         let media_type = NSString::from_str("soun");
@@ -507,6 +508,9 @@ fn microphone_status() -> PermissionStatus {
 }
 
 fn request_microphone_async(scope: DashboardScope) {
+    // SAFETY: the class selector and argument encodings match AVFoundation.
+    // The Objective-C API copies the heap-backed RcBlock for the asynchronous
+    // callback, and the closure captures only the Copy dashboard scope.
     unsafe {
         let cls = class!(AVCaptureDevice);
         let media_type = NSString::from_str("soun");
@@ -521,10 +525,14 @@ fn request_microphone_async(scope: DashboardScope) {
 
 fn accessibility_granted() -> bool {
     let null: *const NSDictionary<NSString, NSNumber> = std::ptr::null();
+    // SAFETY: AXIsProcessTrustedWithOptions explicitly accepts null to query
+    // trust without showing the system prompt.
     unsafe { AXIsProcessTrustedWithOptions(null) }
 }
 
 fn request_accessibility() -> bool {
+    // SAFETY: both dictionary entries are retained for the duration of the C
+    // call and match the documented NSString-to-CFBoolean options contract.
     unsafe {
         let key = ax_trusted_check_option_prompt_key();
         let value = NSNumber::new_bool(true);
@@ -535,8 +543,22 @@ fn request_accessibility() -> bool {
 }
 
 fn ax_trusted_check_option_prompt_key() -> Retained<NSString> {
+    // SAFETY: this is the public ApplicationServices constant. `retain`
+    // accepts a nullable pointer, and the fallback handles a missing symbol.
     let from_symbol = unsafe { Retained::retain(kAXTrustedCheckOptionPrompt.cast_mut()) };
     from_symbol.unwrap_or_else(|| NSString::from_str("AXTrustedCheckOptionPrompt"))
+}
+
+pub(crate) fn input_monitoring_granted() -> bool {
+    // SAFETY: this public CoreGraphics preflight has no pointer arguments or
+    // caller preconditions and only reads process-level TCC state.
+    unsafe { CGPreflightListenEventAccess() }
+}
+
+fn request_input_monitoring() -> bool {
+    // SAFETY: this public CoreGraphics request has no pointer arguments. It is
+    // invoked from the main-thread permission dashboard action.
+    unsafe { CGRequestListenEventAccess() }
 }
 
 fn open_settings(permission: Permission) -> bool {

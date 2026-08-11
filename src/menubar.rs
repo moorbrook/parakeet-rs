@@ -106,7 +106,7 @@ define_class!(
             let mtm = self.mtm();
             crate::objc_util::selector_guard("quit:", || {
                 let ns_app = NSApplication::sharedApplication(mtm);
-                unsafe { ns_app.terminate(None) };
+                ns_app.terminate(None);
             });
         }
     }
@@ -115,6 +115,8 @@ define_class!(
 impl MenuController {
     fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: `this` is freshly allocated with initialized Rust ivars;
+        // NSObject's `init` is the designated superclass initializer.
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -158,11 +160,11 @@ fn on_main<F: FnOnce(MainThreadMarker) + Send + 'static>(f: F) {
 
 pub fn install(mtm: MainThreadMarker) -> Result<(), anyhow::Error> {
     let bar = NSStatusBar::systemStatusBar();
-    let status_item = unsafe { bar.statusItemWithLength(NSVariableStatusItemLength) };
+    let status_item = bar.statusItemWithLength(NSVariableStatusItemLength);
 
     if let Some(img) = sf_symbol::load("arrow.down.circle", 18.0) {
         if let Some(button) = status_item.button(mtm) {
-            unsafe { button.setImage(Some(&img)) };
+            button.setImage(Some(&img));
         }
     }
 
@@ -214,7 +216,7 @@ pub fn install(mtm: MainThreadMarker) -> Result<(), anyhow::Error> {
     menu.addItem(&separator_3);
     menu.addItem(&quit_item);
 
-    unsafe { status_item.setMenu(Some(&menu)) };
+    status_item.setMenu(Some(&menu));
 
     MENU_BAR.with(|slot| {
         if slot.borrow().is_some() {
@@ -240,6 +242,9 @@ fn make_menu_item(
 ) -> Retained<NSMenuItem> {
     let title_ns = NSString::from_str(title);
     let key_ns = NSString::from_str("");
+    // SAFETY: the selector and argument encodings match NSMenuItem's
+    // designated initializer; both strings and the optional selector remain
+    // valid for the synchronous call.
     let item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -249,6 +254,9 @@ fn make_menu_item(
         )
     };
     if let Some(target) = target {
+        // SAFETY: every targeted item is installed in the same MenuBar that
+        // retains its MenuController, so the non-owning target outlives the
+        // item; action selectors are declared on that controller.
         unsafe { item.setTarget(Some(target.as_ref())) };
     }
     item.setEnabled(enabled);
@@ -323,15 +331,13 @@ fn refresh_on_main(
 
         if let Some(img) = sf_symbol::load(symbol, 18.0) {
             if let Some(button) = bar.status_item.button(mtm) {
-                unsafe { button.setImage(Some(&img)) };
+                button.setImage(Some(&img));
             }
         }
-        unsafe {
-            bar.status_header
-                .setTitle(&NSString::from_str(&header_label));
-        };
-        unsafe { bar.mode_item.setTitle(&NSString::from_str(&mode_label)) };
-        unsafe { bar.toggle_item.setTitle(&NSString::from_str(&toggle_label)) };
+        bar.status_header
+            .setTitle(&NSString::from_str(&header_label));
+        bar.mode_item.setTitle(&NSString::from_str(&mode_label));
+        bar.toggle_item.setTitle(&NSString::from_str(&toggle_label));
         bar.toggle_item.setEnabled(toggle_enabled);
     });
 }
@@ -341,7 +347,7 @@ pub fn set_status_text(text: &str) {
     on_main(move |_mtm| {
         MENU_BAR.with(|slot| {
             if let Some(bar) = slot.borrow_mut().as_mut() {
-                unsafe { bar.status_header.setTitle(&NSString::from_str(&text)) };
+                bar.status_header.setTitle(&NSString::from_str(&text));
             }
         });
     });
