@@ -1,4 +1,4 @@
-//! parakeet-rs entry point.
+//! Parakeet Dictation entry point.
 //!
 //! Single-binary, no Tauri, no WebKit. Sets up the `NSApplication`,
 //! installs the `NSApplicationDelegate` (which owns all post-launch
@@ -11,9 +11,9 @@ use anyhow::{Context, Result};
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::MainThreadMarker;
 
-use parakeet_rs::app::{App, AppHandle};
-use parakeet_rs::settings::SettingsStore;
-use parakeet_rs::{app_delegate, objc_util};
+use parakeet_dictation::app::{App, AppHandle};
+use parakeet_dictation::settings::SettingsStore;
+use parakeet_dictation::{app_delegate, objc_util};
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();

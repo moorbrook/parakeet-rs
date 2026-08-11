@@ -1,4 +1,4 @@
-//! `NSApplicationDelegate` for parakeet-rs.
+//! `NSApplicationDelegate` for Parakeet Dictation.
 //!
 //! Owns the application lifecycle hooks (`applicationDidFinishLaunching:`,
 //! `applicationDidBecomeActive:`,
@@ -133,7 +133,7 @@ define_class!(
                     // session slot atomically.
                     app.fsm.recover(crate::app::DictationState::Idle);
                 }
-                log::info!("parakeet-rs terminating");
+                log::info!("Parakeet Dictation terminating");
             });
         }
     }
@@ -205,7 +205,7 @@ fn install_runtime_state(mtm: MainThreadMarker) -> anyhow::Result<()> {
     app.refresh_menu();
     permissions::install(mtm, input_monitoring_granted);
 
-    log::info!("parakeet-rs runtime installed");
+    log::info!("Parakeet Dictation runtime installed");
     Ok(())
 }
 

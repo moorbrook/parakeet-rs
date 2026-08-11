@@ -1,6 +1,6 @@
 //! Headless ASR bench harness.
 //!
-//! Loads a WAV file, runs it through `parakeet_rs::asr::Asr` N times, and
+//! Loads a WAV file, runs it through `parakeet_dictation::asr::Asr` N times, and
 //! emits one `phase_timer` line per iteration to stderr. `scripts/bench-latency.sh`
 //! drives it across {1, 3, 5, 10, 20} s fixtures and `scripts/bench-aggregate.py`
 //! reduces the log into p50/p95/p99 per length.
@@ -18,12 +18,14 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use parakeet_rs::asr::{Asr, AsrConfig};
-use parakeet_rs::coreml_worker::{load_coreml_worker, CoreMlComputeUnits, CoreMlWorkerConfig};
-use parakeet_rs::performance::{self, next_session_id, PhaseTimer, PhaseTimerMode};
-use parakeet_rs::settings::SettingsStore;
-use parakeet_rs::warmup;
-use parakeet_rs::wav::read_wav_mono;
+use parakeet_dictation::asr::{Asr, AsrConfig};
+use parakeet_dictation::coreml_worker::{
+    load_coreml_worker, CoreMlComputeUnits, CoreMlWorkerConfig,
+};
+use parakeet_dictation::performance::{self, next_session_id, PhaseTimer, PhaseTimerMode};
+use parakeet_dictation::settings::SettingsStore;
+use parakeet_dictation::warmup;
+use parakeet_dictation::wav::read_wav_mono;
 
 const DEFAULT_REPS: usize = 30;
 const DEFAULT_WARMUP_REPS: usize = 3;

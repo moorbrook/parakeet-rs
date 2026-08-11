@@ -1,4 +1,4 @@
-# Architecture Decision Records — parakeet-rs
+# Architecture Decision Records — Parakeet Dictation
 
 One file, one ADR per heading. Status legend: **Accepted** (in code today),
 **Proposed** (next pass), **Rejected** (considered and dropped),

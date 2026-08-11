@@ -1,4 +1,4 @@
-//! `parakeet-rs` library crate. Re-exports modules so the binaries under
+//! `parakeet-dictation` library crate. Re-exports modules so the binaries under
 //! `src/bin/` can link them.
 //!
 //! Lint policy is declared in `Cargo.toml [lints.rust]` and

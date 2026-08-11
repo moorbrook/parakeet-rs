@@ -7,20 +7,20 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use parakeet_rs::asr::{Asr, Decoded};
-use parakeet_rs::asr_eval::{self, DecodeMetadata, GoldManifest, RunMetadata};
-use parakeet_rs::asr_tuning::{
+use parakeet_dictation::asr::{Asr, Decoded};
+use parakeet_dictation::asr_eval::{self, DecodeMetadata, GoldManifest, RunMetadata};
+use parakeet_dictation::asr_tuning::{
     self, CandidateMeasurement, CandidateStatus, CategoryQuality, HardwareFingerprint,
     QualityMeasurement, RegimeMeasurement, TuningProfile,
 };
-use parakeet_rs::coreml_worker::{
+use parakeet_dictation::coreml_worker::{
     load_coreml_worker, CoreMlComputeUnits, CoreMlWorkerConfig, DEFAULT_LONG_REGIME_SECONDS,
 };
-use parakeet_rs::model_fetch;
-use parakeet_rs::performance;
-use parakeet_rs::settings::SettingsStore;
-use parakeet_rs::warmup;
-use parakeet_rs::wav::read_wav_mono;
+use parakeet_dictation::model_fetch;
+use parakeet_dictation::performance;
+use parakeet_dictation::settings::SettingsStore;
+use parakeet_dictation::warmup;
+use parakeet_dictation::wav::read_wav_mono;
 
 const DEFAULT_GOLD: &str = "bench/gold/manifest.json";
 const DEFAULT_AUDIO_DIR: &str = "bench/gold/audio";

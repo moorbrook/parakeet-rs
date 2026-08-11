@@ -1,13 +1,17 @@
 <p align="center">
-  <img src="assets/icon-readme.png" width="160" alt="parakeet-rs icon" />
+  <img src="assets/icon-readme.png" width="160" alt="Parakeet Dictation icon" />
 </p>
 
-# parakeet-rs
+# Parakeet Dictation
 
 Native macOS / Apple Silicon dictation menu-bar app. Press a global
 hotkey, speak, transcript inserts at your cursor. Fully local — no API
 keys, telemetry, or network traffic after the required and optional model
 downloads complete.
+
+The Cargo package and Rust library crate are `parakeet-dictation` and
+`parakeet_dictation`. The user-facing app remains **Parakeet**, and its existing
+`parakeet-rs` executable target is retained for bundle and permission stability.
 
 - **ASR**: Parakeet Unified EN 0.6B int8 via a resident native Core ML worker
   (sherpa-onnx fallback and contextual-vocabulary backend)

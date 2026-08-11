@@ -1,4 +1,4 @@
-# parakeet-rs — Big-Improvement Review (2026-07-12)
+# Parakeet Dictation — Big-Improvement Review (2026-07-12)
 
 > Historical point-in-time review. Several recommendations were implemented or superseded after publication. See the project [README](../README.md) and [ADR](../docs/ADR.md) for current behavior and decisions.
 
@@ -81,7 +81,7 @@ Qwen 3.5 4B (Feb 2026) remains the strongest instruction-follower at ≤5 GB as 
 ## Rust-ecosystem notes (no action forced, one warning)
 
 - **`ort` is still 2.0.0-rc (rc.12)** — going direct-to-ONNX-Runtime remains wrong for this app; sherpa-onnx (crate now 1.13.4, actively released) stays the right call. Candle still has no Parakeet/conformer-transducer implementation.
-- **Name collision:** a crate literally named **`parakeet-rs` (0.3.2) exists on crates.io** — someone else's Parakeet-via-`ort` library. If this app is ever published to crates.io or promoted publicly, the name is taken; rename or namespace before any release.
+- **Name collision:** a crate literally named **`parakeet-rs` (0.3.2) exists on crates.io** — someone else's Parakeet-via-`ort` library. If this app is ever published to crates.io or promoted publicly, the name is taken; rename or namespace before any release. **Resolved 2026-08-11:** this app's Cargo package was renamed to `parakeet-dictation` and marked non-publishable; the user-facing app and established executable name remain Parakeet / `parakeet-rs`.
 - Pure-Rust Qwen3-ASR implementations exist (`qwen-asr` CPU-only, `qwen3-asr-rs` libtorch/MLX) — useful reference code for #1, not production paths.
 
 ## Killed ideas (evaluated, not worth it)

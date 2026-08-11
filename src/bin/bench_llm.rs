@@ -30,8 +30,8 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::LlamaModel;
 
-use parakeet_rs::performance::next_session_id;
-use parakeet_rs::polish::{self, GenerateOutcome, PromptTemplate, PROD_GENERATE_CONFIG};
+use parakeet_dictation::performance::next_session_id;
+use parakeet_dictation::polish::{self, GenerateOutcome, PromptTemplate, PROD_GENERATE_CONFIG};
 
 /// A representative messy dictation transcript — fillers, no punctuation,
 /// the kind of thing the polish pass is supposed to fix. Length picked

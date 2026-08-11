@@ -210,7 +210,7 @@ fn run_tap(binding: Arc<Mutex<Binding>>, on_press: EventFn, on_release: EventFn)
             // Trace every keyboard event the tap sees. Useful for
             // diagnosing "I pressed X but nothing happened" — e.g. F-keys
             // being intercepted as media keys by the system. Turn on with
-            // RUST_LOG=parakeet_rs::hotkey=trace.
+            // RUST_LOG=parakeet_dictation::hotkey=trace.
             log::trace!(
                 "tap event: type={:?} keycode={} flags={:#010x}",
                 event_type,

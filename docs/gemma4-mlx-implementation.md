@@ -1,7 +1,7 @@
 # Implementing a `gemma4-mlx` crate on OminiX-MLX
 
 > **Status: archived and superseded.** This was a May 2026 implementation study,
-> not a current parakeet-rs plan. The original 2 GB download cap was later
+> not a current Parakeet Dictation plan. The original 2 GB download cap was later
 > relaxed, and production now ships Qwen 3.5 4B Q6_K through llama.cpp/Metal;
 > see [ADR-0018](./ADR.md#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m).
 >

@@ -1,12 +1,19 @@
 [package]
-name = "parakeet-rs"
+name = "parakeet-dictation"
 version = "0.1.0"
 description = "Voice-to-text dictation on Apple Silicon — Parakeet, fully local"
-authors = ["parakeet-rs"]
+authors = ["Parakeet Dictation contributors"]
 edition = "2021"
 rust-version = "1.77"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/moorbrook/parakeet-rs"
+publish = false
+
+# Keep the installed executable stable even though the Cargo package and
+# library crate use the conflict-free parakeet-dictation identity.
+[[bin]]
+name = "parakeet-rs"
+path = "src/main.rs"
 
 # Workspace-wide lint configuration. Replaces per-file `#![warn(...)]`
 # attributes so the policy is reviewable in one place.
@@ -46,7 +53,7 @@ redundant_closure_for_method_calls = "warn"
 #   without `--bin` (e.g. for the lib package itself).
 # - `[package.metadata.bundle.bin.parakeet-rs]` — per-bin overrides;
 #   used when bundling with `--bin parakeet-rs` (which we need because
-#   the crate also exposes several headless benchmark and evaluation binaries).
+#   the package also exposes several headless benchmark and evaluation binaries).
 #   Without this section, cargo-bundle uses the binary's raw name
 #   (`parakeet-rs`) for the .app filename and skips our custom display
 #   name / identifier / icon.
@@ -55,7 +62,7 @@ name = "Parakeet"
 identifier = "com.parakeet.rs"
 icon = ["assets/icon.icns"]
 version = "0.1.0"
-copyright = "Copyright (c) 2026 parakeet-rs"
+copyright = "Copyright (c) 2026 Parakeet Dictation contributors"
 category = "Productivity"
 short_description = "Voice-to-text dictation, fully local, Apple Silicon."
 long_description = """
@@ -78,7 +85,7 @@ name = "Parakeet"
 identifier = "com.parakeet.rs"
 icon = ["assets/icon.icns"]
 version = "0.1.0"
-copyright = "Copyright (c) 2026 parakeet-rs"
+copyright = "Copyright (c) 2026 Parakeet Dictation contributors"
 category = "Productivity"
 short_description = "Voice-to-text dictation, fully local, Apple Silicon."
 osx_minimum_system_version = "11.0"

@@ -103,7 +103,7 @@ Two things constrain what Parakeet can do with it:
 One disclosure: the callback contains a `log::trace!` that prints each
 event's keycode and modifier flags, for diagnosing "I pressed my
 shortcut and nothing happened". It is off unless you explicitly set
-`RUST_LOG=parakeet_rs::hotkey=trace`, and even then it goes to stderr,
+`RUST_LOG=parakeet_dictation::hotkey=trace`, and even then it goes to stderr,
 which the bundled app discards. If you turn it on from a terminal, that
 terminal will show keycodes for everything you type until you close it.
 

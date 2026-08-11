@@ -1,6 +1,6 @@
 # AppKit Checklist for Rust / `objc2-app-kit`
 
-> Research snapshot from May 15, 2026. This is a general reference checklist, not a statement of current `parakeet-rs` implementation status. See the project [README](../README.md) and [ADR](../docs/ADR.md) for current behavior.
+> Research snapshot from May 15, 2026. This is a general reference checklist, not a statement of current Parakeet Dictation implementation status. See the project [README](../README.md) and [ADR](../docs/ADR.md) for current behavior.
 
 AppKit is a large, event-driven Objective-C framework with decades of conventions. When using it from Rust, keep the impedance mismatch explicit: AppKit is a dynamic, reentrant, main-thread-owned object runtime, while Rust is a static, ownership-checked, concurrency-safe systems language. Keep AppKit at the boundary, translate it into typed Rust state/events quickly, and preserve the `.app` bundle context AppKit expects.
 

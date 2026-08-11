@@ -26,13 +26,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
-use parakeet_rs::asr::{Asr, AsrBackendMetadata, AsrConfig, Decoded};
-use parakeet_rs::asr_eval::{self, DecodeMetadata, GoldManifest, QualityReport, RunMetadata};
-use parakeet_rs::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
-use parakeet_rs::performance;
-use parakeet_rs::settings::SettingsStore;
-use parakeet_rs::wav::read_wav_mono;
-use parakeet_rs::{vocabulary, warmup};
+use parakeet_dictation::asr::{Asr, AsrBackendMetadata, AsrConfig, Decoded};
+use parakeet_dictation::asr_eval::{
+    self, DecodeMetadata, GoldManifest, QualityReport, RunMetadata,
+};
+use parakeet_dictation::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
+use parakeet_dictation::performance;
+use parakeet_dictation::settings::SettingsStore;
+use parakeet_dictation::wav::read_wav_mono;
+use parakeet_dictation::{vocabulary, warmup};
 use sha2::{Digest, Sha256};
 
 const DEFAULT_AUDIO_DIR: &str = "bench/audio";

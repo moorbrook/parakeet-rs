@@ -520,7 +520,7 @@ async fn download_to(artifact: Artifact, dest: &Path, on_progress: &ProgressFn) 
     remove_file_if_exists(&tmp).await?;
 
     let client = reqwest::Client::builder()
-        .user_agent(concat!("parakeet-rs/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("parakeet-dictation/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let response = client.get(artifact.url).send().await?.error_for_status()?;
 

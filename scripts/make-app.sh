@@ -24,14 +24,14 @@ WORKER_SRC="$ROOT/target/release/parakeet-coreml-worker"
 DYLIB_SRC="$ROOT/target/release"
 
 # --- 0. arm64-only architecture gate -------------------------------------
-# parakeet-rs is Apple Silicon only (ADR-0002). sherpa-onnx and the
+# Parakeet Dictation is Apple Silicon only (ADR-0002). sherpa-onnx and the
 # onnxruntime dylibs we bundle are arm64-only — silently producing a
 # fat / Intel binary would yield a .app that crashes on launch. Pin the
 # expected arch here so a wrong CI matrix entry fails loudly instead.
 if [ -f "$BIN_SRC" ]; then
   if ! lipo -archs "$BIN_SRC" | grep -qx arm64; then
     echo "ERROR: $BIN_SRC is not arm64-only (got: $(lipo -archs "$BIN_SRC"))" >&2
-    echo "       parakeet-rs ships Apple Silicon only — see docs/ADR.md ADR-0002." >&2
+    echo "       Parakeet Dictation ships Apple Silicon only — see docs/ADR.md ADR-0002." >&2
     exit 1
   fi
 fi
@@ -47,7 +47,7 @@ fi
 
 echo "1. cargo bundle --release --bin parakeet-rs"
 cd "$ROOT"
-# Explicit `--bin parakeet-rs` because the crate also exposes
+# Explicit `--bin parakeet-rs` because the package also exposes
 # several headless binaries under `src/bin/`; without
 # the flag cargo-bundle picks the first one alphabetically (bench_asr),
 # which produces a .app whose `Contents/MacOS/parakeet-rs` is missing
@@ -84,7 +84,7 @@ add_key NSHighResolutionCapable bool true
 # dictation, transcription, voice-to-text utilities.
 add_key LSApplicationCategoryType string "public.app-category.productivity"
 # Required for notarization + nice-to-have for the Get Info pane.
-add_key NSHumanReadableCopyright string "Copyright © 2026 parakeet-rs"
+add_key NSHumanReadableCopyright string "Copyright © 2026 Parakeet Dictation contributors"
 
 # --- 3. bundle dylibs ----------------------------------------------------
 # sherpa-onnx-sys copied them to target/release/ during the cargo build.
