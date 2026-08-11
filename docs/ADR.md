@@ -1752,6 +1752,13 @@ open the service-specific System Settings pane, falling back to the generic
 Privacy & Security pane. `applicationDidBecomeActive:` refreshes after a
 Settings trip and surfaces granted-to-missing revocation.
 
+Input Monitoring onboarding consumes the same preflight snapshot taken before
+the detector threads start. A second `CGPreflightListenEventAccess` racing
+`CGEventTapCreate` was observed to transiently report missing on the signed QA
+build even though the registration-time preflight and System Settings both
+reported granted; using one snapshot prevents false onboarding and relaunch
+instructions.
+
 **Differences from ZoomIt.** Parakeet never requests Screen Recording or
 Camera; neither capability exists here. Input Monitoring is its launch-time
 analog to ZoomIt's Screen Recording. Microphone and Accessibility are tied to

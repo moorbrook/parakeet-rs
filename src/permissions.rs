@@ -257,6 +257,18 @@ fn startup_needs_onboarding(state: PermissionState) -> bool {
     !state.input_monitoring.is_granted()
 }
 
+fn with_registration_input(
+    mut state: PermissionState,
+    input_monitoring_granted_at_registration: bool,
+) -> PermissionState {
+    state.input_monitoring = if input_monitoring_granted_at_registration {
+        PermissionStatus::Granted
+    } else {
+        PermissionStatus::NotGranted
+    };
+    state
+}
+
 fn dictation_ready(state: PermissionState) -> bool {
     state.microphone.is_granted() && state.accessibility.is_granted()
 }
@@ -284,10 +296,16 @@ thread_local! {
 }
 
 /// Install permission-state observation after the app's menu and runtime are
-/// alive. First launch presents an explanation only when Input Monitoring—the
-/// grant needed for the global hotkey at that moment—is missing.
-pub fn install(mtm: MainThreadMarker) {
-    let state = SystemPermissionService.current_state();
+/// alive. `input_monitoring_granted_at_registration` is the single preflight
+/// captured before the detector threads start; querying again while the event
+/// tap is being created can transiently disagree on macOS. First launch
+/// presents an explanation only when that authoritative registration-time
+/// grant is missing.
+pub fn install(mtm: MainThreadMarker, input_monitoring_granted_at_registration: bool) {
+    let state = with_registration_input(
+        SystemPermissionService.current_state(),
+        input_monitoring_granted_at_registration,
+    );
     UI_STATE.with(|slot| {
         let mut ui = slot.borrow_mut();
         ui.last_state = Some(state);
@@ -561,6 +579,29 @@ mod tests {
             PermissionStatus::Granted,
             PermissionStatus::Granted,
         )));
+    }
+
+    #[test]
+    fn registration_preflight_wins_over_a_racing_live_input_query() {
+        let racing_missing = state(
+            PermissionStatus::NotGranted,
+            PermissionStatus::Granted,
+            PermissionStatus::Granted,
+        );
+        assert_eq!(
+            with_registration_input(racing_missing, true).input_monitoring,
+            PermissionStatus::Granted
+        );
+
+        let racing_granted = state(
+            PermissionStatus::Granted,
+            PermissionStatus::Granted,
+            PermissionStatus::Granted,
+        );
+        assert_eq!(
+            with_registration_input(racing_granted, false).input_monitoring,
+            PermissionStatus::NotGranted
+        );
     }
 
     #[test]

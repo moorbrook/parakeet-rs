@@ -74,6 +74,7 @@ pub enum Binding {
 
 pub struct HotkeyHandle {
     binding: Arc<Mutex<Binding>>,
+    input_monitoring_granted_at_registration: bool,
 }
 
 impl HotkeyHandle {
@@ -84,6 +85,14 @@ impl HotkeyHandle {
         let new = parse(new_spec).with_context(|| format!("parsing hotkey: {new_spec}"))?;
         *self.binding.lock() = new;
         Ok(())
+    }
+
+    /// The authoritative preflight captured before either detector started.
+    /// Re-querying while the event-tap thread is being created can produce a
+    /// transient false result on macOS, so permission onboarding consumes this
+    /// snapshot instead of racing detector installation.
+    pub fn input_monitoring_granted_at_registration(&self) -> bool {
+        self.input_monitoring_granted_at_registration
     }
 }
 
@@ -149,7 +158,10 @@ pub fn register(
         install_media_key_monitor(mtm, binding.clone(), on_press, on_release)?;
     }
 
-    Ok(HotkeyHandle { binding })
+    Ok(HotkeyHandle {
+        binding,
+        input_monitoring_granted_at_registration: granted,
+    })
 }
 
 /// CGEventTap callback runs on its own dedicated thread (we spawn it). The

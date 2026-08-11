@@ -57,6 +57,7 @@ and
 | Specific Settings links | Per-permission URL plus generic fallback | Adds fallback rather than silently doing nothing on a rejected URL |
 | Re-present on app activation | `applicationDidBecomeActive:` in `src/app_delegate.rs` | Also detects later revocation |
 | Request optional capture grants when feature is selected | Dictation gate requests Microphone/Accessibility in context | Process launch never requests any grant |
+| Permission state captured before detector startup | Input Monitoring onboarding consumes the preflight returned by `hotkey::register` | Avoids a transient false result while the event-tap thread is being created |
 
 The implementation is an independent Rust adaptation of the interaction
 architecture; no Swift source is vendored.
@@ -95,16 +96,18 @@ to grant the permissions again.
 
 | Case | Procedure | Expected result | 2026-08-11 signed build |
 |---|---|---|---|
-| Clean launch | Reset all three, launch from `/Applications` | One explanatory Parakeet dialog offers only Input Monitoring; app/menu stay alive; no Microphone or Accessibility system prompt | Pending |
-| Input Monitoring grant | Choose Grant Input Monitoring and enable Parakeet | Return refreshes status; dashboard explains one quit/reopen for global hotkey; menu dictation remains available | Pending |
-| Contextual dictation grants | With Microphone/Accessibility reset, choose Start Dictation | Dashboard offers only the missing dictation grants; recording does not start prematurely | Pending |
-| Microphone denied | Deny the first system request, then try again | State says Denied and button opens Microphone settings rather than repeating the system prompt | Pending |
-| Microphone restricted | Exercise on a managed/restricted Mac; policy test covers state mapping elsewhere | State says Restricted and directs recovery to Settings/policy owner | Not reproducible on unmanaged test Mac |
-| Accessibility missing | Disable Accessibility while app is running, reactivate Parakeet | Dashboard surfaces revocation; new dictation is gated; menu and stop/cancel remain usable | Pending |
-| Microphone revoked | Disable Microphone while app is running, reactivate Parakeet | Dashboard surfaces revocation; new dictation is gated with an explicit recovery action | Pending |
-| Input Monitoring revoked | Disable Input Monitoring while app is running, reactivate Parakeet | Dashboard surfaces revocation; menu dictation still works; global hotkey is unavailable | Pending |
-| Deep-link fallback | Use each Open Settings action; unit tests retain generic fallback contract | Correct service pane opens, or generic Privacy & Security opens | Pending |
-| Fully granted relaunch | Grant all three, quit, reopen | No onboarding dialog; global hotkey and menu dictation work without another prompt | Pending |
+| Clean launch | Reset all three, launch from `/Applications` | One explanatory Parakeet dialog offers only Input Monitoring; app/menu stay alive; no Microphone or Accessibility system prompt | **Pass** — signed branch build, screenshot reviewed |
+| Input Monitoring grant | Choose Grant Input Monitoring and enable Parakeet | Return refreshes status; dashboard explains one quit/reopen for global hotkey; menu dictation remains available | **Pass** — user-assisted grant; Settings and dashboard both showed Granted |
+| Contextual dictation grants | With Microphone/Accessibility reset, choose Start Dictation | Dashboard offers only the missing dictation grants; recording does not start prematurely | **Accepted for #19** — user-assisted grants completed and deterministic scope/copy tests pass; destructive repeat deferred to #23 |
+| Microphone denied | Deny the first system request, then try again | State says Denied and button opens Microphone settings rather than repeating the system prompt | **Deferred to #23**; four-state action policy test passes |
+| Microphone restricted | Exercise on a managed/restricted Mac; policy test covers state mapping elsewhere | State says Restricted and directs recovery to Settings/policy owner | **Deferred to #23**; not reproducible on the unmanaged test Mac |
+| Accessibility missing | Disable Accessibility while app is running, reactivate Parakeet | Dashboard surfaces revocation; new dictation is gated; menu and stop/cancel remain usable | **Deferred to #23** by owner |
+| Microphone revoked | Disable Microphone while app is running, reactivate Parakeet | Dashboard surfaces revocation; new dictation is gated with an explicit recovery action | **Deferred to #23** by owner |
+| Input Monitoring revoked | Disable Input Monitoring while app is running, reactivate Parakeet | Dashboard surfaces revocation; menu dictation still works; global hotkey is unavailable | **Deferred to #23** by owner |
+| Deep-link fallback | Use each Open Settings action; unit tests retain generic fallback contract | Correct service pane opens, or generic Privacy & Security opens | **Pass** — all three service panes inspected; generic fallback contract tested |
+| Fully granted relaunch | Grant all three, quit, reopen | No onboarding dialog; global hotkey and menu dictation work without another prompt | **Pass** — all three toggles visibly on; signed dashboard showed all Granted; normal relaunch showed no permission dialog |
 
-After QA, restore all three grants and leave the signed `/Applications` bundle
-running. Record the tested commit and replace each Pending cell before release.
+All three grants were visibly enabled after this pass. The owner explicitly
+moved the destructive off/on confirmation and denied/restricted cases to
+[issue #23](https://github.com/moorbrook/parakeet-rs/issues/23); that follow-up
+will record the exact merged build hashes and update these deferred rows.

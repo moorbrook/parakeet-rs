@@ -179,6 +179,7 @@ fn install_runtime_state(mtm: MainThreadMarker) -> anyhow::Result<()> {
         mtm,
     )
     .context("register global hotkey")?;
+    let input_monitoring_granted = hotkey_handle.input_monitoring_granted_at_registration();
     *app.hotkey.lock() = Some(hotkey_handle);
 
     // Tokio runtime drives the model download + spawn_blocking ASR
@@ -199,7 +200,7 @@ fn install_runtime_state(mtm: MainThreadMarker) -> anyhow::Result<()> {
 
     // Initial menu paint reflecting "model loading" state.
     app.refresh_menu();
-    permissions::install(mtm);
+    permissions::install(mtm, input_monitoring_granted);
 
     log::info!("parakeet-rs runtime installed");
     Ok(())
