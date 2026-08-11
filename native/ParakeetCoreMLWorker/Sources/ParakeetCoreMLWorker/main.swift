@@ -6,6 +6,7 @@ private let protocolMagic = Data([0x50, 0x52, 0x4b, 0x54]) // "PRKT"
 private let protocolVersion: UInt32 = 1
 private let requestHeaderBytes = 16
 private let maximumAudioSeconds: UInt64 = 30 * 60
+private let maximumLongRegimeSeconds: UInt32 = 60
 private let maximumResponseBytes = 4 * 1024 * 1024
 
 private enum WorkerError: LocalizedError {
@@ -33,10 +34,16 @@ private enum WorkerError: LocalizedError {
 private struct WorkerOptions {
     let modelDirectory: URL?
     let modelRoot: URL?
+    let shortComputeUnits: MLComputeUnits
+    let longComputeUnits: MLComputeUnits
+    let longRegimeSeconds: UInt32
 
     static func parse(_ arguments: [String]) throws -> Self {
         var modelDirectory: URL?
         var modelRoot: URL?
+        var shortComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
+        var longComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
+        var longRegimeSeconds: UInt32 = 8
         var index = 0
         while index < arguments.count {
             switch arguments[index] {
@@ -52,12 +59,44 @@ private struct WorkerOptions {
                     throw WorkerError.invalidArgument("--model-root needs a path")
                 }
                 modelRoot = URL(fileURLWithPath: arguments[index], isDirectory: true)
-            case "-h", "--help":
-                FileHandle.standardError.write(
-                    Data(
-                        "usage: parakeet-coreml-worker [--model-dir DIR | --model-root DIR]\n"
-                            .utf8
+            case "--compute-units":
+                index += 1
+                guard index < arguments.count else {
+                    throw WorkerError.invalidArgument("--compute-units needs a name")
+                }
+                let computeUnits = try parseComputeUnits(arguments[index])
+                shortComputeUnits = computeUnits
+                longComputeUnits = computeUnits
+            case "--short-compute-units":
+                index += 1
+                guard index < arguments.count else {
+                    throw WorkerError.invalidArgument("--short-compute-units needs a name")
+                }
+                shortComputeUnits = try parseComputeUnits(arguments[index])
+            case "--long-compute-units":
+                index += 1
+                guard index < arguments.count else {
+                    throw WorkerError.invalidArgument("--long-compute-units needs a name")
+                }
+                longComputeUnits = try parseComputeUnits(arguments[index])
+            case "--long-regime-seconds":
+                index += 1
+                guard index < arguments.count,
+                    let seconds = UInt32(arguments[index]),
+                    (1...maximumLongRegimeSeconds).contains(seconds)
+                else {
+                    throw WorkerError.invalidArgument(
+                        "--long-regime-seconds must be between 1 and 60"
                     )
+                }
+                longRegimeSeconds = seconds
+            case "-h", "--help":
+                let usage =
+                    "usage: parakeet-coreml-worker [--model-dir DIR | --model-root DIR] "
+                    + "[--compute-units NAME | --short-compute-units NAME "
+                    + "--long-compute-units NAME --long-regime-seconds N]\n"
+                FileHandle.standardError.write(
+                    Data(usage.utf8)
                 )
                 Foundation.exit(0)
             default:
@@ -68,7 +107,26 @@ private struct WorkerOptions {
         guard modelDirectory == nil || modelRoot == nil else {
             throw WorkerError.invalidArgument("--model-dir and --model-root are mutually exclusive")
         }
-        return Self(modelDirectory: modelDirectory, modelRoot: modelRoot)
+        return Self(
+            modelDirectory: modelDirectory,
+            modelRoot: modelRoot,
+            shortComputeUnits: shortComputeUnits,
+            longComputeUnits: longComputeUnits,
+            longRegimeSeconds: longRegimeSeconds
+        )
+    }
+
+    private static func parseComputeUnits(_ value: String) throws -> MLComputeUnits {
+        switch value {
+        case "all": .all
+        case "cpu-and-gpu": .cpuAndGPU
+        case "cpu-and-neural-engine": .cpuAndNeuralEngine
+        case "cpu-only": .cpuOnly
+        default:
+            throw WorkerError.invalidArgument(
+                "compute units must be all, cpu-and-gpu, cpu-and-neural-engine, or cpu-only"
+            )
+        }
     }
 }
 
@@ -132,18 +190,19 @@ private struct ParakeetCoreMLWorker {
     }
 
     private static func run(options: WorkerOptions) async throws {
-        let configuration = MLModelConfiguration()
-        configuration.computeUnits = .cpuAndNeuralEngine
-        let manager = UnifiedAsrManager(
-            configuration: configuration,
-            encoderPrecision: .int8
-        )
-
         let loadStart = ContinuousClock.now
-        if let modelDirectory = options.modelDirectory {
-            try await manager.loadModels(from: modelDirectory)
+        let shortManager = try await loadManager(
+            computeUnits: options.shortComputeUnits,
+            options: options
+        )
+        let longManager: UnifiedAsrManager?
+        if options.longComputeUnits == options.shortComputeUnits {
+            longManager = nil
         } else {
-            try await manager.loadModels(to: options.modelRoot, configuration: nil)
+            longManager = try await loadManager(
+                computeUnits: options.longComputeUnits,
+                options: options
+            )
         }
         let loadSeconds = seconds(since: loadStart)
         try writeResponse(.ready(loadSeconds: loadSeconds))
@@ -163,6 +222,10 @@ private struct ParakeetCoreMLWorker {
                 let modelSamples = try converter.resample(samples, from: Double(request.sampleRate))
                 let resampleSeconds = seconds(since: resampleStart)
 
+                let thresholdSamples = Int(options.longRegimeSeconds) * 16_000
+                let manager = modelSamples.count >= thresholdSamples
+                    ? (longManager ?? shortManager)
+                    : shortManager
                 let decodeStart = ContinuousClock.now
                 let text = try await manager.transcribe(modelSamples)
                 let decodeSeconds = seconds(since: decodeStart)
@@ -177,6 +240,24 @@ private struct ParakeetCoreMLWorker {
                 try writeResponse(.failure(kind: "result", error: error))
             }
         }
+    }
+
+    private static func loadManager(
+        computeUnits: MLComputeUnits,
+        options: WorkerOptions
+    ) async throws -> UnifiedAsrManager {
+        let configuration = MLModelConfiguration()
+        configuration.computeUnits = computeUnits
+        let manager = UnifiedAsrManager(
+            configuration: configuration,
+            encoderPrecision: .int8
+        )
+        if let modelDirectory = options.modelDirectory {
+            try await manager.loadModels(from: modelDirectory)
+        } else {
+            try await manager.loadModels(to: options.modelRoot, configuration: nil)
+        }
+        return manager
     }
 }
 

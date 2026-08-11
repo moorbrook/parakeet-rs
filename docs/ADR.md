@@ -1561,6 +1561,55 @@ mode is the unambiguous choice for rehearsals or unusually long pauses.
 
 ---
 
+## 0026 — Evidence-gated per-chip Core ML runtime plans
+
+**Status:** **Accepted — implemented and measured.**
+
+**Context.** Core ML's `MLComputeUnits` values are placement requests, not
+portable performance guarantees. A generic model can behave differently across
+Apple chip and macOS combinations, while a latency-only tuner could silently
+trade away transcription quality, repeatability, or memory. Tuning model
+weights locally is unnecessary for this layer: the safe adaptation seam is the
+runtime plan around the same immutable model.
+
+**Decision.** Keep CPU+ANE as an unconditional baseline and provide an explicit
+full tuner over exactly four plans: CPU+ANE, `all`, CPU+GPU, and CPU-only. It
+runs the ADR-0021 human-speech gold corpus, separates utterances at an
+eight-second boundary, and records model load, warmup, p50/p95 wall latency,
+RTFx, process-tree peak RSS, WER/CER, per-category quality, and output spread.
+A challenger must pass every quality gate, be no worse in any category, stay
+within 1.25× baseline memory, and improve a median-load-plus-first-decode-
+warmup-plus-20-utterance score by at least 5%. Short and long plans may differ
+only when each independently wins those gates.
+
+The atomic JSON profile is keyed by chip, architecture, memory, logical and
+named performance levels, macOS, backend, complete Core ML artifact-manifest
+digest, and tuner version. Startup verifies model bytes first, rejects unknown
+fields, recomputes the profile selection from its evidence, and falls back to
+CPU+ANE on any missing, stale, unreadable, or invalid profile.
+`PARAKEET_ASR_TUNING=off` is the non-destructive escape hatch. The worker
+accepts only the four named plans and a 1–60 second regime boundary.
+
+**Evidence.** On the M5 Pro 24 GiB / macOS 26.5.1 target, ten gold repetitions
+selected CPU+ANE for both regimes. CPU+ANE versus `all` measured 316.64 versus
+315.53 ms for the combined short corpus and 132.87 versus 132.10 ms for the
+14.225 s long fixture: below the 5% win floor after startup costs. CPU-only
+measured 680.35 / 194.83 ms and 1.26 GiB, versus CPU+ANE's 316.64 / 132.87 ms
+and 0.10 GiB.
+CPU+GPU failed in Apple's MPSGraph MLIR compiler and remained recorded as a
+failed candidate. Shipping quality remained 5.43% WER / 3.57% CER with zero
+output spread.
+
+**Consequences.** The architecture can adapt a generic ASR model to later Mac
+families without hard-coding marketing assumptions, but this M5 Pro correctly
+receives no nominal plan change because none cleared the evidence threshold.
+Profiles are inspectable and removable with `tune_asr`; ordinary startup never
+runs a benchmark. A model, OS, hardware, backend, or tuner change invalidates
+the old result and safely returns to CPU+ANE until the explicit full tuner is
+run again.
+
+---
+
 ## Index of open decisions vs targets
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -1590,6 +1639,12 @@ mode is the unambiguous choice for rehearsals or unusually long pauses.
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-08-11** — [ADR-0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans)
+  added: bounded Core ML candidate tuning, short/long regime selection,
+  hardware/OS/model/tuner cache invalidation, quality/category/memory gates,
+  an inspectable atomic profile, and measured M5 Pro negative evidence that
+  keeps CPU+ANE.
 
 - **2026-08-11** — [ADR-0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode)
   added: 750 ms pause-friendly Tap default, explicit 150 ms Tap Fast, and a

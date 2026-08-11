@@ -78,3 +78,40 @@ PARAKEET_COREML_MODEL_DIR="$HOME/Library/Application Support/com.parakeet.rs/mod
   BACKEND=coreml-unified REPS=30 WARMUP_REPS=3 \
   OUT_CSV=bench/coreml-unified.csv scripts/bench-latency.sh
 ```
+
+## Core ML runtime-plan tuner — 2026-08-11
+
+Release worker, ten corpus repetitions and three model-load repetitions on the
+same M5 Pro 24 GiB / macOS 26.5.1 machine. `short` is the combined six-fixture
+19.825 s bucket; `long` is the 14.225 s human fixture. Peak RSS includes the
+Rust process and resident worker.
+
+| plan | load p50 | warmup | short p50 / p95 | long p50 / p95 | short / long RTFx | peak RSS | WER / CER | result |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| CPU+ANE | 90.6 ms | 77.4 ms | 316.6 / 324.6 ms | 132.9 / 135.6 ms | 62.6× / 107.1× | **0.10 GiB** | 5.43% / 3.57% | **selected both regimes** |
+| All | 89.8 ms | **72.3 ms** | **315.5 / 318.8 ms** | **132.1 / 133.5 ms** | **62.8× / 107.7×** | **0.10 GiB** | 5.43% / 3.57% | safe, below 5% win floor |
+| CPU+GPU | — | — | — | — | — | — | — | MPSGraph MLIR compile failure |
+| CPU-only | **80.4 ms** | 262.2 ms | 680.3 / 705.1 ms | 194.8 / 217.1 ms | 29.1× / 73.0× | 1.26 GiB | 4.35% / 3.36% | memory and latency loss |
+
+CPU+ANE and `all` differ by less than 0.8 ms at long p50 and 1.2 ms over the
+entire short corpus. Normalizing each bucket to a per-utterance p50 and
+including median load and first-decode warmup in a representative 20-utterance
+session leaves `all` below the 5% minimum win, so deterministic policy retains
+the baseline. CPU-only is 2.15× slower short and 1.46× slower long, with roughly
+12.5× the observed memory.
+Every completed candidate passed the absolute gold limits with zero
+within-candidate output spread; category scores are preserved in the JSON
+profile and checked against the baseline.
+
+Independent ten-pass reruns selected the same two CPU+ANE regimes and repeated
+the same three-completed/one-failed candidate pattern. Core ML's persistent
+plan cache made CPU-only's process-first warmup vary from 262 ms to 3.35 s;
+steady-state latency and the memory gate still rejected it in every run.
+
+Replay:
+
+```bash
+scripts/build-coreml-worker.sh
+cargo run --release --locked --bin tune_asr -- \
+  --repetitions 10 --load-repetitions 3
+```

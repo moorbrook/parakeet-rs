@@ -16,7 +16,9 @@ independent, immutable identities:
 - Frontend: FluidAudio native 16 kHz, 128-bin mel extraction with NeMo
   per-feature normalization; fixed 15-second full-attention windows, 8x
   subsampling, and a two-second overlap for longer audio
-- Execution: Core ML, int8 encoder, CPU and Apple Neural Engine
+- Execution: Core ML, int8 encoder; CPU and Apple Neural Engine is the safe
+  baseline, with an optional evidence-gated per-chip runtime profile described
+  in [AUTOTUNING.md](AUTOTUNING.md)
 - Text contract: the model's punctuation and capitalization are retained
 - License: model CC-BY-4.0; FluidAudio Apache-2.0
 
@@ -79,6 +81,8 @@ sherpa-onnx backend. A non-empty custom vocabulary also selects sherpa because
 it owns contextual biasing. For diagnosis or emergency rollback, launch with
 `PARAKEET_ASR_BACKEND=sherpa`; unset it or use `auto` to restore normal policy.
 Unknown values are rejected instead of silently selecting a backend.
+Missing, stale, or invalid runtime-plan profiles use CPU+ANE;
+`PARAKEET_ASR_TUNING=off` bypasses a valid profile without deleting it.
 
 Power is not reported as a one-shot benchmark. `powermetrics` requires elevated
 access, and its sampling interval is longer than these sub-second decodes, so

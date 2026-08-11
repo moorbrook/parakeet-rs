@@ -107,8 +107,7 @@ const POLISH_GGUF: Artifact = Artifact {
     size: 3_525_956_768,
 };
 
-#[cfg(test)]
-const COREML_REVISION: &str = "4252711f6f060f9a2f91e5f081a806d7f45eebd8";
+pub const COREML_REVISION: &str = "4252711f6f060f9a2f91e5f081a806d7f45eebd8";
 
 macro_rules! coreml_artifact {
     ($path:literal, $sha256:literal, $size:literal) => {
@@ -204,6 +203,23 @@ const COREML_ARTIFACTS: &[Artifact] = &[
         3_446_978
     ),
 ];
+
+/// Stable digest of the reviewed Core ML manifest, not a rehash of the 614 MB
+/// model on every launch. `ensure_coreml_model` verifies the corresponding
+/// bytes before a profile keyed by this identity can be used.
+pub fn coreml_artifact_digest() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(COREML_REVISION.as_bytes());
+    hasher.update(b"\n");
+    for artifact in COREML_ARTIFACTS {
+        hasher.update(artifact.label.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(artifact.size.to_le_bytes());
+        hasher.update(artifact.sha256.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!("{:x}", hasher.finalize())
+}
 
 /// Parakeet TDT triplet + tokens, all relative to the per-model dir.
 /// `pub(crate)` so `settings.rs`'s tests can cross-check that this list
@@ -876,6 +892,8 @@ mod tests {
         assert!(paths.contains(&"parakeet_unified_encoder_int8.mlmodelc/weights/weight.bin"));
         assert!(paths
             .contains(&"parakeet_unified_joint_decision_single_step.mlmodelc/weights/weight.bin"));
+        assert_eq!(coreml_artifact_digest().len(), 64);
+        assert_eq!(coreml_artifact_digest(), coreml_artifact_digest());
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::asr::{Asr, AsrBackend, AsrBackendMetadata, Decoded};
 
@@ -22,6 +22,8 @@ const MIN_SAMPLE_RATE: u32 = 8_000;
 const MAX_SAMPLE_RATE: u32 = 384_000;
 const MAX_AUDIO_SECONDS: u64 = 30 * 60;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_LONG_REGIME_SECONDS: u32 = 8;
+pub const MAX_LONG_REGIME_SECONDS: u32 = 60;
 const WORKER_NAME: &str = "parakeet-coreml-worker";
 pub const COREML_MODEL_FOLDER: &str = "parakeet-unified-en-0.6b";
 
@@ -30,6 +32,9 @@ pub const COREML_MODEL_FOLDER: &str = "parakeet-unified-en-0.6b";
 pub struct CoreMlWorkerConfig {
     pub worker_path: PathBuf,
     pub model_source: CoreMlModelSource,
+    pub short_compute_units: CoreMlComputeUnits,
+    pub long_compute_units: CoreMlComputeUnits,
+    pub long_regime_seconds: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,11 +43,59 @@ pub enum CoreMlModelSource {
     DownloadRoot(PathBuf),
 }
 
+/// Core ML placement request passed to the native worker.
+///
+/// These are candidates, not capability claims: a tuner may select one only
+/// after the worker loads it and the measured result clears quality.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoreMlComputeUnits {
+    All,
+    CpuAndGpu,
+    #[default]
+    CpuAndNeuralEngine,
+    CpuOnly,
+}
+
+impl CoreMlComputeUnits {
+    pub const CANDIDATES: [Self; 4] = [
+        Self::CpuAndNeuralEngine,
+        Self::All,
+        Self::CpuAndGpu,
+        Self::CpuOnly,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::CpuAndGpu => "cpu-and-gpu",
+            Self::CpuAndNeuralEngine => "cpu-and-neural-engine",
+            Self::CpuOnly => "cpu-only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "all" => Ok(Self::All),
+            "cpu-and-gpu" => Ok(Self::CpuAndGpu),
+            "cpu-and-neural-engine" => Ok(Self::CpuAndNeuralEngine),
+            "cpu-only" => Ok(Self::CpuOnly),
+            _ => bail!(
+                "unknown Core ML compute units {value:?}; expected all, cpu-and-gpu, \
+                 cpu-and-neural-engine, or cpu-only"
+            ),
+        }
+    }
+}
+
 impl CoreMlWorkerConfig {
     pub fn new(worker_path: impl Into<PathBuf>, model_directory: impl Into<PathBuf>) -> Self {
         Self {
             worker_path: worker_path.into(),
             model_source: CoreMlModelSource::ExistingDirectory(model_directory.into()),
+            short_compute_units: CoreMlComputeUnits::default(),
+            long_compute_units: CoreMlComputeUnits::default(),
+            long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
         }
     }
 
@@ -50,6 +103,9 @@ impl CoreMlWorkerConfig {
         Self {
             worker_path: worker_path.into(),
             model_source: CoreMlModelSource::DownloadRoot(model_root.into()),
+            short_compute_units: CoreMlComputeUnits::default(),
+            long_compute_units: CoreMlComputeUnits::default(),
+            long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
         }
     }
 
@@ -59,6 +115,29 @@ impl CoreMlWorkerConfig {
 
     pub fn set_download_root(&mut self, model_root: impl Into<PathBuf>) {
         self.model_source = CoreMlModelSource::DownloadRoot(model_root.into());
+    }
+
+    pub fn set_compute_units(&mut self, compute_units: CoreMlComputeUnits) {
+        self.short_compute_units = compute_units;
+        self.long_compute_units = compute_units;
+    }
+
+    pub fn set_regime_compute_units(
+        &mut self,
+        short: CoreMlComputeUnits,
+        long: CoreMlComputeUnits,
+        long_regime_seconds: u32,
+    ) -> Result<()> {
+        if !(1..=MAX_LONG_REGIME_SECONDS).contains(&long_regime_seconds) {
+            bail!(
+                "long-regime threshold must be between 1 and \
+                 {MAX_LONG_REGIME_SECONDS} seconds"
+            );
+        }
+        self.short_compute_units = short;
+        self.long_compute_units = long;
+        self.long_regime_seconds = long_regime_seconds;
+        Ok(())
     }
 
     /// Discover the bundled worker and the standard FluidAudio model cache.
@@ -126,6 +205,12 @@ impl CoreMlWorkerBackend {
         let mut child = Command::new(&config.worker_path)
             .arg(model_flag)
             .arg(model_path)
+            .arg("--short-compute-units")
+            .arg(config.short_compute_units.as_str())
+            .arg("--long-compute-units")
+            .arg(config.long_compute_units.as_str())
+            .arg("--long-regime-seconds")
+            .arg(config.long_regime_seconds.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -158,7 +243,12 @@ impl CoreMlWorkerBackend {
                 backend: "fluid-audio-worker".to_string(),
                 model: "Parakeet Unified EN 0.6B offline 15s".to_string(),
                 quantization: "int8 encoder".to_string(),
-                execution_provider: "Core ML CPU+ANE".to_string(),
+                execution_provider: format!(
+                    "Core ML short={} long={} threshold={}s",
+                    config.short_compute_units.as_str(),
+                    config.long_compute_units.as_str(),
+                    config.long_regime_seconds
+                ),
             },
             load_seconds,
         })
@@ -367,5 +457,38 @@ mod tests {
         let maximum_48khz_samples = 48_000_usize * MAX_AUDIO_SECONDS as usize;
         assert!(validate_request(maximum_48khz_samples, 48_000).is_ok());
         assert!(validate_request(maximum_48khz_samples + 1, 48_000).is_err());
+    }
+
+    #[test]
+    fn compute_unit_names_round_trip_and_keep_the_safe_default() {
+        assert_eq!(
+            CoreMlComputeUnits::default(),
+            CoreMlComputeUnits::CpuAndNeuralEngine
+        );
+        for candidate in CoreMlComputeUnits::CANDIDATES {
+            assert_eq!(
+                CoreMlComputeUnits::parse(candidate.as_str()).unwrap(),
+                candidate
+            );
+        }
+        assert!(CoreMlComputeUnits::parse("ane").is_err());
+
+        let mut config = CoreMlWorkerConfig::new("worker", "model");
+        config
+            .set_regime_compute_units(CoreMlComputeUnits::All, CoreMlComputeUnits::CpuOnly, 12)
+            .unwrap();
+        assert_eq!(config.short_compute_units, CoreMlComputeUnits::All);
+        assert_eq!(config.long_compute_units, CoreMlComputeUnits::CpuOnly);
+        assert_eq!(config.long_regime_seconds, 12);
+        assert!(config
+            .set_regime_compute_units(CoreMlComputeUnits::All, CoreMlComputeUnits::CpuOnly, 0,)
+            .is_err());
+        assert!(config
+            .set_regime_compute_units(
+                CoreMlComputeUnits::All,
+                CoreMlComputeUnits::CpuOnly,
+                MAX_LONG_REGIME_SECONDS + 1,
+            )
+            .is_err());
     }
 }

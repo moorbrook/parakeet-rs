@@ -211,6 +211,11 @@ impl SettingsStore {
             .join(crate::coreml_worker::COREML_MODEL_FOLDER)
     }
 
+    /// Inspectable/removable, machine-derived ASR tuning evidence.
+    pub fn asr_tuning_profile_path(&self) -> PathBuf {
+        self.data_dir.join("asr-tuning-profile.json")
+    }
+
     pub fn encoder_path(&self) -> PathBuf {
         self.model_dir().join("encoder.int8.onnx")
     }
