@@ -59,3 +59,26 @@ CPU+GPU aborted on its first warm decode inside Apple's MPSGraph with
 and recorded the candidate as failed. Do not infer performance from a compute
 unit name or retry CPU+GPU in production without a new macOS/Core ML result and
 the full quality gate.
+
+## Qwen3-ASR q8 is not a production streaming replacement — 2026-08-11
+
+Qwen3-ASR 0.6B q8 improved aggregate offline gold quality from shipping
+Parakeet's 5.43% / 3.57% WER/CER to 4.35% / 3.15%, but that row is not a backend
+win. Even with audio preparation excluded, it was 1.86× slower at corpus p50,
+used about 11.0× the observed resident memory, and regressed the `noisy` and
+`numbers` category baselines.
+
+More importantly, actual incremental q8 decoding at the model's 2-second
+boundaries produced 23.91% WER / 21.01% CER under exact, unpaced 100 ms
+segmented, and jittered transport schedules. The 14.225 s human fixture was
+exact offline and 41.86% WER streaming because middle spans disappeared and an
+earlier phrase repeated. The schedules' identical text rules out outer
+segmentation as the cause; they do not model real-time queueing.
+
+q4 does not rescue the candidate: it has only 17.2% more throughput than q8
+while WER rises to 6.52%. A native `mlx-rs` 0.25.3 spike also failed before linking
+because Xcode's separately downloaded Metal Toolchain was absent, and the
+crate raises the repo MSRV from 1.77 to 1.82. Do not add Qwen, Python, MLX, a
+Core ML conversion project, or a Candle architecture port unless a new native
+runtime first changes these quality/resource facts. See
+[`QWEN3_ASR_EVALUATION.md`](QWEN3_ASR_EVALUATION.md).

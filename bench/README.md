@@ -44,6 +44,11 @@ only as the older macOS `say` format/smoke example.
 Measured M5 Pro baselines, fairness rules, threshold derivation, known errors,
 and rejected variants live in `docs/asr/{PERF,DISCREPANCIES,NEGATIVE_EVIDENCE}.md`.
 
+The developer-only Qwen3-ASR challenger uses pinned PEP 723/`uv` oracle scripts
+and does not affect the shipping dependency graph. Its immutable artifact
+summary and no-go evidence are under `bench/qwen3-asr/`; the full interpretation
+is in `docs/asr/QWEN3_ASR_EVALUATION.md`.
+
 ## Quick start
 
 ```bash

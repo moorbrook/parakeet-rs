@@ -1,0 +1,679 @@
+{
+  "schema_version": 1,
+  "runtime_commit": "d1a035514e1d6ac31da7658b273482656eacba61",
+  "runtime_versions": {
+    "python": "3.14.2",
+    "distributions": {
+      "mlx-qwen3-asr": "0.3.5",
+      "mlx": "0.32.0",
+      "numpy": "2.5.2",
+      "regex": "2026.7.19",
+      "huggingface-hub": "1.27.0"
+    }
+  },
+  "audio_runtime": {
+    "executable": "/opt/homebrew/Cellar/ffmpeg/8.1.2_1/bin/ffmpeg",
+    "version": "ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers",
+    "sha256": "1332dc2de372bade9a8a63da0d6cdfab9de97fcefbae707bcc0b0506e1203327"
+  },
+  "gold_input_identity": {
+    "sources_schema_version": 1,
+    "sources_sha256": "a0a5f1fb4cc373375ba0f42dfefd7e3546a4234686548cba372c4fb176768126",
+    "conversion": "ffmpeg: mono, 48000 Hz, signed 16-bit little-endian PCM; no trimming or normalization",
+    "audio_artifact_sha256": "1abd8c9b4a8a85b7be02fed49480c9d6e7455372419f2d72567689df0275987d",
+    "audio_artifact_manifest": {
+      "librispeech-single-6930-75918-0000-48000.wav": {
+        "bytes": 336558,
+        "sha256": "89deae6d4161c79ca53b67f52655816eccf1b82a8eb8e0eb71af73e5d9cc1df8"
+      },
+      "librispeech-multi-6930-75918-0001-48000.wav": {
+        "bytes": 1365678,
+        "sha256": "bc56fd4d8f36350323fa2e8805376903d97439e3b316596af02609448f40b6eb"
+      },
+      "slurp-calendar-amy-close-1490262086-48000.wav": {
+        "bytes": 319592,
+        "sha256": "4b2b98dccee53696a83946882a847c36682115def85138537076b8a67080d6e2"
+      },
+      "slurp-calendar-amy-distant-1490262086-48000.wav": {
+        "bytes": 319550,
+        "sha256": "b081b211cb606c2f7da7449eb08bf9f6d94dfd57d301c35a8f46f6c5ae0c227d"
+      },
+      "slurp-alarm-seven-thirty-close-1497886326-48000.wav": {
+        "bytes": 381032,
+        "sha256": "1c66857a118e1c0b4748623e14a1b2ba1d9edb12bf40cf06b4bd90969e40a982"
+      },
+      "slurp-stock-ibm-close-1502199029-48000.wav": {
+        "bytes": 190568,
+        "sha256": "12132d0354ff8284bff5de79f9a907bc05ea5937c42ac49496f58cbabbd8d3c1"
+      },
+      "slurp-music-olly-tactics-close-1490194280-48000.wav": {
+        "bytes": 356456,
+        "sha256": "a22cc5d122fba275bac0f2d9dfa3953e8b18762caf2af1599d4469d8f2216a71"
+      }
+    }
+  },
+  "evaluator_identity": {
+    "evaluator_sha256": "e65f839a96029b078c1662ee064599e301d39584b5b09e42c6bbe08d43cd9911",
+    "shared_helper_sha256": "8cea355b2aea129314fd98ef7eb826b2bc4c7308e092c1d4a020b78708917d3d",
+    "uv_lock_sha256": "1a912169240b3dbabac2710f779ad8894e1cf9750e165752d783b2abf90e6361"
+  },
+  "model": "mlx-community/Qwen3-ASR-0.6B-8bit",
+  "model_snapshot": "89e96d92ba34aca20b3e29fb10cc284097d1219f",
+  "weight_bytes": 1006229426,
+  "weight_sha256": "b5bfe4abc1b4c6e58b633096682ec2b6297298add1527119936107d211adf0e8",
+  "model_artifact_sha256": "901975e84de875144dabd3a64655ed8f7335562626f816e68409bd61c50f278a",
+  "model_artifact_manifest": {
+    "chat_template.json": {
+      "bytes": 1161,
+      "sha256": "75a8cfca24f00de72d796fbfed6858fc9614ef3dabd8696684cc3bc03a9c58ff"
+    },
+    "config.json": {
+      "bytes": 7187,
+      "sha256": "5d104a945fed08728ab010f12bf3ce5ab4d0794bba276d81bff5bd83ae9d2be0"
+    },
+    "generation_config.json": {
+      "bytes": 142,
+      "sha256": "1da527824d81e07118facff437e03f2e24a23311e3bdeb2368973fe77e5f275c"
+    },
+    "merges.txt": {
+      "bytes": 1671853,
+      "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5"
+    },
+    "model.safetensors": {
+      "bytes": 1006229426,
+      "sha256": "b5bfe4abc1b4c6e58b633096682ec2b6297298add1527119936107d211adf0e8"
+    },
+    "model.safetensors.index.json": {
+      "bytes": 71815,
+      "sha256": "caa32ece76c395ba241533eb4aceb0efbc72488ef3d8d2fd3c677ce068dad57d"
+    },
+    "preprocessor_config.json": {
+      "bytes": 330,
+      "sha256": "45e120a4eda2c20c5d7f2ea9354e63536bf35e27aa573fb7cdf78017b378770d"
+    },
+    "tokenizer_config.json": {
+      "bytes": 12487,
+      "sha256": "4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c"
+    },
+    "vocab.json": {
+      "bytes": 2776833,
+      "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910"
+    }
+  },
+  "model_config": {
+    "model_type": null,
+    "classify_num": null
+  },
+  "repetitions": 10,
+  "load_seconds": 0.11868958408012986,
+  "warmup_seconds": 0.11011583299841732,
+  "corpus_wall_seconds": [
+    0.8424437080975622,
+    0.8386242090491578,
+    0.8376228749984875,
+    0.8399154999060556,
+    0.8391873340588063,
+    0.8420198749518022,
+    0.8429775409167632,
+    0.8404649579897523,
+    0.8414277909323573,
+    0.8412854589987546
+  ],
+  "corpus_wall_p50_seconds": 0.8404649579897523,
+  "corpus_wall_p95_seconds": 0.8429775409167632,
+  "rtfx_p50": 40.51276876723177,
+  "peak_rss_bytes": 1201995776,
+  "wer_percent_max": 4.3478260869565215,
+  "cer_percent_max": 3.1512605042016806,
+  "nondeterministic_outputs": 0,
+  "categories": {
+    "commands": {
+      "wer_percent": 9.75609756097561,
+      "cer_percent": 7.5
+    },
+    "custom-vocabulary": {
+      "wer_percent": 9.090909090909092,
+      "cer_percent": 3.5714285714285716
+    },
+    "general": {
+      "wer_percent": 0.0,
+      "cer_percent": 0.0
+    },
+    "long": {
+      "wer_percent": 0.0,
+      "cer_percent": 0.0
+    },
+    "noisy": {
+      "wer_percent": 9.090909090909092,
+      "cer_percent": 3.7037037037037037
+    },
+    "numbers": {
+      "wer_percent": 10.0,
+      "cer_percent": 9.027777777777779
+    },
+    "proper-nouns": {
+      "wer_percent": 2.380952380952381,
+      "cer_percent": 0.9090909090909091
+    },
+    "punctuation": {
+      "wer_percent": 4.3478260869565215,
+      "cer_percent": 3.1512605042016806
+    }
+  },
+  "quality_gate": {
+    "passed": false,
+    "thresholds": {
+      "max_wer_percent": 8.0,
+      "max_cer_percent": 5.0,
+      "baseline_wer_percent": 5.434782608695652,
+      "baseline_cer_percent": 3.5714285714285716,
+      "max_wer_regression_percent": 0.0,
+      "max_cer_regression_percent": 0.0
+    },
+    "baseline_backend": "coreml-parakeet-unified-cpu-and-neural-engine",
+    "failures": [
+      "noisy wer_percent 9.090909% exceeds coreml-parakeet-unified-cpu-and-neural-engine 0.000000%",
+      "noisy cer_percent 3.703704% exceeds coreml-parakeet-unified-cpu-and-neural-engine 0.000000%",
+      "numbers wer_percent 10.000000% exceeds coreml-parakeet-unified-cpu-and-neural-engine 6.666667%",
+      "numbers cer_percent 9.027778% exceeds coreml-parakeet-unified-cpu-and-neural-engine 8.333333%"
+    ]
+  },
+  "fixtures": {
+    "librispeech-single-6930-75918-0000-48000.wav": {
+      "reference": "Concord returned to its place amidst the tents.",
+      "categories": [
+        "general",
+        "proper-nouns",
+        "punctuation"
+      ],
+      "runs": [
+        {
+          "text": "Concord returned to its place amidst the tents.",
+          "language": "English",
+          "wall_seconds": 0.08800424996297807,
+          "audio_seconds": 3.505
+        },
+        {
+          "text": "Concord returned to its place amidst the tents.",
+          "language": "English",
+          "wall_seconds": 0.0870586249511689,
+          "audio_seconds": 3.505
+        },
+        {
+          "text": "Concord returned to its place amidst the tents.",
+          "language": "English",
+          "wall_seconds": 0.08672166697215289,
+          "audio_seconds": 3.505
+        },
+        {
+          "text": "Concord returned to its place amidst the tents.",
+          "language": "English",
+          "wall_seconds": 0.08717170800082386,
+          "audio_seconds": 3.505
+        },
+        {
+          "text": "Concord returned to its place amidst the tents.",
+          "language": "English",
+          "wall_seconds": 0.08701254101470113,
+          "audio_seconds": 3.505
+        },
+        {
+          "text": "Concord returned to its place amidst the tents.",
+          "language": "English",
+          "wall_seconds": 0.08788720797747374,
+          "audio_seconds": 3.505
+        },
+        {
+          "text": "Concord returned to its place amidst the tents.",
+          "language": "English",
+          "wall_seconds": 0.08760529197752476,
+          "audio_seconds": 3.505
+        },
+        {
+          "text": "Concord returned to its place amidst the tents.",
+          "language": "English",
+          "wall_seconds": 0.08748337510041893,
+          "audio_seconds": 3.505
+        },
+        {
+          "text": "Concord returned to its place amidst the tents.",
+          "language": "English",
+          "wall_seconds": 0.08744091691914946,
+          "audio_seconds": 3.505
+        },
+        {
+          "text": "Concord returned to its place amidst the tents.",
+          "language": "English",
+          "wall_seconds": 0.08666670799721032,
+          "audio_seconds": 3.505
+        }
+      ]
+    },
+    "librispeech-multi-6930-75918-0001-48000.wav": {
+      "reference": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision, to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+      "categories": [
+        "general",
+        "long",
+        "proper-nouns",
+        "punctuation"
+      ],
+      "runs": [
+        {
+          "text": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+          "language": "English",
+          "wall_seconds": 0.3057062089210376,
+          "audio_seconds": 14.225
+        },
+        {
+          "text": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+          "language": "English",
+          "wall_seconds": 0.3028308330103755,
+          "audio_seconds": 14.225
+        },
+        {
+          "text": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+          "language": "English",
+          "wall_seconds": 0.3026416669599712,
+          "audio_seconds": 14.225
+        },
+        {
+          "text": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+          "language": "English",
+          "wall_seconds": 0.30400066694710404,
+          "audio_seconds": 14.225
+        },
+        {
+          "text": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+          "language": "English",
+          "wall_seconds": 0.30340208299458027,
+          "audio_seconds": 14.225
+        },
+        {
+          "text": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+          "language": "English",
+          "wall_seconds": 0.30397087498568,
+          "audio_seconds": 14.225
+        },
+        {
+          "text": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+          "language": "English",
+          "wall_seconds": 0.30496450001373887,
+          "audio_seconds": 14.225
+        },
+        {
+          "text": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+          "language": "English",
+          "wall_seconds": 0.3044257500441745,
+          "audio_seconds": 14.225
+        },
+        {
+          "text": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+          "language": "English",
+          "wall_seconds": 0.305258332984522,
+          "audio_seconds": 14.225
+        },
+        {
+          "text": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+          "language": "English",
+          "wall_seconds": 0.3046634580241516,
+          "audio_seconds": 14.225
+        }
+      ]
+    },
+    "slurp-calendar-amy-close-1490262086-48000.wav": {
+      "reference": "I need an event three days from now scheduled with Amy.",
+      "categories": [
+        "commands",
+        "numbers",
+        "proper-nouns",
+        "punctuation"
+      ],
+      "runs": [
+        {
+          "text": "I need an event three days from now scheduled with Amy.",
+          "language": "English",
+          "wall_seconds": 0.09665366692934185,
+          "audio_seconds": 3.328
+        },
+        {
+          "text": "I need an event three days from now scheduled with Amy.",
+          "language": "English",
+          "wall_seconds": 0.09825487504713237,
+          "audio_seconds": 3.328
+        },
+        {
+          "text": "I need an event three days from now scheduled with Amy.",
+          "language": "English",
+          "wall_seconds": 0.09721945901401341,
+          "audio_seconds": 3.328
+        },
+        {
+          "text": "I need an event three days from now scheduled with Amy.",
+          "language": "English",
+          "wall_seconds": 0.09732554096262902,
+          "audio_seconds": 3.328
+        },
+        {
+          "text": "I need an event three days from now scheduled with Amy.",
+          "language": "English",
+          "wall_seconds": 0.09793708298821002,
+          "audio_seconds": 3.328
+        },
+        {
+          "text": "I need an event three days from now scheduled with Amy.",
+          "language": "English",
+          "wall_seconds": 0.09773179097101092,
+          "audio_seconds": 3.328
+        },
+        {
+          "text": "I need an event three days from now scheduled with Amy.",
+          "language": "English",
+          "wall_seconds": 0.09816325001884252,
+          "audio_seconds": 3.328
+        },
+        {
+          "text": "I need an event three days from now scheduled with Amy.",
+          "language": "English",
+          "wall_seconds": 0.09721470798831433,
+          "audio_seconds": 3.328
+        },
+        {
+          "text": "I need an event three days from now scheduled with Amy.",
+          "language": "English",
+          "wall_seconds": 0.09680770803242922,
+          "audio_seconds": 3.328
+        },
+        {
+          "text": "I need an event three days from now scheduled with Amy.",
+          "language": "English",
+          "wall_seconds": 0.09706395806279033,
+          "audio_seconds": 3.328
+        }
+      ]
+    },
+    "slurp-calendar-amy-distant-1490262086-48000.wav": {
+      "reference": "I need an event three days from now scheduled with Amy.",
+      "categories": [
+        "commands",
+        "noisy",
+        "numbers",
+        "proper-nouns",
+        "punctuation"
+      ],
+      "runs": [
+        {
+          "text": "I need an event three days from now scheduled with Ali.",
+          "language": "English",
+          "wall_seconds": 0.0974706249544397,
+          "audio_seconds": 3.3275625
+        },
+        {
+          "text": "I need an event three days from now scheduled with Ali.",
+          "language": "English",
+          "wall_seconds": 0.09627291699871421,
+          "audio_seconds": 3.3275625
+        },
+        {
+          "text": "I need an event three days from now scheduled with Ali.",
+          "language": "English",
+          "wall_seconds": 0.09622404095716774,
+          "audio_seconds": 3.3275625
+        },
+        {
+          "text": "I need an event three days from now scheduled with Ali.",
+          "language": "English",
+          "wall_seconds": 0.09668733389116824,
+          "audio_seconds": 3.3275625
+        },
+        {
+          "text": "I need an event three days from now scheduled with Ali.",
+          "language": "English",
+          "wall_seconds": 0.09621129196602851,
+          "audio_seconds": 3.3275625
+        },
+        {
+          "text": "I need an event three days from now scheduled with Ali.",
+          "language": "English",
+          "wall_seconds": 0.09715937497094274,
+          "audio_seconds": 3.3275625
+        },
+        {
+          "text": "I need an event three days from now scheduled with Ali.",
+          "language": "English",
+          "wall_seconds": 0.09644658293109387,
+          "audio_seconds": 3.3275625
+        },
+        {
+          "text": "I need an event three days from now scheduled with Ali.",
+          "language": "English",
+          "wall_seconds": 0.0976668749935925,
+          "audio_seconds": 3.3275625
+        },
+        {
+          "text": "I need an event three days from now scheduled with Ali.",
+          "language": "English",
+          "wall_seconds": 0.09772199997678399,
+          "audio_seconds": 3.3275625
+        },
+        {
+          "text": "I need an event three days from now scheduled with Ali.",
+          "language": "English",
+          "wall_seconds": 0.09636379091534764,
+          "audio_seconds": 3.3275625
+        }
+      ]
+    },
+    "slurp-alarm-seven-thirty-close-1497886326-48000.wav": {
+      "reference": "Please wake me up at seven thirty AM.",
+      "categories": [
+        "commands",
+        "numbers",
+        "punctuation"
+      ],
+      "runs": [
+        {
+          "text": "Please wake me up at 7:30 AM.",
+          "language": "English",
+          "wall_seconds": 0.09915987506974488,
+          "audio_seconds": 3.968
+        },
+        {
+          "text": "Please wake me up at 7:30 AM.",
+          "language": "English",
+          "wall_seconds": 0.09840458305552602,
+          "audio_seconds": 3.968
+        },
+        {
+          "text": "Please wake me up at 7:30 AM.",
+          "language": "English",
+          "wall_seconds": 0.09787366702221334,
+          "audio_seconds": 3.968
+        },
+        {
+          "text": "Please wake me up at 7:30 AM.",
+          "language": "English",
+          "wall_seconds": 0.098122916999273,
+          "audio_seconds": 3.968
+        },
+        {
+          "text": "Please wake me up at 7:30 AM.",
+          "language": "English",
+          "wall_seconds": 0.09975845797453076,
+          "audio_seconds": 3.968
+        },
+        {
+          "text": "Please wake me up at 7:30 AM.",
+          "language": "English",
+          "wall_seconds": 0.0982752499403432,
+          "audio_seconds": 3.968
+        },
+        {
+          "text": "Please wake me up at 7:30 AM.",
+          "language": "English",
+          "wall_seconds": 0.09960812504868954,
+          "audio_seconds": 3.968
+        },
+        {
+          "text": "Please wake me up at 7:30 AM.",
+          "language": "English",
+          "wall_seconds": 0.09688241593539715,
+          "audio_seconds": 3.968
+        },
+        {
+          "text": "Please wake me up at 7:30 AM.",
+          "language": "English",
+          "wall_seconds": 0.09676350001245737,
+          "audio_seconds": 3.968
+        },
+        {
+          "text": "Please wake me up at 7:30 AM.",
+          "language": "English",
+          "wall_seconds": 0.09927629202138633,
+          "audio_seconds": 3.968
+        }
+      ]
+    },
+    "slurp-stock-ibm-close-1502199029-48000.wav": {
+      "reference": "Is IBM up today?",
+      "categories": [
+        "commands",
+        "custom-vocabulary",
+        "proper-nouns",
+        "punctuation"
+      ],
+      "runs": [
+        {
+          "text": "Is IBM up today?",
+          "language": "English",
+          "wall_seconds": 0.06169387500267476,
+          "audio_seconds": 1.984
+        },
+        {
+          "text": "Is IBM up today?",
+          "language": "English",
+          "wall_seconds": 0.06261079106479883,
+          "audio_seconds": 1.984
+        },
+        {
+          "text": "Is IBM up today?",
+          "language": "English",
+          "wall_seconds": 0.0625163750955835,
+          "audio_seconds": 1.984
+        },
+        {
+          "text": "Is IBM up today?",
+          "language": "English",
+          "wall_seconds": 0.06350787496194243,
+          "audio_seconds": 1.984
+        },
+        {
+          "text": "Is IBM up today?",
+          "language": "English",
+          "wall_seconds": 0.061712833936326206,
+          "audio_seconds": 1.984
+        },
+        {
+          "text": "Is IBM up today?",
+          "language": "English",
+          "wall_seconds": 0.0635327500058338,
+          "audio_seconds": 1.984
+        },
+        {
+          "text": "Is IBM up today?",
+          "language": "English",
+          "wall_seconds": 0.062005916028283536,
+          "audio_seconds": 1.984
+        },
+        {
+          "text": "Is IBM up today?",
+          "language": "English",
+          "wall_seconds": 0.062387458980083466,
+          "audio_seconds": 1.984
+        },
+        {
+          "text": "Is IBM up today?",
+          "language": "English",
+          "wall_seconds": 0.06329045898746699,
+          "audio_seconds": 1.984
+        },
+        {
+          "text": "Is IBM up today?",
+          "language": "English",
+          "wall_seconds": 0.06293608294799924,
+          "audio_seconds": 1.984
+        }
+      ]
+    },
+    "slurp-music-olly-tactics-close-1490194280-48000.wav": {
+      "reference": "Hey Olly, play playlist Tactics from music.",
+      "categories": [
+        "commands",
+        "custom-vocabulary",
+        "proper-nouns",
+        "punctuation"
+      ],
+      "runs": [
+        {
+          "text": "Hey Ollie, play playlist Tactics from Music.",
+          "language": "English",
+          "wall_seconds": 0.09371720789931715,
+          "audio_seconds": 3.712
+        },
+        {
+          "text": "Hey Ollie, play playlist Tactics from Music.",
+          "language": "English",
+          "wall_seconds": 0.09317141701467335,
+          "audio_seconds": 3.712
+        },
+        {
+          "text": "Hey Ollie, play playlist Tactics from Music.",
+          "language": "English",
+          "wall_seconds": 0.09440770791843534,
+          "audio_seconds": 3.712
+        },
+        {
+          "text": "Hey Ollie, play playlist Tactics from Music.",
+          "language": "English",
+          "wall_seconds": 0.09308045892976224,
+          "audio_seconds": 3.712
+        },
+        {
+          "text": "Hey Ollie, play playlist Tactics from Music.",
+          "language": "English",
+          "wall_seconds": 0.09313487506005913,
+          "audio_seconds": 3.712
+        },
+        {
+          "text": "Hey Ollie, play playlist Tactics from Music.",
+          "language": "English",
+          "wall_seconds": 0.09344454202800989,
+          "audio_seconds": 3.712
+        },
+        {
+          "text": "Hey Ollie, play playlist Tactics from Music.",
+          "language": "English",
+          "wall_seconds": 0.09416558302473277,
+          "audio_seconds": 3.712
+        },
+        {
+          "text": "Hey Ollie, play playlist Tactics from Music.",
+          "language": "English",
+          "wall_seconds": 0.09438720799516886,
+          "audio_seconds": 3.712
+        },
+        {
+          "text": "Hey Ollie, play playlist Tactics from Music.",
+          "language": "English",
+          "wall_seconds": 0.09412512497510761,
+          "audio_seconds": 3.712
+        },
+        {
+          "text": "Hey Ollie, play playlist Tactics from Music.",
+          "language": "English",
+          "wall_seconds": 0.09429754095617682,
+          "audio_seconds": 3.712
+        }
+      ]
+    }
+  }
+}
