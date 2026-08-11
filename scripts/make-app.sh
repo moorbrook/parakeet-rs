@@ -48,7 +48,7 @@ fi
 echo "1. cargo bundle --release --bin parakeet-rs"
 cd "$ROOT"
 # Explicit `--bin parakeet-rs` because the crate also exposes
-# `bench_asr` and `bench_llm` binaries (under `src/bin/`); without
+# several headless binaries under `src/bin/`; without
 # the flag cargo-bundle picks the first one alphabetically (bench_asr),
 # which produces a .app whose `Contents/MacOS/parakeet-rs` is missing
 # and breaks every subsequent step.
@@ -238,8 +238,7 @@ fi
 #        ./scripts/make-app.sh
 #   3. ditto -c -k --keepParent "$APP" Parakeet.zip
 #   4. xcrun notarytool submit Parakeet.zip \
-#        --apple-id you@example.com --team-id TEAMID \
-#        --password APP_SPECIFIC_PASSWORD --wait
+#        --keychain-profile Parakeet --wait
 #   5. xcrun stapler staple "$APP"
 #   6. ditto -c -k --keepParent "$APP" Parakeet-notarised.zip
 #

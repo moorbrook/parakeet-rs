@@ -102,7 +102,6 @@ impl Default for Settings {
 
 #[derive(Clone)]
 pub struct SettingsStore {
-    #[allow(dead_code)] // Reserved for the future settings-save UI.
     settings_path: PathBuf,
     data_dir: PathBuf,
     cache: Arc<Mutex<Settings>>,
@@ -353,7 +352,7 @@ mod tests {
     #[test]
     fn polish_defaults_to_off() {
         // The polish pass is opt-in: a fresh install doesn't load the
-        // ~1.2 GB Qwen GGUF until the user enables polish explicitly.
+        // ~3.5 GB Qwen GGUF until the user enables polish explicitly.
         // Pin the default so an accidental flip doesn't silently start
         // a download + warmup the user didn't ask for.
         let s = Settings::default();

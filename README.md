@@ -6,7 +6,8 @@
 
 Native macOS / Apple Silicon dictation menu-bar app. Press a global
 hotkey, speak, transcript inserts at your cursor. Fully local — no API
-keys, no network after the first-run model download.
+keys, telemetry, or network traffic after the required and optional model
+downloads complete.
 
 - **ASR**: Parakeet Unified EN 0.6B int8 via a resident native Core ML worker
   (sherpa-onnx fallback and contextual-vocabulary backend)
@@ -17,6 +18,8 @@ keys, no network after the first-run model download.
 ## Install from source
 
 No prebuilt releases — build it yourself. Apple Silicon Mac, macOS 11.0+.
+The optimized Parakeet Unified worker requires macOS 14+; macOS 11–13 use the
+bundled sherpa-onnx fallback.
 
 1. **Install prerequisites** (skip what you already have):
    ```bash
@@ -80,13 +83,11 @@ session.
 
 ### Optional polish pass
 
-
-
 Flip Polish to On in Settings; the Qwen GGUF (3.5 GB) downloads
-automatically on first enable and is SHA-256 verified before loading. Polish strips fillers, fixes
-punctuation, honours inline commands ("new paragraph", "scratch
-that"); adds wall-clock latency but streams to the cursor on word
-boundaries.
+automatically on first enable and is SHA-256 verified before loading. Polish
+strips fillers, fixes punctuation, and honours inline commands ("new
+paragraph", "scratch that"). It adds wall-clock latency but streams to the
+cursor on word boundaries.
 
 ### Custom vocabulary
 
@@ -112,6 +113,19 @@ For diagnosis or emergency rollback, `PARAKEET_ASR_BACKEND=sherpa` forces the
 fallback without changing vocabulary. Unset it or use `auto` to restore normal
 selection.
 
+Terms are validated against the model's token inventory, so a word the model
+can't represent (emoji, unusual scripts) is reported in the log and skipped
+rather than silently doing nothing.
+
+An empty list costs nothing. A non-empty one switches the decoder from greedy
+to beam search, measured at **+13%** decode time
+([ADR-0020](docs/ADR.md#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list)).
+The boost strength is `hotword_score` in `settings.json`, default 2.0; the
+measured sweep saw the first unrelated-term injection at 4.5 and broad
+corruption at 6, so re-check with `asr_diff` if you raise it. No safe global
+increase was found; see
+[`docs/asr/DOMAIN_ADAPTATION.md`](docs/asr/DOMAIN_ADAPTATION.md).
+
 ### Apple Silicon runtime tuning
 
 The shipped model is generic; an explicit tuner can benchmark its bounded Core
@@ -131,23 +145,37 @@ Missing or stale profiles use the safe CPU+ANE baseline. Set
 [`docs/asr/AUTOTUNING.md`](docs/asr/AUTOTUNING.md) for the selection gates,
 profile removal, and current M5 Pro evidence.
 
-Terms are validated against the model's token inventory, so a word the
-model can't represent (emoji, unusual scripts) is reported in the log
-and skipped rather than silently doing nothing.
+### Settings and developer overrides
 
-An empty list costs nothing. A non-empty one switches the decoder from
-greedy to beam search, measured at **+13%** decode time
-([ADR-0020](docs/ADR.md#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list)).
-The boost strength is `hotword_score` in `settings.json`, default 2.0;
-the measured sweep saw the first unrelated-term injection at 4.5 and broad
-corruption at 6, so re-check with `asr_diff` if you raise it. No safe global
-increase was found; see
-[`docs/asr/DOMAIN_ADAPTATION.md`](docs/asr/DOMAIN_ADAPTATION.md).
+Settings lets you record a new global shortcut, select Tap, Tap Fast, or Hold,
+toggle Polish, and open the vocabulary file. Changes apply without restarting.
+Caps Lock is also supported as a shortcut; because it emits toggle events
+rather than a press/release pair, Parakeet gives it tap-to-start,
+tap-to-finish semantics and locks the trigger selector accordingly.
+
+Runtime and diagnostic overrides are intentionally narrow:
+
+| Variable | Effect |
+|---|---|
+| `PARAKEET_ASR_BACKEND=sherpa` | Force the fallback recognizer. |
+| `PARAKEET_ASR_TUNING=off` | Ignore a valid per-chip tuning profile without deleting it. |
+| `PARAKEET_COREML_WORKER=/path/to/worker` | Use a specific native worker in development or benchmarks. |
+| `PARAKEET_COREML_MODEL_DIR=/path/to/model` | Use an existing Core ML model directory. |
+| `PARAKEET_REQUIRE_COREML=1` | Make the build fail when the sherpa ONNX Runtime library lacks its Core ML symbol. |
+| `PARAKEET_HUD_PREVIEW=1` | Open the Listening HUD without recording. |
+| `PARAKEET_PERMISSIONS_PREVIEW=startup\|dictation\|all` | Open a permission-dashboard scope using real permission state. |
+
+Persistent settings, vocabulary, tuning evidence, and model paths are under
+`~/Library/Application Support/com.parakeet.rs/`. See
+[`PRIVACY.md`](PRIVACY.md#files-on-disk) for the exact disk inventory.
 
 ## Caveats
 
 - **Apple Silicon only.** No plans for a universal binary
   ([ADR-0002](docs/ADR.md#0002--macos-only)).
+- **Optimized ASR requires macOS 14+.** On macOS 11–13, or whenever the native
+  worker/model cannot load, Parakeet automatically uses sherpa-onnx. A custom
+  vocabulary also selects sherpa intentionally.
 - **Text injection** works in terminals (Ghostty, iTerm2, Terminal.app),
   browsers, native Cocoa, Electron (Slack/VS Code/etc.), JetBrains,
   Xcode. Doesn't reach password fields or apps with aggressive input
@@ -163,6 +191,10 @@ increase was found; see
 App state lives behind two small state machines so the
 session/polish-load races stay localised:
 
+`hotkey/menu → capture → VAD + speculative ASR → optional Qwen polish →
+word-boundary streamer → synthetic Unicode keystroke`. Silero remains the sole
+endpoint authority; speculative recognition is discarded if speech resumes.
+
 - `src/app.rs` — orchestration, supervised worker spawns, panic recovery
 - `src/dictation_fsm.rs` — atomic (state, session, pending_terminate)
 - `src/llm_manager.rs` — polish-LLM lifecycle (Disabled / Loading / Ready)
@@ -176,8 +208,10 @@ session/polish-load races stay localised:
 - `src/clipboard.rs` — rescue copy when keystroke delivery fails
 - `src/{audio,asr,vad,hud,hotkey,menubar,settings,settings_ui,…}.rs`
 
-Three headless harnesses under `src/bin/`: `bench_asr` and `bench_llm`
-(latency), and `asr_diff` (transcript regressions — see below).
+Five headless tools live under `src/bin/`: `bench_asr` and `bench_llm` measure
+the individual inference stages; `bench_e2e` replays production capture,
+endpointing, and recognition; `asr_diff` gates transcript quality; and
+`tune_asr` selects an evidence-backed runtime plan.
 
 Privacy behaviour — what each permission does, what touches the network,
 what lands on disk — is documented in [`PRIVACY.md`](PRIVACY.md). Permission
@@ -185,18 +219,19 @@ state, recovery behavior, and the clean/revoked QA matrix are in
 [`docs/macos-permissions.md`](docs/macos-permissions.md).
 
 Architectural rationale lives in [`docs/ADR.md`](docs/ADR.md) (decisions
-0001-0029); latency targets and measurements in
-[`docs/latency-plan.md`](docs/latency-plan.md). The deferred
+0001-0029). Reproducible latency and quality evidence lives in
+[`bench/README.md`](bench/README.md); the original, now-archived optimization
+plan is [`docs/latency-plan.md`](docs/latency-plan.md). The deferred
 Developer-ID/notarization shipping procedure is captured in
 [`docs/notarized-distribution.md`](docs/notarized-distribution.md).
 
 ## Verification
 
 ```bash
-cargo build --release && scripts/make-app.sh
-cargo run --release --bin bench_asr -- --help
-cargo test
-cargo clippy --all-targets --no-deps             # clean
+scripts/make-app.sh
+cargo run --release --locked --bin bench_asr -- --help
+cargo test --locked
+cargo clippy --locked --all-targets --no-deps
 ```
 
 Anything that could change what the recogniser *says* — model weights,
@@ -216,19 +251,13 @@ Before comparing a new model or backend, use human-authored references rather
 than treating the current model's output as truth:
 
 ```bash
-cp bench/gold.example.json bench/gold.json
-# Review every reference and category in bench/gold.json.
-./target/release/asr_diff --gold bench/gold.json
-# Human summary on stdout; hardware-tagged JSON in bench/asr-quality.json.
+REPETITIONS=10 scripts/bench-gold.sh
+# Human summaries on stdout; machine reports under bench/ (gitignored).
 ```
 
 The gold manifest owns the WER/CER limits. Lexical scoring lowercases and
 removes punctuation while the report tracks exact formatting separately, so a
 punctuation-only regression remains visible without inflating WER.
-
-## Roadmap
-
-- Wire keyboard shortcut customization into the Settings UI.
 
 ## License
 

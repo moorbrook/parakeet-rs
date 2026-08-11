@@ -46,7 +46,7 @@ redundant_closure_for_method_calls = "warn"
 #   without `--bin` (e.g. for the lib package itself).
 # - `[package.metadata.bundle.bin.parakeet-rs]` — per-bin overrides;
 #   used when bundling with `--bin parakeet-rs` (which we need because
-#   the crate also exposes `bench_asr` and `bench_llm` binaries).
+#   the crate also exposes several headless benchmark and evaluation binaries).
 #   Without this section, cargo-bundle uses the binary's raw name
 #   (`parakeet-rs`) for the .app filename and skips our custom display
 #   name / identifier / icon.
@@ -63,9 +63,9 @@ Press a global hotkey, speak, and Parakeet inserts the transcript at
 your cursor. Powered by Parakeet Unified EN 0.6B int8 running locally
 on the Apple Neural Engine via a resident native Core ML worker, with
 sherpa-onnx as the contextual-vocabulary and load-failure fallback. Optional LLM
-cleanup pass (Qwen 3.5 4B Q6_K, llama.cpp + Metal, in-process)
+polish pass (Qwen 3.5 4B Q6_K, llama.cpp + Metal, in-process)
 removes filler words and fixes punctuation. Fully local — no API
-keys, no network calls after the first-run model download.
+keys, telemetry, or network calls after required and optional model downloads.
 """
 osx_minimum_system_version = "11.0"
 # cargo-bundle's `osx_info_plist_exts` concatenates rather than merges, which
@@ -87,7 +87,7 @@ osx_minimum_system_version = "11.0"
 # - fat LTO + single codegen unit gives the compiler full cross-crate
 #   inlining and dead-code elimination, important since the audio path
 #   crosses several small crates.
-# - panic="unwind" is REQUIRED for the cleanup-pipeline panic-isolation
+# - panic="unwind" is REQUIRED for the polish-pipeline panic-isolation
 #   acceptance criterion (latency-plan.md §7): a panic from the llama-cpp
 #   safe wrapper must be caught by `catch_unwind` in `run_polish_isolated`
 #   so the next dictation falls back to raw paste. `panic="abort"` would
@@ -212,7 +212,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSNotification",
 ] }
 
-# llama.cpp via FFI for the §6 cleanup tier (Qwen 3.5 4B Q6_K GGUF). Metal
+# llama.cpp via FFI for the polish tier (Qwen 3.5 4B Q6_K GGUF). Metal
 # backend on Apple Silicon — same FFI pattern as sherpa-onnx. Default
 # features (openmp, android-shared-stdcxx) disabled — openmp duplicates
 # work on top of Apple's GCD scheduler; android-shared-stdcxx is

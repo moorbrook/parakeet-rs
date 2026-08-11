@@ -1,8 +1,13 @@
 # Implementing a `gemma4-mlx` crate on OminiX-MLX
 
-> **Status: DISQUALIFIED for parakeet-rs polish tier.** Gemma 4 E2B 4-bit on-disk size exceeds 2 GB, the cap parakeet-rs accepts for the first-run polish-model download. The candidate has been dropped from the Phase-0 benchmark in [latency-plan.md §6](./latency-plan.md).
+> **Status: archived and superseded.** This was a May 2026 implementation study,
+> not a current parakeet-rs plan. The original 2 GB download cap was later
+> relaxed, and production now ships Qwen 3.5 4B Q6_K through llama.cpp/Metal;
+> see [ADR-0018](./ADR.md#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m).
 >
-> This document is preserved as a reference in case (a) a smaller Gemma 4 quant (sub-2 GB int3 / mixed-precision) becomes available, or (b) the 2 GB cap is revisited. Everything below is still accurate for someone wanting to write a `gemma4-mlx` crate on OminiX-MLX — only the recommendation that parakeet-rs should is rescinded.
+> The technical notes below are preserved only as historical research. They are
+> not maintained as claims about current OminiX-MLX, Candle, Gemma artifacts, or
+> repository APIs; re-verify upstream before using them.
 
 Companion to [latency-plan.md](./latency-plan.md). This doc was originally the implementation map for the OminiX-MLX side of the Phase-0 polish-backend benchmark.
 
@@ -28,7 +33,7 @@ License: MIT/Apache-2.0 dual. Contributing a new model crate back upstream is th
 | `utils` | `AttentionMask`, `SdpaMask`, causal & sliding-window mask generators, RoPE init |
 | `utils` (SDPA) | Scaled-dot-product attention with mask support |
 | `Sampler` trait + `DefaultSampler` | Greedy / temperature / top-p sampling |
-| Metal fused kernels | Fused SwiGLU (won't help Gemma — see [Activation](#mlp-activation-geglu-not-swiglu)) |
+| Metal fused kernels | Fused SwiGLU (won't help Gemma — see [Activation](#2-mlp-activation--geglu-not-swiglu)) |
 
 **Not provided** (you write it): tokenizer loading, safetensors weight loading, model forward pass, generation loop.
 
@@ -167,7 +172,7 @@ Common divergence sources, in rough frequency order:
 
 When tokens diverge, dump per-layer logits from both sides and binary-search to find the divergence layer. Tedious but deterministic.
 
-## Implication for the latency plan
+## Historical implication for the latency plan
 
 The Phase-0 benchmark in [latency-plan.md §6](./latency-plan.md) currently frames Candle vs OminiX-MLX as a symmetric head-to-head. **It isn't.**
 
@@ -176,7 +181,9 @@ The Phase-0 benchmark in [latency-plan.md §6](./latency-plan.md) currently fram
 | **Candle** | Add `candle-core` + `candle-transformers` deps; use existing Gemma 4 module. Library-deep work. |
 | **OminiX-MLX (with new `gemma4-mlx`)** | Write a new model crate from scratch (architecture port + weight loader + validation against the Python oracle). From-scratch work. |
 
-**Recommendation:** ship Candle integration first as the working baseline for the polish tier. Only invest in writing `gemma4-mlx` if a measured Candle Gemma 4 E2B 4-bit polish on M5 Pro fails the **≤300 ms p50** acceptance threshold from latency-plan.md §6. If Candle hits the number, OminiX-MLX isn't worth the from-scratch port for an expected ~10–25% speed bump.
+**Superseded recommendation:** the original study proposed a Candle baseline and
+gated a new `gemma4-mlx` crate on measured need. That path was not taken;
+llama.cpp + Qwen became the production backend.
 
 The latency-plan ADR for the polish backend should reflect this asymmetry: not "pick the fastest of two equivalent options" but "ship Candle; gate OminiX-MLX investment on a measured Candle miss."
 

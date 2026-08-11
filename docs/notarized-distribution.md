@@ -12,8 +12,8 @@ below is reachable. Deferred deliberately: the app is personal-use only.
 `scripts/make-app.sh` already does the hard parts (hardened runtime,
 `entitlements.plist`, the `Developer ID Application:` codesign branch,
 `spctl` assessment). The only missing piece is automating
-notarize → staple → re-verify, which today lives as dead comments at the
-tail of that script.
+notarize → staple → re-verify; the tail of that script contains the matching
+manual outline.
 
 ## One-time setup (GUI / interactive, once)
 
@@ -118,10 +118,9 @@ printf "\n\033[1;32m✓ Parakeet notarized, stapled, installed.\033[0m\n"
 
 - **Pre-flight before build.** A missing notary profile should fail in
   one second, not after a full release build.
-- **`store-credentials`, not `--password` in argv.** The tail comment in
-  `make-app.sh` currently shows `--password APP_SPECIFIC_PASSWORD` on the
-  command line, which leaks into shell history. The keychain profile
-  avoids that. Worth fixing that comment regardless of this doc.
+- **`store-credentials`, not `--password` in argv.** The keychain profile keeps
+  the app-specific password out of shell history; both this recipe and the
+  outline in `make-app.sh` use that form.
 - **`--options runtime --timestamp` + entitlements.** Already handled by
   `make-app.sh`'s `Developer ID Application:` branch. Notarization
   rejects bundles without hardened runtime.

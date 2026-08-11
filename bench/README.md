@@ -64,10 +64,7 @@ open target/release/bundle/osx/Parakeet.app   # or however you launch it
 
 # Then:
 scripts/bench-latency.sh                           # → bench/baseline.csv
-OUT_CSV=bench/post-coreml-cache.csv \
-    scripts/bench-latency.sh                       # § 2 re-bench
-
-# Native int8 Parakeet Unified challenger (builds the pinned Swift worker):
+# Shipping native int8 Parakeet Unified backend (builds the pinned worker):
 BACKEND=coreml-unified OUT_CSV=bench/coreml-unified.csv \
     scripts/bench-latency.sh
 
@@ -187,16 +184,13 @@ the representative-speech gate described above still applies before a release.
 | 10 s   | 30 | 573     | 572    | 589    | 591    |
 | 20 s   | 30 | 1120    | 1114   | 1162   | 1185   |
 
-**Steady-state RTFx** ≈ 13–14× real time on the 5 s bucket. This is
-materially better than ADR-0012's 7.8× figure — likely due to OS / driver
-updates and/or that the bench uses clean TTS speech. Worth folding into
-the §6 ADR once §2 numbers land.
+**Steady-state RTFx** ≈ 13–14× real time on the 5 s bucket. This historical
+sherpa baseline is retained for comparison; the shipping native Core ML and
+end-to-end measurements above supersede it as the current performance record.
 
 **Implied total post-endpoint latency on 5 s (pre-cache):**
-362 ms ASR + 150 ms VAD ≈ **512 ms** — under the 700 ms acceptance
-target before any optimization. §2 should still cut
-**first-dictation-after-launch** cold-start, which is what the user
-actually feels on app open; warm steady-state may not budge much.
+362 ms ASR + 150 ms VAD ≈ **512 ms** — under the former 700 ms acceptance
+target before the native worker and speculative-decode work landed.
 
 ## §6 Phase-0 polish-backend bench: Qwen 3.5 2B Q4_K_M (2026-05-16, M5 Pro 24 GB)
 
@@ -231,13 +225,8 @@ The 2B's instruction-following misses (paraphrasing, over-deleted
 Q6_K** (3.53 GB) — same family, so the ChatML + `/no_think` template
 carries over unchanged. See the ADR-0018 amendment.
 
-Fetch one-liner:
-
-```bash
-mkdir -p ~/Library/Application\ Support/com.parakeet.rs/llm/qwen3.5-4b-q6_k && \
-curl -L -o ~/Library/Application\ Support/com.parakeet.rs/llm/qwen3.5-4b-q6_k/Qwen3.5-4B-Q6_K.gguf \
-  https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q6_K.gguf
-```
+Enable Polish once in the app to download and SHA-256 verify the pinned GGUF;
+the replay command below uses that standard application path.
 
 30 reps, same 240-char sample transcript, same `bench_llm` harness:
 
@@ -273,5 +262,8 @@ Replay:
 | `asr-quality.json`          | Generated machine-readable quality/latency report (gitignored). |
 | `llm-raw.log`                | All `llm_timer` lines from the last LLM run.     |
 | `baseline.csv`               | Aggregated ASR baseline (pre-CoreML-cache).      |
-| `post-coreml-cache.csv`      | Aggregated post-§2 (deferred — see ADR-0017).    |
-| `polish-backends.csv`       | §6 Phase-0 polish backend numbers (this run).   |
+| `coreml-unified.csv`         | Generated shipping-backend ASR percentiles.     |
+| `*-boundary.csv`             | Generated Rust/worker boundary measurements.    |
+| `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |
+| `endpoint-*.{log,csv}`       | Generated pause-friendly endpoint gate runs.   |
+| `polish-backends.csv`        | Historical §6 Phase-0 2B polish measurements.  |

@@ -21,9 +21,9 @@
 #   REPS=50 scripts/bench-latency.sh           # more reps per length
 #   BACKEND=coreml-unified \
 #       OUT_CSV=bench/coreml-unified.csv \
-#       scripts/bench-latency.sh                # native Core ML challenger
-#   OUT_CSV=bench/post-coreml-cache.csv \
-#       scripts/bench-latency.sh               # name the output (for §2 re-bench)
+#       scripts/bench-latency.sh                # shipping native Core ML backend
+#   OUT_CSV=bench/experiment.csv \
+#       scripts/bench-latency.sh                # name an experiment output
 
 set -euo pipefail
 

@@ -21,6 +21,39 @@ application.
 - Model license: Creative Commons Attribution 4.0 International
   (<https://creativecommons.org/licenses/by/4.0/>)
 
+## Parakeet TDT 0.6B v3 int8 fallback model
+
+The fallback and contextual-vocabulary backend downloads the sherpa-onnx ONNX
+conversion of NVIDIA Parakeet TDT 0.6B v3. The weights are not stored in this
+repository or bundled in the application.
+
+- Model (exact revision): <https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/tree/2bda32ec70b097a55adaa07d9a7173915b43cc78>
+- Original model: NVIDIA Parakeet TDT 0.6B v3
+- Conversion: sherpa-onnx contributors
+- Model license: Creative Commons Attribution 4.0 International
+  (<https://creativecommons.org/licenses/by/4.0/>)
+
+## Silero VAD
+
+Parakeet downloads the Silero voice-activity detector distributed with the
+sherpa-onnx ASR model releases. The exact downloaded bytes are pinned in
+`src/model_fetch.rs` by length and SHA-256.
+
+- Upstream project: <https://github.com/snakers4/silero-vad>
+- Distributed artifact: <https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models>
+- License: MIT
+
+## Qwen 3.5 4B polish model
+
+The optional Polish feature downloads an Unsloth GGUF conversion of Qwen 3.5
+4B Instruct. The weights are not stored in this repository or bundled in the
+application.
+
+- Model (exact revision): <https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/tree/e87f176479d0855a907a41277aca2f8ee7a09523>
+- Original model: Qwen 3.5 4B Instruct
+- Conversion: Unsloth contributors
+- Model license: Apache License 2.0; see `LICENSE-APACHE`
+
 ## LibriSpeech endpoint regression fixtures
 
 The two human-speech WAV files under `bench/endpointing/` come from the

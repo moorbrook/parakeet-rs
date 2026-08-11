@@ -4,7 +4,7 @@ One file, one ADR per heading. Status legend: **Accepted** (in code today),
 **Proposed** (next pass), **Rejected** (considered and dropped),
 **Superseded** (replaced by a later ADR).
 
-The overarching goal is in [ADR-0007](#0007-performance-targets). Every decision
+The overarching goal is in [ADR-0007](#0007--performance-targets-beat-wispr-flow). Every decision
 below should be re-evaluated against it.
 
 ---
@@ -16,20 +16,21 @@ ADRs target. Update whenever the code lands or a measurement is taken.
 
 | Dimension | Today (measured / asserted) | Target (ADR-0007) | Blocker to close the gap |
 |---|---|---|---|
-| End-of-speech → text appears | **press-once + Silero VAD auto-stop** wired (`streamer.rs`); 16 kHz resample inline; offline encoder runs at 7.8x RTFx on M5 Pro, so a 5 s utterance finalizes in ~640 ms after EoS | **<1 s p50 with WER ≤ 2% (revised)** — was <200 ms but retired after streaming-Parakeet survey found no viable substitute (see ADR-0009) | nothing for the revised target |
-| Recognition acceleration | **CoreML EP linked AND engaged.** `sherpa-onnx-sys` set to `shared` linkage; `libonnxruntime.1.24.4.dylib` exports `OrtSessionOptionsAppendExecutionProvider_CoreML` (verified by `nm -gU`); `build.rs` symbol check is green; the **2 s warmup decode runs at 7.8x real time**, well above the 2x CoreML floor that signals CPU fallback. ANE/GPU is in use. | CoreML EP routes ops to ANE / Metal / CPU per-op | **none — ADR-0012 + ADR-0015 fully shipped.** |
+| End-of-speech → text appears | Resident Parakeet Unified Core ML recognition starts speculatively behind an unchanged Silero stop authority. Tap Fast measured **182.0 ms p50 / 203.0 ms p95** on the representative 5 s production-path replay; pause-friendly Tap measured **637.0 ms p50 / 658.1 ms p95** on the 14.225 s endpoint fixture. | **<1 s p50** with the representative-speech quality gate intact | none — ADR-0022, ADR-0023, and ADR-0025 shipped and measured |
+| Recognition acceleration | A resident native Swift worker owns the int8 Parakeet Unified Core ML graph on CPU+ANE. The sherpa CoreML backend remains the automatic load-failure and contextual-vocabulary fallback. An explicit per-chip tuner keeps CPU+ANE unless another bounded plan clears quality, memory, and ≥5% performance gates. | Native Apple Silicon execution with evidence-backed placement | none — ADR-0022 + ADR-0026 shipped; current M5 Pro evidence correctly retains CPU+ANE |
 | Resident set | ~800 MB (640 MB mmap'd ASR model + ORT arenas + audio buffers); +~4 GB when polish is On (Qwen 3.5 4B Q6_K weights + KV cache); ~50 MB bundled dylibs | ≤5 GB steady state with polish On (revised with the 4B bump, ADR-0018 amendment) | none — ADR-0016 + ADR-0018 shipped |
 | Settings window | Native `NSWindow` opened from menubar "Settings…" (`src/settings_ui.rs`); `orderFrontRegardless` so it surfaces above other apps | native, on-demand | none — shipped |
 | Menubar UX | SF Symbols (`mic` / `mic.fill` / `arrow.down.circle`) via `objc2_app_kit::NSImage`; state-reflective menu labels | HIG-conformant template image with state | none — shipped |
 | Paste path | `CGEventKeyboardSetUnicodeString` synthetic keystroke at `AnnotatedSession` tap layer (`src/ax_paste.rs`) | no clipboard mutation; works in terminals, browsers, native, Electron, IDEs | none — [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) shipped, supersedes ADR-0011 |
 | Smart formatting | In-process LLM polish pass: Qwen 3.5 4B Q6_K via llama-cpp-2 + Metal (`src/polish.rs`); opt-in via Settings → Polish → On | optional local polish, streaming output to cursor on word boundaries | none — [ADR-0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) shipped + amended (4B bump) |
+| Custom vocabulary | A plain-text vocabulary selects sherpa beam search with validated hotword encoding; the default empty vocabulary keeps the faster native worker | explicit specialization without silently changing the generic model | none — ADR-0020 + ADR-0028 shipped and bounded by measured evidence |
+| macOS permissions | Contextual Input Monitoring onboarding, just-in-time Microphone/Accessibility requests, a permanent dashboard, settings recovery links, and activation-time revocation detection | explain before requesting and remain usable when a grant is absent | implementation shipped in ADR-0029; destructive revocation confirmation remains issue #23 |
 
-**Foundational dependency cleared.** The CoreML EP blocker that gated
-almost every other ADR was resolved by the [ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage)
-spike: switching `sherpa-onnx-sys` to its `shared` feature swaps in
-Microsoft's official onnxruntime dylib, which already includes the CoreML
-EP. All three ADR-0015 verification layers are green — including layer 3,
-where the warmup decode reports **7.8x real-time on this M5 Pro**.
+**Primary acceleration path complete.** ADR-0012 and ADR-0015 first proved the
+sherpa fallback's CoreML execution. ADR-0022 then moved the default empty-
+vocabulary path to a resident native Parakeet Unified worker, ADR-0023
+overlapped recognition with endpoint confirmation, and ADR-0026 added safe
+per-chip runtime selection without changing model weights.
 
 ---
 
@@ -78,7 +79,7 @@ for other OSes, no cross-platform abstractions.
 
 **Alternatives.**
 - *Cross-platform via tauri-cross-platform-shortcut-y libs*: works, but every
-  optimization in [ADR-0006](#0006-apple-silicon-optimizations) becomes
+  optimization in [ADR-0006](#0006--apple-silicon-optimization-plan-ds4-playbook-applied) becomes
   conditional, which doubles the maintenance burden for no user gain on day
   one.
 - *Intel mac support*: M-series is now ubiquitous in our user base.
@@ -119,7 +120,8 @@ cloud competitor including Wispr Flow.
 
 ## 0004 — Parakeet TDT 0.6B v3 as the model
 
-**Status:** Accepted (this session, after re-evaluation)
+**Status:** **Accepted as fallback; superseded as the default backend by
+[ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend).**
 
 **Context.** Candidates considered, with English WER on LibriSpeech-clean and
 deployability on M5 Pro:
@@ -154,7 +156,10 @@ non-European languages lose. Acceptable for our user base.
 
 ## 0005 — sherpa-onnx as the inference binding
 
-**Status:** Accepted
+**Status:** **Accepted as the fallback/contextual-vocabulary binding; superseded
+as the default empty-vocabulary path by [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend).**
+The body below records the original binding decision and the static-library
+risk that ADR-0012 later resolved for the fallback.
 
 **Context.** Three Rust paths to running ONNX/ML models on Apple Silicon:
 
@@ -178,32 +183,28 @@ Runtime's CoreML Execution Provider routes ops to ANE / Metal / CPU per-op.
 
 **Consequences.** We inherit sherpa-onnx's release cadence, build process,
 and limitations. The static lib in the upstream prebuilt may or may not
-include the CoreML EP — see [ADR-0006](#0006-apple-silicon-optimizations) for
+include the CoreML EP — see [ADR-0006](#0006--apple-silicon-optimization-plan-ds4-playbook-applied) for
 the verification path. We do not own the inference code, so we cannot easily
 add custom kernels.
 
-**Open risk — REALISED.** The upstream prebuilt **does not include the CoreML
-EP**. Verified 2026-05-15 by running
+**Historical risk — realised, then resolved.** The static upstream prebuilt did
+not include the CoreML EP. This was verified 2026-05-15 by running
 `nm -gU target/sherpa-onnx-prebuilt/sherpa-onnx-v1.13.2-osx-arm64-static-lib/lib/libonnxruntime.a | grep -i coreml`
-which returns zero matches; available providers are CPU / CUDA / DML / Dnnl /
+which returned zero matches; available providers were CPU / CUDA / DML / Dnnl /
 MIGraphX / Nnapi / OpenVINO / ROCM / TensorRT / VitisAI / CANN. Setting
-`provider="coreml"` in the recognizer config is currently a silent no-op —
-ONNX Runtime falls back to the CPU EP. Mitigation is
-[ADR-0012](#0012-self-built-sherpa-onnx-with-coreml-ep) (self-build with the
-EP enabled) gated by [ADR-0015](#0015-coreml-ep-verification-protocol).
+`provider="coreml"` against that artifact was a silent no-op. ADR-0012 switched
+the fallback to shared linkage with a CoreML-capable ONNX Runtime dylib, and
+ADR-0015 added build/runtime verification.
 
 ---
 
 ## 0006 — Apple Silicon optimization plan (ds4 playbook applied)
 
-**Status:** **Partly Accepted, partly Proposed.** The CPU-side optimizations
-listed below (P-core scheduling, thread count, page-touch warmup, mmap'd
-weights, long-lived runtime object) are in code today and verified by
-inspection. The **CoreML EP / ANE acceleration claims are Proposed**, gated
-on [ADR-0012](#0012-self-built-sherpa-onnx-with-coreml-ep) landing and
-[ADR-0015](#0015-coreml-ep-verification-protocol) returning a green run.
-Until then, the "Metal-first execution" line is a no-op (see the
-[Current state snapshot](#current-state-vs-target-snapshot)).
+**Status:** **Accepted for the CPU-side baseline; accelerator selection is
+superseded by [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend)
+and [ADR-0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans).** The
+P-core scheduling, thread count, page-touch warmup, mmap'd weights, and
+long-lived runtime object remain in the fallback path.
 
 **Context.** [antirez/ds4](https://github.com/antirez/ds4) is a from-scratch
 DeepSeek V4 inference engine for Apple Silicon. Its kernel set is
@@ -235,8 +236,8 @@ ONNX Runtime kernels.
 
 ## 0007 — Performance targets (beat Wispr Flow)
 
-**Status:** Accepted (targets); current state lags — see
-[Current state snapshot](#current-state-vs-target-snapshot).
+**Status:** **Accepted; the revised latency and representative-speech gates are
+met.** See [Current state snapshot](#current-state-vs-target-snapshot).
 
 **Context.** Wispr Flow is the de-facto premium AI dictation app: cloud-only,
 $144/yr, claims **<500 ms** felt latency, **95%+ accuracy** in quiet
@@ -252,14 +253,14 @@ never confuse aspiration with engineering:
 
 | Metric | Wispr Flow | Today (baseline) | Target | Path to closing |
 |---|---|---|---|---|
-| End-of-speech → text appears | <500 ms cloud | **~840 ms** on a 5 s utterance (VAD 150 ms hangover + offline encoder at 7.8x RTFx + ~50 ms finalize) | **<1 s p50 with WER ≤ 2%** *(revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected) for why streaming-model swap was rejected)* | nothing; meets revised target today |
+| End-of-speech → text appears | <500 ms cloud | **182.0 ms p50 / 203.0 ms p95** in Tap Fast's matched 5 s production replay; pause-friendly Tap remains below 1 s p95 on the endpoint corpus | **<1 s p50** with the representative-speech quality gate intact | met by ADR-0022/0023/0025 |
 | First word in indicator | <500 ms | **n/a — indicator removed in [ADR-0014]** | n/a | retired |
-| Cold start (launch → first hotkey responsive) | ~2 s | unmeasured (~4 s observed in spike: load + warmup + 2 s dummy decode) | **<3 s** with model present | warmup pass is the bulk; consider deferring the 2 s measured pass |
-| WER (LibriSpeech clean / dictation) | not published | 1.93% / 3.59% (Parakeet v3 published) | **≤2% / ≤4%** | already met by model choice |
-| Privacy | cloud | zero net calls post-download | **zero network calls after first-run download** | [ADR-0003](#0003-100-local-inference-no-cloud-apis-as-defaults) |
-| Smart formatting | yes, cloud LLM | none | **yes, local LLM post-pass** | [ADR-0010](#0010-local-llm-post-processing-for-smart-formatting) |
-| Resident set (steady state) | ~150 MB | ~1.0 GB asserted (640 MB model mmap + Tauri/WebKit + ORT arenas + audio buffers) | **≤1.2 GB** | [ADR-0014](#0014-tray-only-headless-ux) drops the indicator window; further cuts unlikely until we drop WebKit entirely |
-| Battery cost / 30 min dictation | n/a | unmeasured | **<2% on M5 Pro** | ANE preference (requires [ADR-0012](#0012-self-built-sherpa-onnx-with-coreml-ep)), QoS drop at idle |
+| Cold start (launch → first hotkey responsive) | ~2 s | native model load **0.130 s**, first-result path **0.278 s** on the measured M5 Pro; full AppKit launch is not separately claimed | **<3 s** with models present | component evidence passes; keep full-launch measurement honest |
+| Representative-speech WER / CER | not published | **5.43% / 3.57%**, zero ten-repeat spread on the seven-file human corpus | frozen product gate **≤8% / ≤5%** with no added baseline error or category regression | met by ADR-0021/0022 |
+| Privacy | cloud | zero network calls after installed model artifacts pass local verification | **zero network calls after required/optional model downloads** | [ADR-0003](#0003--100-local-inference-no-cloud-apis-as-defaults) |
+| Smart formatting | yes, cloud LLM | Qwen 3.5 4B Q6_K, local and streamed | **yes, local LLM post-pass** | met by ADR-0018/0019 |
+| Resident set (steady state) | ~150 MB | ~800 MB asserted without polish; ~4 GB with Qwen loaded | **≤5 GB with polish On** | met after the ADR-0018 4B amendment |
+| Battery cost / 30 min dictation | n/a | unmeasured | **<2% on M5 Pro** | resident CPU+ANE worker and idle QoS policy exist; a controlled energy protocol is still required |
 
 **Honesty notes.**
 - The resident-set target was previously set at "<400 MB including model"
@@ -270,15 +271,17 @@ never confuse aspiration with engineering:
   streaming-model survey: no streaming Parakeet TDT 0.6B v3 ONNX exists,
   the realistic substitutes (NeMo FastConformer-streaming-large at 114 M
   params, Kroko Streaming Zipformer at ~50 M) all regress WER on test-other
-  and lose native punctuation. We refuse the trade and accept the offline
-  encoder's ~640 ms finalize cost on a 5 s utterance. New target: **<1 s p50
-  end-to-end with WER ≤ 2%**, which the current build already meets.
+  and lose native punctuation. Later ADR-0022/0023 retained offline quality but
+  removed most of the finalize tail through a faster native model and
+  speculative decode. The current acceptance limits are the representative
+  corpus's 8% WER / 5% CER gates, not the former published-model proxy.
 
 **Alternatives.** Lower bars (parity with Whisper.cpp dictation tools like
 Superwhisper). Rejected — point of the exercise is to beat Wispr Flow.
 
-**Consequences.** Every subsequent ADR is judged against these targets. If
-something below pushes p99 over 300 ms, it doesn't ship.
+**Consequences.** Every subsequent performance change is judged against the
+representative quality, latency, repeatability, and memory gates recorded by
+ADR-0021, ADR-0023, ADR-0025, and ADR-0026.
 
 ---
 
@@ -286,7 +289,7 @@ something below pushes p99 over 300 ms, it doesn't ship.
 
 **Status:** **Both halves superseded.** Press-twice was replaced by
 hotkey-press → talk → VAD-auto-stop per
-[ADR-0009](#0009-streaming-recognition--vad-auto-stop). Clipboard +
+[ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected). Clipboard +
 ⌘V was replaced by `CGEventKeyboardSetUnicodeString` synthetic
 keystrokes per [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession).
 Original v0.1 framing preserved below.
@@ -301,7 +304,7 @@ tolerable in exchange for breadth of app compatibility. AX injection
 deferred to v2.
 
 The press-twice UX was replaced by hotkey-press → talk →
-VAD-auto-stop in [ADR-0009](#0009-streaming-recognition--vad-auto-stop)
+VAD-auto-stop in [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)
 because press-twice adds a user-input delay on top of inference
 latency.
 
@@ -312,7 +315,7 @@ latency.
 **Status:** **Accepted in current form (press-once + Silero VAD + offline
 Parakeet); streaming model swap rejected after measurement.**
 
-Replaces [ADR-0008](#0008-hotkey-press-to-toggle--clipboard-paste) on the
+Replaces [ADR-0008](#0008--hotkey-press-to-toggle--clipboard-paste) on the
 press-twice toggle; supersedes the originally proposed
 `OfflineRecognizer` → `OnlineRecognizer` switch.
 
@@ -345,7 +348,7 @@ the recording window so the finalize cost drops to one chunk + decoder pass.
    test-other. The Parakeet WER difference between 1.9% and ~3% is one extra
    error per 100 words on long-form text — noticeable.
 3. **Native punctuation/capitalization is part of Parakeet TDT v3's value.**
-   Losing it means we'd need [ADR-0010](#0010-local-llm-post-processing-for-smart-formatting)
+   Losing it means we'd need [ADR-0010](#0010--local-llm-post-processing-for-smart-formatting)
    to ship before v1, adding 150–400 ms of LLM warmed-pass latency — which
    would more than erase the streaming latency savings.
 
@@ -370,7 +373,7 @@ the measured 7.8x RTFx that's `150 ms + 640 ms + ~50 ms ≈ 840 ms` —
 **slower than Wispr Flow's ~500 ms cloud latency, but with the WER and
 punctuation advantages of a bigger offline model.**
 
-**Revised target.** [ADR-0007](#0007-performance-targets) "<200 ms p50 felt
+**Revised target.** [ADR-0007](#0007--performance-targets-beat-wispr-flow) "<200 ms p50 felt
 latency" target is **provisionally retired** — it is not reachable with an
 offline 600 M-param encoder regardless of CoreML acceleration. Replaced by:
 **end-of-speech-to-text under 1 s p50 on M5 Pro, with WER ≤ 2% on
@@ -393,16 +396,18 @@ becomes available upstream.
 
 **Consequences.** [ADR-0009] is now narrower than originally drafted:
 it covers the VAD auto-stop UX (shipped) but explicitly does NOT cover a
-recognizer swap. ADR-0010 LLM post-pass becomes less urgent (Parakeet
-already does punctuation). [ADR-0007]'s sub-200 ms p50 target is retired
-in favour of a more honest sub-1 s target. The Silero VAD threshold of
-150 ms remains the user-tunable knob for late-cut sensitivity.
+recognizer swap. ADR-0010 LLM post-pass became less urgent because Parakeet
+already emitted punctuation. [ADR-0007]'s original sub-200 ms p50 target was
+retired in favour of a more honest sub-1 s target. The 150 ms endpoint remains
+available through explicit Tap Fast mode; normal Tap uses ADR-0025's
+pause-friendly policy.
 
 ---
 
-## 0010 — Local LLM post-processing for smart formatting (PROPOSED)
+## 0010 — Local LLM post-processing for smart formatting
 
-**Status:** Proposed
+**Status:** **Superseded by [ADR-0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m),
+which shipped the local polish pass.** The body below is the original proposal.
 
 **Context.** Wispr Flow's headline feature is *context-aware AI rewriting*:
 dictate casually, output is a polished email; dictate in a code editor,
@@ -422,7 +427,7 @@ context: "you are formatting dictation about to be pasted into <app>."
 - *No formatting*: matches raw Parakeet output. Misses the Wispr Flow bar.
 - *Rule-based formatting only* ("um/uh removal, voice commands like
   'new paragraph')*: easy, helps, but doesn't reach LLM-quality rewriting.
-- *Cloud LLM* (Anthropic/OpenAI): violates [ADR-0003](#0003-100-local-inference-no-cloud-apis-as-defaults).
+- *Cloud LLM* (Anthropic/OpenAI): violates [ADR-0003](#0003--100-local-inference-no-cloud-apis-as-defaults).
 
 **Consequences.** Realistic post-pass latency: **150–400 ms warmed**, not
 the 50–150 ms originally quoted. Breakdown for a 1.5B-param model on M5 Pro
@@ -431,7 +436,7 @@ at ~10 ms/token = ~300 ms generation, plus tokenize/detokenize overhead
 ~20–50 ms. Token streaming **does not help** here because we need a single
 final string before injection — partial-rewrite streaming would cause
 flicker in the target app and corrections after paste. If the post-pass
-budget collides with [ADR-0007](#0007-performance-targets), default it off
+budget collides with [ADR-0007](#0007--performance-targets-beat-wispr-flow), default it off
 and surface as an opt-in "polish output" toggle in settings.
 
 We're now bundling two models (~640 MB ASR + ~1.5–3 GB LLM). Privacy story
@@ -466,7 +471,7 @@ than the ~150-line estimate: `kAXValueAttribute` replaces the entire field,
 implementation needs a per-app-class fallback table plus user-permission UX.
 Realistic scope is ~300 lines plus ongoing per-app-bug maintenance. The
 incremental latency win (~15-50 ms) is not worth taking on that maintenance
-surface in v1, especially since [ADR-0009](#0009-streaming-recognition--vad-auto-stop)
+surface in v1, especially since [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)
 delivers larger latency gains for less code.
 
 Kept in the ADR for the v2 conversation. Not on the v1 critical path.
@@ -484,7 +489,7 @@ Kept in the ADR for the v2 conversation. Not on the v1 critical path.
 
 ## 0012 — sherpa-onnx prebuilt with CoreML EP (shared linkage)
 
-**Status:** **Accepted — shipped.** Spike per [ADR-0016](#0016-tauri--rust-vs-swiftui-re-evaluation)
+**Status:** **Accepted — shipped.** Spike per [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation)
 revealed that a **5-minute Cargo feature change** gets us a CoreML-enabled
 libonnxruntime, with no submodule, no cmake build, no maintenance tax. The
 4-hour vendored-self-build plan documented below as "originally drafted" has
@@ -527,7 +532,7 @@ Bundle the dylibs into the `.app` via `tauri.conf.json`:
 `sherpa-onnx-sys` already emits `cargo:rustc-link-arg=-Wl,-rpath,…` so the
 binary loads the dylibs from the bundle's `Contents/Frameworks/` at runtime.
 
-**Verification.** All three [ADR-0015](#0015-coreml-ep-verification-protocol)
+**Verification.** All three [ADR-0015](#0015--coreml-ep-verification-protocol)
 layers are green, with **empirical numbers measured on this machine**:
 
 - **Layer 1 (build-time symbol check):** `build.rs::check_coreml_ep` runs
@@ -561,9 +566,9 @@ layers are green, with **empirical numbers measured on this machine**:
   initial build, ongoing tag-bump tax, owning ORT regressions. Only worth
   doing if we needed something the prebuilt shared dylib lacks; it doesn't.
 - *Keep upstream `static` prebuilt* — CPU-only, kills the [ADR-0007]
-  (#0007-performance-targets) latency story. Rejected.
+  (#0007--performance-targets-beat-wispr-flow) latency story. Rejected.
 - *Different inference binding* — see
-  [ADR-0005](#0005-sherpa-onnx-as-the-inference-binding); already rejected.
+  [ADR-0005](#0005--sherpa-onnx-as-the-inference-binding); already rejected.
 
 **Consequences.**
 - Bundle size grows by ~30 MB (mostly `libonnxruntime`'s 25 MB).
@@ -588,7 +593,7 @@ do need to fall back to a self-build.
 
 **Status:** Accepted
 
-**Context.** After [ADR-0012](#0012-self-built-sherpa-onnx-with-coreml-ep)
+**Context.** After [ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage)
 lands, we need an automated, repeatable way to **prove** the CoreML EP is
 actually present and being used — not just hope that `provider="coreml"`
 silently fell back to CPU again.
@@ -633,9 +638,10 @@ Replaces "I hope it works" with "we know it works."
 
 ---
 
-## 0013 — Hotword / custom dictionary support (PROPOSED, future)
+## 0013 — Hotword / custom dictionary support
 
-**Status:** Proposed
+**Status:** **Superseded by [ADR-0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list),
+which shipped a plain-text vocabulary and measured decoder policy.**
 
 **Context.** Domain vocabulary (engineering terms, names, product names) gets
 mistranscribed by general ASR. sherpa-onnx supports an external
@@ -650,12 +656,11 @@ on dictation about the user's actual work.
 
 ---
 
-## 0014 — Tray-only headless UX (PROPOSED)
+## 0014 — Tray-only headless UX
 
-**Status:** Proposed. Current `src-tauri/tauri.conf.json` still has
-`"visible": true` for the settings window — code does not yet match this ADR
-and the [Current state snapshot](#current-state-vs-target-snapshot)
-acknowledges the gap.
+**Status:** **Superseded in implementation by [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation).**
+The intended tray-only outcome shipped in native AppKit without Tauri/WebKit;
+the body below preserves the original Tauri-era proposal.
 
 **Context.** Current `tauri.conf.json` opens the settings window at launch
 (`visible: true`). WebKit init costs ~300–500 ms; for most launches the
@@ -702,10 +707,10 @@ A SwiftUI rewrite would substitute:
   sherpa-onnx.
 - **AVAudioEngine** for cpal.
 - **AXUIElement APIs** for objc2-accessibility glue (un-defers
-  [ADR-0011](#0011-direct-accessibility-text-injection)).
+  [ADR-0011](#0011--direct-accessibility-text-injection-deferred)).
 - **NSStatusBar + SwiftUI settings view** for Tauri tray + WebView settings.
 - **Apple Foundation Model API** (macOS 26+) for the
-  [ADR-0010](#0010-local-llm-post-processing-for-smart-formatting) post-pass.
+  [ADR-0010](#0010--local-llm-post-processing-for-smart-formatting) post-pass.
 
 Cost: a Swift rewrite is ~1,000 lines thrown away, several weeks of Swift
 fluency development, and lock-in to a single OS forever.
@@ -763,7 +768,7 @@ makes CoreML EP unreliable.
 
 ## 0018 — Polish backend: llama.cpp + Qwen 3.5 2B Q4_K_M
 
-**Status:** Accepted (Phase-0 measured)
+**Status:** **Accepted — shipped and measured; amended to Qwen 3.5 4B Q6_K.**
 
 **Context.** [docs/latency-plan.md](./latency-plan.md) §6 calls for a
 Candle vs OminiX-MLX head-to-head on Gemma 4 E2B 4-bit. Research surfaced
@@ -956,7 +961,9 @@ top of this file is updated accordingly.
 
 ## 0017 — CoreML `ModelCacheDirectory` blocked at the sherpa-onnx Rust binding
 
-**Status:** Blocked / Deferred
+**Status:** **Superseded as the primary optimization path by
+[ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend).** The
+sherpa binding limitation remains true for the fallback backend.
 
 **Context.** [docs/latency-plan.md](./latency-plan.md) §2 wants us to set
 ONNX Runtime's CoreML EP `ModelCacheDirectory` provider option to
@@ -1776,31 +1783,30 @@ map are maintained in [`docs/macos-permissions.md`](macos-permissions.md).
 
 ---
 
-## Index of open decisions vs targets
+## Target status index
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
 |---|---|---|---|
-| **CoreML EP actually present** | [0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage) + [0015](#0015-coreml-ep-verification-protocol) | **Shipped + measured** — 7.8x RTFx on the warmup decode confirms ANE/GPU is engaged | nothing |
+| Accelerated Core ML path present | [0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage) + [0015](#0015--coreml-ep-verification-protocol) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped + measured** — native worker quality/latency gates pass; the sherpa fallback retains its CoreML symbol/runtime checks | exact per-op placement remains Apple-managed |
 | <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) + [0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) | **Shipped + measured** — Tap Fast is 182.0 ms p50 on the representative 5 s bucket; pause-friendly Tap remains below 1 s on the endpoint corpus | nothing |
-| Live partial transcripts | [0009](#0009-streaming-recognition--vad-auto-stop) | Proposed | switch to streaming Parakeet model |
-| ANE confirmed in use | [0015](#0015-coreml-ep-verification-protocol) | **All three layers green** — layer 1 nm-check, layer 2 init log, layer 3 measured 7.8x RTFx | nothing |
-| ≤1.2 GB resident set | [0014](#0014-tray-only-headless-ux) + [ADR-0006](#0006-apple-silicon-optimization-plan-ds4-playbook-applied) mmap | Tray-only shipped, mmap shipped; lazy webview still Proposed | nothing |
-| Smart formatting parity with Wispr Flow | [0010](#0010-local-llm-post-processing-for-smart-formatting) | Proposed | nothing |
-| Clipboard not clobbered | [0011](#0011-direct-accessibility-text-injection) | **Deferred to v2** | not in v1 scope |
+| Live partial transcripts | [0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) | **Out of scope** — no quality-preserving streaming model won; speculative final decode provides the measured latency win | a new candidate must beat the existing quality/latency/resource gates |
+| CPU+ANE requested and performance-gated | [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans) | **Shipped** — explicit tuner retained CPU+ANE on the M5 Pro after all challengers failed the ≥5%/quality/memory gates | Core ML owns final per-op placement |
+| ≤5 GB resident set with polish On | [0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation) + [0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped** — native tray shell, resident Core ML worker, and Qwen mmap/lifecycle | nothing |
+| Smart formatting parity with Wispr Flow | [0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) | **Shipped** — optional local Qwen polish streams on word boundaries | strict last-token latency remains above the original target |
+| Clipboard not clobbered | [0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) | **Shipped** on the normal path; clipboard is rescue-only for observable delivery failure | `CGEventPost` has no delivery receipt |
 | Custom vocabulary | [0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0028](#0028--generic-asr-base-with-evidence-gated-domain-and-user-adaptation) | **Shipped + bounded** — non-empty vocabulary selects sherpa; no measured global score clears the quality gate | constrained native Unified biasing requires new separated evidence |
 
 **Completed path to the ADR-0007 latency claim:**
-1. **Spike: [ADR-0012](#0012-self-built-sherpa-onnx-with-coreml-ep)** —
-   self-build sherpa-onnx with CoreML EP (vendored submodule). ≤ 4 hours.
-   Pivot to SwiftUI if it doesn't land cleanly (see
-   [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation)).
-2. [ADR-0015](#0015-coreml-ep-verification-protocol) — wire build-time +
-   runtime EP checks; confirm ANE is actually engaged.
-3. [ADR-0009](#0009-streaming-recognition--vad-auto-stop) +
-   [ADR-0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) —
-   Silero VAD with pause-friendly and explicit fast policies.
+1. [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend) — move
+   the generic default path to a pinned resident Parakeet Unified worker while
+   retaining sherpa for fallback and vocabulary.
+2. [ADR-0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans) — keep
+   hardware placement evidence-gated, quality-safe, and reversible.
+3. [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)
+   + [ADR-0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) —
+   retain Silero endpoint authority with pause-friendly and explicit fast modes.
 4. [ADR-0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority)
-   — measure the production capture path and clear the 3× matched p50/p95 gate.
+   — overlap recognition with confirmation and clear the matched 3× p50/p95 gate.
 
 Anything not on this table is either accepted-and-done or out of scope.
 
@@ -1855,26 +1861,26 @@ Anything not on this table is either accepted-and-done or out of scope.
   prebuilt static lib) via `nm -gU` symbol inspection. Material revisions:
   - Added [Current state snapshot](#current-state-vs-target-snapshot) so the
     code-vs-target gap is impossible to overlook.
-  - [ADR-0005](#0005-sherpa-onnx-as-the-inference-binding) updated to
+  - [ADR-0005](#0005--sherpa-onnx-as-the-inference-binding) updated to
     record the realised CoreML EP risk with evidence.
-  - [ADR-0006](#0006-apple-silicon-optimization-plan-ds4-playbook-applied)
+  - [ADR-0006](#0006--apple-silicon-optimization-plan-ds4-playbook-applied)
     split: CPU optimizations Accepted, CoreML / ANE claims downgraded to
     Proposed-gated-on-0012.
-  - [ADR-0007](#0007-performance-targets) latency table gained a "Today
+  - [ADR-0007](#0007--performance-targets-beat-wispr-flow) latency table gained a "Today
     (baseline)" column; the impossible "<400 MB resident set including
     model" target replaced with the honest "≤1.2 GB" steady-state target.
-  - [ADR-0009](#0009-streaming-recognition--vad-auto-stop) VAD silence
+  - [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected) VAD silence
     threshold tightened from 250 ms to 150 ms; latency budget made
     explicit and shown to require ADR-0012 to hold.
-  - [ADR-0010](#0010-local-llm-post-processing-for-smart-formatting)
+  - [ADR-0010](#0010--local-llm-post-processing-for-smart-formatting)
     post-pass latency estimate bumped from "50–150 ms" (hand-waved) to
     "150–400 ms warmed" (engineered).
-  - [ADR-0011](#0011-direct-accessibility-text-injection) **deferred to
+  - [ADR-0011](#0011--direct-accessibility-text-injection-deferred) **deferred to
     v2** by user direction.
-  - [ADR-0012](#0012-self-built-sherpa-onnx-with-coreml-ep) **promoted
+  - [ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage) **promoted
     from Proposed to Accepted**; vendor as submodule rather than env-var
     redirection; explicit cmake flag list; honest maintenance cost.
-  - New [ADR-0015](#0015-coreml-ep-verification-protocol) added with a
+  - New [ADR-0015](#0015--coreml-ep-verification-protocol) added with a
     three-layer verification protocol (build-time symbol check, runtime
     provider log parse, per-utterance latency probe).
   - New [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation)
@@ -1884,13 +1890,13 @@ Anything not on this table is either accepted-and-done or out of scope.
     triggers documented.
 
 - **2026-05-15** (later) — Implementation pass landed:
-  - [ADR-0014](#0014-tray-only-headless-ux) shipped: settings window
+  - [ADR-0014](#0014--tray-only-headless-ux) shipped: settings window
     `visible: false` at launch; tray menu opens it on demand.
-  - [ADR-0009](#0009-streaming-recognition--vad-auto-stop) shipped (offline
+  - [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected) shipped (offline
     encoder variant): press-twice toggle deleted; new `streamer.rs` +
     `vad.rs` modules drive Silero VAD over an audio tap channel; cancel-on-
     second-press preserved. Streaming Parakeet still future work.
-  - [ADR-0015](#0015-coreml-ep-verification-protocol) implemented: layer 1
+  - [ADR-0015](#0015--coreml-ep-verification-protocol) implemented: layer 1
     in `build.rs`, layer 2 in `asr.rs::Asr::load`, layer 3 in
     `asr.rs::Asr::recognize_with_timing` with an RTFx-floor warn at 2x.
   - HIG audit findings #1, #2, #3, #5, #9, #11, #12, #14, #15 addressed:
@@ -1958,7 +1964,7 @@ Anything not on this table is either accepted-and-done or out of scope.
     re-titled and rewritten to record the reasoning, the WER trade-off
     table, and the new accepted scope (Silero VAD auto-stop only, no
     recognizer swap).
-  - [ADR-0007](#0007-performance-targets) latency table updated:
+  - [ADR-0007](#0007--performance-targets-beat-wispr-flow) latency table updated:
     **<200 ms p50 target retired** in favour of **<1 s p50 with WER ≤ 2%**,
     which the current shipped build already meets (~840 ms p50 on a 5 s
     utterance: 150 ms VAD hangover + 640 ms offline encoder + ~50 ms

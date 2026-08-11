@@ -20,8 +20,9 @@ model downloads over HTTPS:
 
 | When | What | Where from |
 |---|---|---|
+| First launch | Parakeet Unified EN 0.6B int8 Core ML bundle (~595 MB) | `huggingface.co` |
 | First launch | Parakeet TDT 0.6B v3 int8 + tokens (~640 MB) | `huggingface.co` |
-| First launch | Silero VAD (~2 MB) | `github.com` |
+| First launch | Silero VAD (~0.6 MB) | `github.com` |
 | First time you enable Polish | Qwen 3.5 4B Q6_K GGUF (~3.5 GB) | `huggingface.co` |
 
 Once those files are on disk there are no further network calls. There
@@ -111,7 +112,7 @@ inserts your transcript at the cursor. Parakeet does not read the
 contents of other applications through the Accessibility API. An
 earlier version did use `AXUIElementSetAttributeValue` to write text
 directly; that path was removed (see
-[ADR-0019](docs/ADR.md#0019--paste-delivery-synthetic-unicode-keystroke))
+[ADR-0019](docs/ADR.md#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession)
 because it silently failed in terminals, not for privacy reasons — but
 the practical effect is that the current code touches less of the AX
 API, not more.
@@ -156,10 +157,10 @@ Everything lives under
 
 | Path | Contents |
 |---|---|
-| `settings.json` | Your hotkey, trigger mode, polish mode, hotword score. No secrets — there is no API key to store. |
+| `settings.json` | Your hotkey, trigger mode, polish mode, hotword score, and reserved language hint. No secrets — there is no API key to store. |
 | `vocabulary.txt` | Custom terms you added, if any. Parakeet creates it with a commented-out template the first time you click "Edit Vocabulary…", and only reads it after that — it never modifies content you write. |
 | `hotwords.generated.txt` | Machine translation of the above. Regenerated on every model load; safe to delete. |
-| `models/` | Downloaded ASR + VAD weights (~640 MB). |
+| `models/` | Downloaded optimized ASR, fallback ASR, and VAD weights (~1.3 GB total). |
 | `llm/` | Downloaded Polish GGUF (~3.5 GB), only if you enabled Polish. |
 
 No audio, no transcripts. Deleting the whole directory resets Parakeet
