@@ -19,6 +19,7 @@ use objc2_app_kit::{
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 
 use crate::app::{AppHandle, DictationState};
+use crate::permissions;
 use crate::settings::TriggerMode;
 use crate::settings_ui;
 use crate::sf_symbol;
@@ -56,7 +57,11 @@ define_class!(
                     match state {
                         // Click while idle: start a session. Press
                         // handler decides Tap vs Hold internally.
-                        DictationState::Idle => app.on_hotkey_press(),
+                        DictationState::Idle => {
+                            if permissions::ensure_dictation_ready() {
+                                app.on_hotkey_press();
+                            }
+                        }
                         // Click while listening: stop. In Tap mode a
                         // second press cancels; in Hold mode the
                         // release edge finalizes.
@@ -85,6 +90,14 @@ define_class!(
             let mtm = self.mtm();
             crate::objc_util::selector_guard("openSettings:", || {
                 settings_ui::open(mtm);
+            });
+        }
+
+        #[unsafe(method(checkPermissions:))]
+        fn check_permissions(&self, _sender: *mut NSObject) {
+            let mtm = self.mtm();
+            crate::objc_util::selector_guard("checkPermissions:", || {
+                permissions::show_dashboard(mtm);
             });
         }
 
@@ -175,6 +188,13 @@ pub fn install(mtm: MainThreadMarker) -> Result<(), anyhow::Error> {
         Some(sel!(openSettings:)),
         true,
     );
+    let permissions_item = make_menu_item(
+        mtm,
+        "Check Permissions…",
+        Some(&controller),
+        Some(sel!(checkPermissions:)),
+        true,
+    );
     let separator_3 = NSMenuItem::separatorItem(mtm);
     let quit_item = make_menu_item(
         mtm,
@@ -190,6 +210,7 @@ pub fn install(mtm: MainThreadMarker) -> Result<(), anyhow::Error> {
     menu.addItem(&toggle_item);
     menu.addItem(&separator_2);
     menu.addItem(&settings_item);
+    menu.addItem(&permissions_item);
     menu.addItem(&separator_3);
     menu.addItem(&quit_item);
 

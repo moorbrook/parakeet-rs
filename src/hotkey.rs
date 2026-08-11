@@ -12,9 +12,9 @@
 //! permission for HID-level taps *and* global NSEvent monitors. The
 //! Accessibility permission we already grab for the CGEvent keystroke
 //! paste path (`src/ax_paste.rs`, ADR-0019) is *not* sufficient — Input
-//! Monitoring is a separate TCC bucket. On first launch the user is
-//! prompted to allow Parakeet in System Settings → Privacy & Security
-//! → Input Monitoring.
+//! Monitoring is a separate TCC bucket. Parakeet's permission dashboard
+//! explains why it is needed and lets the user request it; simply launching
+//! the process never triggers a system permission prompt.
 
 use std::cell::Cell;
 use std::ptr::NonNull;
@@ -33,11 +33,6 @@ unsafe extern "C" {
     /// via `CGEventTap`. Equivalent to checking the Input Monitoring TCC
     /// permission.
     fn CGPreflightListenEventAccess() -> bool;
-    /// Triggers the Input Monitoring permission dialog if not already
-    /// granted. Returns the current state. The user's decision is
-    /// asynchronous — they grant it in System Settings, then must restart
-    /// the app for the tap to actually start delivering events.
-    fn CGRequestListenEventAccess() -> bool;
 }
 
 use anyhow::{anyhow, Context, Result};
@@ -117,21 +112,20 @@ pub fn register(
     // ---------- 0. Input Monitoring preflight ----------
     // CGEventTapCreate returns a "valid" mach port even without Input
     // Monitoring permission, but the tap never delivers events. Check up
-    // front so we can surface a clear log line and trigger the system
-    // prompt instead of failing silently.
+    // front so we can surface a clear log line instead of failing silently.
+    // Permission requests belong to the dashboard, where the user first sees
+    // what the permission enables and has a clear recovery path.
     let granted = unsafe { CGPreflightListenEventAccess() };
     if !granted {
         log::warn!(
-            "Input Monitoring permission not yet granted. Requesting it now — \
-             macOS will open System Settings → Privacy & Security → Input \
-             Monitoring. Enable Parakeet there and relaunch the app for the \
-             hotkey to start working."
+            "Input Monitoring permission not yet granted; global hotkey \
+             detectors will remain inert. Use Parakeet → Check Permissions… \
+             to enable it, then relaunch Parakeet once for the hotkey to \
+             start working. Menu-bar dictation remains available."
         );
-        let _ = unsafe { CGRequestListenEventAccess() };
-        // The request returns immediately; the user has to grant it in
-        // System Settings and then relaunch. We continue starting the
-        // detectors anyway — they'll be inert until permission lands and
-        // the app restarts.
+        // Continue starting the detectors so the rest of the app remains
+        // usable. They stay inert until permission lands and the app is
+        // relaunched; the dashboard explains that one-time relaunch.
     } else {
         log::info!("Input Monitoring permission granted");
     }

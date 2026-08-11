@@ -1,286 +1,711 @@
-//! Pre-flight TCC permission preflight.
+//! Native macOS TCC permission state, onboarding, and recovery.
 //!
-//! On every launch we (a) **request** every permission we need so first-run
-//! actually triggers the macOS system prompts, then (b) **re-check** them
-//! and refuse to start if any is still missing — pointing the user at the
-//! exact System Settings pane that fixes it.
+//! This follows ZoomItForMac's useful permission architecture: querying state
+//! is separate from requesting it, the app stays alive while permissions are
+//! missing, a menu command always exposes current status, and returning from
+//! System Settings refreshes the dialog. Unlike the old startup preflight, no
+//! permission is requested merely because the process launched.
 //!
-//! Three permissions matter:
+//! Parakeet needs three TCC services:
 //!
-//! - **Microphone** (`kTCCServiceMicrophone`) — for `cpal` to capture audio.
-//! - **Accessibility** (`kTCCServiceAccessibility`) — so `CGEventPost`
-//!   in `ax_paste.rs` can inject synthetic Unicode keystrokes into
-//!   the focused app (ADR-0019).
-//! - **Input Monitoring** (`kTCCServiceListenEvent`) — so the global
-//!   `CGEventTap` in `hotkey.rs` actually receives keyboard events.
-//!   `CGEventTapCreate` silently returns a valid-looking mach port even
-//!   when this is missing, so users see "the hotkey just does nothing"
-//!   with no feedback. The preflight is what stops that footgun.
+//! - **Input Monitoring** for the global `CGEventTap`. It is the only grant
+//!   needed at launch, because without it the configured global hotkey cannot
+//!   work. The menu remains usable without it.
+//! - **Microphone** when the user first asks to dictate.
+//! - **Accessibility** when dictation needs to deliver text with
+//!   `CGEventPost`. We ask before recording so a completed transcript is not
+//!   surprised by a delivery prompt.
+//!
+//! AVFoundation exposes microphone's full four-state authorization model.
+//! CoreGraphics and Accessibility expose only granted/not-granted preflights,
+//! so their UI truthfully says "Not granted" rather than inventing a denied vs
+//! not-determined distinction macOS does not publish.
 
-use std::sync::mpsc;
-use std::time::Duration;
+use std::cell::RefCell;
 
+use block2::RcBlock;
 use objc2::class;
 use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::Bool;
-use objc2_foundation::{NSDictionary, NSNumber, NSString};
+use objc2::MainThreadOnly;
+use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSView, NSWorkspace};
+use objc2_foundation::{
+    MainThreadMarker, NSDictionary, NSNumber, NSPoint, NSRect, NSSize, NSString, NSURL,
+};
 
 unsafe extern "C" {
-    /// `<CoreGraphics/CGEventSource.h>`. Returns true if the calling
-    /// process is allowed to listen to events via `CGEventTap` — i.e. the
-    /// Input Monitoring TCC permission is granted.
+    /// `<CoreGraphics/CGEventSource.h>`.
     fn CGPreflightListenEventAccess() -> bool;
-    /// Triggers the Input Monitoring permission dialog if not already
-    /// granted. Returns the current state (which is almost always still
-    /// false the first time — the user has to flip it in System Settings
-    /// and relaunch).
+    /// Requests/registers Input Monitoring. The user's decision is external to
+    /// this call and an event tap created before the grant needs a relaunch.
     fn CGRequestListenEventAccess() -> bool;
-    /// `<ApplicationServices/HIServices/AXUIElement.h>`. Returns true if
-    /// the calling process is trusted for Accessibility access. The
-    /// options dict is allowed to contain `kAXTrustedCheckOptionPrompt`
-    /// to surface a prompt on the first call.
+    /// `<ApplicationServices/HIServices/AXUIElement.h>`.
     fn AXIsProcessTrustedWithOptions(options: *const NSDictionary<NSString, NSNumber>) -> bool;
-    /// String constant `"AXTrustedCheckOptionPrompt"`. Static `*const`
-    /// because the symbol is a global NSString published by HIServices.
     static kAXTrustedCheckOptionPrompt: *const NSString;
 }
 
+const GENERIC_PRIVACY_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
+    InputMonitoring,
     Microphone,
     Accessibility,
-    InputMonitoring,
 }
 
 impl Permission {
+    pub const ALL: [Self; 3] = [Self::InputMonitoring, Self::Microphone, Self::Accessibility];
+
     pub fn label(self) -> &'static str {
         match self {
+            Self::InputMonitoring => "Input Monitoring",
             Self::Microphone => "Microphone",
             Self::Accessibility => "Accessibility",
-            Self::InputMonitoring => "Input Monitoring",
+        }
+    }
+
+    pub fn purpose(self) -> &'static str {
+        match self {
+            Self::InputMonitoring => "detect the global dictation hotkey",
+            Self::Microphone => "record speech while a dictation is active",
+            Self::Accessibility => "type the finished transcript into the focused app",
         }
     }
 
     pub fn settings_url(self) -> &'static str {
         match self {
+            Self::InputMonitoring => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+            }
             Self::Microphone => {
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
             }
             Self::Accessibility => {
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
             }
-            Self::InputMonitoring => {
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
-            }
         }
     }
 }
 
-fn mic_status() -> i32 {
-    // `[AVCaptureDevice authorizationStatusForMediaType:@"soun"]`
-    //   0 = NotDetermined, 1 = Restricted, 2 = Denied, 3 = Authorized
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionStatus {
+    Granted,
+    NotDetermined,
+    Denied,
+    Restricted,
+    /// The underlying API exposes only a Boolean preflight.
+    NotGranted,
+}
+
+impl PermissionStatus {
+    pub fn is_granted(self) -> bool {
+        self == Self::Granted
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Granted => "Granted",
+            Self::NotDetermined => "Not requested",
+            Self::Denied => "Denied — open System Settings to recover",
+            Self::Restricted => "Restricted — managed by macOS or device policy",
+            Self::NotGranted => "Not granted — request it or open System Settings",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionState {
+    pub input_monitoring: PermissionStatus,
+    pub microphone: PermissionStatus,
+    pub accessibility: PermissionStatus,
+}
+
+impl PermissionState {
+    pub fn status(self, permission: Permission) -> PermissionStatus {
+        match permission {
+            Permission::InputMonitoring => self.input_monitoring,
+            Permission::Microphone => self.microphone,
+            Permission::Accessibility => self.accessibility,
+        }
+    }
+}
+
+/// State-query seam matching ZoomItForMac's `PermissionService`. UI policy and
+/// tests consume a snapshot rather than reaching into TCC calls themselves.
+pub trait PermissionService {
+    fn current_state(&self) -> PermissionState;
+}
+
+pub struct SystemPermissionService;
+
+impl PermissionService for SystemPermissionService {
+    fn current_state(&self) -> PermissionState {
+        PermissionState {
+            input_monitoring: if unsafe { CGPreflightListenEventAccess() } {
+                PermissionStatus::Granted
+            } else {
+                PermissionStatus::NotGranted
+            },
+            microphone: microphone_status(),
+            accessibility: if accessibility_granted() {
+                PermissionStatus::Granted
+            } else {
+                PermissionStatus::NotGranted
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionAction {
+    Request,
+    OpenSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DashboardScope {
+    Startup,
+    Dictation,
+    #[default]
+    All,
+}
+
+fn visible_permissions(scope: DashboardScope, state: PermissionState) -> Vec<Permission> {
+    match scope {
+        DashboardScope::Startup => vec![Permission::InputMonitoring],
+        DashboardScope::Dictation => [Permission::Microphone, Permission::Accessibility]
+            .into_iter()
+            .filter(|permission| !state.status(*permission).is_granted())
+            .collect(),
+        DashboardScope::All => Permission::ALL.to_vec(),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DashboardModel {
+    detail: String,
+    permissions: Vec<Permission>,
+}
+
+fn dashboard_model(
+    scope: DashboardScope,
+    state: PermissionState,
+    input_needs_relaunch: bool,
+) -> DashboardModel {
+    let permissions = visible_permissions(scope, state);
+    let mut detail = String::new();
+    for permission in &permissions {
+        let status = state.status(*permission);
+        detail.push_str(&format!(
+            "{}: {}\n  Used to {}.\n",
+            permission.label(),
+            status.description(),
+            permission.purpose(),
+        ));
+    }
+    match scope {
+        DashboardScope::Startup => detail.push_str(
+            "\nThe global hotkey is the only capability needed now. Microphone and Accessibility are requested only when you start dictation. Until then, Parakeet remains available from the menu bar.",
+        ),
+        DashboardScope::Dictation => detail.push_str(
+            "\nThese permissions are needed for the dictation you just requested. Parakeet will not begin recording until they are granted.",
+        ),
+        DashboardScope::All => detail.push_str(
+            "\nParakeet requests a permission only after you choose its Grant button or use the feature that needs it.",
+        ),
+    }
+    if input_needs_relaunch {
+        detail.push_str(
+            "\n\nInput Monitoring was granted after this process created its event tap. Quit and reopen Parakeet once to activate the global hotkey. The menu remains usable now.",
+        );
+    }
+    DashboardModel {
+        detail,
+        permissions,
+    }
+}
+
+fn primary_action(permission: Permission, status: PermissionStatus) -> PermissionAction {
+    match (permission, status) {
+        (Permission::Microphone, PermissionStatus::NotDetermined)
+        | (Permission::InputMonitoring | Permission::Accessibility, PermissionStatus::NotGranted) => {
+            PermissionAction::Request
+        }
+        _ => PermissionAction::OpenSettings,
+    }
+}
+
+fn button_title(permission: Permission, status: PermissionStatus) -> String {
+    let verb = match primary_action(permission, status) {
+        PermissionAction::Request => "Grant",
+        PermissionAction::OpenSettings => "Open",
+    };
+    let suffix = if matches!(
+        primary_action(permission, status),
+        PermissionAction::OpenSettings
+    ) {
+        " Settings…"
+    } else {
+        "…"
+    };
+    format!("{verb} {}{suffix}", permission.label())
+}
+
+fn startup_needs_onboarding(state: PermissionState) -> bool {
+    !state.input_monitoring.is_granted()
+}
+
+fn dictation_ready(state: PermissionState) -> bool {
+    state.microphone.is_granted() && state.accessibility.is_granted()
+}
+
+fn revoked_permissions(before: PermissionState, after: PermissionState) -> Vec<Permission> {
+    Permission::ALL
+        .into_iter()
+        .filter(|permission| {
+            before.status(*permission).is_granted() && !after.status(*permission).is_granted()
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct PermissionUiState {
+    last_state: Option<PermissionState>,
+    refresh_when_active: bool,
+    dialog_visible: bool,
+    input_missing_at_install: bool,
+    return_scope: DashboardScope,
+}
+
+thread_local! {
+    static UI_STATE: RefCell<PermissionUiState> = RefCell::new(PermissionUiState::default());
+}
+
+/// Install permission-state observation after the app's menu and runtime are
+/// alive. First launch presents an explanation only when Input Monitoring—the
+/// grant needed for the global hotkey at that moment—is missing.
+pub fn install(mtm: MainThreadMarker) {
+    let state = SystemPermissionService.current_state();
+    UI_STATE.with(|slot| {
+        let mut ui = slot.borrow_mut();
+        ui.last_state = Some(state);
+        ui.input_missing_at_install = !state.input_monitoring.is_granted();
+    });
+    if let Some(scope) = permission_preview_scope() {
+        present_dashboard(mtm, scope);
+        return;
+    }
+    if startup_needs_onboarding(state) {
+        present_dashboard(mtm, DashboardScope::Startup);
+    }
+}
+
+fn permission_preview_scope() -> Option<DashboardScope> {
+    let value = std::env::var("PARAKEET_PERMISSIONS_PREVIEW").ok()?;
+    match value.as_str() {
+        "startup" => Some(DashboardScope::Startup),
+        "dictation" => Some(DashboardScope::Dictation),
+        "all" => Some(DashboardScope::All),
+        _ => {
+            log::warn!(
+                "ignoring unknown PARAKEET_PERMISSIONS_PREVIEW={value:?}; expected startup, dictation, or all"
+            );
+            None
+        }
+    }
+}
+
+/// Called from `applicationDidBecomeActive:`. It re-presents once after a
+/// System Settings trip and also catches later revocation without forcing an
+/// unexplained restart.
+pub fn application_did_become_active(mtm: MainThreadMarker) {
+    let current = SystemPermissionService.current_state();
+    let should_present = UI_STATE.with(|slot| {
+        let mut ui = slot.borrow_mut();
+        let revoked = ui
+            .last_state
+            .is_some_and(|previous| !revoked_permissions(previous, current).is_empty());
+        let should_present = (ui.refresh_when_active || revoked) && !ui.dialog_visible;
+        let scope = if revoked {
+            DashboardScope::All
+        } else {
+            ui.return_scope
+        };
+        ui.refresh_when_active = false;
+        ui.last_state = Some(current);
+        (should_present, scope)
+    });
+    if should_present.0 {
+        present_dashboard(mtm, should_present.1);
+    }
+}
+
+/// Gate only the start edge of dictation. Stop/cancel edges must remain usable
+/// if a grant is revoked while recording. The menu can start dictation without
+/// Input Monitoring; microphone and delivery still need to be ready.
+pub fn ensure_dictation_ready() -> bool {
+    let ready = dictation_ready(SystemPermissionService.current_state());
+    if !ready {
+        schedule_dashboard(DashboardScope::Dictation);
+    }
+    ready
+}
+
+/// Explicit menu action, equivalent to ZoomIt's "Check Permissions" command.
+pub fn show_dashboard(mtm: MainThreadMarker) {
+    present_dashboard(mtm, DashboardScope::All);
+}
+
+fn schedule_dashboard(scope: DashboardScope) {
+    crate::objc_util::dispatch_to_main(move || {
+        let Some(mtm) = MainThreadMarker::new() else {
+            log::error!("permission dashboard dispatched off the main thread");
+            return;
+        };
+        present_dashboard(mtm, scope);
+    });
+}
+
+fn present_dashboard(mtm: MainThreadMarker, scope: DashboardScope) {
+    let should_show = UI_STATE.with(|slot| {
+        let mut ui = slot.borrow_mut();
+        if ui.dialog_visible {
+            false
+        } else {
+            ui.dialog_visible = true;
+            true
+        }
+    });
+    if !should_show {
+        return;
+    }
+
+    let state = SystemPermissionService.current_state();
+    let input_needs_relaunch = UI_STATE
+        .with(|slot| slot.borrow().input_missing_at_install && state.input_monitoring.is_granted());
+    let model = dashboard_model(scope, state, input_needs_relaunch);
+
+    let alert = unsafe { NSAlert::new(mtm) };
     unsafe {
+        alert.setMessageText(&NSString::from_str("Parakeet Permissions"));
+        alert.setInformativeText(&NSString::from_str(&model.detail));
+        alert.setAlertStyle(NSAlertStyle::Informational);
+        let _ = alert.addButtonWithTitle(&NSString::from_str("Done"));
+        for permission in &model.permissions {
+            let permission = *permission;
+            let title = button_title(permission, state.status(permission));
+            let _ = alert.addButtonWithTitle(&NSString::from_str(&title));
+        }
+        // NSAlert may otherwise collapse to roughly 260 points and wrap every
+        // sentence into a tall, hard-to-scan column. A transparent standard
+        // accessory view gives AppKit a stable native minimum width without
+        // replacing the alert's layout or controls.
+        let spacer = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(480.0, 1.0)),
+        );
+        alert.setAccessoryView(Some(&spacer));
+    }
+    let ns_app = NSApplication::sharedApplication(mtm);
+    ns_app.activate();
+    let response = unsafe { alert.runModal() };
+
+    UI_STATE.with(|slot| {
+        let mut ui = slot.borrow_mut();
+        ui.dialog_visible = false;
+        ui.last_state = Some(state);
+    });
+
+    let index = response - 1000;
+    if index <= 0 {
+        return;
+    }
+    let permission_index = usize::try_from(index - 1).ok();
+    let Some(permission) = permission_index.and_then(|index| model.permissions.get(index).copied())
+    else {
+        return;
+    };
+    perform_action(permission, state.status(permission), scope);
+}
+
+fn perform_action(permission: Permission, status: PermissionStatus, scope: DashboardScope) {
+    match primary_action(permission, status) {
+        PermissionAction::OpenSettings => {
+            arm_refresh_when_active(scope);
+            if !open_settings(permission) {
+                log::error!(
+                    "failed to open {} or generic Privacy & Security settings",
+                    permission.label()
+                );
+                schedule_dashboard(scope);
+            }
+        }
+        PermissionAction::Request => match permission {
+            Permission::Microphone => request_microphone_async(scope),
+            Permission::Accessibility => {
+                arm_refresh_when_active(scope);
+                if request_accessibility() {
+                    schedule_dashboard(scope);
+                }
+            }
+            Permission::InputMonitoring => {
+                arm_refresh_when_active(scope);
+                if unsafe { CGRequestListenEventAccess() } {
+                    schedule_dashboard(scope);
+                }
+            }
+        },
+    }
+}
+
+fn arm_refresh_when_active(scope: DashboardScope) {
+    UI_STATE.with(|slot| {
+        let mut ui = slot.borrow_mut();
+        ui.refresh_when_active = true;
+        ui.return_scope = scope;
+    });
+}
+
+fn microphone_status() -> PermissionStatus {
+    // `[AVCaptureDevice authorizationStatusForMediaType:@"soun"]`:
+    // 0 = not determined, 1 = restricted, 2 = denied, 3 = authorized.
+    let raw: i32 = unsafe {
         let cls = class!(AVCaptureDevice);
         let media_type = NSString::from_str("soun");
         msg_send![cls, authorizationStatusForMediaType: &*media_type]
+    };
+    match raw {
+        0 => PermissionStatus::NotDetermined,
+        1 => PermissionStatus::Restricted,
+        2 => PermissionStatus::Denied,
+        3 => PermissionStatus::Granted,
+        other => {
+            log::warn!("unknown AVAuthorizationStatus {other}; treating microphone as denied");
+            PermissionStatus::Denied
+        }
     }
 }
 
-fn mic_granted() -> bool {
-    mic_status() == 3
-}
-
-/// Trigger the system mic-permission prompt if status is `NotDetermined`.
-/// Blocks briefly on a channel because `requestAccessForMediaType:` is
-/// async — but the synchronous wait happens before AppKit is up so we're
-/// not deadlocking a run loop.
-fn request_mic() {
-    if mic_status() != 0 {
-        // Already determined (granted, denied, or restricted) — no prompt
-        // would appear; don't waste a wait.
-        return;
-    }
-    let (tx, rx) = mpsc::channel::<bool>();
+fn request_microphone_async(scope: DashboardScope) {
     unsafe {
         let cls = class!(AVCaptureDevice);
         let media_type = NSString::from_str("soun");
-        // The handler block fires on a background queue. We just forward
-        // the result over the channel and unblock the main thread.
-        let block = block2::RcBlock::new(move |granted: Bool| {
-            let _ = tx.send(granted.as_bool());
-        });
+        let block = RcBlock::new(move |_granted: Bool| schedule_dashboard(scope));
         let _: () = msg_send![
             cls,
             requestAccessForMediaType: &*media_type,
             completionHandler: &*block,
         ];
     }
-    // Bound the wait so a broken framework can't hang startup forever.
-    let _ = rx.recv_timeout(Duration::from_secs(60));
-}
-
-fn accessibility_granted_with_prompt() -> bool {
-    unsafe {
-        // Build `{ kAXTrustedCheckOptionPrompt: @YES }`. The prompt
-        // option lifts the system Accessibility dialog (or, if denied,
-        // takes the user to the right pane in System Settings) on the
-        // first call per launch.
-        let key = ax_trusted_check_option_prompt_key();
-        let value = NSNumber::new_bool(true);
-        let opts: Retained<NSDictionary<NSString, NSNumber>> =
-            NSDictionary::from_slices(&[&*key], &[&*value]);
-        AXIsProcessTrustedWithOptions(&*opts)
-    }
 }
 
 fn accessibility_granted() -> bool {
-    // Plain check, no prompt. Used for the post-request verification step.
     let null: *const NSDictionary<NSString, NSNumber> = std::ptr::null();
     unsafe { AXIsProcessTrustedWithOptions(null) }
 }
 
-/// Return the `kAXTrustedCheckOptionPrompt` `NSString`, with a graceful
-/// fallback to a hand-constructed string if the HIServices global
-/// symbol resolves NULL.
-///
-/// Apple documents the *value* of this option key as the stable string
-/// literal `"AXTrustedCheckOptionPrompt"`. If a future SDK ever
-/// reshuffles the symbol export, the hand-constructed fallback still
-/// produces a working prompt dialog — vs. the previous `.expect(...)`
-/// which would panic the app on launch.
+fn request_accessibility() -> bool {
+    unsafe {
+        let key = ax_trusted_check_option_prompt_key();
+        let value = NSNumber::new_bool(true);
+        let options: Retained<NSDictionary<NSString, NSNumber>> =
+            NSDictionary::from_slices(&[&*key], &[&*value]);
+        AXIsProcessTrustedWithOptions(&*options)
+    }
+}
+
 fn ax_trusted_check_option_prompt_key() -> Retained<NSString> {
-    // SAFETY: `kAXTrustedCheckOptionPrompt` is exported by HIServices on
-    // every macOS we support. It MAY be null on a stripped-down system
-    // or a future SDK change — `Retained::retain` returns `None` in that
-    // case and we fall back to the documented literal.
     let from_symbol = unsafe { Retained::retain(kAXTrustedCheckOptionPrompt.cast_mut()) };
     from_symbol.unwrap_or_else(|| NSString::from_str("AXTrustedCheckOptionPrompt"))
 }
 
-/// Request every permission we need (showing system prompts the first
-/// time per launch), then return the list of permissions that are still
-/// missing after the prompts. Empty Vec means everything is granted and
-/// the app can start.
-///
-/// This is preflight only — it doesn't present any UI of its own. The
-/// caller is expected to decide what to do about the missing list
-/// (typically: show an NSAlert and exit). Splitting the request from the
-/// presentation lets `main.rs` route the failure through a native dialog
-/// instead of stderr — important because for an `LSUIElement` app
-/// launched from Finder, stderr is invisible.
-pub fn check_all() -> Vec<Permission> {
-    // ---- 1. Request what we can ----
-    // Mic and Accessibility surface their first-time system dialogs from
-    // these calls. Input Monitoring's prompt only fires from
-    // `CGRequestListenEventAccess`; we surface it the first time the user
-    // launches with a missing grant.
-    request_mic();
-    let _ = accessibility_granted_with_prompt();
-    if !unsafe { CGPreflightListenEventAccess() } {
-        let _ = unsafe { CGRequestListenEventAccess() };
-    }
-
-    // ---- 2. Re-check ----
-    let mut missing: Vec<Permission> = Vec::new();
-    if !mic_granted() {
-        missing.push(Permission::Microphone);
-    }
-    if !accessibility_granted() {
-        missing.push(Permission::Accessibility);
-    }
-    if !unsafe { CGPreflightListenEventAccess() } {
-        missing.push(Permission::InputMonitoring);
-    }
-
-    if missing.is_empty() {
-        log::info!("All required permissions granted: Microphone, Accessibility, Input Monitoring");
-    }
-    missing
+fn open_settings(permission: Permission) -> bool {
+    open_url(permission.settings_url()) || open_url(GENERIC_PRIVACY_SETTINGS_URL)
 }
 
-/// Show a native NSAlert listing the missing permissions, with one
-/// "Open …" button per missing permission plus a "Quit" button. Loops
-/// until the user picks Quit. Must be called on the main thread, after
-/// `NSApplication::sharedApplication` exists.
-///
-/// For an `LSUIElement` app launched from Finder, this is the only
-/// feedback the user gets that something needs to be granted — without
-/// it, `eprintln! + exit` is invisible.
-pub fn present_missing_alert_blocking(
-    mtm: objc2_foundation::MainThreadMarker,
-    missing: &[Permission],
-) {
-    use objc2_app_kit::{NSAlert, NSAlertStyle, NSApplication, NSApplicationActivationPolicy};
-    use objc2_foundation::NSURL;
+fn open_url(value: &str) -> bool {
+    let value = NSString::from_str(value);
+    let Some(url) = NSURL::URLWithString(&value) else {
+        return false;
+    };
+    NSWorkspace::sharedWorkspace().openURL(&url)
+}
 
-    if missing.is_empty() {
-        return;
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // The app is normally an Accessory (LSUIElement). The alert needs us
-    // to be a Regular app momentarily, otherwise it appears behind the
-    // frontmost window and the user never sees it. Snap back to Accessory
-    // before exiting so nothing leaks into the Dock if the alert dance
-    // ever runs as part of a larger flow.
-    let ns_app = NSApplication::sharedApplication(mtm);
-    unsafe {
-        ns_app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
-        ns_app.activate();
-    }
-
-    let mut detail = String::from(
-        "Parakeet needs these permissions before it can start. Click an \
-         \"Open\" button below to jump straight to the right pane in \
-         System Settings, grant the permission, then relaunch Parakeet.\n\n\
-         Missing:\n",
-    );
-    for p in missing {
-        detail.push_str(&format!("  •  {}\n", p.label()));
-    }
-
-    let alert: Retained<NSAlert> = unsafe { NSAlert::new(mtm) };
-    unsafe {
-        alert.setMessageText(&NSString::from_str(
-            "Parakeet can't start: missing permissions",
-        ));
-        alert.setInformativeText(&NSString::from_str(&detail));
-        alert.setAlertStyle(NSAlertStyle::Warning);
-        // One "Open <pane>" button per missing permission, then Quit at
-        // the end so the rightmost button is the safe default.
-        for p in missing {
-            let label = format!("Open {}", p.label());
-            let _ = alert.addButtonWithTitle(&NSString::from_str(&label));
+    fn state(
+        input_monitoring: PermissionStatus,
+        microphone: PermissionStatus,
+        accessibility: PermissionStatus,
+    ) -> PermissionState {
+        PermissionState {
+            input_monitoring,
+            microphone,
+            accessibility,
         }
-        let _ = alert.addButtonWithTitle(&NSString::from_str("Quit"));
     }
 
-    loop {
-        // NSAlert returns NSModalResponse values; the first added button
-        // is `NSAlertFirstButtonReturn` (1000), the next 1001, etc.
-        let response = unsafe { alert.runModal() };
-        // `NSAlert::runModal` returns the new-style `NSModalResponse`
-        // which is a plain isize. The first added button is 1000
-        // (`NSAlertFirstButtonReturn`), the next 1001, etc.
-        let idx = (response - 1000) as usize;
-        if idx < missing.len() {
-            // Open the requested System Settings pane via NSWorkspace,
-            // then loop so the alert stays up while the user grants the
-            // permission (they have to relaunch anyway, but at least
-            // they don't lose the list).
-            let url_str = NSString::from_str(missing[idx].settings_url());
-            unsafe {
-                if let Some(url) = NSURL::URLWithString(&url_str) {
-                    let workspace = objc2_app_kit::NSWorkspace::sharedWorkspace();
-                    let _: Bool = msg_send![&*workspace, openURL: &*url];
-                }
-            }
-            // Loop and re-show — the user might want to open the next one.
-            continue;
+    #[test]
+    fn launch_onboarding_only_requires_the_launch_time_capability() {
+        assert!(!startup_needs_onboarding(state(
+            PermissionStatus::Granted,
+            PermissionStatus::NotDetermined,
+            PermissionStatus::NotGranted,
+        )));
+        assert!(startup_needs_onboarding(state(
+            PermissionStatus::NotGranted,
+            PermissionStatus::Granted,
+            PermissionStatus::Granted,
+        )));
+    }
+
+    #[test]
+    fn dictation_gate_requires_microphone_and_delivery_but_not_hotkey() {
+        assert!(dictation_ready(state(
+            PermissionStatus::NotGranted,
+            PermissionStatus::Granted,
+            PermissionStatus::Granted,
+        )));
+        assert!(!dictation_ready(state(
+            PermissionStatus::Granted,
+            PermissionStatus::Denied,
+            PermissionStatus::Granted,
+        )));
+        assert!(!dictation_ready(state(
+            PermissionStatus::Granted,
+            PermissionStatus::Granted,
+            PermissionStatus::NotGranted,
+        )));
+    }
+
+    #[test]
+    fn dashboard_scope_never_front_loads_future_permission_requests() {
+        let all_missing = state(
+            PermissionStatus::NotGranted,
+            PermissionStatus::NotDetermined,
+            PermissionStatus::NotGranted,
+        );
+        assert_eq!(
+            visible_permissions(DashboardScope::Startup, all_missing),
+            vec![Permission::InputMonitoring]
+        );
+        assert_eq!(
+            visible_permissions(DashboardScope::Dictation, all_missing),
+            vec![Permission::Microphone, Permission::Accessibility]
+        );
+
+        let microphone_granted = state(
+            PermissionStatus::NotGranted,
+            PermissionStatus::Granted,
+            PermissionStatus::NotGranted,
+        );
+        assert_eq!(
+            visible_permissions(DashboardScope::Dictation, microphone_granted),
+            vec![Permission::Accessibility]
+        );
+        assert_eq!(
+            visible_permissions(DashboardScope::All, microphone_granted),
+            Permission::ALL
+        );
+    }
+
+    #[test]
+    fn contextual_dashboard_copy_matches_the_actions_it_offers() {
+        let all_missing = state(
+            PermissionStatus::NotGranted,
+            PermissionStatus::NotDetermined,
+            PermissionStatus::NotGranted,
+        );
+        let startup = dashboard_model(DashboardScope::Startup, all_missing, false);
+        assert_eq!(startup.permissions, vec![Permission::InputMonitoring]);
+        assert!(startup
+            .detail
+            .contains("global hotkey is the only capability needed now"));
+        assert!(startup
+            .detail
+            .contains("requested only when you start dictation"));
+
+        let dictation = dashboard_model(DashboardScope::Dictation, all_missing, false);
+        assert_eq!(
+            dictation.permissions,
+            vec![Permission::Microphone, Permission::Accessibility]
+        );
+        assert!(dictation.detail.contains("dictation you just requested"));
+        assert!(!dictation.detail.contains("Input Monitoring:"));
+
+        let after_input_grant = dashboard_model(DashboardScope::Startup, all_missing, true);
+        assert!(after_input_grant
+            .detail
+            .contains("Quit and reopen Parakeet once"));
+        assert!(after_input_grant.detail.contains("menu remains usable now"));
+    }
+
+    #[test]
+    fn microphone_four_state_policy_has_an_explicit_recovery_action() {
+        assert_eq!(
+            primary_action(Permission::Microphone, PermissionStatus::NotDetermined),
+            PermissionAction::Request
+        );
+        for status in [
+            PermissionStatus::Granted,
+            PermissionStatus::Denied,
+            PermissionStatus::Restricted,
+        ] {
+            assert_eq!(
+                primary_action(Permission::Microphone, status),
+                PermissionAction::OpenSettings
+            );
         }
-        // Anything else (Quit button, or Esc / Cmd-. → NSModalResponseStop):
-        // drop back to Accessory and let the caller exit the process.
-        unsafe { ns_app.setActivationPolicy(NSApplicationActivationPolicy::Accessory) };
-        return;
+    }
+
+    #[test]
+    fn binary_permissions_request_when_missing_and_open_settings_when_granted() {
+        for permission in [Permission::InputMonitoring, Permission::Accessibility] {
+            assert_eq!(
+                primary_action(permission, PermissionStatus::NotGranted),
+                PermissionAction::Request
+            );
+            assert_eq!(
+                primary_action(permission, PermissionStatus::Granted),
+                PermissionAction::OpenSettings
+            );
+        }
+    }
+
+    #[test]
+    fn revocation_detects_only_granted_to_missing_transitions() {
+        let before = state(
+            PermissionStatus::Granted,
+            PermissionStatus::Granted,
+            PermissionStatus::Granted,
+        );
+        let after = state(
+            PermissionStatus::NotGranted,
+            PermissionStatus::Denied,
+            PermissionStatus::Granted,
+        );
+        assert_eq!(
+            revoked_permissions(before, after),
+            vec![Permission::InputMonitoring, Permission::Microphone]
+        );
+        assert!(revoked_permissions(after, after).is_empty());
+    }
+
+    #[test]
+    fn each_permission_has_a_specific_settings_link_and_generic_fallback_exists() {
+        for permission in Permission::ALL {
+            assert!(permission
+                .settings_url()
+                .starts_with("x-apple.systempreferences:"));
+            assert!(permission.settings_url().contains("Privacy_"));
+        }
+        assert_eq!(
+            GENERIC_PRIVACY_SETTINGS_URL,
+            "x-apple.systempreferences:com.apple.preference.security"
+        );
     }
 }
