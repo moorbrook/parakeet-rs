@@ -18,7 +18,7 @@ use objc2_foundation::MainThreadMarker;
 
 use parakeet_rs::app::{App, AppHandle};
 use parakeet_rs::settings::SettingsStore;
-use parakeet_rs::{app_delegate, objc_util, permissions};
+use parakeet_rs::{app_delegate, objc_util};
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -32,29 +32,6 @@ fn main() -> Result<()> {
     // AppKit requires its first contact to be on the main thread. Rust's
     // entry point already is.
     let mtm = MainThreadMarker::new().context("main() must run on the main thread")?;
-
-    // Pre-flight TCC permissions: Microphone, Accessibility, Input
-    // Monitoring. Missing permissions show a native NSAlert (the previous
-    // stderr-then-exit path was invisible for an LSUIElement app launched
-    // from Finder). The alert lets the user open each System Settings
-    // pane directly, then Quit — and we relaunch on the next attempt.
-    //
-    // Runs BEFORE the delegate is installed so a permissions-missing
-    // exit happens cleanly without the partial post-launch setup the
-    // delegate would have done.
-    let missing = permissions::check_all();
-    if !missing.is_empty() {
-        permissions::present_missing_alert_blocking(mtm, &missing);
-        eprintln!(
-            "Parakeet exiting: missing permission(s): {}",
-            missing
-                .iter()
-                .map(|p| p.label())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        std::process::exit(1);
-    }
 
     // Build the app state up-front so the delegate (and the menu-action
     // selectors it transitively wires up) can reach it via the

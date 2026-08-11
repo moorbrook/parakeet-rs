@@ -46,9 +46,9 @@ PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
 
 ## First launch
 
-1. macOS prompts for **Microphone**, **Accessibility**, and **Input
-   Monitoring** in System Settings → Privacy & Security. All three are
-   required.
+1. Parakeet explains **Input Monitoring**, the permission needed for its
+   global hotkey. It stays running in the menu bar if you defer it, and does
+   not trigger a macOS permission prompt until you choose **Grant**.
 2. The int8 Core ML model (~595 MB) and sherpa fallback/VAD bundle (~640 MB)
    download on first launch. They live under
    `~/Library/Application Support/com.parakeet.rs/models/`. All model downloads,
@@ -56,7 +56,10 @@ PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
    revisions and SHA-256 verified before use. Existing verified files are
    reused, and unchanged files use a local metadata cache on later launches.
    Menu bar status text shows setup progress.
-3. Press `⌘⇧Space` (default hotkey), speak. **Tap mode** waits through natural
+3. Press `⌘⇧Space` (default hotkey), or choose **Start Dictation** from the
+   menu. On the first attempt Parakeet explains and requests **Microphone** and
+   **Accessibility**; neither is requested merely because the app launched.
+   **Tap mode** waits through natural
    clause and sentence pauses before auto-stopping. **Tap Fast** preserves the
    original 150 ms stop window for short commands where latency matters more
    than pause tolerance. **Hold mode** stops on release.
@@ -177,10 +180,12 @@ Three headless harnesses under `src/bin/`: `bench_asr` and `bench_llm`
 (latency), and `asr_diff` (transcript regressions — see below).
 
 Privacy behaviour — what each permission does, what touches the network,
-what lands on disk — is documented in [`PRIVACY.md`](PRIVACY.md).
+what lands on disk — is documented in [`PRIVACY.md`](PRIVACY.md). Permission
+state, recovery behavior, and the clean/revoked QA matrix are in
+[`docs/macos-permissions.md`](docs/macos-permissions.md).
 
 Architectural rationale lives in [`docs/ADR.md`](docs/ADR.md) (decisions
-0001-0028); latency targets and measurements in
+0001-0029); latency targets and measurements in
 [`docs/latency-plan.md`](docs/latency-plan.md). The deferred
 Developer-ID/notarization shipping procedure is captured in
 [`docs/notarized-distribution.md`](docs/notarized-distribution.md).

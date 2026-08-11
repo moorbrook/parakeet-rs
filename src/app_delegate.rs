@@ -1,6 +1,7 @@
 //! `NSApplicationDelegate` for parakeet-rs.
 //!
 //! Owns the application lifecycle hooks (`applicationDidFinishLaunching:`,
+//! `applicationDidBecomeActive:`,
 //! `applicationShouldHandleReopen:hasVisibleWindows:`,
 //! `applicationWillTerminate:`). All AppKit installation that used to
 //! live inline in `main.rs` now happens in `didFinishLaunching` so the
@@ -23,7 +24,7 @@ use objc2_app_kit::{NSApplication, NSApplicationDelegate};
 use objc2_foundation::{MainThreadMarker, NSNotification, NSObject, NSObjectProtocol};
 
 use crate::app::AppHandle;
-use crate::{hotkey, hud, menubar};
+use crate::{hotkey, hud, menubar, permissions};
 
 define_class!(
     /// Lives for the life of the process. AppKit holds the only strong
@@ -55,6 +56,20 @@ define_class!(
                 if let Err(e) = install_runtime_state(mtm) {
                     log::error!("applicationDidFinishLaunching install failed: {e:#}");
                 }
+            });
+        }
+
+        /// Re-check permission state when Parakeet becomes active again.
+        /// This is the same one-shot return-from-System-Settings pattern used
+        /// by ZoomItForMac: the dashboard refreshes without polling or an
+        /// unexplained restart loop, and revocations are surfaced explicitly.
+        #[unsafe(method(applicationDidBecomeActive:))]
+        fn application_did_become_active(&self, _notification: &NSNotification) {
+            crate::objc_util::selector_guard("applicationDidBecomeActive:", || {
+                let Some(mtm) = MainThreadMarker::new() else {
+                    return;
+                };
+                permissions::application_did_become_active(mtm);
             });
         }
 
@@ -153,11 +168,18 @@ fn install_runtime_state(mtm: MainThreadMarker) -> anyhow::Result<()> {
     let app_for_release = Arc::clone(&app);
     let hotkey_handle = hotkey::register(
         &app.settings.load().hotkey,
-        Arc::new(move || app_for_press.on_hotkey_press()),
+        Arc::new(move || {
+            if app_for_press.fsm.state() != crate::app::DictationState::Idle
+                || permissions::ensure_dictation_ready()
+            {
+                app_for_press.on_hotkey_press();
+            }
+        }),
         Arc::new(move || app_for_release.on_hotkey_release()),
         mtm,
     )
     .context("register global hotkey")?;
+    let input_monitoring_granted = hotkey_handle.input_monitoring_granted_at_registration();
     *app.hotkey.lock() = Some(hotkey_handle);
 
     // Tokio runtime drives the model download + spawn_blocking ASR
@@ -178,6 +200,7 @@ fn install_runtime_state(mtm: MainThreadMarker) -> anyhow::Result<()> {
 
     // Initial menu paint reflecting "model loading" state.
     app.refresh_menu();
+    permissions::install(mtm, input_monitoring_granted);
 
     log::info!("parakeet-rs runtime installed");
     Ok(())

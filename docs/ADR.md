@@ -1718,6 +1718,64 @@ Full thresholds and reopen conditions are in
 
 ---
 
+## 0029 — Contextual macOS permission onboarding and recovery
+
+**Status:** **Accepted — implemented.**
+
+**Context.** Parakeet previously requested Microphone, Accessibility, and Input
+Monitoring before AppKit installed its delegate, displayed a blocking alert,
+and exited when any grant was absent. That front-loaded permissions the user
+had not exercised, left no usable menu, duplicated the Input Monitoring
+request in the hotkey module, and treated relaunch as the universal recovery
+path.
+
+Microsoft ZoomItForMac commit
+[`e14bc9b97e784a5208addc8031f9f1c17c6f3a7f`](https://github.com/microsoft/ZoomitForMac/commit/e14bc9b97e784a5208addc8031f9f1c17c6f3a7f)
+provides a better architectural pattern: a permission-service state seam,
+tri-state AVFoundation authorization, explicit status/actions, direct System
+Settings links, a persistent **Check Permissions** command, and refresh when
+the app becomes active after a Settings trip.
+
+**Decision.** Adopt that interaction model in native Rust while mapping it to
+Parakeet's actual capabilities. Process launch never calls a TCC request API.
+First-run onboarding explains and offers only Input Monitoring because the
+global hotkey is the only capability needed then. Starting dictation gates and
+offers only missing Microphone/Accessibility grants. Stop/cancel remains
+available after revocation. The app always stays in the menu bar, and menu
+dictation does not depend on Input Monitoring.
+
+The status dashboard is also permanently available from the menu. Microphone
+uses AVFoundation's granted/not-determined/denied/restricted states;
+CoreGraphics and Accessibility expose only Boolean preflights, so their state
+is honestly described as granted/not granted. Determined or granted states
+open the service-specific System Settings pane, falling back to the generic
+Privacy & Security pane. `applicationDidBecomeActive:` refreshes after a
+Settings trip and surfaces granted-to-missing revocation.
+
+Input Monitoring onboarding consumes the same preflight snapshot taken before
+the detector threads start. A second `CGPreflightListenEventAccess` racing
+`CGEventTapCreate` was observed to transiently report missing on the signed QA
+build even though the registration-time preflight and System Settings both
+reported granted; using one snapshot prevents false onboarding and relaunch
+instructions.
+
+**Differences from ZoomIt.** Parakeet never requests Screen Recording or
+Camera; neither capability exists here. Input Monitoring is its launch-time
+analog to ZoomIt's Screen Recording. Microphone and Accessibility are tied to
+the user's first dictation request. A global event tap created before Input
+Monitoring is granted cannot be made live safely with the process-global
+detector guards, so the dashboard explicitly asks for one quit/reopen in that
+single case and states that menu dictation remains usable meanwhile.
+
+**Consequences.** The app no longer fails closed on missing TCC grants, system
+prompts have explanatory user intent immediately before them, and each
+published permission state has a recovery action. Pure policy tests cover
+scope, every microphone state, Boolean permission actions, revocation, and
+deep-link fallback. The signed clean/revoked manual matrix and implementation
+map are maintained in [`docs/macos-permissions.md`](macos-permissions.md).
+
+---
+
 ## Index of open decisions vs targets
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -1747,6 +1805,12 @@ Full thresholds and reopen conditions are in
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-08-11** — [ADR-0029](#0029--contextual-macos-permission-onboarding-and-recovery)
+  added: ZoomItForMac-inspired permission-state separation, contextual
+  request scopes, explicit denied/restricted/revoked recovery, targeted
+  settings links with fallback, activation refresh, and a signed manual QA
+  matrix without adding Screen Recording or Camera access.
 
 - **2026-08-11** — [ADR-0028](#0028--generic-asr-base-with-evidence-gated-domain-and-user-adaptation)
   added: a 27-point vocabulary sweep with six repeated boundary reports, a

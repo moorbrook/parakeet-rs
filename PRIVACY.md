@@ -68,8 +68,18 @@ if you launch the binary from a terminal.
 
 ## Permissions, and what each one is actually used for
 
-macOS will prompt for all three at first launch. All three are
-required for dictation to work at all.
+Parakeet does **not** ask macOS for all three merely because it launched.
+Onboarding first explains Input Monitoring, which enables the global hotkey;
+the app and its menu remain usable if you defer it. Microphone and
+Accessibility are explained and requested only when you try to start
+dictation. A **Check Permissions…** menu command always shows current state
+and recovery actions. Parakeet refreshes that state after you return from
+System Settings and if a previously granted permission is later revoked.
+
+Microphone and Accessibility are required for a complete dictation. Input
+Monitoring is required only for the global hotkey; menu-bar dictation works
+without it. macOS requires one explained quit/reopen when Input Monitoring is
+granted after Parakeet has already created its event tap.
 
 **Microphone** — capture audio while a session is active. Nothing else.
 
@@ -105,6 +115,9 @@ directly; that path was removed (see
 because it silently failed in terminals, not for privacy reasons — but
 the practical effect is that the current code touches less of the AX
 API, not more.
+
+The exact macOS state model and recovery/QA matrix are documented in
+[`docs/macos-permissions.md`](docs/macos-permissions.md).
 
 ## Clipboard
 
