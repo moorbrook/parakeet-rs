@@ -19,7 +19,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use parakeet_rs::asr::{Asr, AsrConfig};
-use parakeet_rs::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
+use parakeet_rs::coreml_worker::{load_coreml_worker, CoreMlComputeUnits, CoreMlWorkerConfig};
 use parakeet_rs::performance::{self, next_session_id, PhaseTimer, PhaseTimerMode};
 use parakeet_rs::settings::SettingsStore;
 use parakeet_rs::warmup;
@@ -35,6 +35,7 @@ struct Args {
     backend: Backend,
     worker: Option<PathBuf>,
     model_dir: Option<PathBuf>,
+    compute_units: CoreMlComputeUnits,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +62,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut backend = Backend::Sherpa;
     let mut worker = None;
     let mut model_dir = None;
+    let mut compute_units = CoreMlComputeUnits::default();
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -99,6 +101,12 @@ fn parse_args() -> anyhow::Result<Args> {
                         .ok_or_else(|| anyhow!("--model-dir needs a path"))?,
                 ));
             }
+            "--compute-units" => {
+                compute_units = CoreMlComputeUnits::parse(
+                    &it.next()
+                        .ok_or_else(|| anyhow!("--compute-units needs a name"))?,
+                )?;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -114,6 +122,7 @@ fn parse_args() -> anyhow::Result<Args> {
         backend,
         worker,
         model_dir,
+        compute_units,
     })
 }
 
@@ -122,6 +131,7 @@ fn print_usage() {
         "usage: bench_asr --wav PATH [--reps N] [--warmup-reps N]\n\
          \x20                [--backend sherpa|coreml-unified]\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\
+         \x20                [--compute-units all|cpu-and-gpu|cpu-and-neural-engine|cpu-only]\n\
          \n\
          Runs the loaded Parakeet recognizer over WAV PATH `--reps` times,\n\
          emitting one `phase_timer` log line per iteration on stderr.\n\
@@ -235,6 +245,7 @@ fn load_backend(args: &Args, store: &SettingsStore) -> anyhow::Result<Asr> {
             if let Some(model_dir) = &args.model_dir {
                 config.set_existing_model_directory(model_dir);
             }
+            config.set_compute_units(args.compute_units);
             log::info!(
                 "loading Core ML worker {} with {:?}",
                 config.worker_path.display(),

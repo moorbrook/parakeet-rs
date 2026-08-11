@@ -1,5 +1,6 @@
-//! Apple-Silicon P-core count + per-dictation `PhaseTimer` (one structured
-//! log line per dictation, parsed by `scripts/bench-aggregate.py`).
+//! Apple-Silicon highest-performance-cluster count + per-dictation
+//! `PhaseTimer` (one structured log line per dictation, parsed by
+//! `scripts/bench-aggregate.py`).
 //! See `docs/latency-plan.md` §1 for the log-line contract.
 
 use std::ffi::CString;
@@ -9,9 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-/// `sysctlbyname("hw.perflevel0.logicalcpu")` returns the P-core count on
-/// Apple Silicon (M1+). Falls back to half of total logicals if the sysctl
-/// is missing — non-Apple-Silicon Macs, hypothetically.
+/// `sysctlbyname("hw.perflevel0.logicalcpu")` returns the logical CPU count in
+/// Apple Silicon's highest-performance cluster. New chips may name that level
+/// something other than "Performance" (M5 Pro calls it "Super"). Falls back
+/// to half of total logicals if the sysctl is missing.
 pub fn performance_core_count() -> i32 {
     if let Ok(value) = sysctl_i32("hw.perflevel0.logicalcpu") {
         if value > 0 {
@@ -21,7 +23,8 @@ pub fn performance_core_count() -> i32 {
     (num_cpus_total() / 2).max(2) as i32
 }
 
-fn sysctl_i32(name: &str) -> io::Result<i32> {
+/// Read a signed 32-bit macOS sysctl without spawning a subprocess.
+pub fn sysctl_i32(name: &str) -> io::Result<i32> {
     sysctl_number(name)
 }
 

@@ -790,6 +790,7 @@ fn load_optimized_asr(settings: &SettingsStore) -> anyhow::Result<Asr> {
 
     let mut config = CoreMlWorkerConfig::discover()?;
     config.set_existing_model_directory(&app_model_directory);
+    let long_plan_warmup_seconds = configure_coreml_runtime_plan(settings, &mut config)?;
     menubar::set_status_text("Loading optimized recogniser…");
 
     let (asr, load_seconds) = load_coreml_worker(&config)?;
@@ -803,8 +804,101 @@ fn load_optimized_asr(settings: &SettingsStore) -> anyhow::Result<Asr> {
     // needs this cheap warmup; Core ML's cache is not shared with the old
     // worker that will be dropped after the swap.
     menubar::set_status_text("Pre-warming optimized graph…");
+    if let Some(seconds) = long_plan_warmup_seconds {
+        let samples = vec![0.0_f32; seconds as usize * 16_000];
+        let _ = asr.recognize_silent_warmup(&samples, 16_000)?;
+    }
     warmup::dummy_decode(&asr)?;
     Ok(asr)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AsrTuningOverride {
+    Auto,
+    Off,
+}
+
+fn parse_asr_tuning_override(value: Option<&str>) -> anyhow::Result<AsrTuningOverride> {
+    match value {
+        None | Some("") | Some("auto") => Ok(AsrTuningOverride::Auto),
+        Some("off") => Ok(AsrTuningOverride::Off),
+        Some(other) => {
+            anyhow::bail!("invalid PARAKEET_ASR_TUNING={other:?}; expected auto or off")
+        }
+    }
+}
+
+fn configured_asr_tuning_override() -> anyhow::Result<AsrTuningOverride> {
+    match std::env::var("PARAKEET_ASR_TUNING") {
+        Ok(value) => parse_asr_tuning_override(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_asr_tuning_override(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Apply an evidence-backed runtime plan when its complete cache identity still
+/// matches this Mac. Missing, unreadable, or stale profiles stay on the safe
+/// CPU+ANE baseline; only an invalid explicit environment override is fatal.
+/// The returned duration requests one long-regime warmup when two plans load.
+fn configure_coreml_runtime_plan(
+    settings: &SettingsStore,
+    config: &mut CoreMlWorkerConfig,
+) -> anyhow::Result<Option<u32>> {
+    use crate::asr_tuning::{self, HardwareFingerprint, BASELINE_COMPUTE_UNITS};
+
+    config.set_compute_units(BASELINE_COMPUTE_UNITS);
+    if configured_asr_tuning_override()? == AsrTuningOverride::Off {
+        log::info!("PARAKEET_ASR_TUNING=off; selecting safe CPU+ANE baseline");
+        return Ok(None);
+    }
+
+    let profile_path = settings.asr_tuning_profile_path();
+    let profile = match asr_tuning::load(&profile_path) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            log::info!(
+                "no ASR tuning profile at {}; selecting safe CPU+ANE baseline",
+                profile_path.display()
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            log::warn!(
+                "ASR tuning profile is unreadable; selecting safe CPU+ANE baseline: {error:#}"
+            );
+            return Ok(None);
+        }
+    };
+    let hardware = match HardwareFingerprint::current() {
+        Ok(hardware) => hardware,
+        Err(error) => {
+            log::warn!(
+                "cannot fingerprint this Mac for ASR tuning; selecting safe CPU+ANE baseline: \
+                 {error:#}"
+            );
+            return Ok(None);
+        }
+    };
+    let artifact_digest = model_fetch::coreml_artifact_digest();
+    if let Err(error) = profile.validate_for(&hardware, &artifact_digest) {
+        log::warn!(
+            "ASR tuning profile is stale or invalid; selecting safe CPU+ANE baseline: {error:#}"
+        );
+        return Ok(None);
+    }
+
+    let short = profile.selection.short.compute_units;
+    let long = profile.selection.long.compute_units;
+    config.set_regime_compute_units(short, long, profile.long_regime_seconds)?;
+    log::info!(
+        "using ASR tuning profile {}: short={}, long={}, threshold={}s, cache_key={}",
+        profile_path.display(),
+        short.as_str(),
+        long.as_str(),
+        profile.long_regime_seconds,
+        profile.cache_key
+    );
+    Ok((short != long).then_some(profile.long_regime_seconds + 1))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1212,6 +1306,23 @@ mod tests {
             AsrBackendOverride::Sherpa
         );
         assert!(parse_asr_backend_override(Some("coreml")).is_err());
+    }
+
+    #[test]
+    fn asr_tuning_override_keeps_safe_baseline_one_setting_away() {
+        assert_eq!(
+            parse_asr_tuning_override(None).unwrap(),
+            AsrTuningOverride::Auto
+        );
+        assert_eq!(
+            parse_asr_tuning_override(Some("auto")).unwrap(),
+            AsrTuningOverride::Auto
+        );
+        assert_eq!(
+            parse_asr_tuning_override(Some("off")).unwrap(),
+            AsrTuningOverride::Off
+        );
+        assert!(parse_asr_tuning_override(Some("force")).is_err());
     }
 
     #[test]

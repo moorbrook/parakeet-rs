@@ -109,6 +109,25 @@ For diagnosis or emergency rollback, `PARAKEET_ASR_BACKEND=sherpa` forces the
 fallback without changing vocabulary. Unset it or use `auto` to restore normal
 selection.
 
+### Apple Silicon runtime tuning
+
+The shipped model is generic; an explicit tuner can benchmark its bounded Core
+ML execution plans against this Mac and the checked-in human-speech quality
+gate. It saves an inspectable hardware/OS/model-keyed profile that the app uses
+only while all identities and recomputed evidence still match:
+
+```bash
+scripts/build-coreml-worker.sh
+cargo run --release --locked --bin tune_asr -- \
+  --repetitions 10 --load-repetitions 3
+cargo run --release --locked --bin tune_asr -- --show-profile
+```
+
+Missing or stale profiles use the safe CPU+ANE baseline. Set
+`PARAKEET_ASR_TUNING=off` to bypass a valid profile without deleting it. See
+[`docs/asr/AUTOTUNING.md`](docs/asr/AUTOTUNING.md) for the selection gates,
+profile removal, and current M5 Pro evidence.
+
 Terms are validated against the model's token inventory, so a word the
 model can't represent (emoji, unusual scripts) is reported in the log
 and skipped rather than silently doing nothing.
