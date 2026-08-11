@@ -1313,11 +1313,11 @@ and retain the existing custom-vocabulary behavior.
 
 **Decision.** Prefer FluidAudio's int8 Parakeet Unified EN 0.6B offline model
 through a resident Swift worker. Rust remains the application and policy
-layer; `AsrBackend` is the stable seam. The worker owns model download/load,
-native mel extraction, Core ML CPU+ANE execution, and greedy RNNT decode, then
-accepts framed little-endian Float32 audio over stdin and returns framed JSON
-over stdout. It is pinned to FluidAudio commit
-`00a9aa771900ea09c485659663be31019e293e47`.
+layer; `AsrBackend` is the stable seam. Rust owns the pinned download and
+integrity gate. The worker owns model load, native mel extraction, Core ML
+CPU+ANE execution, and greedy RNNT decode, then accepts framed little-endian
+Float32 audio over stdin and returns framed JSON over stdout. It is pinned to
+FluidAudio commit `00a9aa771900ea09c485659663be31019e293e47`.
 
 - Model load and ANE plan compilation happen once per worker, not once per
   utterance.
@@ -1358,6 +1358,23 @@ cold load measured about 10 seconds on first Core ML plan creation and about
 0.12 seconds from a warm compiled cache; startup warmup keeps both off the
 dictation path. The helper requires macOS 14; older supported systems fail the
 specialized spawn/load and use sherpa.
+
+The later real-speech gold gate measured 5.43% WER / 3.57% CER with zero
+ten-repeat spread. Against sherpa greedy it was 6.21× faster at corpus-decode
+p50 and 6.39× at p95; model load was 0.130 s versus 3.647 s, first result
+0.278 s versus 4.582 s, and observed full-process-tree RSS 0.10 GiB versus
+4.25 GiB. Production now verifies the complete 15-file Core ML bundle from
+model revision `4252711f6f060f9a2f91e5f081a806d7f45eebd8` through the Rust
+integrity gate before the worker may load it. `PARAKEET_ASR_BACKEND=sherpa`
+keeps the fallback one setting away. The exact graph, tokenizer, decoder,
+license, compatibility, and conversion limitation are recorded in
+[`docs/asr/COREML_MODEL.md`](asr/COREML_MODEL.md).
+
+Paired outer/internal instrumentation also prices the worker boundary rather
+than inferring it from bucket scaling. At 30 repetitions the boundary was
+0.128 ms p50 / 0.143 ms p95 for one-second audio and 1.111 ms / 1.209 ms for
+20-second audio. The 35 ms short-utterance floor is model-side work, so shared
+memory or an in-process rewrite is not justified by current measurements.
 
 ---
 
@@ -1467,10 +1484,11 @@ and
 [`e87f176479d0855a907a41277aca2f8ee7a09523`](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/commit/e87f176479d0855a907a41277aca2f8ee7a09523).
 Silero's mutable release URL is made byte-immutable by the pinned digest.
 
-**Scope.** This ADR covers the six files fetched by the Rust downloader. The
-FluidAudio-managed Core ML bundle uses a separate Swift download path; its
-manifest/integrity closeout remains part of ADR-0022's Core ML follow-up rather
-than being implicitly claimed here.
+**Scope.** This ADR's original table covers six artifacts. ADR-0022 now adds
+the separately reviewed 15-file Core ML truth pack and reuses this verifier,
+cache, and atomic-publish path before the Swift worker may load it. Its exact
+manifest is maintained in `model_fetch.rs` and
+[`docs/asr/COREML_MODEL.md`](asr/COREML_MODEL.md).
 
 **Consequences.** A first launch after upgrading reads and hashes each existing
 Rust-managed model once. On later launches the integrity gate is a handful of

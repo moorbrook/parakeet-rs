@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::asr::Asr;
-use crate::coreml_worker::{load_coreml_worker, CoreMlModelSource, CoreMlWorkerConfig};
+use crate::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
 use crate::dictation_fsm::{DictationFsm, HoldPressOutcome, TapPressOutcome};
 use crate::hotkey::HotkeyHandle;
 use crate::hud;
@@ -713,7 +713,8 @@ fn load_asr_blocking(settings: &SettingsStore, warm: bool) -> anyhow::Result<(Ar
         }
     };
 
-    if !has_vocabulary {
+    let backend_override = configured_asr_backend_override()?;
+    if !has_vocabulary && backend_override == AsrBackendOverride::Auto {
         match load_optimized_asr(settings) {
             Ok(asr) => return Ok((Arc::new(asr), biasing)),
             Err(error) => {
@@ -723,8 +724,10 @@ fn load_asr_blocking(settings: &SettingsStore, warm: bool) -> anyhow::Result<(Ar
                 menubar::set_status_text("Optimized model unavailable — loading fallback…");
             }
         }
-    } else {
+    } else if has_vocabulary {
         log::info!("custom vocabulary is active; selecting sherpa contextual-biasing backend");
+    } else {
+        log::info!("PARAKEET_ASR_BACKEND=sherpa; selecting explicit fallback backend");
     }
 
     menubar::set_status_text("Warming page cache…");
@@ -766,23 +769,28 @@ fn load_asr_blocking(settings: &SettingsStore, warm: bool) -> anyhow::Result<(Ar
 }
 
 fn load_optimized_asr(settings: &SettingsStore) -> anyhow::Result<Asr> {
-    let mut config = CoreMlWorkerConfig::discover()?;
+    use anyhow::Context as _;
+
     let app_model_directory = settings.coreml_model_dir();
-    let model_is_available = if app_model_directory.is_dir() {
-        config.set_existing_model_directory(&app_model_directory);
-        true
-    } else {
-        matches!(
-            &config.model_source,
-            CoreMlModelSource::ExistingDirectory(path) if path.is_dir()
-        )
-    };
-    if !model_is_available {
-        config.set_download_root(settings.coreml_model_root());
-        menubar::set_status_text("Downloading optimized model (~595 MB, first run)…");
-    } else {
-        menubar::set_status_text("Loading optimized recogniser…");
-    }
+    let on_progress: model_fetch::ProgressFn = Arc::new(fetch_progress_to_menubar);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building optimized-model download runtime")?
+        .block_on(model_fetch::ensure_coreml_model(
+            &app_model_directory,
+            on_progress,
+        ))
+        .with_context(|| {
+            format!(
+                "verifying or auto-downloading optimized model to {}",
+                app_model_directory.display()
+            )
+        })?;
+
+    let mut config = CoreMlWorkerConfig::discover()?;
+    config.set_existing_model_directory(&app_model_directory);
+    menubar::set_status_text("Loading optimized recogniser…");
 
     let (asr, load_seconds) = load_coreml_worker(&config)?;
     log::info!(
@@ -797,6 +805,30 @@ fn load_optimized_asr(settings: &SettingsStore) -> anyhow::Result<Asr> {
     menubar::set_status_text("Pre-warming optimized graph…");
     warmup::dummy_decode(&asr)?;
     Ok(asr)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AsrBackendOverride {
+    Auto,
+    Sherpa,
+}
+
+fn parse_asr_backend_override(value: Option<&str>) -> anyhow::Result<AsrBackendOverride> {
+    match value {
+        None | Some("") | Some("auto") => Ok(AsrBackendOverride::Auto),
+        Some("sherpa") => Ok(AsrBackendOverride::Sherpa),
+        Some(other) => {
+            anyhow::bail!("invalid PARAKEET_ASR_BACKEND={other:?}; expected auto or sherpa")
+        }
+    }
+}
+
+fn configured_asr_backend_override() -> anyhow::Result<AsrBackendOverride> {
+    match std::env::var("PARAKEET_ASR_BACKEND") {
+        Ok(value) => parse_asr_backend_override(Some(&value)),
+        Err(std::env::VarError::NotPresent) => parse_asr_backend_override(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Synchronous polish-LLM load. Used by both the boot path (via
@@ -1164,6 +1196,23 @@ fn fmt_bytes(n: u64) -> String {
 mod tests {
     use super::*;
     use crate::settings::TriggerMode;
+
+    #[test]
+    fn asr_backend_override_keeps_sherpa_one_setting_away() {
+        assert_eq!(
+            parse_asr_backend_override(None).unwrap(),
+            AsrBackendOverride::Auto
+        );
+        assert_eq!(
+            parse_asr_backend_override(Some("auto")).unwrap(),
+            AsrBackendOverride::Auto
+        );
+        assert_eq!(
+            parse_asr_backend_override(Some("sherpa")).unwrap(),
+            AsrBackendOverride::Sherpa
+        );
+        assert!(parse_asr_backend_override(Some("coreml")).is_err());
+    }
 
     #[test]
     fn panic_message_extracts_static_str_payload() {

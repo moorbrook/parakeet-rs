@@ -1,6 +1,6 @@
 //! First-run download and integrity verification for the Rust-managed model
-//! artifacts: Parakeet TDT 0.6B v3 int8, Silero VAD, and the optional polish
-//! GGUF.
+//! artifacts: Parakeet TDT 0.6B v3 int8, Parakeet Unified Core ML, Silero VAD,
+//! and the optional polish GGUF.
 //!
 //! Every artifact has an immutable upstream identity (revision where the host
 //! supports one, expected byte length, and SHA-256). Downloads are hashed while
@@ -106,6 +106,104 @@ const POLISH_GGUF: Artifact = Artifact {
     sha256: "fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66",
     size: 3_525_956_768,
 };
+
+#[cfg(test)]
+const COREML_REVISION: &str = "4252711f6f060f9a2f91e5f081a806d7f45eebd8";
+
+macro_rules! coreml_artifact {
+    ($path:literal, $sha256:literal, $size:literal) => {
+        Artifact {
+            label: $path,
+            url: concat!(
+                "https://huggingface.co/FluidInference/",
+                "parakeet-unified-en-0.6b-coreml/resolve/",
+                "4252711f6f060f9a2f91e5f081a806d7f45eebd8/",
+                $path
+            ),
+            sha256: $sha256,
+            size: $size,
+        }
+    };
+}
+
+/// Exact offline int8 truth pack consumed by `UnifiedAsrManager`.
+const COREML_ARTIFACTS: &[Artifact] = &[
+    coreml_artifact!(
+        "config.json",
+        "6cbe6c76445410c5c6debf3d44c8c3b75e9966bf09bba5cd138c2378c62120f6",
+        1_355
+    ),
+    coreml_artifact!(
+        "metadata.json",
+        "2b26a96b76fe1f7a04d3e867f50c75d6ce5dd1650d0dbcd4c35b591b22305f0e",
+        1_046
+    ),
+    coreml_artifact!(
+        "vocab.json",
+        "e1a7bff4f5df133c0f4ad47b8e43c96f6bf1865d99126a4c4725ef51d0108bec",
+        15_088
+    ),
+    coreml_artifact!(
+        "parakeet_unified_decoder.mlmodelc/analytics/coremldata.bin",
+        "9ae70f6559989f88b856b326e59315798f9f0d08207a19fcc2dd3287a30088a5",
+        243
+    ),
+    coreml_artifact!(
+        "parakeet_unified_decoder.mlmodelc/coremldata.bin",
+        "ce99c4488840fc463d59f8d4d6d2a9e8ceae8138ead51e3c265dde4d2ba4a0e9",
+        560
+    ),
+    coreml_artifact!(
+        "parakeet_unified_decoder.mlmodelc/model.mil",
+        "6e60965b89c93943aa2be2d991c2461108145851fde05e1d048223a32d4cb20d",
+        13_102
+    ),
+    coreml_artifact!(
+        "parakeet_unified_decoder.mlmodelc/weights/weight.bin",
+        "96f990461a5986d5e7309ad1a0f36084fbf0f4b28aec35948f8b8d0dcbf8599e",
+        14_429_952
+    ),
+    coreml_artifact!(
+        "parakeet_unified_encoder_int8.mlmodelc/analytics/coremldata.bin",
+        "57e116a9d5765e39c0cdf754137ab744ddae34d9c6d68a5fdcad6600ae3a7b6b",
+        243
+    ),
+    coreml_artifact!(
+        "parakeet_unified_encoder_int8.mlmodelc/coremldata.bin",
+        "54f533d30343d5e62b324a0691e4c262a6768b07b6e88e7aa14c617a2baba8a3",
+        492
+    ),
+    coreml_artifact!(
+        "parakeet_unified_encoder_int8.mlmodelc/model.mil",
+        "c1c5d71c6cbf4d35bba08458746bde3640da7b1b444e1229a269393a58222c10",
+        1_110_902
+    ),
+    coreml_artifact!(
+        "parakeet_unified_encoder_int8.mlmodelc/weights/weight.bin",
+        "f984b81590a4deae041ae20fbab8981c2d2a5b528b2ac81fae81c432633535c6",
+        595_051_904
+    ),
+    coreml_artifact!(
+        "parakeet_unified_joint_decision_single_step.mlmodelc/analytics/coremldata.bin",
+        "163877ad14af97ec4107cd854fd1c6d336ee5d40ad25a657cc764fb763f452f5",
+        243
+    ),
+    coreml_artifact!(
+        "parakeet_unified_joint_decision_single_step.mlmodelc/coremldata.bin",
+        "68a081570a48b52ec9379e153bd56748a5408a50be16767601563f231eaeff03",
+        556
+    ),
+    coreml_artifact!(
+        "parakeet_unified_joint_decision_single_step.mlmodelc/model.mil",
+        "03c21096090bcd0b71c896c5ae0eb815db31a91c6676f572a7868eee4299abe3",
+        9_611
+    ),
+    coreml_artifact!(
+        "parakeet_unified_joint_decision_single_step.mlmodelc/weights/weight.bin",
+        "06831afa6d1beb0c0b10350ebf7886bc37638e951d14e738d7e06fbd2a05012f",
+        3_446_978
+    ),
+];
 
 /// Parakeet TDT triplet + tokens, all relative to the per-model dir.
 /// `pub(crate)` so `settings.rs`'s tests can cross-check that this list
@@ -233,11 +331,37 @@ pub async fn ensure_polish_model(dest: &Path, on_progress: ProgressFn) -> Result
     Ok(())
 }
 
+/// Verify or download the pinned Core ML truth pack before the Swift worker is
+/// allowed to load it. This deliberately bypasses FluidAudio's mutable-main,
+/// layout-only cache check while continuing to use FluidAudio for inference.
+pub async fn ensure_coreml_model(model_dir: &Path, on_progress: ProgressFn) -> Result<()> {
+    tokio::fs::create_dir_all(model_dir).await?;
+    on_progress(Progress::Status(
+        "Checking optimized model integrity…".to_string(),
+    ));
+    let mut downloaded = false;
+    for artifact in COREML_ARTIFACTS {
+        downloaded |= ensure_artifact(*artifact, &model_dir.join(artifact.label), &on_progress)
+            .await
+            .with_context(|| format!("ensuring Core ML {}", artifact.label))?;
+    }
+    let status = if downloaded {
+        "Optimized model downloaded and verified."
+    } else {
+        "Optimized model verified."
+    };
+    on_progress(Progress::Status(status.to_string()));
+    Ok(())
+}
+
 async fn ensure_artifact(
     artifact: Artifact,
     dest: &Path,
     on_progress: &ProgressFn,
 ) -> Result<bool> {
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let verification_started = std::time::Instant::now();
     let verify_path = dest.to_path_buf();
     let verification =
@@ -730,6 +854,45 @@ mod tests {
         assert_eq!(POLISH_GGUF.sha256.len(), 64);
         assert_eq!(POLISH_GGUF.size, 3_525_956_768);
         assert!(POLISH_GGUF_URL.ends_with(POLISH_GGUF.label));
+    }
+
+    #[test]
+    fn coreml_truth_pack_is_complete_revision_pinned_and_unique() {
+        assert_eq!(COREML_ARTIFACTS.len(), 15);
+        assert!(COREML_ARTIFACTS.iter().all(|artifact| {
+            artifact.url.contains(COREML_REVISION)
+                && artifact.url.ends_with(artifact.label)
+                && artifact.sha256.len() == 64
+                && artifact.size > 0
+        }));
+        let mut paths: Vec<&str> = COREML_ARTIFACTS
+            .iter()
+            .map(|artifact| artifact.label)
+            .collect();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths.len(), COREML_ARTIFACTS.len());
+        assert!(paths.contains(&"vocab.json"));
+        assert!(paths.contains(&"parakeet_unified_encoder_int8.mlmodelc/weights/weight.bin"));
+        assert!(paths
+            .contains(&"parakeet_unified_joint_decision_single_step.mlmodelc/weights/weight.bin"));
+    }
+
+    #[tokio::test]
+    async fn nested_artifact_creates_destination_directories() {
+        let (url, server) = serve_once_without_content_length(b"abc");
+        let artifact = Artifact {
+            label: "model.mlmodelc/weights/weight.bin",
+            url: Box::leak(url.into_boxed_str()),
+            ..ABC
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join(artifact.label);
+        let progress: ProgressFn = Arc::new(|_| {});
+
+        assert!(ensure_artifact(artifact, &dest, &progress).await.unwrap());
+        server.join().unwrap();
+        assert_eq!(fs::read(dest).unwrap(), b"abc");
     }
 
     #[test]

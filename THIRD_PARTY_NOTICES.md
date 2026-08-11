@@ -15,7 +15,7 @@ The optimized backend downloads the `FluidInference/parakeet-unified-en-0.6b-cor
 model on demand. The weights are not stored in this repository or bundled in the
 application.
 
-- Model: <https://huggingface.co/FluidInference/parakeet-unified-en-0.6b-coreml>
+- Model (exact revision): <https://huggingface.co/FluidInference/parakeet-unified-en-0.6b-coreml/tree/4252711f6f060f9a2f91e5f081a806d7f45eebd8>
 - Core ML conversion and integration: FluidInference contributors
 - Based on NVIDIA Parakeet
 - Model license: Creative Commons Attribution 4.0 International

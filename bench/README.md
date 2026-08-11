@@ -2,7 +2,9 @@
 
 `scripts/bench-latency.sh` drives `bench_asr` over generated TTS WAVs at
 {1, 3, 5, 10, 20}s, 30 reps each, and emits `phase_timer` log lines that
-`scripts/bench-aggregate.py` reduces into `baseline.csv` (or `$OUT_CSV`).
+`scripts/bench-aggregate.py` reduces into `baseline.csv` (or `$OUT_CSV`). It
+also writes the matching `*-boundary.csv` through the PEP 723
+`scripts/bench-boundary.py` aggregator.
 
 See `docs/latency-plan.md` §1 for design and acceptance criteria.
 
@@ -66,6 +68,11 @@ scripts/bench-end-to-end.sh
 ## What is and isn't measured
 
 The bench loads pre-recorded WAVs and runs `Asr::recognize()` directly.
+Each repetition also emits `asr_boundary` with worker-internal
+resample-plus-inference time, outer Rust wall time, and their difference. For
+the Core ML worker that difference prices Float32 pipe transfer, scheduling,
+framing, response JSON, and Rust-side handling instead of attributing the full
+short-utterance floor to IPC.
 It **does not** exercise:
 
 - `cpal` mic-capture callback latency
