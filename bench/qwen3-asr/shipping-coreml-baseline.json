@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "backend": "coreml-parakeet-unified-cpu-and-neural-engine",
+  "gold_manifest_sha256": "899857a4972bebe428835dd9d4aee4c4975e099e3c6f7a5408ce18d5b01c1435",
+  "source_report": "raw/shipping-coreml-gold.json",
+  "source_report_sha256": "a7aee1c6c9019245f18a04d1a3b8bfb771961fe5d6dcc7c4130bd53144b4d019",
+  "wer_percent": 5.434782608695652,
+  "cer_percent": 3.5714285714285716,
+  "categories": {
+    "commands": { "wer_percent": 12.195121951219512, "cer_percent": 8.5 },
+    "custom-vocabulary": { "wer_percent": 27.272727272727273, "cer_percent": 8.928571428571429 },
+    "general": { "wer_percent": 0.0, "cer_percent": 0.0 },
+    "long": { "wer_percent": 0.0, "cer_percent": 0.0 },
+    "noisy": { "wer_percent": 0.0, "cer_percent": 0.0 },
+    "numbers": { "wer_percent": 6.666666666666667, "cer_percent": 8.333333333333334 },
+    "proper-nouns": { "wer_percent": 3.5714285714285716, "cer_percent": 1.1363636363636365 },
+    "punctuation": { "wer_percent": 5.434782608695652, "cer_percent": 3.5714285714285716 }
+  }
+}

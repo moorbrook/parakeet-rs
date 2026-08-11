@@ -1610,6 +1610,49 @@ run again.
 
 ---
 
+## 0027 — Qwen3-ASR q8 Apple Silicon challenger
+
+**Status:** **Rejected — measured no-go; no production code added.**
+
+**Context.** Qwen3-ASR 0.6B offers multilingual offline/streaming recognition
+and quantized MLX conversions. Its q8 artifact could improve offline lexical
+quality while applying the same fixed-model/hardware-specialization thesis as
+ADR-0026, but the shipping app cannot add Python and no reviewed native Rust or
+Core ML implementation exists.
+
+**Decision.** Retain native Core ML Parakeet Unified as the default and
+sherpa-onnx as the contextual-vocabulary/load-failure fallback. Treat q8 as the
+only default Qwen quantization candidate; reject q4 unless it wins quality as
+well as memory/latency. Do not fund a native Qwen port, package its weights, or
+expose it through the backend selector until a maintained native runtime passes
+the same per-category, real-boundary streaming, process-cold startup, latency,
+memory, immutable-artifact, signing, and fallback gates.
+
+**Evidence.** On M5 Pro, the pinned q8 MLX oracle measured 4.35% WER / 3.15%
+CER offline, 0.840 s corpus p50, 40.5× RTFx, 1.12 GiB peak RSS, and a 960 MiB
+weight artifact. It improved aggregate offline quality but was 1.86× slower and
+about 11.0× larger in resident memory than shipping Parakeet, while regressing
+the `noisy` and `numbers` category rows. q4 added only 17.2% throughput over q8
+and regressed WER to 6.52%; fp16 was 3.52× slower than q8.
+
+At actual 2-second model boundaries, q8 measured 23.91% WER / 21.01% CER under
+exact, unpaced 100 ms segmented, and jittered transport writes. The 14.225 s
+fixture was exact offline and 41.86% WER streaming. A native `mlx-rs` 0.25.3
+release spike bound
+the needed primitive ops but failed before linking because Xcode's separately
+downloaded Metal Toolchain was absent; the crate also raises the MSRV from 1.77
+to 1.82 and still requires a several-thousand-line architecture/tokenizer/
+cache/streaming port plus a separately packaged `mlx.metallib`.
+
+**Consequences.** No Qwen, MLX, Candle, Python, model download, runtime switch,
+or MSRV change enters the app. The PEP 723 oracle and losing measurements stay
+checked in for future comparison. Multilingual evaluation is deferred because
+the English product, streaming, latency, memory, and native-build gates already
+fail. Full evidence and the reopen conditions are in
+[`docs/asr/QWEN3_ASR_EVALUATION.md`](asr/QWEN3_ASR_EVALUATION.md).
+
+---
+
 ## Index of open decisions vs targets
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -1639,6 +1682,11 @@ run again.
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-08-11** — [ADR-0027](#0027--qwen3-asr-q8-apple-silicon-challenger)
+  added: pinned q8/q4/fp16 offline evidence, actual mid-chunk streaming
+  measurements, `mlx-rs`/Candle/Core ML feasibility and packaging analysis,
+  and a measured no-go that leaves the production backend unchanged.
 
 - **2026-08-11** — [ADR-0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans)
   added: bounded Core ML candidate tuning, short/long regime selection,

@@ -25,12 +25,12 @@ The optimized row uses FluidAudio commit
 
 | backend | decoding | WER | CER | load | first result | decode p50 | decode p95 | p50 RTFx | peak RSS | gate |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| FluidAudio Core ML | greedy, int8 CPU+ANE | **5.43%** | **3.57%** | **0.130 s** | **0.278 s** | **0.445 s** | **0.462 s** | **76.5×** | **0.10 GiB** | pass |
+| FluidAudio Core ML | greedy, int8 CPU+ANE | **5.43%** | **3.57%** | **0.168 s** | **0.321 s** | **0.452 s** | **0.470 s** | **75.4×** | **0.10 GiB** | pass |
 | sherpa-onnx | greedy, int8, Core ML requested | 10.87% | 5.46% | 3.647 s | 4.582 s | 2.764 s | 2.949 s | 12.3× | 4.25 GiB | fail |
 | sherpa-onnx | vocabulary, modified beam, score 2 | 10.87% | 5.46% | 3.717 s | 4.716 s | 3.126 s | 3.148 s | 10.9× | 4.26 GiB | fail |
 
-Core ML is 6.21× faster at corpus-decode p50 and 6.39× at p95 than the unbiased
-sherpa baseline. It reduces model load by 28.0×, first result by 16.5×, and
+Core ML is 6.12× faster at corpus-decode p50 and 6.28× at p95 than the unbiased
+sherpa baseline. It reduces model load by 21.8×, first result by 14.3×, and
 observed peak RSS by about 41.5×. The vocabulary row did not change any gold
 transcript and was 13.1% slower than sherpa greedy at p50.
 
@@ -115,3 +115,33 @@ scripts/build-coreml-worker.sh
 cargo run --release --locked --bin tune_asr -- \
   --repetitions 10 --load-repetitions 3
 ```
+
+## Qwen3-ASR 0.6B challenger — 2026-08-11
+
+Developer-only MLX oracle at commit
+`d1a035514e1d6ac31da7658b273482656eacba61`, cached immutable weights, one
+warmup, and ten measured runs over the same gold corpus:
+
+| precision | WER / CER | corpus p50 / p95 | RTFx | peak RSS | weights | decision |
+|---|---:|---:|---:|---:|---:|---|
+| q8 | **4.35% / 3.15%** | 0.840 / 0.843 s | 40.5× | 1.12 GiB | 960 MiB | offline aggregate win; production fail |
+| q4 | 6.52% / 3.36% | **0.717 / 0.722 s** | **47.5×** | **0.84 GiB** | **676 MiB** | quality loss vs q8 |
+| fp16 | 5.43% / 3.57% | 2.961 / 2.974 s | 11.5× | 1.94 GiB | 1.75 GiB | dominated by q8 |
+
+The Qwen WAVs are preloaded/resampled before timing, a conservative advantage
+against shipping Core ML's resample-plus-inference row. Even so, q8 is 1.86×
+slower at corpus p50 and uses about 11.0× its measured resident memory. It also
+regresses the shipping `noisy` and `numbers` category rows, so the better
+aggregate offline WER does not clear the existing no-category-regression gate.
+
+Actual q8 streaming over exact 2 s, unpaced 100 ms segmented, and jittered
+transport writes was repeated ten times. Every schedule produced the same
+final output at 12 model boundaries per repetition, with zero nondeterministic
+outputs. These synchronous schedules test segmentation, not real-time queueing.
+All fixtures ended mid-model-chunk. Every schedule measured **23.91% WER /
+21.01% CER**;
+the 14.225 s fixture rose from 0% offline WER to 41.86% streaming WER. Qwen is
+therefore rejected as a production backend. Full artifact identities,
+per-category rows, native-build evidence, replay commands, and packaging
+analysis are in [`QWEN3_ASR_EVALUATION.md`](QWEN3_ASR_EVALUATION.md). The raw
+reports and machine-verifiable summary are under `bench/qwen3-asr/`.

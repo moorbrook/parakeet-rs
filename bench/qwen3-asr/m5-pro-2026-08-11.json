@@ -1,0 +1,302 @@
+{
+  "schema_version": 1,
+  "measured_at": "2026-08-11",
+  "hardware": {
+    "chip": "Apple M5 Pro",
+    "memory_bytes": 25769803776,
+    "logical_cpus": 15,
+    "architecture": "arm64",
+    "macos_version": "26.5.1"
+  },
+  "corpus": {
+    "manifest": "bench/gold/manifest.json",
+    "manifest_sha256": "899857a4972bebe428835dd9d4aee4c4975e099e3c6f7a5408ce18d5b01c1435",
+    "audio_dir": "bench/gold/audio",
+    "sources": "bench/gold/sources.json",
+    "sources_sha256": "a0a5f1fb4cc373375ba0f42dfefd7e3546a4234686548cba372c4fb176768126",
+    "audio_artifact_sha256": "1abd8c9b4a8a85b7be02fed49480c9d6e7455372419f2d72567689df0275987d",
+    "fixtures": 7,
+    "audio_seconds": 34.0495625,
+    "reference_words": 92,
+    "reference_chars": 476,
+    "timing_boundary": "WAV decode and 16 kHz resampling occur before timed Qwen inference"
+  },
+  "reference_runtime": {
+    "repository": "https://github.com/moona3k/mlx-qwen3-asr",
+    "commit": "d1a035514e1d6ac31da7658b273482656eacba61",
+    "role": "developer-only oracle; not shipped"
+  },
+  "oracle_environment": {
+    "python": "3.14.2",
+    "uv": "0.12.3",
+    "distributions": {
+      "mlx-qwen3-asr": "0.3.5",
+      "mlx": "0.32.0",
+      "numpy": "2.5.2",
+      "regex": "2026.7.19",
+      "huggingface-hub": "1.27.0"
+    }
+  },
+  "audio_runtime": {
+    "executable": "/opt/homebrew/Cellar/ffmpeg/8.1.2_1/bin/ffmpeg",
+    "version": "ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers",
+    "sha256": "1332dc2de372bade9a8a63da0d6cdfab9de97fcefbae707bcc0b0506e1203327"
+  },
+  "quality_baseline": {
+    "path": "bench/qwen3-asr/shipping-coreml-baseline.json",
+    "sha256": "640a148b49b6c3a814813beba7e77c1eff46251e16460f05f2bd02f5d74ab63a"
+  },
+  "shipping_coreml": {
+    "load_seconds": 0.167673875,
+    "first_result_seconds": 0.32136125,
+    "corpus_wall_p50_seconds": 0.45187362655997276,
+    "corpus_wall_p95_seconds": 0.4699025899171829,
+    "rtfx_p50": 75.35195888787221,
+    "peak_rss_bytes": 109740032,
+    "wer_percent": 5.434782608695652,
+    "cer_percent": 3.5714285714285716,
+    "nondeterministic_outputs": 0
+  },
+  "source_reports": {
+    "shipping_coreml_gold": {
+      "path": "bench/qwen3-asr/raw/shipping-coreml-gold.json",
+      "sha256": "a7aee1c6c9019245f18a04d1a3b8bfb771961fe5d6dcc7c4130bd53144b4d019"
+    },
+    "q8_offline": {
+      "path": "bench/qwen3-asr/raw/q8-offline.json",
+      "sha256": "a1223b27e1fb1acc4967242bac2c88f4bd9297f357440f6cd1631c06f62274d8"
+    },
+    "q4_offline": {
+      "path": "bench/qwen3-asr/raw/q4-offline.json",
+      "sha256": "b0f90f511a57d42b8e69f62b0f7ebeb759bf66309c0cc0f3d8e26dd474efadea"
+    },
+    "fp16_offline": {
+      "path": "bench/qwen3-asr/raw/fp16-offline.json",
+      "sha256": "a61937173fd1dc2982ef554f6a7c09500ba950d494c29fee35f10058813cedb4"
+    },
+    "q8_streaming": {
+      "path": "bench/qwen3-asr/raw/q8-streaming.json",
+      "sha256": "667f63de2ad27677f957c6dc92a49efe58d5e6f68ea74eb5b9786eb9e4e1684a"
+    }
+  },
+  "artifacts": [
+    {
+      "name": "q8",
+      "model": "mlx-community/Qwen3-ASR-0.6B-8bit",
+      "snapshot": "89e96d92ba34aca20b3e29fb10cc284097d1219f",
+      "weight_bytes": 1006229426,
+      "weight_sha256": "b5bfe4abc1b4c6e58b633096682ec2b6297298add1527119936107d211adf0e8",
+      "artifact_sha256": "901975e84de875144dabd3a64655ed8f7335562626f816e68409bd61c50f278a"
+    },
+    {
+      "name": "q4",
+      "model": "mlx-community/Qwen3-ASR-0.6B-4bit",
+      "snapshot": "313d850181767edf09f00a9c289becca70e58cd0",
+      "weight_bytes": 708236945,
+      "weight_sha256": "70c7e67e588062adce4f10796e47ad42ead51c6671eda61a0987eae38ca95ddf",
+      "artifact_sha256": "6a4eb8cb3beb9b61610ba0b4e3e1411279dcde22cd38cd9dfb877c56668c3690"
+    },
+    {
+      "name": "fp16",
+      "model": "Qwen/Qwen3-ASR-0.6B",
+      "snapshot": "5eb144179a02acc5e5ba31e748d22b0cf3e303b0",
+      "weight_bytes": 1876091704,
+      "weight_sha256": "79d6cbd4c98c7bbffe9db2edac07f56cd6637d0d5944b27f6c2b8353840323ea",
+      "artifact_sha256": "f875aed4bba9e00f466773ed70bf08db6b3ceecdf59b5877d269e9da5ae2dcea"
+    }
+  ],
+  "offline": [
+    {
+      "name": "q8",
+      "repetitions": 10,
+      "load_seconds": 0.11868958408012986,
+      "warmup_seconds": 0.11011583299841732,
+      "corpus_wall_p50_seconds": 0.8404649579897523,
+      "corpus_wall_p95_seconds": 0.8429775409167632,
+      "rtfx_p50": 40.51276876723177,
+      "peak_rss_bytes": 1201995776,
+      "wer_percent": 4.3478260869565215,
+      "cer_percent": 3.1512605042016806,
+      "nondeterministic_outputs": 0,
+      "categories": {
+        "commands": { "wer_percent": 9.75609756097561, "cer_percent": 7.5 },
+        "custom-vocabulary": { "wer_percent": 9.090909090909092, "cer_percent": 3.5714285714285716 },
+        "general": { "wer_percent": 0.0, "cer_percent": 0.0 },
+        "long": { "wer_percent": 0.0, "cer_percent": 0.0 },
+        "noisy": { "wer_percent": 9.090909090909092, "cer_percent": 3.7037037037037037 },
+        "numbers": { "wer_percent": 10.0, "cer_percent": 9.027777777777779 },
+        "proper-nouns": { "wer_percent": 2.380952380952381, "cer_percent": 0.9090909090909091 },
+        "punctuation": { "wer_percent": 4.3478260869565215, "cer_percent": 3.1512605042016806 }
+      }
+    },
+    {
+      "name": "q4",
+      "repetitions": 10,
+      "load_seconds": 0.09553891699761152,
+      "warmup_seconds": 0.09281474992167205,
+      "corpus_wall_p50_seconds": 0.7170892499852926,
+      "corpus_wall_p95_seconds": 0.7223992500221357,
+      "rtfx_p50": 47.48301902545374,
+      "peak_rss_bytes": 904019968,
+      "wer_percent": 6.521739130434782,
+      "cer_percent": 3.361344537815126,
+      "nondeterministic_outputs": 0,
+      "categories": {
+        "commands": { "wer_percent": 14.634146341463415, "cer_percent": 8.0 },
+        "custom-vocabulary": { "wer_percent": 9.090909090909092, "cer_percent": 3.5714285714285716 },
+        "general": { "wer_percent": 0.0, "cer_percent": 0.0 },
+        "long": { "wer_percent": 0.0, "cer_percent": 0.0 },
+        "noisy": { "wer_percent": 9.090909090909092, "cer_percent": 3.7037037037037037 },
+        "numbers": { "wer_percent": 16.666666666666668, "cer_percent": 9.722222222222221 },
+        "proper-nouns": { "wer_percent": 2.380952380952381, "cer_percent": 0.9090909090909091 },
+        "punctuation": { "wer_percent": 6.521739130434782, "cer_percent": 3.361344537815126 }
+      }
+    },
+    {
+      "name": "fp16",
+      "repetitions": 10,
+      "load_seconds": 0.20514829107560217,
+      "warmup_seconds": 0.45268008310813457,
+      "corpus_wall_p50_seconds": 2.96135429199785,
+      "corpus_wall_p95_seconds": 2.974178583943285,
+      "rtfx_p50": 11.497969895736043,
+      "peak_rss_bytes": 2078081024,
+      "wer_percent": 5.434782608695652,
+      "cer_percent": 3.5714285714285716,
+      "nondeterministic_outputs": 0,
+      "categories": {
+        "commands": { "wer_percent": 12.195121951219512, "cer_percent": 8.5 },
+        "custom-vocabulary": { "wer_percent": 18.181818181818183, "cer_percent": 7.142857142857143 },
+        "general": { "wer_percent": 0.0, "cer_percent": 0.0 },
+        "long": { "wer_percent": 0.0, "cer_percent": 0.0 },
+        "noisy": { "wer_percent": 9.090909090909092, "cer_percent": 3.7037037037037037 },
+        "numbers": { "wer_percent": 10.0, "cer_percent": 9.027777777777779 },
+        "proper-nouns": { "wer_percent": 3.5714285714285716, "cer_percent": 1.3636363636363635 },
+        "punctuation": { "wer_percent": 5.434782608695652, "cer_percent": 3.5714285714285716 }
+      }
+    }
+  ],
+  "streaming_q8": {
+    "model_chunk_seconds": 2.0,
+    "repetitions": 10,
+    "tail_refine_enabled": true,
+    "tail_refine_tokenizer_binding": "verified-session",
+    "all_fixtures_end_mid_chunk": true,
+    "streaming_peak_rss_bytes": 1266958336,
+    "post_reference_peak_rss_bytes": 1267318784,
+    "schedules": [
+      {
+        "name": "exact-2s",
+        "transport_chunk_seconds": [2.0],
+        "boundary_events_min": 12,
+        "boundary_events_max": 12,
+        "wer_percent": 23.91304347826087,
+        "cer_percent": 21.008403361344538,
+        "offline_mismatch_fixtures": 2,
+        "nondeterministic_outputs": 0,
+        "corpus_wall_p50_seconds": 1.8557625839021057,
+        "corpus_wall_p95_seconds": 1.858265334740281,
+        "finalize_wall_p50_seconds": 0.9848241680301726,
+        "finalize_wall_p95_seconds": 0.9900205818703398
+      },
+      {
+        "name": "segmented-100ms",
+        "transport_chunk_seconds": [0.1],
+        "boundary_events_min": 12,
+        "boundary_events_max": 12,
+        "wer_percent": 23.91304347826087,
+        "cer_percent": 21.008403361344538,
+        "offline_mismatch_fixtures": 2,
+        "nondeterministic_outputs": 0,
+        "corpus_wall_p50_seconds": 1.8597369680646807,
+        "corpus_wall_p95_seconds": 1.8657691254047677,
+        "finalize_wall_p50_seconds": 0.9848002928774804,
+        "finalize_wall_p95_seconds": 0.991197791066952
+      },
+      {
+        "name": "jittered",
+        "transport_chunk_seconds": [0.37, 0.83, 1.41, 0.29, 2.17, 0.53],
+        "boundary_events_min": 12,
+        "boundary_events_max": 12,
+        "wer_percent": 23.91304347826087,
+        "cer_percent": 21.008403361344538,
+        "offline_mismatch_fixtures": 2,
+        "nondeterministic_outputs": 0,
+        "corpus_wall_p50_seconds": 1.8537702086614445,
+        "corpus_wall_p95_seconds": 1.8580464537953958,
+        "finalize_wall_p50_seconds": 0.9849204582860693,
+        "finalize_wall_p95_seconds": 0.9874641668284312
+      }
+    ],
+    "failures": [
+      {
+        "file": "librispeech-multi-6930-75918-0001-48000.wav",
+        "audio_seconds": 14.225,
+        "pending_tail_seconds": 0.225,
+        "offline_wer_percent": 0.0,
+        "streaming_wer_percent": 41.86046511627907,
+        "observed": "middle spans were omitted and an earlier phrase was repeated"
+      },
+      {
+        "file": "slurp-alarm-seven-thirty-close-1497886326-48000.wav",
+        "audio_seconds": 3.968,
+        "pending_tail_seconds": 1.968,
+        "offline_text": "Please wake me up at 7:30 AM.",
+        "streaming_text": "Please wake me up at seven. hundred."
+      }
+    ]
+  },
+  "native_bridge_spike": {
+    "crate": "mlx-rs",
+    "crate_version": "0.25.3",
+    "repository_commit": "93ed8db7255cdc0d3f9a890aa0b3ad40c50d1eaf",
+    "license": "MIT OR Apache-2.0",
+    "crate_msrv": "1.82.0",
+    "repository_msrv": "1.77",
+    "bundled_mlx_version": "0.25.1",
+    "required_ops_bound": [
+      "conv2d",
+      "quantized_matmul",
+      "scaled_dot_product_attention",
+      "RoPE",
+      "RMSNorm",
+      "safetensors"
+    ],
+    "default_release_build": {
+      "status": "failed",
+      "wall_seconds_to_failure": 15.11,
+      "peak_rss_bytes": 428883968,
+      "partial_target_bytes": 390070272,
+      "error": "xcrun metal cannot execute because Xcode MetalToolchain is uninstalled"
+    },
+    "default_features_false_attempt": {
+      "status": "failed",
+      "wall_seconds_to_failure": 46.57,
+      "reason": "mlx-rs enables mlx-sys default features at its dependency edge, so downstream default-features=false does not disable MLX-C Metal compilation"
+    },
+    "baseline_release_build": {
+      "wall_seconds": 0.14,
+      "binary_bytes": 431216,
+      "target_bytes": 901120
+    },
+    "completed_binary_bytes": null,
+    "distribution_notes": [
+      "MLX and MLX-C are built as static libraries",
+      "mlx.metallib is a separate runtime asset that must be placed where MLX can find it and included before code signing",
+      "a native port still requires Qwen3-ASR model, tokenizer, generation, cache, and streaming logic"
+    ],
+    "reference_python_runtime_lines": 8982,
+    "reference_python_test_lines": 10189
+  },
+  "decision": {
+    "result": "no-go",
+    "production_backend_changed": false,
+    "multilingual_fixtures_run": false,
+    "multilingual_reason": "English, streaming, latency, memory, and native-build gates already fail; the current product baseline is English",
+    "reconsider_when": [
+      "a native Apple Silicon implementation is maintained and builds in the pinned toolchain",
+      "streaming matches offline quality on long and mid-chunk utterances",
+      "q8 clears per-category quality, latency, and memory gates against shipping Parakeet"
+    ]
+  }
+}
