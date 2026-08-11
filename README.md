@@ -56,8 +56,10 @@ PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
    immutable revisions and SHA-256 verified before use; unchanged files use a
    local metadata cache on later launches. Menu bar status text shows setup
    progress.
-3. Press `⌘⇧Space` (default hotkey), speak. **Tap mode** auto-stops at
-   end-of-speech; **Hold mode** stops on release.
+3. Press `⌘⇧Space` (default hotkey), speak. **Tap mode** waits through natural
+   clause and sentence pauses before auto-stopping. **Tap Fast** preserves the
+   original 150 ms stop window for short commands where latency matters more
+   than pause tolerance. **Hold mode** stops on release.
 
 While listening, a large-display HUD shows an animated pastel-iridescent
 waveform on a 70%-alpha glass panel. macOS 26 and later use

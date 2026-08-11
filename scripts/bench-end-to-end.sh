@@ -32,6 +32,7 @@ echo "Baseline: sherpa + serial endpoint ($REPS measured repetitions)"
 RUST_LOG=info ./target/release/bench_e2e \
     --backend sherpa \
     --strategy serial \
+    --endpoint-policy fast \
     --device "$DEVICE" \
     --wav "$WAV" \
     --expected "$EXPECTED" \
@@ -43,6 +44,7 @@ echo "Optimized: Core ML + speculative decode ($REPS measured repetitions)"
 RUST_LOG=info ./target/release/bench_e2e \
     --backend coreml-unified \
     --strategy speculative \
+    --endpoint-policy fast \
     --device "$DEVICE" \
     --wav "$WAV" \
     --expected "$EXPECTED" \

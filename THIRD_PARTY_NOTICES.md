@@ -20,3 +20,16 @@ application.
 - Based on NVIDIA Parakeet
 - Model license: Creative Commons Attribution 4.0 International
   (<https://creativecommons.org/licenses/by/4.0/>)
+
+## LibriSpeech endpoint regression fixtures
+
+The two human-speech WAV files under `bench/endpointing/` come from the
+LibriSpeech `test.clean` split (OpenSLR SLR12), prepared by Vassil Panayotov,
+Guoguo Chen, Daniel Povey, and Sanjeev Khudanpur from LibriVox recordings.
+They are test assets only and are not bundled in Parakeet.app.
+
+- Corpus: <https://www.openslr.org/12>
+- Mirror and exact source revision: <https://huggingface.co/datasets/openslr/librispeech_asr/tree/71cacbfb7e2354c4226d01e70d77d5fca3d04ba1>
+- Source utterance IDs: `6930-75918-0000`, `6930-75918-0001`
+- License: Creative Commons Attribution 4.0 International
+  (<https://creativecommons.org/licenses/by/4.0/>)

@@ -126,10 +126,10 @@ impl App {
     pub fn on_hotkey_press(self: &Arc<Self>) {
         let mode = effective_trigger_mode(&self.settings.load());
         match mode {
-            TriggerMode::Tap => match self.fsm.on_press_tap() {
+            TriggerMode::Tap | TriggerMode::TapFast => match self.fsm.on_press_tap() {
                 TapPressOutcome::ClaimedListening => {
                     self.announce_state(DictationState::Listening);
-                    self.start_session(StreamerMode::VadAutoStop);
+                    self.start_session(StreamerMode::VadAutoStop, mode.endpoint_policy());
                 }
                 TapPressOutcome::CancelledLive | TapPressOutcome::QueuedCancel => {
                     // The FSM already routed the cancel; nothing
@@ -143,7 +143,7 @@ impl App {
             TriggerMode::Hold => match self.fsm.on_press_hold() {
                 HoldPressOutcome::ClaimedListening => {
                     self.announce_state(DictationState::Listening);
-                    self.start_session(StreamerMode::Manual);
+                    self.start_session(StreamerMode::Manual, mode.endpoint_policy());
                 }
                 HoldPressOutcome::Ignored(state) => {
                     log::debug!("hotkey press ignored from state {state:?}");
@@ -180,7 +180,11 @@ impl App {
     /// `pending_terminate` by `on_hotkey_press` / `on_hotkey_release`
     /// when the session slot is empty, and drained here as soon as
     /// the slot is populated.
-    fn start_session(self: &Arc<Self>, mode: StreamerMode) {
+    fn start_session(
+        self: &Arc<Self>,
+        mode: StreamerMode,
+        endpoint_policy: crate::endpointing::EndpointPolicy,
+    ) {
         let next = self.resting_state();
         if matches!(next, DictationState::ModelLoading) {
             // Defensive: a press got past `try_claim_listening` even
@@ -195,7 +199,7 @@ impl App {
         }
         let vad_path = self.settings.vad_path();
         self.spawn_supervised("session-starter", move |app| {
-            app.start_session_blocking(mode, vad_path);
+            app.start_session_blocking(mode, endpoint_policy, vad_path);
         });
     }
 
@@ -203,7 +207,12 @@ impl App {
     /// `session-starter` worker; never call from the AppKit main
     /// thread or the CGEventTap callback — `streamer::start` opens
     /// the mic and loads Silero VAD (~100-300 ms cold).
-    fn start_session_blocking(self: Arc<Self>, mode: StreamerMode, vad_path: std::path::PathBuf) {
+    fn start_session_blocking(
+        self: Arc<Self>,
+        mode: StreamerMode,
+        endpoint_policy: crate::endpointing::EndpointPolicy,
+        vad_path: std::path::PathBuf,
+    ) {
         let Some(asr) = self.asr.lock().clone() else {
             log::error!("start session failed: recognizer unavailable");
             let next = self.resting_state();
@@ -211,7 +220,7 @@ impl App {
             self.announce_state(next);
             return;
         };
-        let (session, outcome_rx) = match streamer::start(&vad_path, mode, asr) {
+        let (session, outcome_rx) = match streamer::start(&vad_path, mode, asr, endpoint_policy) {
             Ok(pair) => pair,
             Err(e) => {
                 log::error!("start session failed: {e:#}");
@@ -1393,5 +1402,7 @@ mod tests {
         assert_eq!(effective_trigger_mode(&s), TriggerMode::Hold);
         s.trigger_mode = TriggerMode::Tap;
         assert_eq!(effective_trigger_mode(&s), TriggerMode::Tap);
+        s.trigger_mode = TriggerMode::TapFast;
+        assert_eq!(effective_trigger_mode(&s), TriggerMode::TapFast);
     }
 }

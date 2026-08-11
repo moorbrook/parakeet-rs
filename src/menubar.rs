@@ -61,7 +61,7 @@ define_class!(
                         // second press cancels; in Hold mode the
                         // release edge finalizes.
                         DictationState::Listening => match mode {
-                            TriggerMode::Tap => app.on_hotkey_press(),
+                            TriggerMode::Tap | TriggerMode::TapFast => app.on_hotkey_press(),
                             TriggerMode::Hold => app.on_hotkey_release(),
                         },
                         // Click while post-processing: ignore. A new
@@ -255,11 +255,12 @@ fn refresh_on_main(
         };
 
         let mode_verb = match trigger_mode {
-            TriggerMode::Tap => "Start",
+            TriggerMode::Tap | TriggerMode::TapFast => "Start",
             TriggerMode::Hold => "Hold",
         };
         let mode_label = match trigger_mode {
-            TriggerMode::Tap => "Mode: Tap (VAD auto-stop)".to_string(),
+            TriggerMode::Tap => "Mode: Tap (pause-friendly auto-stop)".to_string(),
+            TriggerMode::TapFast => "Mode: Tap Fast (150 ms auto-stop)".to_string(),
             TriggerMode::Hold => "Mode: Hold (release to paste)".to_string(),
         };
         let (symbol, header_label, toggle_label, toggle_enabled) = match state {

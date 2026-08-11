@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "source": {
+    "dataset": "OpenSLR SLR12 / LibriSpeech ASR corpus",
+    "dataset_url": "https://www.openslr.org/12",
+    "hugging_face_mirror": "openslr/librispeech_asr",
+    "mirror_revision": "71cacbfb7e2354c4226d01e70d77d5fca3d04ba1",
+    "config": "clean",
+    "split": "test",
+    "license": "CC BY 4.0"
+  },
+  "thresholds": {
+    "max_false_stops": 0,
+    "max_final_pause_p95_ms": 1000
+  },
+  "fixtures": [
+    {
+      "name": "single_sentence",
+      "file": "librispeech-single-6930-75918-0000-48000.wav",
+      "source_id": "6930-75918-0000",
+      "source_row": 0,
+      "duration_seconds": 3.505,
+      "reference": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS",
+      "source_sha256": "103c3f15eb3715ebc6243d142244128a3ac39b6bfae315baa6b8dc4a8be14aa8",
+      "sha256": "89deae6d4161c79ca53b67f52655816eccf1b82a8eb8e0eb71af73e5d9cc1df8"
+    },
+    {
+      "name": "multi_sentence",
+      "file": "librispeech-multi-6930-75918-0001-48000.wav",
+      "source_id": "6930-75918-0001",
+      "source_row": 1,
+      "duration_seconds": 14.225,
+      "reference": "THE ENGLISH FORWARDED TO THE FRENCH BASKETS OF FLOWERS OF WHICH THEY HAD MADE A PLENTIFUL PROVISION TO GREET THE ARRIVAL OF THE YOUNG PRINCESS THE FRENCH IN RETURN INVITED THE ENGLISH TO A SUPPER WHICH WAS TO BE GIVEN THE NEXT DAY",
+      "source_sha256": "7a0c28ad2cca523cd7e7d72e360a3f314eeb905688358dbf6f150c0a87b87f76",
+      "sha256": "bc56fd4d8f36350323fa2e8805376903d97439e3b316596af02609448f40b6eb"
+    }
+  ]
+}
