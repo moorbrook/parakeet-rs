@@ -1352,12 +1352,78 @@ specialized spawn/load and use sherpa.
 
 ---
 
+## 0023 — Speculative decode behind an unchanged endpoint authority
+
+**Status:** **Accepted — implemented and measured.**
+
+**Context.** ADR-0022 made five-second recognition 5.48× faster, but the live
+pipeline remained serial: wait for Silero to confirm trailing silence, stop
+capture, then start ASR. Adding the nominal 150 ms endpoint delay to both
+backends reduced the projected end-to-end gain below the requested 3×. The
+projection was also too weak to support a user-facing latency claim because it
+excluded live Core Audio capture, resampling, session shutdown, and the actual
+runtime interaction between VAD and inference.
+
+**Decision.** Run two independent Silero states over each 32 ms frame:
+
+1. A candidate state with 32 ms minimum speech/silence starts a provisional
+   decode. Any resumed speech invalidates its transcript, including a resumed
+   word as short as one VAD frame.
+2. A confirming state retains the previous 150 ms configuration and is the
+   only state allowed to stop capture. The candidate state cannot shorten the
+   existing cutoff-safety policy.
+
+Audio capture continues on its real-time thread during provisional inference.
+The VAD watcher catches up from its channel after inference, commits the early
+transcript only when the confirming state ends the session, and otherwise runs
+the existing final decode fallback. Model load and Core ML compilation remain
+outside the per-dictation path through ADR-0022's resident worker.
+
+`PhaseTimer` now records a true `dur_end_to_end_ms` from the estimated acoustic
+endpoint rather than calling confirmation-to-paste `dur_post_endpoint_ms`
+user-facing. The deterministic harness selects the installed `BlackHole 2ch`
+device directly, without mutating system defaults, and overrides that estimate
+with Core Audio's predicted playback instant for the fixture's last non-silent
+sample. It exercises production capture, resampling, VAD, endpoint, shutdown,
+and ASR. It stops at transcript-ready so it cannot type into the user's focused
+application; ADR-0019's synchronous Unicode event post is the only excluded
+sub-ms step.
+
+**Evidence.** M5 Pro, 24 GB, release build, `5s_48000.wav` (4.854 s), two
+warmups, 30 measured repetitions per variant, exact lexical transcript checked
+on every repetition:
+
+| pipeline | mean | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| frozen sherpa + serial ASR | 613.6 ms | 613.0 ms | 652.5 ms | 657.3 ms |
+| Core ML + speculative ASR | 189.7 ms | 182.0 ms | 203.0 ms | 203.0 ms |
+| speedup | **3.23×** | **3.37×** | **3.21×** | **3.24×** |
+
+The optimized range was 181–203 ms versus 569–659 ms for the baseline. The
+existing five-file offline quality gate also passed at 2.38% WER / 2.22% CER.
+The endpoint tracker unit tests prove that silence before speech cannot stop a
+session, a provisional candidate cannot locally confirm before five frames,
+and resumed speech invalidates it.
+
+**Consequence.** The requested end-of-speech gain is above 3× at both p50 and
+p95 without relaxing the existing stop authority. The early detector may run
+more than one decode during a long utterance with internal pauses; those
+results are discarded and affect energy use, not visible text.
+
+The 10 s and 20 s macOS `say` fixtures include long pauses that the unchanged
+150 ms confirming detector already treats as final. That is a pre-existing
+multi-sentence endpoint-policy limitation, not a speculative-decode
+regression, and remains separate from this representative five-second latency
+gate.
+
+---
+
 ## Index of open decisions vs targets
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
 |---|---|---|---|
 | **CoreML EP actually present** | [0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage) + [0015](#0015-coreml-ep-verification-protocol) | **Shipped + measured** — 7.8x RTFx on the warmup decode confirms ANE/GPU is engaged | nothing |
-| <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped + measured** — 67 ms ASR p50 on the 5 s bucket; about 217 ms including the 150 ms VAD hangover | nothing |
+| <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) | **Shipped + measured** — 182.0 ms end-of-speech-to-transcript-ready p50 on the representative 5 s bucket, 3.37× faster than the matched serial baseline | nothing |
 | Live partial transcripts | [0009](#0009-streaming-recognition--vad-auto-stop) | Proposed | switch to streaming Parakeet model |
 | ANE confirmed in use | [0015](#0015-coreml-ep-verification-protocol) | **All three layers green** — layer 1 nm-check, layer 2 init log, layer 3 measured 7.8x RTFx | nothing |
 | ≤1.2 GB resident set | [0014](#0014-tray-only-headless-ux) + [ADR-0006](#0006-apple-silicon-optimization-plan-ds4-playbook-applied) mmap | Tray-only shipped, mmap shipped; lazy webview still Proposed | nothing |
@@ -1365,9 +1431,7 @@ specialized spawn/load and use sherpa.
 | Clipboard not clobbered | [0011](#0011-direct-accessibility-text-injection) | **Deferred to v2** | not in v1 scope |
 | Custom vocabulary | [0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped** — non-empty vocabulary selects the sherpa biasing backend | native Unified biasing remains future work |
 
-**Critical path to ADR-0007 latency claim (gated by
-[ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation)
-time-boxed spike):**
+**Completed path to the ADR-0007 latency claim:**
 1. **Spike: [ADR-0012](#0012-self-built-sherpa-onnx-with-coreml-ep)** —
    self-build sherpa-onnx with CoreML EP (vendored submodule). ≤ 4 hours.
    Pivot to SwiftUI if it doesn't land cleanly (see
@@ -1376,13 +1440,17 @@ time-boxed spike):**
    runtime EP checks; confirm ANE is actually engaged.
 3. [ADR-0009](#0009-streaming-recognition--vad-auto-stop) — streaming +
    Silero VAD with 150 ms threshold.
-4. Measure end-of-speech → text latency on real utterances; only then
-   update [ADR-0007](#0007-performance-targets) "Today (baseline)" column
-   with the post-optimization number.
+4. [ADR-0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority)
+   — measure the production capture path and clear the 3× matched p50/p95 gate.
 
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-08-10** — [ADR-0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority)
+  added: dual-VAD speculative decode with the original confirmer retained as
+  stop authority, true acoustic-end timing, deterministic BlackHole replay,
+  and a passing 30-repetition 3.37× p50 / 3.21× p95 end-to-end gate.
 
 - **2026-08-10** — [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend)
   added: pinned resident FluidAudio worker, int8 Parakeet Unified CPU+ANE

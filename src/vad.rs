@@ -9,13 +9,17 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 
+use crate::endpointing::{CONFIRM_SILENCE_MS, SPECULATIVE_MIN_SILENCE_S};
+
 /// Silero operates at 16 kHz natively.
 pub const VAD_SAMPLE_RATE: i32 = 16_000;
 
-/// 150 ms of trailing silence ends a segment (matches ADR-0009 latency budget).
-pub const MIN_SILENCE_S: f32 = 0.150;
 /// Discard segments shorter than 200 ms — almost always a stray click / breath.
 pub const MIN_SPEECH_S: f32 = 0.200;
+/// Candidate-state resume detection should react within one VAD frame. The
+/// confirming detector still applies [`MIN_SPEECH_S`] before it can establish
+/// the initial speech segment or stop the recording.
+pub const CANDIDATE_MIN_SPEECH_S: f32 = SPECULATIVE_MIN_SILENCE_S;
 /// Hard cap so a microphone left hot can't grow an unbounded segment.
 pub const MAX_SPEECH_S: f32 = 30.0;
 /// Silero's expected window size, in samples at 16 kHz.
@@ -26,7 +30,30 @@ pub struct Vad {
 }
 
 impl Vad {
-    pub fn load(model: &Path, num_threads: i32) -> Result<Self> {
+    pub fn load_candidate(model: &Path, num_threads: i32) -> Result<Self> {
+        Self::load_with_durations(
+            model,
+            num_threads,
+            SPECULATIVE_MIN_SILENCE_S,
+            CANDIDATE_MIN_SPEECH_S,
+        )
+    }
+
+    pub fn load_confirming(model: &Path, num_threads: i32) -> Result<Self> {
+        Self::load_with_durations(
+            model,
+            num_threads,
+            CONFIRM_SILENCE_MS as f32 / 1_000.0,
+            MIN_SPEECH_S,
+        )
+    }
+
+    fn load_with_durations(
+        model: &Path,
+        num_threads: i32,
+        min_silence_duration: f32,
+        min_speech_duration: f32,
+    ) -> Result<Self> {
         if !model.exists() {
             return Err(anyhow!("silero VAD model missing: {}", model.display()));
         }
@@ -34,8 +61,11 @@ impl Vad {
             silero_vad: SileroVadModelConfig {
                 model: Some(model.to_string_lossy().into_owned()),
                 threshold: 0.5,
-                min_silence_duration: MIN_SILENCE_S,
-                min_speech_duration: MIN_SPEECH_S,
+                // The candidate state exposes an early edge for provisional
+                // decode. The separate confirming state retains the original
+                // 150 ms configuration and alone may stop capture.
+                min_silence_duration,
+                min_speech_duration,
                 window_size: WINDOW_SIZE,
                 max_speech_duration: MAX_SPEECH_S,
             },

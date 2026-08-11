@@ -38,8 +38,19 @@ impl AudioCapture {
     /// forwarded over `tap`; if the receiver is dropped the send fails silently
     /// and capture continues for the buffered-recording consumer.
     pub fn start_with_tap(tap: Sender<Vec<f32>>) -> Result<Self> {
+        Self::start_with_tap_on_device(tap, None)
+    }
+
+    /// Start capture on a specific Core Audio input device. Production passes
+    /// `None` and uses the system default; the end-to-end benchmark selects the
+    /// BlackHole loopback explicitly so it never mutates the user's defaults.
+    pub fn start_with_tap_on_device(
+        tap: Sender<Vec<f32>>,
+        device_name: Option<&str>,
+    ) -> Result<Self> {
         let (tx, rx) = channel::<Cmd>();
         let (ready_tx, ready_rx) = channel::<Result<(u32, u16)>>();
+        let device_name = device_name.map(str::to_owned);
 
         let join = std::thread::Builder::new()
             .name("audio-capture".into())
@@ -52,7 +63,7 @@ impl AudioCapture {
                 // mid-recording, blocking the realtime cpal callback.
                 let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
                 let (sample_rate, channels, stream) =
-                    match build_stream(buffer.clone(), tap.clone()) {
+                    match build_stream(buffer.clone(), tap.clone(), device_name.as_deref()) {
                         Ok(v) => v,
                         Err(e) => {
                             let _ = ready_tx.send(Err(e));
@@ -154,11 +165,19 @@ fn forward_samples(
 fn build_stream(
     buffer: Arc<Mutex<Vec<f32>>>,
     tap: Sender<Vec<f32>>,
+    device_name: Option<&str>,
 ) -> Result<(u32, u16, cpal::Stream)> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no default input device"))?;
+    let device = match device_name {
+        Some(name) => host
+            .input_devices()
+            .context("enumerating input devices")?
+            .find(|device| device.name().is_ok_and(|candidate| candidate == name))
+            .ok_or_else(|| anyhow!("input device not found: {name}"))?,
+        None => host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device"))?,
+    };
     let config = device
         .default_input_config()
         .context("default input config")?;

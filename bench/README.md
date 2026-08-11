@@ -55,6 +55,10 @@ OUT_CSV=bench/post-coreml-cache.csv \
 # Native int8 Parakeet Unified challenger (builds the pinned Swift worker):
 BACKEND=coreml-unified OUT_CSV=bench/coreml-unified.csv \
     scripts/bench-latency.sh
+
+# Production capture + VAD + ASR, frozen serial baseline vs optimized path.
+# Requires a duplex Core Audio loopback named "BlackHole 2ch".
+scripts/bench-end-to-end.sh
 ```
 
 ## What is and isn't measured
@@ -67,10 +71,46 @@ It **does not** exercise:
 - the `CGEventKeyboardSetUnicodeString` keystroke insertion step
   (sub-ms per chord — see ADR-0019)
 
-So the bench number is **ASR-only**. Real end-to-end is the bench number
-plus ~150 ms (VAD hangover; keystroke insertion is negligible), captured
-separately by the in-app PhaseTimer that emits the same `phase_timer`
-log line during live dictation.
+So `scripts/bench-latency.sh` is **ASR-only**. Use
+`scripts/bench-end-to-end.sh` for the production capture, resampling, dual-VAD,
+endpoint, session-shutdown, and ASR path. That harness stops at
+transcript-ready rather than typing into the user's focused app; the only
+excluded production step is the synchronous synthetic-Unicode event post
+(sub-ms per chord; see ADR-0019).
+
+## End-to-end 3x result: M5 Pro 24 GB (2026-08-10)
+
+The end-to-end harness selects `BlackHole 2ch` directly for both input and
+output without changing macOS defaults. It trims only sub-threshold trailing
+fixture silence, uses Core Audio's predicted playback timestamp for the last
+non-silent sample, and feeds the production `cpal` capture and `streamer` path.
+Both variants receive the same measurement-only acoustic endpoint marker.
+
+The representative fixture is `5s_48000.wav` (4.854 s measured). Release
+builds used two warmups and 30 measured repetitions per variant. Every
+measured transcript had an exact lexical match to the reviewed reference.
+
+| pipeline | n | mean | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| sherpa + serial endpoint | 30 | 613.6 ms | 613.0 ms | 652.5 ms | 657.3 ms |
+| Core ML + speculative decode | 30 | 189.7 ms | 182.0 ms | 203.0 ms | 203.0 ms |
+| speedup | | **3.23×** | **3.37×** | **3.21×** | **3.24×** |
+
+The optimized path starts ASR from the early 32 ms detector, discards the
+provisional result whenever speech resumes, and lets an independent Silero
+state with the original 150 ms configuration remain the sole stop authority.
+The gate fails unless both p50 and p95 are at least 3.0× and every transcript
+matches:
+
+```bash
+REPS=30 WARMUP_REPS=2 scripts/bench-end-to-end.sh
+```
+
+The longer synthesized fixtures contain pauses that already trigger the
+shipping 150 ms auto-stop policy; they are not valid end-to-end latency
+fixtures until the separate multi-sentence endpoint policy is redesigned.
+They remain in the offline five-file WER/CER gate, which passes at 2.38% WER
+and 2.22% CER.
 
 ## Native Core ML result: M5 Pro 24 GB (2026-08-10)
 
