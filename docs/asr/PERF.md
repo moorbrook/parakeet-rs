@@ -18,6 +18,10 @@ peak resident set of the Rust process plus any resident worker.
 
 Hardware: Apple M5 Pro, 24 GiB, 15 logical CPUs; macOS 26.5.1, arm64. Corpus:
 92 reference words / 476 reference characters across seven fixtures.
+The optimized row uses FluidAudio commit
+`00a9aa771900ea09c485659663be31019e293e47` and Core ML model revision
+`4252711f6f060f9a2f91e5f081a806d7f45eebd8`; the full artifact manifest is in
+[`COREML_MODEL.md`](COREML_MODEL.md).
 
 | backend | decoding | WER | CER | load | first result | decode p50 | decode p95 | p50 RTFx | peak RSS | gate |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
@@ -43,4 +47,34 @@ Replay:
 
 ```bash
 REPETITIONS=10 scripts/bench-gold.sh
+```
+
+## Core ML worker boundary — 2026-08-11
+
+The worker reports its own resample-plus-inference time. `bench_asr` measures
+the same call from the Rust side and records the non-negative difference as
+`boundary_ms`, covering Float32 pipe transfer, framing, process wakeup,
+response JSON, and Rust-side handling. Release build, three warmups and 30
+measured repetitions per generated 48 kHz bucket:
+
+| bucket | internal p50 | outer p50 | boundary p50 | boundary p95 |
+|---|---:|---:|---:|---:|
+| 1 s | 35.112 ms | 35.242 ms | **0.128 ms** | 0.143 ms |
+| 3 s | 49.965 ms | 50.231 ms | **0.260 ms** | 0.290 ms |
+| 5 s | 65.664 ms | 66.044 ms | **0.380 ms** | 0.397 ms |
+| 10 s | 88.856 ms | 89.480 ms | **0.581 ms** | 0.618 ms |
+| 20 s | 185.029 ms | 186.142 ms | **1.111 ms** | 1.209 ms |
+
+The earlier inference that roughly 30 ms of the one-second result was IPC was
+wrong: 99.6% of that outer p50 is worker-internal. Boundary time is 0.36% of
+the one-second call and 0.60% of the 20-second call. Shared memory, Mach ports,
+or moving the Core ML runtime in-process cannot materially improve current
+latency unless a future profile shows this balance has changed.
+
+Replay:
+
+```bash
+PARAKEET_COREML_MODEL_DIR="$HOME/Library/Application Support/com.parakeet.rs/models/coreml/parakeet-unified-en-0.6b" \
+  BACKEND=coreml-unified REPS=30 WARMUP_REPS=3 \
+  OUT_CSV=bench/coreml-unified.csv scripts/bench-latency.sh
 ```

@@ -106,7 +106,12 @@ done
 
 # Step 4 — aggregate to CSV.
 uv run --quiet scripts/bench-aggregate.py --log "$RAW_LOG" --out "$OUT_CSV"
+BOUNDARY_CSV="${OUT_CSV%.csv}-boundary.csv"
+uv run --quiet scripts/bench-boundary.py --log "$RAW_LOG" --out "$BOUNDARY_CSV"
 
 echo
 echo "Wrote $OUT_CSV"
 cat "$OUT_CSV"
+echo
+echo "Wrote $BOUNDARY_CSV"
+cat "$BOUNDARY_CSV"

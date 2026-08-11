@@ -51,11 +51,11 @@ PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
    required.
 2. The int8 Core ML model (~595 MB) and sherpa fallback/VAD bundle (~640 MB)
    download on first launch. They live under
-   `~/Library/Application Support/com.parakeet.rs/models/`; an existing
-   FluidAudio cache is reused. Rust-managed model downloads are pinned to
-   immutable revisions and SHA-256 verified before use; unchanged files use a
-   local metadata cache on later launches. Menu bar status text shows setup
-   progress.
+   `~/Library/Application Support/com.parakeet.rs/models/`. All model downloads,
+   including every file in the Core ML bundle, are pinned to immutable
+   revisions and SHA-256 verified before use. Existing verified files are
+   reused, and unchanged files use a local metadata cache on later launches.
+   Menu bar status text shows setup progress.
 3. Press `⌘⇧Space` (default hotkey), speak. **Tap mode** waits through natural
    clause and sentence pauses before auto-stopping. **Tap Fast** preserves the
    original 150 ms stop window for short commands where latency matters more
@@ -104,6 +104,10 @@ the current dictation finishes).
 A non-empty vocabulary selects the sherpa contextual-biasing backend. An empty
 vocabulary uses the faster Parakeet Unified Core ML backend. This makes the
 backend change explicit instead of silently dropping custom terms.
+
+For diagnosis or emergency rollback, `PARAKEET_ASR_BACKEND=sherpa` forces the
+fallback without changing vocabulary. Unset it or use `auto` to restore normal
+selection.
 
 Terms are validated against the model's token inventory, so a word the
 model can't represent (emoji, unusual scripts) is reported in the log

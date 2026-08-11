@@ -16,6 +16,7 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use parakeet_rs::asr::{Asr, AsrConfig};
 use parakeet_rs::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
@@ -256,12 +257,22 @@ fn run_one(
     // Combine the label with a unique counter so the timer log can be
     // grouped without collisions across runs.
     let sid = format!("{session_label}-{}", next_session_id());
-    let mut t = PhaseTimer::start(PhaseTimerMode::Bench, sid);
+    let mut t = PhaseTimer::start(PhaseTimerMode::Bench, sid.clone());
     // The WAV is already in hand; capture and VAD collapsed into t0.
     t.mark_capture_end(audio_s);
     t.mark_vad_endpoint();
     t.mark_asr_start();
-    let _decoded = asr.recognize(samples, sample_rate)?;
+    let wall_started = Instant::now();
+    let decoded = asr.recognize_with_metrics(samples, sample_rate)?;
+    let wall_seconds = wall_started.elapsed().as_secs_f64();
+    let internal_seconds = f64::from(decoded.decode_seconds);
+    let boundary_seconds = (wall_seconds - internal_seconds).max(0.0);
+    log::info!(
+        "asr_boundary session_id={sid} internal_ms={:.3} wall_ms={:.3} boundary_ms={:.3}",
+        internal_seconds * 1_000.0,
+        wall_seconds * 1_000.0,
+        boundary_seconds * 1_000.0
+    );
     t.mark_asr_done();
     // No paste in bench mode — mark it equal to asr_done so the
     // `dur_post_endpoint_ms` field cleanly reads as "ASR-only latency".
