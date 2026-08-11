@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Produce a complete, runnable Parakeet.app:
+#   0. Build native Core ML worker        — pinned FluidAudio Swift package
 #   1. `cargo bundle --release`           — scaffolds the .app skeleton
 #   2. Merge our Info.plist keys          — LSUIElement, mic + apple-events
 #                                           usage strings (cargo-bundle
@@ -19,6 +20,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/target/release/bundle/osx/Parakeet.app"
 BIN_SRC="$ROOT/target/release/parakeet-rs"
+WORKER_SRC="$ROOT/target/release/parakeet-coreml-worker"
 DYLIB_SRC="$ROOT/target/release"
 
 # --- 0. arm64-only architecture gate -------------------------------------
@@ -32,6 +34,13 @@ if [ -f "$BIN_SRC" ]; then
     echo "       parakeet-rs ships Apple Silicon only — see docs/ADR.md ADR-0002." >&2
     exit 1
   fi
+fi
+
+echo "0. build native Core ML worker"
+"$ROOT/scripts/build-coreml-worker.sh" >/dev/null
+if ! lipo -archs "$WORKER_SRC" | grep -qx arm64; then
+  echo "ERROR: $WORKER_SRC is not arm64-only (got: $(lipo -archs "$WORKER_SRC"))" >&2
+  exit 1
 fi
 # NOTE: there is no repo-root Info.plist; all custom keys are merged
 # into cargo-bundle's generated plist via PlistBuddy below.
@@ -81,8 +90,12 @@ add_key NSHumanReadableCopyright string "Copyright © 2026 parakeet-rs"
 # sherpa-onnx-sys copied them to target/release/ during the cargo build.
 # Put them in Contents/Frameworks/ where macOS expects bundled libraries.
 
-echo "3. copy dylibs into Contents/Frameworks"
+echo "3. copy worker, notices, and dylibs"
 mkdir -p "$APP/Contents/Frameworks"
+cp -f "$WORKER_SRC" "$APP/Contents/MacOS/parakeet-coreml-worker"
+mkdir -p "$APP/Contents/Resources/Licenses"
+cp -f "$ROOT/LICENSE-APACHE" "$APP/Contents/Resources/Licenses/LICENSE-APACHE"
+cp -f "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
 for lib in libsherpa-onnx-c-api.dylib libsherpa-onnx-cxx-api.dylib \
            libonnxruntime.dylib libonnxruntime.1.24.4.dylib; do
   if [ -f "$DYLIB_SRC/$lib" ]; then
@@ -174,6 +187,7 @@ for lib in "$APP"/Contents/Frameworks/*.dylib; do
   [ -f "$lib" ] && sign_one "$lib"
 done
 # Then the main executable.
+sign_one "$APP/Contents/MacOS/parakeet-coreml-worker"
 sign_one "$APP/Contents/MacOS/parakeet-rs"
 # Then the bundle as a whole — codesign requires this last step to seal
 # the Contents/_CodeSignature resource manifest.

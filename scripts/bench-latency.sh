@@ -19,6 +19,9 @@
 # Usage:
 #   scripts/bench-latency.sh                   # defaults
 #   REPS=50 scripts/bench-latency.sh           # more reps per length
+#   BACKEND=coreml-unified \
+#       OUT_CSV=bench/coreml-unified.csv \
+#       scripts/bench-latency.sh                # native Core ML challenger
 #   OUT_CSV=bench/post-coreml-cache.csv \
 #       scripts/bench-latency.sh               # name the output (for §2 re-bench)
 
@@ -35,6 +38,15 @@ LENGTHS=(1 3 5 10 20)
 WAV_DIR="bench/audio"
 RAW_LOG="bench/raw.log"
 OUT_CSV="${OUT_CSV:-bench/baseline.csv}"
+BACKEND="${BACKEND:-sherpa}"
+
+case "$BACKEND" in
+    sherpa|coreml-unified) ;;
+    *)
+        echo "unknown BACKEND=$BACKEND (expected sherpa or coreml-unified)" >&2
+        exit 2
+        ;;
+esac
 
 # Texts sized to land near the target duration when fed through macOS `say`
 # at its default rate (~200 wpm ≈ 3.3 wps). Exact durations don't matter —
@@ -73,6 +85,10 @@ for len in "${LENGTHS[@]}"; do
 done
 
 # Step 2 — release build (debug numbers are useless for latency comparison).
+if [[ "$BACKEND" == "coreml-unified" ]]; then
+    echo "Building native Core ML worker…"
+    scripts/build-coreml-worker.sh
+fi
 echo "Building bench_asr (release)…"
 cargo build --release --bin bench_asr 2>&1 | tail -3
 
@@ -81,8 +97,9 @@ cargo build --release --bin bench_asr 2>&1 | tail -3
 BENCH_BIN="./target/release/bench_asr"
 for len in "${LENGTHS[@]}"; do
     wav="$WAV_DIR/${len}s_${SAMPLE_RATE}.wav"
-    echo "Benching $wav (warmup=$WARMUP_REPS, reps=$REPS)…"
-    "$BENCH_BIN" --wav "$wav" --reps "$REPS" --warmup-reps "$WARMUP_REPS" \
+    echo "Benching $wav (backend=$BACKEND, warmup=$WARMUP_REPS, reps=$REPS)…"
+    "$BENCH_BIN" --backend "$BACKEND" --wav "$wav" \
+        --reps "$REPS" --warmup-reps "$WARMUP_REPS" \
         2>>"$RAW_LOG" \
         || echo "  ↑ bench failed for $wav (see $RAW_LOG)"
 done

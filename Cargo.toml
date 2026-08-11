@@ -1,7 +1,7 @@
 [package]
 name = "parakeet-rs"
 version = "0.1.0"
-description = "Voice-to-text dictation on Apple Silicon — Parakeet TDT 0.6B v3, fully local"
+description = "Voice-to-text dictation on Apple Silicon — Parakeet, fully local"
 authors = ["parakeet-rs"]
 edition = "2021"
 rust-version = "1.77"
@@ -60,8 +60,9 @@ category = "Productivity"
 short_description = "Voice-to-text dictation, fully local, Apple Silicon."
 long_description = """
 Press a global hotkey, speak, and Parakeet inserts the transcript at
-your cursor. Powered by NVIDIA Parakeet TDT 0.6B v3 running locally
-on the Apple Neural Engine via sherpa-onnx + CoreML. Optional LLM
+your cursor. Powered by Parakeet Unified EN 0.6B int8 running locally
+on the Apple Neural Engine via a resident native Core ML worker, with
+sherpa-onnx as the contextual-vocabulary and load-failure fallback. Optional LLM
 cleanup pass (Qwen 3.5 4B Q6_K, llama.cpp + Metal, in-process)
 removes filler words and fixes punctuation. Fully local — no API
 keys, no network calls after the first-run model download.

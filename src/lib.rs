@@ -27,6 +27,8 @@
 pub mod app;
 pub mod app_delegate;
 pub mod asr;
+pub mod asr_eval;
+pub mod coreml_worker;
 pub mod dictation_fsm;
 pub mod llm_manager;
 pub mod objc_util;

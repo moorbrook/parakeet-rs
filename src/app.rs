@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::asr::Asr;
+use crate::coreml_worker::{load_coreml_worker, CoreMlModelSource, CoreMlWorkerConfig};
 use crate::dictation_fsm::{DictationFsm, HoldPressOutcome, TapPressOutcome};
 use crate::hotkey::HotkeyHandle;
 use crate::hud;
@@ -296,10 +297,7 @@ impl App {
             timer.mark_paste_done();
             timer.emit();
             if let Err(failure) = result {
-                rescue_to_clipboard(
-                    &failure,
-                    "Paste blocked — transcript on clipboard (⌘V)",
-                );
+                rescue_to_clipboard(&failure, "Paste blocked — transcript on clipboard (⌘V)");
             }
             app.on_session_finished();
         });
@@ -551,9 +549,10 @@ impl App {
         }
 
         let settings = self.settings.clone();
-        let result =
-            tokio::task::spawn_blocking(move || load_asr_blocking(&settings, /* warm = */ true))
-                .await;
+        let result = tokio::task::spawn_blocking(move || {
+            load_asr_blocking(&settings, /* warm = */ true)
+        })
+        .await;
 
         match result {
             Ok(Ok((asr, biasing))) => {
@@ -675,15 +674,34 @@ impl App {
 /// fall back to unbiased greedy decoding, because a malformed
 /// `vocabulary.txt` should cost the user their custom terms, not their
 /// ability to dictate at all.
-fn load_asr_blocking(
-    settings: &SettingsStore,
-    warm: bool,
-) -> anyhow::Result<(Arc<Asr>, Biasing)> {
+fn load_asr_blocking(settings: &SettingsStore, warm: bool) -> anyhow::Result<(Arc<Asr>, Biasing)> {
     let encoder_path = settings.encoder_path();
 
     // Sample BEFORE reading the vocabulary, so the recorded fingerprint
     // can never be newer than the bytes this build actually consumed.
     let biasing = Biasing::sample(settings);
+
+    let has_vocabulary = match crate::vocabulary::has_terms(&settings.vocabulary_path()) {
+        Ok(has_terms) => has_terms,
+        Err(error) => {
+            log::error!("vocabulary unreadable, optimized backend will run unbiased: {error:#}");
+            false
+        }
+    };
+
+    if !has_vocabulary {
+        match load_optimized_asr(settings) {
+            Ok(asr) => return Ok((Arc::new(asr), biasing)),
+            Err(error) => {
+                log::warn!(
+                    "optimized Core ML backend unavailable; falling back to sherpa: {error:#}"
+                );
+                menubar::set_status_text("Optimized model unavailable — loading fallback…");
+            }
+        }
+    } else {
+        log::info!("custom vocabulary is active; selecting sherpa contextual-biasing backend");
+    }
 
     menubar::set_status_text("Warming page cache…");
     let _ = warmup::page_touch(&encoder_path)?;
@@ -721,6 +739,40 @@ fn load_asr_blocking(
         warmup::dummy_decode(&asr)?;
     }
     Ok((Arc::new(asr), biasing))
+}
+
+fn load_optimized_asr(settings: &SettingsStore) -> anyhow::Result<Asr> {
+    let mut config = CoreMlWorkerConfig::discover()?;
+    let app_model_directory = settings.coreml_model_dir();
+    let model_is_available = if app_model_directory.is_dir() {
+        config.set_existing_model_directory(&app_model_directory);
+        true
+    } else {
+        matches!(
+            &config.model_source,
+            CoreMlModelSource::ExistingDirectory(path) if path.is_dir()
+        )
+    };
+    if !model_is_available {
+        config.set_download_root(settings.coreml_model_root());
+        menubar::set_status_text("Downloading optimized model (~595 MB, first run)…");
+    } else {
+        menubar::set_status_text("Loading optimized recogniser…");
+    }
+
+    let (asr, load_seconds) = load_coreml_worker(&config)?;
+    log::info!(
+        "optimized ASR ready in {load_seconds:.3}s: {:?}",
+        asr.backend_metadata()
+    );
+
+    // Every backend load starts a fresh resident worker process. Its first
+    // prediction compiles the ANE plan, so even a vocabulary-triggered reload
+    // needs this cheap warmup; Core ML's cache is not shared with the old
+    // worker that will be dropped after the swap.
+    menubar::set_status_text("Pre-warming optimized graph…");
+    warmup::dummy_decode(&asr)?;
+    Ok(asr)
 }
 
 /// Synchronous polish-LLM load. Used by both the boot path (via
@@ -785,8 +837,7 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> Result<(), Deli
     };
     app.set_state(DictationState::Polishing);
 
-    let mut streamer =
-        paste::Streamer::start().map_err(|e| DeliveryFailure::unsent(e, raw))?;
+    let mut streamer = paste::Streamer::start().map_err(|e| DeliveryFailure::unsent(e, raw))?;
     let outcome = run_polish_isolated(llm.as_ref(), raw, settings, |chunk| {
         streamer
             .push(chunk)
@@ -821,10 +872,7 @@ fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> Result<(), Deli
                 // enough. Before this, the tail plus everything the LLM
                 // hadn't emitted yet was simply lost.
                 rescue_to_clipboard(
-                    &DeliveryFailure::unsent(
-                        anyhow::anyhow!("polish failed mid-stream: {e}"),
-                        raw,
-                    ),
+                    &DeliveryFailure::unsent(anyhow::anyhow!("polish failed mid-stream: {e}"), raw),
                     "Polish failed mid-stream — partial kept, full transcript on clipboard",
                 );
                 Ok(())

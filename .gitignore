@@ -3,6 +3,7 @@
 # (~600 MB) and the `target/release/bundle/osx/Parakeet.app` produced by
 # `scripts/make-app.sh`.
 target/
+**/.build/
 **/*.rs.bk
 *.pdb
 *.profraw

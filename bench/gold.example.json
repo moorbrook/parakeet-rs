@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "thresholds": {
+    "max_wer_percent": 4.0,
+    "max_cer_percent": 3.0
+  },
+  "fixtures": [
+    {
+      "file": "1s_48000.wav",
+      "reference": "Quick test.",
+      "categories": ["short", "punctuation"]
+    },
+    {
+      "file": "3s_48000.wav",
+      "reference": "The quick brown fox jumps over the lazy dog.",
+      "categories": ["general", "punctuation"]
+    },
+    {
+      "file": "5s_48000.wav",
+      "reference": "The latency benchmark measures end to end speech recognition pipeline performance.",
+      "categories": ["technical", "punctuation"]
+    },
+    {
+      "file": "10s_48000.wav",
+      "reference": "The latency benchmark drives the recognizer with audio of fixed lengths, recording timing for thirty iterations and aggregating the result.",
+      "categories": ["long", "numbers", "punctuation"]
+    },
+    {
+      "file": "20s_48000.wav",
+      "reference": "The latency benchmark drives the recognizer with audio of fixed lengths, recording timing for thirty iterations and aggregating the result into percentiles. Then it writes them to a CSV file for inclusion in the architecture decision record under the latency plan section.",
+      "categories": ["long", "numbers", "proper-nouns", "punctuation"]
+    }
+  ]
+}

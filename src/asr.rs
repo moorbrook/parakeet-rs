@@ -1,7 +1,9 @@
-//! Local Parakeet TDT 0.6B v3 ASR via sherpa-onnx.
+//! Stable local-ASR facade and the sherpa fallback backend.
 //!
-//! Holds a single `OfflineRecognizer` for the life of the app; reused across
-//! every hotkey press so CoreML doesn't recompile its graph each time.
+//! The app prefers the resident native Core ML Parakeet Unified worker and
+//! selects sherpa-onnx when contextual vocabulary is active or specialized
+//! model setup fails. Each backend remains resident across hotkey presses so
+//! model loading and Core ML graph compilation stay off the dictation path.
 //!
 //! ADR-0015 layer 3: every `recognize` call records decode-time vs audio-time
 //! (RTFx). On this M5 Pro, CoreML-resident execution should sit comfortably
@@ -14,6 +16,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
+use serde::Serialize;
 use sherpa_onnx::{
     OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
 };
@@ -21,10 +24,39 @@ use sherpa_onnx::{
 /// Below this real-time factor we assume CoreML is not engaged.
 const RTFX_COREML_FLOOR: f32 = 2.0;
 
-pub struct Asr {
-    inner: Arc<Mutex<OfflineRecognizer>>,
+/// Recognition engine used by [`Asr`].
+///
+/// Backends return their own measured inference time so the common facade can
+/// apply one quality/performance policy without hiding backend-specific work.
+/// Implementations should not log timing themselves.
+pub trait AsrBackend: Send + Sync {
+    fn metadata(&self) -> &AsrBackendMetadata;
+    fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded>;
 }
 
+/// Identity of the exact model/runtime artifact behind an [`AsrBackend`].
+///
+/// Benchmark and quality reports read this from the backend rather than from
+/// CLI constants, so adding a challenger cannot accidentally label its results
+/// as the shipping sherpa model.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AsrBackendMetadata {
+    pub backend: String,
+    pub model: String,
+    pub quantization: String,
+    pub execution_provider: String,
+}
+
+/// Stable recognition facade used by the app.
+///
+/// The current default backend is sherpa-onnx. Keeping callers behind this
+/// facade lets native Core ML or MLX experiments use the same capture, warmup,
+/// timing, and transcript-handling path.
+pub struct Asr {
+    backend: Arc<dyn AsrBackend>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct Decoded {
     pub text: String,
     pub audio_seconds: f32,
@@ -63,6 +95,37 @@ pub struct AsrConfig<'a> {
     /// `Some`. See [`crate::settings::Settings::hotword_score`] for the
     /// measured safe range.
     pub hotwords_score: f32,
+}
+
+struct SherpaBackend {
+    inner: Mutex<OfflineRecognizer>,
+    metadata: AsrBackendMetadata,
+}
+
+impl AsrBackend for SherpaBackend {
+    fn metadata(&self) -> &AsrBackendMetadata {
+        &self.metadata
+    }
+
+    fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
+        let recognizer = self.inner.lock();
+        let stream = recognizer.create_stream();
+        stream.accept_waveform(sample_rate as i32, samples);
+
+        let start = Instant::now();
+        recognizer.decode(&stream);
+        let decode_seconds = start.elapsed().as_secs_f32();
+
+        let result = stream
+            .get_result()
+            .ok_or_else(|| anyhow!("get_result returned None"))?;
+
+        Ok(Decoded {
+            text: result.text,
+            audio_seconds: samples.len() as f32 / sample_rate as f32,
+            decode_seconds,
+        })
+    }
 }
 
 impl Asr {
@@ -134,15 +197,38 @@ impl Asr {
 
         let recognizer = OfflineRecognizer::create(&config)
             .ok_or_else(|| anyhow!("OfflineRecognizer::create returned None"))?;
-        Ok(Self {
-            inner: Arc::new(Mutex::new(recognizer)),
-        })
+        Ok(Self::from_backend(Arc::new(SherpaBackend {
+            inner: Mutex::new(recognizer),
+            metadata: AsrBackendMetadata {
+                backend: "sherpa-onnx".to_string(),
+                model: "NVIDIA Parakeet TDT 0.6B v3".to_string(),
+                quantization: "int8".to_string(),
+                execution_provider: "coreml-requested".to_string(),
+            },
+        })))
+    }
+
+    /// Construct the app-facing recognizer around an explicit backend.
+    ///
+    /// Production startup uses [`Self::load`]. This constructor is the seam
+    /// for benchmark challengers and deterministic test doubles.
+    pub fn from_backend(backend: Arc<dyn AsrBackend>) -> Self {
+        Self { backend }
+    }
+
+    pub fn backend_metadata(&self) -> &AsrBackendMetadata {
+        self.backend.metadata()
     }
 
     pub fn recognize(&self, samples: &[f32], sample_rate: u32) -> Result<String> {
-        let decoded =
-            self.recognize_with_timing(samples, sample_rate, /* warmup = */ false)?;
+        let decoded = self.recognize_with_metrics(samples, sample_rate)?;
         Ok(decoded.text)
+    }
+
+    /// Recognize an utterance and return the metrics needed by quality and
+    /// backend-comparison harnesses.
+    pub fn recognize_with_metrics(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
+        self.recognize_with_timing(samples, sample_rate, /* warmup = */ false)
     }
 
     /// Like `recognize` but doesn't log RTFx — used by the throwaway-first
@@ -166,24 +252,8 @@ impl Asr {
                 decode_seconds: 0.0,
             });
         }
-        let recognizer = self.inner.lock();
-        let stream = recognizer.create_stream();
-        stream.accept_waveform(sample_rate as i32, samples);
-
-        let start = Instant::now();
-        recognizer.decode(&stream);
-        let decode_seconds = start.elapsed().as_secs_f32();
-
-        let result = stream
-            .get_result()
-            .ok_or_else(|| anyhow!("get_result returned None"))?;
-        let audio_seconds = samples.len() as f32 / sample_rate as f32;
-
-        let decoded = Decoded {
-            text: result.text.trim().to_string(),
-            audio_seconds,
-            decode_seconds,
-        };
+        let mut decoded = self.backend.transcribe(samples, sample_rate)?;
+        decoded.text = decoded.text.trim().to_string();
 
         if !warmup {
             let rtfx = decoded.rtfx();
@@ -207,5 +277,84 @@ impl Asr {
             }
         }
         Ok(decoded)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    struct FakeBackend {
+        calls: AtomicUsize,
+        metadata: AsrBackendMetadata,
+    }
+
+    impl AsrBackend for FakeBackend {
+        fn metadata(&self) -> &AsrBackendMetadata {
+            &self.metadata
+        }
+
+        fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Decoded {
+                text: "  hello from a challenger  ".to_string(),
+                audio_seconds: samples.len() as f32 / sample_rate as f32,
+                decode_seconds: 0.25,
+            })
+        }
+    }
+
+    #[test]
+    fn explicit_backend_is_used_and_text_is_normalized() {
+        let backend = Arc::new(FakeBackend {
+            calls: AtomicUsize::new(0),
+            metadata: AsrBackendMetadata {
+                backend: "fake".to_string(),
+                model: "test model".to_string(),
+                quantization: "none".to_string(),
+                execution_provider: "cpu".to_string(),
+            },
+        });
+        let asr = Asr::from_backend(backend.clone());
+
+        let decoded = asr
+            .recognize_with_metrics(&vec![0.0; 16_000], 16_000)
+            .expect("fake backend should transcribe");
+
+        assert_eq!(decoded.text, "hello from a challenger");
+        assert_eq!(decoded.audio_seconds, 1.0);
+        assert_eq!(decoded.decode_seconds, 0.25);
+        assert_eq!(asr.backend_metadata(), &backend.metadata);
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn empty_audio_does_not_call_backend() {
+        let backend = Arc::new(FakeBackend {
+            calls: AtomicUsize::new(0),
+            metadata: AsrBackendMetadata {
+                backend: "fake".to_string(),
+                model: "test model".to_string(),
+                quantization: "none".to_string(),
+                execution_provider: "cpu".to_string(),
+            },
+        });
+        let asr = Asr::from_backend(backend.clone());
+
+        let decoded = asr
+            .recognize_with_metrics(&[], 16_000)
+            .expect("empty audio should be accepted");
+
+        assert_eq!(
+            decoded,
+            Decoded {
+                text: String::new(),
+                audio_seconds: 0.0,
+                decode_seconds: 0.0,
+            }
+        );
+        assert_eq!(backend.calls.load(Ordering::Relaxed), 0);
     }
 }

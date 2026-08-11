@@ -187,6 +187,17 @@ impl SettingsStore {
             .join("parakeet-tdt-0.6b-v3-int8")
     }
 
+    /// Root passed to the native worker's model hub. The worker appends the
+    /// pinned Parakeet Unified repository folder beneath it.
+    pub fn coreml_model_root(&self) -> PathBuf {
+        self.data_dir.join("models").join("coreml")
+    }
+
+    pub fn coreml_model_dir(&self) -> PathBuf {
+        self.coreml_model_root()
+            .join(crate::coreml_worker::COREML_MODEL_FOLDER)
+    }
+
     pub fn encoder_path(&self) -> PathBuf {
         self.model_dir().join("encoder.int8.onnx")
     }
@@ -402,6 +413,14 @@ mod tests {
         assert_eq!(
             store.vad_path(),
             store.data_dir().join("models").join("silero_vad.onnx"),
+        );
+        assert_eq!(
+            store.coreml_model_dir(),
+            store
+                .data_dir()
+                .join("models")
+                .join("coreml")
+                .join("parakeet-unified-en-0.6b")
         );
     }
 

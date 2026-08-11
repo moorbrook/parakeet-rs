@@ -4,5 +4,7 @@ raw.log
 # so the transcripts depend on the local TTS voice and OS version.
 # Record your own with `asr_diff --record`.
 transcripts.json
+asr-quality.json
+*-quality.json
 *.csv
 !cleanup-backends.csv

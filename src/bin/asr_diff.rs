@@ -7,13 +7,14 @@
 //! a new hotword score — landed on the strength of "it still runs and
 //! the numbers look fine".
 //!
-//! This binary decodes a directory of WAV fixtures, then either records
-//! the transcripts as a baseline or compares against a recorded one and
-//! reports the word-level differences.
+//! This binary decodes WAV fixtures, then either records/compares an exact
+//! machine-local transcript baseline or evaluates human-authored gold
+//! references with WER, CER, formatting, category, and latency metrics.
 //!
 //! Usage:
 //!   asr_diff --record                      # write bench/transcripts.json
 //!   asr_diff                               # compare against it
+//!   asr_diff --gold bench/gold.json         # quality gate + JSON report
 //!   asr_diff --vocabulary path/to/vocab.txt   # compare WITH biasing on
 //!
 //! Exits non-zero when any transcript differs, so it can gate a change.
@@ -22,9 +23,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::time::Instant;
 
-use parakeet_rs::asr::{Asr, AsrConfig};
+use parakeet_rs::asr::{Asr, AsrBackendMetadata, AsrConfig, Decoded};
+use parakeet_rs::asr_eval::{self, GoldManifest, QualityReport, RunMetadata};
+use parakeet_rs::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
 use parakeet_rs::performance;
 use parakeet_rs::settings::SettingsStore;
 use parakeet_rs::wav::read_wav_mono;
@@ -32,14 +36,36 @@ use parakeet_rs::{vocabulary, warmup};
 
 const DEFAULT_AUDIO_DIR: &str = "bench/audio";
 const DEFAULT_BASELINE: &str = "bench/transcripts.json";
+const DEFAULT_QUALITY_REPORT: &str = "bench/asr-quality.json";
 
 struct Args {
     audio_dir: PathBuf,
     baseline: PathBuf,
     record: bool,
+    gold: Option<PathBuf>,
+    json_out: PathBuf,
     /// Vocabulary file to bias with. `None` = greedy, unbiased.
     vocabulary: Option<PathBuf>,
     hotword_score: f32,
+    backend: Backend,
+    worker: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Backend {
+    Sherpa,
+    CoreMlUnified,
+}
+
+impl Backend {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "sherpa" => Ok(Self::Sherpa),
+            "coreml-unified" => Ok(Self::CoreMlUnified),
+            _ => anyhow::bail!("unknown backend {value:?}; expected sherpa or coreml-unified"),
+        }
+    }
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -47,8 +73,13 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut audio_dir = PathBuf::from(DEFAULT_AUDIO_DIR);
     let mut baseline = PathBuf::from(DEFAULT_BASELINE);
     let mut record = false;
+    let mut gold = None;
+    let mut json_out = PathBuf::from(DEFAULT_QUALITY_REPORT);
     let mut vocabulary = None;
     let mut hotword_score = 2.0_f32;
+    let mut backend = Backend::Sherpa;
+    let mut worker = None;
+    let mut model_dir = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -65,6 +96,17 @@ fn parse_args() -> anyhow::Result<Args> {
                         .ok_or_else(|| anyhow!("--baseline needs a path"))?,
                 );
             }
+            "--gold" => {
+                gold = Some(PathBuf::from(
+                    it.next().ok_or_else(|| anyhow!("--gold needs a path"))?,
+                ));
+            }
+            "--json-out" => {
+                json_out = PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--json-out needs a path"))?,
+                );
+            }
             "--vocabulary" => {
                 vocabulary = Some(PathBuf::from(
                     it.next()
@@ -78,6 +120,21 @@ fn parse_args() -> anyhow::Result<Args> {
                     .parse()
                     .context("--hotword-score")?;
             }
+            "--backend" => {
+                backend =
+                    Backend::parse(&it.next().ok_or_else(|| anyhow!("--backend needs a name"))?)?;
+            }
+            "--worker" => {
+                worker = Some(PathBuf::from(
+                    it.next().ok_or_else(|| anyhow!("--worker needs a path"))?,
+                ));
+            }
+            "--model-dir" => {
+                model_dir = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--model-dir needs a path"))?,
+                ));
+            }
             "--record" => record = true,
             "-h" | "--help" => {
                 print_usage();
@@ -86,26 +143,38 @@ fn parse_args() -> anyhow::Result<Args> {
             other => bail!("unknown arg: {other}"),
         }
     }
+    if record && gold.is_some() {
+        bail!("--record and --gold are mutually exclusive");
+    }
     Ok(Args {
         audio_dir,
         baseline,
         record,
+        gold,
+        json_out,
         vocabulary,
         hotword_score,
+        backend,
+        worker,
+        model_dir,
     })
 }
 
 fn print_usage() {
     eprintln!(
-        "usage: asr_diff [--record] [--audio-dir DIR] [--baseline JSON]\n\
+        "usage: asr_diff [--record | --gold JSON] [--audio-dir DIR]\n\
+        \x20               [--baseline JSON] [--json-out JSON]\n\
+        \x20               [--backend sherpa|coreml-unified]\n\
+        \x20               [--worker PATH] [--model-dir DIR]\n\
         \x20               [--vocabulary FILE] [--hotword-score N]\n\
          \n\
-         Decodes every *.wav in DIR (default {DEFAULT_AUDIO_DIR}) and either\n\
-         records the transcripts to JSON (--record) or diffs against a\n\
-         previously recorded set (default {DEFAULT_BASELINE}).\n\
+         Without --gold, decodes every *.wav in DIR (default\n\
+         {DEFAULT_AUDIO_DIR}) and either records transcripts (--record) or\n\
+         diffs against {DEFAULT_BASELINE}.\n\
          \n\
-         Exits 1 if any transcript changed, so it can gate a change that\n\
-         was only ever checked for latency.\n\
+         With --gold, decodes the manifest's fixtures, prints WER/CER and\n\
+         category summaries, and writes a machine report (default\n\
+         {DEFAULT_QUALITY_REPORT}). Exits 1 when a manifest threshold fails.\n\
          \n\
          The model must already be downloaded (launch Parakeet.app once)."
     );
@@ -146,12 +215,19 @@ impl Drop for TempFileGuard {
 
 /// Returns `Ok(false)` when transcripts differed from the baseline.
 fn run(args: &Args) -> anyhow::Result<bool> {
+    let gold = args.gold.as_deref().map(read_gold_manifest).transpose()?;
     let store = SettingsStore::new()?;
-    if !store.model_present() {
+    if args.backend == Backend::Sherpa && !store.model_present() {
         anyhow::bail!(
             "ASR model not present at {}. Launch Parakeet.app once so it can \
              download the first-run model bundle.",
             store.encoder_path().display()
+        );
+    }
+    if args.backend == Backend::CoreMlUnified && args.vocabulary.is_some() {
+        anyhow::bail!(
+            "--vocabulary is not supported by the coreml-unified challenger; \
+             run the unbiased quality/performance gate first"
         );
     }
 
@@ -162,8 +238,10 @@ fn run(args: &Args) -> anyhow::Result<bool> {
     // overwrite each other's hotwords while their recognisers loaded,
     // and left a tokenised copy of the user's vocabulary lying around
     // in the temp dir afterwards.
-    let generated =
-        std::env::temp_dir().join(format!("parakeet-asr-diff-hotwords.{}.txt", std::process::id()));
+    let generated = std::env::temp_dir().join(format!(
+        "parakeet-asr-diff-hotwords.{}.txt",
+        std::process::id()
+    ));
     let hotwords = match &args.vocabulary {
         Some(v) => vocabulary::prepare(v, &generated, Some(&store.tokens_path()))?,
         None => None,
@@ -179,19 +257,47 @@ fn run(args: &Args) -> anyhow::Result<bool> {
         None => eprintln!("biasing OFF (greedy decoding)"),
     }
 
-    let asr = Asr::load(&AsrConfig {
-        encoder: &store.encoder_path(),
-        decoder: &store.decoder_path(),
-        joiner: &store.joiner_path(),
-        tokens: &store.tokens_path(),
-        num_threads: performance::performance_core_count(),
-        hotwords: hotwords.as_deref(),
-        hotwords_score: args.hotword_score,
-    })?;
-    warmup::page_touch(&store.encoder_path())?;
-    warmup::dummy_decode(&asr)?;
+    let model_load_started = Instant::now();
+    let asr = match args.backend {
+        Backend::Sherpa => Asr::load(&AsrConfig {
+            encoder: &store.encoder_path(),
+            decoder: &store.decoder_path(),
+            joiner: &store.joiner_path(),
+            tokens: &store.tokens_path(),
+            num_threads: performance::performance_core_count(),
+            hotwords: hotwords.as_deref(),
+            hotwords_score: args.hotword_score,
+        })?,
+        Backend::CoreMlUnified => {
+            let mut config = CoreMlWorkerConfig::discover()?;
+            if let Some(worker) = &args.worker {
+                config.worker_path.clone_from(worker);
+            }
+            if let Some(model_dir) = &args.model_dir {
+                config.set_existing_model_directory(model_dir);
+            }
+            let (asr, worker_load_seconds) = load_coreml_worker(&config)?;
+            eprintln!("Core ML worker ready in {worker_load_seconds:.3}s");
+            asr
+        }
+    };
+    let model_load_seconds = model_load_started.elapsed().as_secs_f64();
 
-    let wavs = collect_wavs(&args.audio_dir)?;
+    let warmup_started = Instant::now();
+    if args.backend == Backend::Sherpa {
+        warmup::page_touch(&store.encoder_path())?;
+    }
+    warmup::dummy_decode(&asr)?;
+    let warmup_seconds = warmup_started.elapsed().as_secs_f64();
+
+    let wavs = match &gold {
+        Some(manifest) => manifest
+            .fixtures
+            .iter()
+            .map(|fixture| args.audio_dir.join(&fixture.file))
+            .collect(),
+        None => collect_wavs(&args.audio_dir)?,
+    };
     if wavs.is_empty() {
         anyhow::bail!(
             "no *.wav fixtures in {}. Generate them with scripts/bench-latency.sh",
@@ -200,14 +306,36 @@ fn run(args: &Args) -> anyhow::Result<bool> {
     }
 
     let mut transcripts: BTreeMap<String, String> = BTreeMap::new();
+    let mut decoded: BTreeMap<String, Decoded> = BTreeMap::new();
     for wav in &wavs {
         let (samples, sample_rate) = read_wav_mono(wav)?;
-        let text = asr.recognize(&samples, sample_rate)?;
+        let result = asr.recognize_with_metrics(&samples, sample_rate)?;
         let name = wav
             .file_name()
             .map_or_else(|| "unknown".into(), |n| n.to_string_lossy().to_string());
-        eprintln!("  {name}: {text:?}");
-        transcripts.insert(name, text);
+        eprintln!(
+            "  {name}: {:?} ({:.3}s, {:.1}x real time)",
+            result.text,
+            result.decode_seconds,
+            result.rtfx()
+        );
+        transcripts.insert(name.clone(), result.text.clone());
+        decoded.insert(name, result);
+    }
+
+    if let Some(manifest) = &gold {
+        let quality = asr_eval::evaluate(
+            manifest,
+            &decoded,
+            run_metadata(
+                asr.backend_metadata().clone(),
+                model_load_seconds,
+                warmup_seconds,
+            ),
+        )?;
+        write_quality_report(&args.json_out, &quality)?;
+        print_quality_report(&quality, &args.json_out);
+        return Ok(quality.passed);
     }
 
     if args.record {
@@ -234,6 +362,132 @@ fn run(args: &Args) -> anyhow::Result<bool> {
     })?;
     let baseline: BTreeMap<String, String> = serde_json::from_str(&raw)?;
     Ok(report(&baseline, &transcripts))
+}
+
+fn read_gold_manifest(path: &Path) -> anyhow::Result<GoldManifest> {
+    use anyhow::Context;
+
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading gold manifest {}", path.display()))?;
+    let manifest: GoldManifest = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing gold manifest {}", path.display()))?;
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+fn write_quality_report(path: &Path, report: &QualityReport) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(path, format!("{}\n", serde_json::to_string_pretty(report)?))
+        .with_context(|| format!("writing quality report {}", path.display()))
+}
+
+fn print_quality_report(report: &QualityReport, json_path: &Path) {
+    println!();
+    println!("gold-reference quality");
+    for fixture in &report.fixtures {
+        let match_kind = if fixture.exact_match {
+            "exact"
+        } else if fixture.lexical_match {
+            "format-only"
+        } else {
+            "lexical-error"
+        };
+        println!(
+            "  {:<14} WER {:>8}  CER {:>8}  {:>13}  {:>6.1}x  {}",
+            fixture.file,
+            format_percent(fixture.wer_percent),
+            format_percent(fixture.cer_percent),
+            match_kind,
+            fixture.rtfx.unwrap_or(0.0),
+            fixture.categories.join(",")
+        );
+        if !fixture.exact_match {
+            println!("      reference : {:?}", fixture.reference);
+            println!("      hypothesis: {:?}", fixture.hypothesis);
+        }
+    }
+
+    if !report.categories.is_empty() {
+        println!();
+        println!("categories");
+        for (category, metrics) in &report.categories {
+            println!(
+                "  {category:<20} {:>2} fixture(s)  WER {:>8}  CER {:>8}  exact {:>8}",
+                metrics.fixtures,
+                format_percent(metrics.wer_percent),
+                format_percent(metrics.cer_percent),
+                format_percent(metrics.exact_match_percent)
+            );
+        }
+    }
+
+    println!();
+    println!(
+        "overall: WER {} (limit {:.2}%), CER {} (limit {:.2}%), exact {}, {:.1}x real time",
+        format_percent(report.overall.wer_percent),
+        report.thresholds.max_wer_percent,
+        format_percent(report.overall.cer_percent),
+        report.thresholds.max_cer_percent,
+        format_percent(report.overall.exact_match_percent),
+        report.overall.rtfx.unwrap_or(0.0)
+    );
+    println!(
+        "{} — machine report: {}",
+        if report.passed { "PASS" } else { "FAIL" },
+        json_path.display()
+    );
+}
+
+fn format_percent(value: Option<f64>) -> String {
+    value.map_or_else(
+        || "undefined".to_string(),
+        |percent| format!("{percent:.2}%"),
+    )
+}
+
+fn run_metadata(
+    backend: AsrBackendMetadata,
+    model_load_seconds: f64,
+    warmup_seconds: f64,
+) -> RunMetadata {
+    let os_name = command_output("sw_vers", &["-productName"])
+        .unwrap_or_else(|| std::env::consts::OS.to_string());
+    let os_version = command_output("sw_vers", &["-productVersion"]);
+    let operating_system =
+        os_version.map_or(os_name.clone(), |version| format!("{os_name} {version}"));
+
+    RunMetadata {
+        application_version: env!("CARGO_PKG_VERSION").to_string(),
+        backend,
+        operating_system,
+        architecture: std::env::consts::ARCH.to_string(),
+        chip: command_output("sysctl", &["-n", "machdep.cpu.brand_string"]),
+        memory_bytes: command_output("sysctl", &["-n", "hw.memsize"])
+            .and_then(|value| value.parse().ok()),
+        logical_cpus: std::thread::available_parallelism()
+            .ok()
+            .map(std::num::NonZeroUsize::get),
+        model_load_seconds,
+        warmup_seconds,
+    }
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 /// Print a per-fixture comparison. Returns true iff everything matched.
