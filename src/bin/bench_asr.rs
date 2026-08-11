@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use parakeet_rs::asr::{Asr, AsrConfig};
+use parakeet_rs::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
 use parakeet_rs::performance::{self, next_session_id, PhaseTimer, PhaseTimerMode};
 use parakeet_rs::settings::SettingsStore;
 use parakeet_rs::warmup;
@@ -30,6 +31,25 @@ struct Args {
     wav: PathBuf,
     reps: usize,
     warmup_reps: usize,
+    backend: Backend,
+    worker: Option<PathBuf>,
+    model_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Backend {
+    Sherpa,
+    CoreMlUnified,
+}
+
+impl Backend {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "sherpa" => Ok(Self::Sherpa),
+            "coreml-unified" => Ok(Self::CoreMlUnified),
+            _ => anyhow::bail!("unknown backend {value:?}; expected sherpa or coreml-unified"),
+        }
+    }
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -37,6 +57,9 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut wav: Option<PathBuf> = None;
     let mut reps: usize = DEFAULT_REPS;
     let mut warmup_reps: usize = DEFAULT_WARMUP_REPS;
+    let mut backend = Backend::Sherpa;
+    let mut worker = None;
+    let mut model_dir = None;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -60,6 +83,21 @@ fn parse_args() -> anyhow::Result<Args> {
                     .parse()
                     .context("--warmup-reps")?;
             }
+            "--backend" => {
+                backend =
+                    Backend::parse(&it.next().ok_or_else(|| anyhow!("--backend needs a name"))?)?;
+            }
+            "--worker" => {
+                worker = Some(PathBuf::from(
+                    it.next().ok_or_else(|| anyhow!("--worker needs a path"))?,
+                ));
+            }
+            "--model-dir" => {
+                model_dir = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--model-dir needs a path"))?,
+                ));
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -72,12 +110,17 @@ fn parse_args() -> anyhow::Result<Args> {
         wav,
         reps,
         warmup_reps,
+        backend,
+        worker,
+        model_dir,
     })
 }
 
 fn print_usage() {
     eprintln!(
         "usage: bench_asr --wav PATH [--reps N] [--warmup-reps N]\n\
+         \x20                [--backend sherpa|coreml-unified]\n\
+         \x20                [--worker PATH] [--model-dir DIR]\n\
          \n\
          Runs the loaded Parakeet recognizer over WAV PATH `--reps` times,\n\
          emitting one `phase_timer` log line per iteration on stderr.\n\
@@ -110,33 +153,14 @@ fn main() -> ExitCode {
 
 fn run(args: &Args) -> anyhow::Result<()> {
     let store = SettingsStore::new()?;
-    if !store.model_present() {
-        anyhow::bail!(
-            "ASR model not present at {}. Launch Parakeet.app once so it can \
-             download the first-run model bundle.",
-            store.encoder_path().display()
-        );
-    }
-
-    let threads = performance::performance_core_count();
-    log::info!("loading Asr (threads={threads}, provider=coreml)");
-    // Latency bench: no contextual biasing, so the number stays
-    // comparable to every previously-recorded run. `asr_diff
-    // --vocabulary` is where the biased path gets exercised.
-    let asr = Asr::load(&AsrConfig {
-        encoder: &store.encoder_path(),
-        decoder: &store.decoder_path(),
-        joiner: &store.joiner_path(),
-        tokens: &store.tokens_path(),
-        num_threads: threads,
-        hotwords: None,
-        hotwords_score: 0.0,
-    })?;
+    let asr = load_backend(args, &store)?;
 
     // CoreML graph compile happens on first inference. The aggregator
     // ignores the warmup reps so steady-state numbers aren't contaminated.
-    log::info!("warming recognizer (page-touch + silent decode)");
-    warmup::page_touch(&store.encoder_path())?;
+    log::info!("warming recognizer (silent decode)");
+    if args.backend == Backend::Sherpa {
+        warmup::page_touch(&store.encoder_path())?;
+    }
     warmup::dummy_decode(&asr)?;
 
     let (samples, sample_rate) = read_wav_mono(&args.wav)?;
@@ -175,6 +199,51 @@ fn run(args: &Args) -> anyhow::Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn load_backend(args: &Args, store: &SettingsStore) -> anyhow::Result<Asr> {
+    match args.backend {
+        Backend::Sherpa => {
+            if !store.model_present() {
+                anyhow::bail!(
+                    "ASR model not present at {}. Launch Parakeet.app once so it can \
+                     download the first-run model bundle.",
+                    store.encoder_path().display()
+                );
+            }
+            let threads = performance::performance_core_count();
+            log::info!("loading sherpa Asr (threads={threads}, provider=coreml)");
+            // Latency bench: no contextual biasing, so the number stays
+            // comparable to every previously-recorded run. `asr_diff
+            // --vocabulary` is where the biased path gets exercised.
+            Asr::load(&AsrConfig {
+                encoder: &store.encoder_path(),
+                decoder: &store.decoder_path(),
+                joiner: &store.joiner_path(),
+                tokens: &store.tokens_path(),
+                num_threads: threads,
+                hotwords: None,
+                hotwords_score: 0.0,
+            })
+        }
+        Backend::CoreMlUnified => {
+            let mut config = CoreMlWorkerConfig::discover()?;
+            if let Some(worker) = &args.worker {
+                config.worker_path.clone_from(worker);
+            }
+            if let Some(model_dir) = &args.model_dir {
+                config.set_existing_model_directory(model_dir);
+            }
+            log::info!(
+                "loading Core ML worker {} with {:?}",
+                config.worker_path.display(),
+                config.model_source
+            );
+            let (asr, load_seconds) = load_coreml_worker(&config)?;
+            log::info!("Core ML worker ready in {load_seconds:.3}s");
+            Ok(asr)
+        }
+    }
 }
 
 fn run_one(

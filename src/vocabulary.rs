@@ -66,6 +66,19 @@ pub fn parse_terms(raw: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Whether the user's vocabulary contains at least one active term.
+///
+/// Backend selection uses this inexpensive check before loading a model:
+/// Parakeet Unified is the fast default, while a non-empty vocabulary keeps
+/// the sherpa backend whose contextual-biasing graph preserves that feature.
+pub fn has_terms(path: &Path) -> Result<bool> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => Ok(!parse_terms(&raw).is_empty()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
 /// Encode one natural-language term into sherpa's space-separated
 /// token form, marking each word's first character as word-initial.
 ///
@@ -105,8 +118,8 @@ pub struct TokenSet(std::collections::HashSet<String>);
 impl TokenSet {
     /// Parse `tokens.txt`, whose lines are `<token> <id>`.
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let set = raw
             .lines()
             // Split from the RIGHT: the id is the last field, and a
@@ -297,10 +310,7 @@ mod tests {
         // The load-bearing encoding. `Kubernetes` verbatim does nothing
         // (not a token); bare chars boost the mid-word form and render
         // glued to the previous word. Only this form is correct.
-        assert_eq!(
-            encode_term("Kubernetes").unwrap(),
-            "▁K u b e r n e t e s"
-        );
+        assert_eq!(encode_term("Kubernetes").unwrap(), "▁K u b e r n e t e s");
     }
 
     #[test]
@@ -344,6 +354,17 @@ mod tests {
         // leading `#` starts a comment.
         assert_eq!(parse_terms("C#\n"), vec!["C#"]);
         assert_eq!(encode_term("C#").unwrap(), "▁C #");
+    }
+
+    #[test]
+    fn has_terms_treats_missing_and_comment_only_files_as_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vocabulary.txt");
+        assert!(!has_terms(&path).unwrap());
+        std::fs::write(&path, "# template only\n\n").unwrap();
+        assert!(!has_terms(&path).unwrap());
+        std::fs::write(&path, "# template\nKubernetes\n").unwrap();
+        assert!(has_terms(&path).unwrap());
     }
 
     #[test]
@@ -435,7 +456,9 @@ mod tests {
         std::fs::write(&vocab, "Zzz\n").unwrap();
         std::fs::write(&tokens, "▁K 1\nu 2\n").unwrap();
 
-        assert!(prepare(&vocab, &generated, Some(&tokens)).unwrap().is_none());
+        assert!(prepare(&vocab, &generated, Some(&tokens))
+            .unwrap()
+            .is_none());
         assert!(!generated.exists());
     }
 
@@ -470,7 +493,9 @@ mod tests {
         let generated = dir.path().join("nested").join("hotwords.generated.txt");
         std::fs::write(&vocab, "Kubernetes\nNew York\n").unwrap();
 
-        let out = prepare(&vocab, &generated, None).unwrap().expect("some terms");
+        let out = prepare(&vocab, &generated, None)
+            .unwrap()
+            .expect("some terms");
         assert_eq!(out, generated);
         assert_eq!(
             std::fs::read_to_string(&generated).unwrap(),

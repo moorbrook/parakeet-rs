@@ -8,9 +8,10 @@ Native macOS / Apple Silicon dictation menu-bar app. Press a global
 hotkey, speak, transcript inserts at your cursor. Fully local — no API
 keys, no network after the first-run model download.
 
-- **ASR**: NVIDIA Parakeet TDT 0.6B v3 int8 via sherpa-onnx + CoreML
+- **ASR**: Parakeet Unified EN 0.6B int8 via a resident native Core ML worker
+  (sherpa-onnx fallback and contextual-vocabulary backend)
 - **Polish (optional)**: Qwen 3.5 4B Q6_K via llama.cpp + Metal
-- **Shell**: AppKit single binary (no Tauri / Electron)
+- **Shell**: AppKit Rust app + resident Swift helper (no Tauri / Electron)
 - **Text injection**: `CGEventKeyboardSetUnicodeString` keystroke
 
 ## Install from source
@@ -48,9 +49,10 @@ PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
 1. macOS prompts for **Microphone**, **Accessibility**, and **Input
    Monitoring** in System Settings → Privacy & Security. All three are
    required.
-2. ~640 MB of model files download to
-   `~/Library/Application Support/com.parakeet.rs/models/`. Menu bar
-   status text shows progress.
+2. The int8 Core ML model (~595 MB) and sherpa fallback/VAD bundle (~640 MB)
+   download on first launch. They live under
+   `~/Library/Application Support/com.parakeet.rs/models/`; an existing
+   FluidAudio cache is reused. Menu bar status text shows setup progress.
 3. Press `⌘⇧Space` (default hotkey), speak. **Tap mode** auto-stops at
    end-of-speech; **Hold mode** stops on release.
 
@@ -94,6 +96,10 @@ jargon, and product names Parakeet mishears. Click Save in Settings
 afterwards — the recogniser rebuilds in the background (or as soon as
 the current dictation finishes).
 
+A non-empty vocabulary selects the sherpa contextual-biasing backend. An empty
+vocabulary uses the faster Parakeet Unified Core ML backend. This makes the
+backend change explicit instead of silently dropping custom terms.
+
 Terms are validated against the model's token inventory, so a word the
 model can't represent (emoji, unusual scripts) is reported in the log
 and skipped rather than silently doing nothing.
@@ -116,8 +122,8 @@ contain them, so re-check with `asr_diff` if you raise it.
   the clipboard and the menu bar says so. `CGEventPost` gives no
   delivery receipt, so an app that accepts the keystroke and discards it
   still looks like success — see [`PRIVACY.md`](PRIVACY.md#clipboard).
-- **Build size**: ~7 MB binary + ~50 MB bundled dylibs (mostly
-  onnxruntime and llama-cpp).
+- **Build size**: ~7 MB Rust binary + ~15 MB native worker + ~50 MB bundled
+  dylibs (mostly onnxruntime and llama-cpp). Model weights download separately.
 
 ## Layout
 
@@ -132,6 +138,8 @@ session/polish-load races stay localised:
 - `src/ax_paste.rs` — `CGEvent` keystroke implementation
 - `src/streamer.rs` — per-session VAD/manual capture
 - `src/vocabulary.rs` — `vocabulary.txt` → sherpa hotwords encoding
+- `src/coreml_worker.rs` — framed IPC backend + specialized-model fallback seam
+- `native/ParakeetCoreMLWorker/` — pinned FluidAudio/Core ML deployment worker
 - `src/clipboard.rs` — rescue copy when keystroke delivery fails
 - `src/{audio,asr,vad,hud,hotkey,menubar,settings,settings_ui,…}.rs`
 
@@ -151,7 +159,8 @@ Developer-ID/notarization shipping procedure is captured in
 
 ```bash
 cargo build --release && scripts/make-app.sh
-cargo test                                       # 118 unit tests
+cargo run --release --bin bench_asr -- --help
+cargo test
 cargo clippy --all-targets --no-deps             # clean
 ```
 
@@ -161,10 +170,26 @@ against recorded transcripts, not just latency:
 
 ```bash
 scripts/bench-latency.sh                 # generates bench/audio/ fixtures
+BACKEND=coreml-unified OUT_CSV=bench/coreml.csv \
+  scripts/bench-latency.sh               # matched native-backend run
 ./target/release/asr_diff --record       # baseline (machine-local)
 # ...make the change...
 ./target/release/asr_diff                # exits 1 on any transcript drift
 ```
+
+Before comparing a new model or backend, use human-authored references rather
+than treating the current model's output as truth:
+
+```bash
+cp bench/gold.example.json bench/gold.json
+# Review every reference and category in bench/gold.json.
+./target/release/asr_diff --gold bench/gold.json
+# Human summary on stdout; hardware-tagged JSON in bench/asr-quality.json.
+```
+
+The gold manifest owns the WER/CER limits. Lexical scoring lowercases and
+removes punctuation while the report tracks exact formatting separately, so a
+punctuation-only regression remains visible without inflating WER.
 
 ## Roadmap
 
@@ -176,4 +201,6 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
 at your option (Rust ecosystem convention).
 
 Runtime-downloaded models ship under their own licenses: Parakeet TDT
-0.6B v3 (NVIDIA), Silero VAD (MIT), Qwen 3.5 4B Instruct (Apache-2.0).
+0.6B v3 (NVIDIA), Parakeet Unified EN 0.6B Core ML (CC-BY-4.0), Silero
+VAD (MIT), Qwen 3.5 4B Instruct (Apache-2.0). See
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

@@ -6,6 +6,40 @@
 
 See `docs/latency-plan.md` §1 for design and acceptance criteria.
 
+## Gold-reference quality gate
+
+The latency fixtures can also gate model, quantization, backend, and hotword
+changes against human-authored transcripts:
+
+```bash
+scripts/bench-latency.sh
+cp bench/gold.example.json bench/gold.json
+# Review the references/categories; use recorded speech for a real product gate.
+cargo build --release --bin asr_diff
+./target/release/asr_diff --gold bench/gold.json
+```
+
+The versioned manifest contains explicit maximum WER and CER percentages.
+`asr_diff` prints per-fixture and per-category summaries, exits non-zero when
+either aggregate threshold fails, and writes `bench/asr-quality.json` with:
+
+- normalized lexical WER/CER plus exact formatting matches;
+- categories such as names, commands, numbers, punctuation, and vocabulary;
+- audio duration, decode time, and real-time factor;
+- backend/model/quantization/provider labels;
+- app version, macOS version, chip, memory, CPU count, model-load time, and
+  warmup time.
+
+Lexical normalization preserves Unicode letters/numbers and accents,
+lowercases them, removes apostrophes without splitting words, and treats other
+punctuation as a separator. Raw reference and hypothesis strings remain in the
+report so capitalization and punctuation changes are still auditable.
+
+The included manifest is only a format and smoke-test example: its audio is
+macOS `say` output. A shipping gate should add consented representative speech,
+proper nouns, commands, numbers, noisy audio, and custom-vocabulary cases, with
+train/tuning data kept out of this evaluation set.
+
 ## Quick start
 
 ```bash
@@ -17,6 +51,10 @@ open target/release/bundle/osx/Parakeet.app   # or however you launch it
 scripts/bench-latency.sh                           # → bench/baseline.csv
 OUT_CSV=bench/post-coreml-cache.csv \
     scripts/bench-latency.sh                       # § 2 re-bench
+
+# Native int8 Parakeet Unified challenger (builds the pinned Swift worker):
+BACKEND=coreml-unified OUT_CSV=bench/coreml-unified.csv \
+    scripts/bench-latency.sh
 ```
 
 ## What is and isn't measured
@@ -33,6 +71,26 @@ So the bench number is **ASR-only**. Real end-to-end is the bench number
 plus ~150 ms (VAD hangover; keystroke insertion is negligible), captured
 separately by the in-app PhaseTimer that emits the same `phase_timer`
 log line during live dictation.
+
+## Native Core ML result: M5 Pro 24 GB (2026-08-10)
+
+Matched release runs used the same 48 kHz WAVs, resident recognizer, three
+warmups, 30 measured repetitions, outer `Asr::recognize()` timer, and CSV
+aggregator. `sherpa` is the frozen previous backend; `coreml-unified` is the
+resident FluidAudio worker with the int8 offline encoder on CPU+ANE.
+
+| bucket | sherpa p50 | unified p50 | p50 speedup | sherpa p95 | unified p95 | p95 speedup |
+|--------|-----------:|------------:|------------:|-----------:|------------:|------------:|
+| 1 s    | 112.0 ms   | 35.0 ms     | **3.20×**   | 116.5 ms   | 36.5 ms     | **3.19×**   |
+| 3 s    | 226.0 ms   | 50.0 ms     | **4.52×**   | 239.6 ms   | 51.0 ms     | **4.70×**   |
+| 5 s    | 361.5 ms   | 66.0 ms     | **5.48×**   | 384.3 ms   | 67.0 ms     | **5.74×**   |
+| 10 s   | 580.0 ms   | 90.0 ms     | **6.44×**   | 597.8 ms   | 91.5 ms     | **6.53×**   |
+| 20 s   | 1195.0 ms  | 188.0 ms    | **6.36×**   | 1245.3 ms  | 192.6 ms    | **6.47×**   |
+
+The companion gold run passed at **2.38% WER / 2.22% CER** against limits of
+4% / 3%, with 40% exact formatting and 74.4× aggregate model-reported RTFx.
+This is a five-item macOS `say` smoke corpus, not a claim about real-user WER;
+the representative-speech gate described above still applies before a release.
 
 ## Baseline: M5 Pro 24 GB (2026-05-16, pre-§2 CoreML cache)
 
@@ -124,6 +182,8 @@ Replay:
 |------------------------------|--------------------------------------------------|
 | `audio/{1,3,5,10,20}s_*.wav` | Generated fixtures (gitignored). Filename includes sample rate (e.g. `5s_16000.wav`). |
 | `raw.log`                    | All `phase_timer` lines from the last ASR run.   |
+| `gold.example.json`         | Reviewed example schema for human gold references. |
+| `asr-quality.json`          | Generated machine-readable quality/latency report (gitignored). |
 | `llm-raw.log`                | All `llm_timer` lines from the last LLM run.     |
 | `baseline.csv`               | Aggregated ASR baseline (pre-CoreML-cache).      |
 | `post-coreml-cache.csv`      | Aggregated post-§2 (deferred — see ADR-0017).    |

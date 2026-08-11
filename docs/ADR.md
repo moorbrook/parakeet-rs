@@ -1290,18 +1290,80 @@ unencodable vocabulary term — rather than only against the happy path.
 
 ---
 
+## 0022 — Resident native Core ML Parakeet Unified backend
+
+**Status:** **Accepted — implemented and measured.**
+
+**Context.** The sherpa-onnx/CoreML path was already usable at roughly
+13–14× real time, but its ONNX execution and decoder path left a large gap to
+hardware-specialized Parakeet runtimes. The target for this change was not an
+external benchmark number: it was at least **3× the frozen previous backend**
+under the same local harness, while preserving the gold-reference WER/CER
+gate. The implementation also needed to keep Python out of the shipping app
+and retain the existing custom-vocabulary behavior.
+
+**Decision.** Prefer FluidAudio's int8 Parakeet Unified EN 0.6B offline model
+through a resident Swift worker. Rust remains the application and policy
+layer; `AsrBackend` is the stable seam. The worker owns model download/load,
+native mel extraction, Core ML CPU+ANE execution, and greedy RNNT decode, then
+accepts framed little-endian Float32 audio over stdin and returns framed JSON
+over stdout. It is pinned to FluidAudio commit
+`00a9aa771900ea09c485659663be31019e293e47`.
+
+- Model load and ANE plan compilation happen once per worker, not once per
+  utterance.
+- The worker is built as a 15 MB arm64 helper, copied into
+  `Contents/MacOS/`, signed before the main executable, and verified with the
+  complete app bundle.
+- A non-empty custom vocabulary deliberately selects sherpa, whose modified
+  beam-search hotword graph preserves ADR-0020. Empty vocabulary selects the
+  optimized backend.
+- Specialized model download/load failure falls back to sherpa. The fallback
+  remains downloaded on first launch so the app does not become unusable when
+  a hardware-specific plan cannot load.
+- The Core ML weights are a separate ~595 MB on-demand artifact under
+  CC-BY-4.0. FluidAudio is Apache-2.0; attribution is shipped in
+  `THIRD_PARTY_NOTICES.md`.
+
+**Evidence.** M5 Pro, 24 GB, macOS 26.5.1, release builds, identical 48 kHz
+fixtures, three warmups, 30 measured repetitions per bucket. Both rows include
+Rust↔worker IPC and resampling because the outer timer wraps
+`Asr::recognize()`.
+
+| bucket | sherpa p50 | unified p50 | speedup | sherpa p95 | unified p95 | speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 s | 112.0 ms | 35.0 ms | **3.20×** | 116.5 ms | 36.5 ms | **3.19×** |
+| 3 s | 226.0 ms | 50.0 ms | **4.52×** | 239.6 ms | 51.0 ms | **4.70×** |
+| 5 s | 361.5 ms | 66.0 ms | **5.48×** | 384.3 ms | 67.0 ms | **5.74×** |
+| 10 s | 580.0 ms | 90.0 ms | **6.44×** | 597.8 ms | 91.5 ms | **6.53×** |
+| 20 s | 1195.0 ms | 188.0 ms | **6.36×** | 1245.3 ms | 192.6 ms | **6.47×** |
+
+The versioned five-fixture smoke gate passed at **2.38% WER / 2.22% CER**
+against 4% / 3% limits, with punctuation/capitalization retained. This corpus
+is macOS `say` output and proves regression-harness compatibility, not
+production WER; representative recorded speech remains a release gate.
+
+**Consequences.** The 3× target holds at p50 and p95 in every measured bucket,
+including one-second audio where fixed IPC cost dominates. Optimized model
+cold load measured about 10 seconds on first Core ML plan creation and about
+0.12 seconds from a warm compiled cache; startup warmup keeps both off the
+dictation path. The helper requires macOS 14; older supported systems fail the
+specialized spawn/load and use sherpa.
+
+---
+
 ## Index of open decisions vs targets
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
 |---|---|---|---|
 | **CoreML EP actually present** | [0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage) + [0015](#0015-coreml-ep-verification-protocol) | **Shipped + measured** — 7.8x RTFx on the warmup decode confirms ANE/GPU is engaged | nothing |
-| <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] | Press-once + VAD auto-stop shipped (offline encoder); ~640 ms encoder finalize on a 5 s utterance — meets the revised <1 s target | nothing |
+| <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped + measured** — 67 ms ASR p50 on the 5 s bucket; about 217 ms including the 150 ms VAD hangover | nothing |
 | Live partial transcripts | [0009](#0009-streaming-recognition--vad-auto-stop) | Proposed | switch to streaming Parakeet model |
 | ANE confirmed in use | [0015](#0015-coreml-ep-verification-protocol) | **All three layers green** — layer 1 nm-check, layer 2 init log, layer 3 measured 7.8x RTFx | nothing |
 | ≤1.2 GB resident set | [0014](#0014-tray-only-headless-ux) + [ADR-0006](#0006-apple-silicon-optimization-plan-ds4-playbook-applied) mmap | Tray-only shipped, mmap shipped; lazy webview still Proposed | nothing |
 | Smart formatting parity with Wispr Flow | [0010](#0010-local-llm-post-processing-for-smart-formatting) | Proposed | nothing |
 | Clipboard not clobbered | [0011](#0011-direct-accessibility-text-injection) | **Deferred to v2** | not in v1 scope |
-| Custom vocabulary | [0013](#0013-hotword--custom-dictionary-support-proposed-future) | Proposed | nothing |
+| Custom vocabulary | [0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped** — non-empty vocabulary selects the sherpa biasing backend | native Unified biasing remains future work |
 
 **Critical path to ADR-0007 latency claim (gated by
 [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation)
@@ -1321,6 +1383,12 @@ time-boxed spike):**
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-08-10** — [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend)
+  added: pinned resident FluidAudio worker, int8 Parakeet Unified CPU+ANE
+  backend, automatic sherpa fallback, vocabulary-aware backend selection,
+  matched 30-repetition evidence showing 3.20–6.44× p50 speedups, and a
+  passing 2.38% WER / 2.22% CER smoke gate.
 
 - **2026-05-15** — Codex challenge review (`/codex challenge docs/ADR.md`)
   surfaced eight findings. Verified the most critical (no CoreML EP in
