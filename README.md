@@ -52,7 +52,10 @@ PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
 2. The int8 Core ML model (~595 MB) and sherpa fallback/VAD bundle (~640 MB)
    download on first launch. They live under
    `~/Library/Application Support/com.parakeet.rs/models/`; an existing
-   FluidAudio cache is reused. Menu bar status text shows setup progress.
+   FluidAudio cache is reused. Rust-managed model downloads are pinned to
+   immutable revisions and SHA-256 verified before use; unchanged files use a
+   local metadata cache on later launches. Menu bar status text shows setup
+   progress.
 3. Press `⌘⇧Space` (default hotkey), speak. **Tap mode** auto-stops at
    end-of-speech; **Hold mode** stops on release.
 
@@ -75,7 +78,7 @@ session.
 
 
 Flip Polish to On in Settings; the Qwen GGUF (3.5 GB) downloads
-automatically on first enable. Polish strips fillers, fixes
+automatically on first enable and is SHA-256 verified before loading. Polish strips fillers, fixes
 punctuation, honours inline commands ("new paragraph", "scratch
 that"); adds wall-clock latency but streams to the cursor on word
 boundaries.

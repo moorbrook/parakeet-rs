@@ -1418,6 +1418,64 @@ gate.
 
 ---
 
+## 0024 — Immutable identities for Rust-managed model artifacts
+
+**Status:** **Accepted — implemented.**
+
+**Context.** The first-run downloader previously treated an existing path as a
+valid model. New downloads were checked against the response's optional
+`Content-Length`, but that length was supplied by the same server as the bytes.
+A truncated response without the header, a wrong upstream object of the same
+length, or a locally changed file could therefore reach an inference runtime.
+
+**Decision.** Give every artifact fetched by `model_fetch.rs` a code-reviewed
+identity: an immutable Hugging Face revision where available, a published byte
+length, and a SHA-256 digest. Hash each response while streaming it to a
+same-directory `.part` file, flush it, and rename it only after the pinned
+digest and length match. `Content-Length` is not an integrity input. A mismatch
+deletes the partial or existing artifact and the normal first-use path fetches
+it again.
+
+Existing artifacts are hashed before their first use by this version. A JSON
+sidecar beside each model records the expected digest plus the file's size,
+mtime, ctime, device, and inode. Later launches may skip the multi-gigabyte hash
+only when all cached identity fields still match. Malformed/unreadable cache
+data is a cache miss, never proof of integrity; cache writes use fsync plus an
+atomic same-directory rename.
+
+| Artifact | Immutable revision / release | Bytes | SHA-256 |
+|---|---|---:|---|
+| `tokens.txt` | sherpa `2bda32e` | 93,939 | `d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d` |
+| `decoder.int8.onnx` | sherpa `2bda32e` | 11,845,275 | `179e50c43d1a9de79c8a24149a2f9bac6eb5981823f2a2ed88d655b24248db4e` |
+| `joiner.int8.onnx` | sherpa `2bda32e` | 6,355,277 | `3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3` |
+| `encoder.int8.onnx` | sherpa `2bda32e` | 652,184,281 | `acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247` |
+| `silero_vad.onnx` | sherpa-onnx `asr-models` release asset | 643,854 | `9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6` |
+| `Qwen3.5-4B-Q6_K.gguf` | Qwen `e87f176` | 3,525,956,768 | `fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66` |
+
+The sherpa and Qwen revisions are the upstream repository commits
+[`2bda32ec70b097a55adaa07d9a7173915b43cc78`](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/commit/2bda32ec70b097a55adaa07d9a7173915b43cc78)
+and
+[`e87f176479d0855a907a41277aca2f8ee7a09523`](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/commit/e87f176479d0855a907a41277aca2f8ee7a09523).
+Silero's mutable release URL is made byte-immutable by the pinned digest.
+
+**Scope.** This ADR covers the six files fetched by the Rust downloader. The
+FluidAudio-managed Core ML bundle uses a separate Swift download path; its
+manifest/integrity closeout remains part of ADR-0022's Core ML follow-up rather
+than being implicitly claimed here.
+
+**Consequences.** A first launch after upgrading reads and hashes each existing
+Rust-managed model once. On later launches the integrity gate is a handful of
+metadata reads and small sidecar reads. Changing a model now requires an
+intentional code review of revision, size, and digest together.
+
+Measured on the M5 Pro release bundle against the installed artifacts, the
+one-time SHA-256 pass took 1.291 s for the 671 MB sherpa/VAD set and 6.313 s for
+the 3.53 GB polish GGUF. The next launch's metadata-cache checks took 0.738 ms
+and 2.632 ms respectively. This is a launch/first-use gate, not part of
+recording, endpointing, or inference.
+
+---
+
 ## Index of open decisions vs targets
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -1446,6 +1504,11 @@ gate.
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-08-10** — [ADR-0024](#0024--immutable-identities-for-rust-managed-model-artifacts)
+  added: immutable Hugging Face revisions, pinned length/SHA-256 identities,
+  streaming `.part` verification, corrupt-file refetch, and metadata-cached
+  first-use verification for all six Rust-managed model artifacts.
 
 - **2026-08-10** — [ADR-0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority)
   added: dual-VAD speculative decode with the original confirmer retained as
