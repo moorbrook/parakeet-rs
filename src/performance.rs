@@ -51,7 +51,8 @@ pub const PHASE_TIMER_TAG: &str = "phase_timer";
 pub enum PhaseTimerMode {
     /// Real dictation triggered by the user's hotkey.
     Real,
-    /// Synthetic bench iteration: pre-loaded WAV, no mic, no paste.
+    /// Synthetic bench iteration. The ASR-only harness uses a pre-loaded WAV;
+    /// the end-to-end harness uses an explicit loopback capture device.
     Bench,
 }
 
@@ -71,23 +72,25 @@ impl PhaseTimerMode {
 ///
 /// ```text
 /// phase_timer mode=real session_id=68291f4b-0007 audio_s=4.83 \
-///   t_capture_end=4831 t_vad_endpoint=4831 t_asr_start=4832 \
-///   t_asr_done=5467 t_paste_done=5519 dur_post_endpoint_ms=688
+///   t_capture_end=4831 t_vad_endpoint=4831 t_asr_start=4704 \
+///   t_asr_done=4770 t_paste_done=4835 dur_post_endpoint_ms=4 \
+///   t_speech_end=4671 dur_end_to_end_ms=164
 /// ```
 ///
 /// All `t_*` are ms offsets from `t0`. Absent markers print as `-` —
 /// `scripts/bench-aggregate.py` skips lines with `-` in fields it needs.
 ///
-/// `dur_post_endpoint_ms` is the **user-facing latency**: ms from "user
-/// finished speaking" (VAD endpoint, or hotkey release in Hold mode) to
-/// "text appears in the focused app". This is the number the latency
-/// plan's acceptance criteria are stated in.
+/// `dur_post_endpoint_ms` is retained for compatibility and starts when VAD
+/// finishes its silence confirmation. `dur_end_to_end_ms` starts at the
+/// estimated last voiced sample, so it includes the VAD hangover and is the
+/// user-facing end-of-speech-to-text measurement.
 pub struct PhaseTimer {
     session_id: String,
     mode: PhaseTimerMode,
     t0: Instant,
     audio_s: Option<f32>,
     t_capture_end_ms: Option<u32>,
+    t_speech_end_ms: Option<u32>,
     t_vad_endpoint_ms: Option<u32>,
     t_asr_start_ms: Option<u32>,
     t_asr_done_ms: Option<u32>,
@@ -105,6 +108,7 @@ impl PhaseTimer {
             t0: Instant::now(),
             audio_s: None,
             t_capture_end_ms: None,
+            t_speech_end_ms: None,
             t_vad_endpoint_ms: None,
             t_asr_start_ms: None,
             t_asr_done_ms: None,
@@ -124,11 +128,35 @@ impl PhaseTimer {
         self.audio_s = Some(audio_s);
     }
 
-    /// VAD declared end-of-speech. In `Mode::Manual` this stays
-    /// `None` (the hotkey release is the endpoint, recorded by
-    /// `mark_capture_end`).
+    /// Record the estimated last voiced sample on the captured-audio
+    /// timeline. The VAD watcher confirms this timestamp only after its full
+    /// silence-safety window survives without resumed speech.
+    pub fn mark_speech_end_at_audio_offset(&mut self, audio_seconds: f32) {
+        let offset_ms = (audio_seconds.max(0.0) * 1_000.0)
+            .round()
+            .clamp(0.0, u32::MAX as f32) as u32;
+        self.t_speech_end_ms = Some(offset_ms.min(self.elapsed_ms()));
+    }
+
+    /// Override the acoustic endpoint with an externally observed monotonic
+    /// instant. The loopback benchmark uses Core Audio's predicted playback
+    /// timestamp for the fixture's final non-silent sample, avoiding any
+    /// dependency on the VAD implementation being measured.
+    pub fn mark_speech_end_at_instant(&mut self, speech_end: Instant) {
+        let offset = speech_end
+            .saturating_duration_since(self.t0)
+            .as_millis()
+            .min(u128::from(u32::MAX)) as u32;
+        self.t_speech_end_ms = Some(offset.min(self.elapsed_ms()));
+    }
+
+    /// VAD confirmed the endpoint, or the user explicitly finalized a Hold
+    /// session. When no earlier acoustic endpoint exists, this moment is the
+    /// best available end-of-speech timestamp.
     pub fn mark_vad_endpoint(&mut self) {
-        self.t_vad_endpoint_ms = Some(self.elapsed_ms());
+        let now = self.elapsed_ms();
+        self.t_speech_end_ms.get_or_insert(now);
+        self.t_vad_endpoint_ms = Some(now);
     }
 
     pub fn mark_asr_start(&mut self) {
@@ -139,7 +167,8 @@ impl PhaseTimer {
         self.t_asr_done_ms = Some(self.elapsed_ms());
     }
 
-    /// Paste returned (the ⌘V chord was sent). Latency clock stops here.
+    /// Transcript delivery returned (currently a synthetic Unicode event).
+    /// Latency clock stops here.
     pub fn mark_paste_done(&mut self) {
         self.t_paste_done_ms = Some(self.elapsed_ms());
     }
@@ -153,14 +182,24 @@ impl PhaseTimer {
         Some(done.saturating_sub(endpoint))
     }
 
+    fn end_to_end_dur_ms(&self) -> Option<u32> {
+        let speech_end = self
+            .t_speech_end_ms
+            .or(self.t_vad_endpoint_ms)
+            .or(self.t_capture_end_ms)?;
+        let done = self.t_paste_done_ms?;
+        Some(done.saturating_sub(speech_end))
+    }
+
     /// Write the structured log line. Idempotent — consumes `self`.
     pub fn emit(self) {
         let post_endpoint = self.post_endpoint_dur_ms();
+        let end_to_end = self.end_to_end_dur_ms();
         // Single-line shape is the contract with the aggregator. Field
         // order doesn't matter (parser is k=v based), but new fields
         // should be appended so older log files remain parseable.
         log::info!(
-            "{tag} mode={mode} session_id={sid} audio_s={audio} t_capture_end={tce} t_vad_endpoint={tve} t_asr_start={tas} t_asr_done={tad} t_paste_done={tpd} dur_post_endpoint_ms={dpe}",
+            "{tag} mode={mode} session_id={sid} audio_s={audio} t_capture_end={tce} t_vad_endpoint={tve} t_asr_start={tas} t_asr_done={tad} t_paste_done={tpd} dur_post_endpoint_ms={dpe} t_speech_end={tse} dur_end_to_end_ms={de2e}",
             tag = PHASE_TIMER_TAG,
             mode = self.mode.as_str(),
             sid = self.session_id,
@@ -171,6 +210,8 @@ impl PhaseTimer {
             tad = OptU32(self.t_asr_done_ms),
             tpd = OptU32(self.t_paste_done_ms),
             dpe = OptU32(post_endpoint),
+            tse = OptU32(self.t_speech_end_ms),
+            de2e = OptU32(end_to_end),
         );
     }
 }
@@ -269,6 +310,32 @@ mod tests {
         t.mark_vad_endpoint();
         // No paste-done mark yet.
         assert!(t.post_endpoint_dur_ms().is_none());
+        assert!(t.end_to_end_dur_ms().is_none());
+    }
+
+    #[test]
+    fn end_to_end_includes_time_before_vad_confirmation() {
+        let mut t = PhaseTimer::start(PhaseTimerMode::Real, "test-e2e".into());
+        t.mark_speech_end_at_audio_offset(0.0);
+        sleep(Duration::from_millis(5));
+        t.mark_vad_endpoint();
+        sleep(Duration::from_millis(5));
+        t.mark_paste_done();
+        let post = t.post_endpoint_dur_ms().expect("set");
+        let end_to_end = t.end_to_end_dur_ms().expect("set");
+        assert!(end_to_end > post);
+    }
+
+    #[test]
+    fn external_acoustic_endpoint_overrides_vad_estimate() {
+        let mut t = PhaseTimer::start(PhaseTimerMode::Bench, "test-external-end".into());
+        let speech_end = Instant::now();
+        sleep(Duration::from_millis(5));
+        t.mark_speech_end_at_audio_offset(99.0);
+        t.mark_speech_end_at_instant(speech_end);
+        sleep(Duration::from_millis(5));
+        t.mark_paste_done();
+        assert!(t.end_to_end_dur_ms().is_some_and(|duration| duration >= 5));
     }
 
     #[test]

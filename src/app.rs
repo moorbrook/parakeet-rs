@@ -204,7 +204,14 @@ impl App {
     /// thread or the CGEventTap callback — `streamer::start` opens
     /// the mic and loads Silero VAD (~100-300 ms cold).
     fn start_session_blocking(self: Arc<Self>, mode: StreamerMode, vad_path: std::path::PathBuf) {
-        let (session, outcome_rx) = match streamer::start(&vad_path, mode) {
+        let Some(asr) = self.asr.lock().clone() else {
+            log::error!("start session failed: recognizer unavailable");
+            let next = self.resting_state();
+            self.fsm.abort_starter(next);
+            self.announce_state(next);
+            return;
+        };
+        let (session, outcome_rx) = match streamer::start(&vad_path, mode, asr) {
             Ok(pair) => pair,
             Err(e) => {
                 log::error!("start session failed: {e:#}");
@@ -251,9 +258,10 @@ impl App {
                 Some(Outcome::Speech {
                     samples,
                     sample_rate,
+                    early_transcript,
                     timer,
                 }) => {
-                    app.transcribe_and_paste(samples, sample_rate, timer);
+                    app.transcribe_and_paste(samples, sample_rate, early_transcript, timer);
                 }
                 Some(Outcome::Cancelled) => {}
                 Some(Outcome::NoSpeech) => {
@@ -271,24 +279,31 @@ impl App {
         self: &Arc<Self>,
         samples: Vec<f32>,
         sample_rate: u32,
+        early_transcript: Option<String>,
         mut timer: PhaseTimer,
     ) {
         self.spawn_supervised("transcribe", move |app| {
-            let Some(asr) = app.asr.lock().clone() else {
-                log::error!("transcribe: model gone");
-                app.on_session_finished();
-                return;
-            };
-            timer.mark_asr_start();
-            let raw = match asr.recognize(&samples, sample_rate) {
-                Ok(t) => t,
-                Err(e) => {
-                    log::error!("recognise failed: {e:#}");
-                    app.on_session_finished();
-                    return;
+            let raw = match early_transcript {
+                Some(text) => text,
+                None => {
+                    let Some(asr) = app.asr.lock().clone() else {
+                        log::error!("transcribe: model gone");
+                        app.on_session_finished();
+                        return;
+                    };
+                    timer.mark_asr_start();
+                    let text = match asr.recognize(&samples, sample_rate) {
+                        Ok(text) => text,
+                        Err(e) => {
+                            log::error!("recognise failed: {e:#}");
+                            app.on_session_finished();
+                            return;
+                        }
+                    };
+                    timer.mark_asr_done();
+                    text
                 }
             };
-            timer.mark_asr_done();
 
             let settings = app.settings.load();
             let result = deliver_cleaned(&app, &raw, &settings);

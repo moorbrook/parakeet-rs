@@ -9,12 +9,12 @@ Reads stderr-style lines like:
     [...] INFO  phase_timer mode=bench session_id=bench-5s-r03-... \\
                 audio_s=5.024 t_capture_end=0 t_vad_endpoint=0 \\
                 t_asr_start=0 t_asr_done=638 t_paste_done=638 \\
-                dur_post_endpoint_ms=638
+                dur_post_endpoint_ms=638 dur_end_to_end_ms=798
 
 Skips:
     * lines without `phase_timer ` tag
     * lines whose session_id begins with `warmup-` (CoreML graph compile)
-    * lines missing audio_s or dur_post_endpoint_ms
+    * lines missing audio_s or the selected duration metric
 
 Writes CSV columns: mode,target_length_s,n,mean_ms,p50_ms,p95_ms,p99_ms.
 Target length = nearest of {1, 3, 5, 10, 20} to the line's audio_s.
@@ -33,6 +33,10 @@ from pathlib import Path
 PHASE_TAG_RE = re.compile(r"phase_timer\s+(.*)$")
 KV_RE = re.compile(r"(\w+)=(\S+)")
 TARGETS_S = [1, 3, 5, 10, 20]
+METRIC_FIELDS = {
+    "post-endpoint": "dur_post_endpoint_ms",
+    "end-to-end": "dur_end_to_end_ms",
+}
 
 
 def bucket_for(audio_s: float) -> int:
@@ -40,7 +44,7 @@ def bucket_for(audio_s: float) -> int:
     return min(TARGETS_S, key=lambda t: abs(t - audio_s))
 
 
-def parse_log(path: Path):
+def parse_log(path: Path, duration_field: str):
     rows: list[tuple[str, float, int]] = []
     for line in path.read_text().splitlines():
         m = PHASE_TAG_RE.search(line)
@@ -52,7 +56,7 @@ def parse_log(path: Path):
             continue
         try:
             audio_s = float(kv.get("audio_s", "-"))
-            dur = int(kv.get("dur_post_endpoint_ms", "-"))
+            dur = int(kv.get(duration_field, "-"))
         except ValueError:
             continue
         rows.append((kv.get("mode", "?"), audio_s, dur))
@@ -78,13 +82,19 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--log", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument(
+        "--metric",
+        choices=METRIC_FIELDS,
+        default="post-endpoint",
+        help="duration to aggregate (default: post-endpoint)",
+    )
     args = ap.parse_args()
 
     if not args.log.exists():
         print(f"log not found: {args.log}", file=sys.stderr)
         return 1
 
-    rows = parse_log(args.log)
+    rows = parse_log(args.log, METRIC_FIELDS[args.metric])
     if not rows:
         print(f"no phase_timer lines in {args.log}", file=sys.stderr)
         return 1

@@ -8,15 +8,20 @@
 
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use sherpa_onnx::LinearResampler;
 
+use crate::asr::Asr;
 use crate::audio::{AudioCapture, Recording};
+use crate::endpointing::{
+    EndpointEvent, EndpointTracker, CONFIRM_SILENCE_WINDOWS, SAMPLE_RATE, WINDOW_SAMPLES,
+};
 use crate::performance::{next_session_id, PhaseTimer, PhaseTimerMode};
-use crate::vad::{Vad, VAD_SAMPLE_RATE, WINDOW_SIZE};
+use crate::vad::Vad;
 
 /// If the user starts dictation and says nothing within this window, give up.
 const NO_SPEECH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,6 +39,15 @@ pub enum Mode {
     Manual,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EndpointStrategy {
+    /// Previous behavior: wait for the full VAD confirmation, then decode.
+    Serial,
+    /// Decode after the first silent frame, but retain the full confirmation
+    /// window before committing the recording.
+    Speculative,
+}
+
 pub enum Outcome {
     /// End of speech reached. Carries the raw mono samples at the native
     /// capture rate so the ASR can do its own resample / decode.
@@ -44,6 +58,9 @@ pub enum Outcome {
     Speech {
         samples: Vec<f32>,
         sample_rate: u32,
+        /// Transcript decoded during the VAD confirmation window. `None`
+        /// means the app must run the normal post-capture decode.
+        early_transcript: Option<String>,
         timer: PhaseTimer,
     },
     /// User aborted before any audio was eligible to commit.
@@ -51,6 +68,26 @@ pub enum Outcome {
     /// VAD never saw speech in the timeout window (VadAutoStop mode only).
     NoSpeech,
     Error(anyhow::Error),
+}
+
+struct VadSet {
+    /// The unchanged 150 ms detector is the only authority allowed to end a
+    /// recording. This keeps cutoff behavior identical to the serial path.
+    confirming: Vad,
+    /// A second low-latency detector may start provisional ASR, but can never
+    /// commit a recording by itself.
+    candidate: Vad,
+}
+
+struct VadRun {
+    capture: AudioCapture,
+    vad: VadSet,
+    asr: Arc<Asr>,
+    endpoint_strategy: EndpointStrategy,
+    sample_rate: u32,
+    tap_rx: Receiver<Vec<f32>>,
+    signal_rx: Receiver<Signal>,
+    timer: PhaseTimer,
 }
 
 enum Signal {
@@ -102,25 +139,66 @@ impl Drop for Session {
 /// Returns the command half (kept by `App` so hotkey edges can reach it)
 /// and the outcome half (passed directly to the watcher thread that
 /// waits for the session to finish).
-pub fn start(vad_model: &Path, mode: Mode) -> Result<(Session, OutcomeRx)> {
+pub fn start(vad_model: &Path, mode: Mode, asr: Arc<Asr>) -> Result<(Session, OutcomeRx)> {
+    start_with_strategy(vad_model, mode, asr, EndpointStrategy::Speculative)
+}
+
+/// Benchmark seam for comparing the frozen serial pipeline against the
+/// production speculative path through identical capture/session code.
+pub fn start_with_strategy(
+    vad_model: &Path,
+    mode: Mode,
+    asr: Arc<Asr>,
+    endpoint_strategy: EndpointStrategy,
+) -> Result<(Session, OutcomeRx)> {
+    start_with_strategy_on_device(vad_model, mode, asr, endpoint_strategy, None)
+}
+
+/// Identical to [`start_with_strategy`], with an explicit capture device for
+/// deterministic loopback benchmarks. Production always passes `None`.
+pub fn start_with_strategy_on_device(
+    vad_model: &Path,
+    mode: Mode,
+    asr: Arc<Asr>,
+    endpoint_strategy: EndpointStrategy,
+    input_device: Option<&str>,
+) -> Result<(Session, OutcomeRx)> {
     let (tap_tx, tap_rx) = channel::<Vec<f32>>();
     let (signal_tx, signal_rx) = channel::<Signal>();
     let (outcome_tx, outcome_rx) = channel::<Outcome>();
 
-    let capture = AudioCapture::start_with_tap(tap_tx).context("starting capture")?;
+    let capture = match input_device {
+        Some(name) => AudioCapture::start_with_tap_on_device(tap_tx, Some(name)),
+        None => AudioCapture::start_with_tap(tap_tx),
+    }
+    .context("starting capture")?;
     let sample_rate = capture.sample_rate();
 
+    // Anchor the audio timeline immediately after capture becomes live. VAD
+    // construction happens while the microphone records leading silence, so
+    // starting this clock after VAD load would shift every sample-derived
+    // endpoint earlier than its matching wall-clock instant.
+    let timer_mode = if input_device.is_some() {
+        PhaseTimerMode::Bench
+    } else {
+        PhaseTimerMode::Real
+    };
+    let timer = PhaseTimer::start(timer_mode, next_session_id());
+
     let vad = if matches!(mode, Mode::VadAutoStop) {
-        // Silero is a small RNN — single thread is plenty.
-        Some(Vad::load(vad_model, 1).context("loading Silero VAD")?)
+        // Silero is a small RNN; two single-threaded states cost far less than
+        // the ASR pass they allow us to hide behind endpoint confirmation.
+        Some(VadSet {
+            confirming: Vad::load_confirming(vad_model, 1)
+                .context("loading confirming Silero VAD")?,
+            // Also run the early detector in serial benchmark mode so old and
+            // new measurements share the exact same acoustic-end anchor. Only
+            // the speculative production path acts on its candidate early.
+            candidate: Vad::load_candidate(vad_model, 1).context("loading candidate Silero VAD")?,
+        })
     } else {
         None
     };
-
-    // The latency clock starts here — mic is hot, the user is about to
-    // speak. The downstream `Outcome::Speech` carries this timer all the
-    // way through ASR and paste; cancellations / no-speech drop it.
-    let timer = PhaseTimer::start(PhaseTimerMode::Real, next_session_id());
 
     let join = std::thread::Builder::new()
         .name(match mode {
@@ -134,7 +212,16 @@ pub fn start(vad_model: &Path, mode: Mode) -> Result<(Session, OutcomeRx)> {
             // combination" arm was unreachable.
             let outcome = match mode {
                 Mode::VadAutoStop => match vad {
-                    Some(vad) => run_vad(capture, vad, sample_rate, tap_rx, signal_rx, timer),
+                    Some(vad) => run_vad(VadRun {
+                        capture,
+                        vad,
+                        asr,
+                        endpoint_strategy,
+                        sample_rate,
+                        tap_rx,
+                        signal_rx,
+                        timer,
+                    }),
                     None => Outcome::Error(anyhow!("VadAutoStop spawned without a VAD model")),
                 },
                 Mode::Manual => run_manual(capture, tap_rx, signal_rx, timer),
@@ -152,23 +239,31 @@ pub fn start(vad_model: &Path, mode: Mode) -> Result<(Session, OutcomeRx)> {
     ))
 }
 
-fn run_vad(
-    capture: AudioCapture,
-    vad: Vad,
-    sample_rate: u32,
-    tap_rx: Receiver<Vec<f32>>,
-    signal_rx: Receiver<Signal>,
-    timer: PhaseTimer,
-) -> Outcome {
-    let Some(resampler) = LinearResampler::create(sample_rate as i32, VAD_SAMPLE_RATE) else {
+fn run_vad(run: VadRun) -> Outcome {
+    let VadRun {
+        capture,
+        vad,
+        asr,
+        endpoint_strategy,
+        sample_rate,
+        tap_rx,
+        signal_rx,
+        mut timer,
+    } = run;
+    let Some(resampler) = LinearResampler::create(sample_rate as i32, SAMPLE_RATE as i32) else {
         let _ = capture.stop();
         return Outcome::Error(anyhow!(
-            "could not build {sample_rate}->{VAD_SAMPLE_RATE} resampler"
+            "could not build {sample_rate}->{SAMPLE_RATE} resampler"
         ));
     };
 
-    let mut window_buf: Vec<f32> = Vec::with_capacity(WINDOW_SIZE as usize * 4);
-    let mut window: Vec<f32> = Vec::with_capacity(WINDOW_SIZE as usize);
+    let mut window_buf: Vec<f32> = Vec::with_capacity(WINDOW_SAMPLES as usize * 4);
+    let mut window: Vec<f32> = Vec::with_capacity(WINDOW_SAMPLES as usize);
+    let mut mono_audio: Vec<f32> = Vec::with_capacity(sample_rate as usize * 5);
+    let mut endpoint = EndpointTracker::default();
+    let mut candidate_speech_end: Option<u64> = None;
+    let mut processed_vad_samples: u64 = 0;
+    let mut early_transcript: Option<String> = None;
     let session_start = Instant::now();
     let mut saw_speech = false;
     let mut speech_started_at: Option<Instant> = None;
@@ -177,7 +272,7 @@ fn run_vad(
         match signal_rx.try_recv() {
             Ok(Signal::Cancel) => return finish(capture, Outcome::Cancelled),
             // VAD mode treats an explicit finalize the same as VAD-end-of-speech.
-            Ok(Signal::Finalize) => return finish_at_vad_endpoint(capture, timer),
+            Ok(Signal::Finalize) => return finish_at_vad_endpoint(capture, timer, None),
             Err(_) => {}
         }
 
@@ -201,40 +296,107 @@ fn run_vad(
             }
         };
 
+        mono_audio.extend_from_slice(&chunk);
         let chunk16 = resampler.resample(&chunk, false);
         if chunk16.is_empty() {
             continue;
         }
         window_buf.extend_from_slice(&chunk16);
 
-        while window_buf.len() >= WINDOW_SIZE as usize {
+        while window_buf.len() >= WINDOW_SAMPLES as usize {
             window.clear();
-            window.extend(window_buf.drain(..WINDOW_SIZE as usize));
-            vad.accept_waveform(&window);
-            vad.drain_segments();
+            window.extend(window_buf.drain(..WINDOW_SAMPLES as usize));
+            vad.confirming.accept_waveform(&window);
+            vad.confirming.drain_segments();
+            processed_vad_samples = processed_vad_samples.saturating_add(u64::from(WINDOW_SAMPLES));
 
-            let detected_now = vad.detected();
-            if detected_now {
-                if !saw_speech {
-                    saw_speech = true;
-                    speech_started_at = Some(Instant::now());
+            let detected_now = vad.confirming.detected();
+            vad.candidate.accept_waveform(&window);
+            vad.candidate.drain_segments();
+            let candidate_detected = vad.candidate.detected();
+            if detected_now && !saw_speech {
+                saw_speech = true;
+                speech_started_at = Some(Instant::now());
+            }
+
+            if endpoint_strategy == EndpointStrategy::Serial && !detected_now && saw_speech {
+                let speech_end_sample = candidate_speech_end.unwrap_or_else(|| {
+                    let confirmed_silence_samples =
+                        u64::from(CONFIRM_SILENCE_WINDOWS) * u64::from(WINDOW_SAMPLES);
+                    processed_vad_samples.saturating_sub(confirmed_silence_samples)
+                });
+                timer
+                    .mark_speech_end_at_audio_offset(speech_end_sample as f32 / SAMPLE_RATE as f32);
+                return finish_at_vad_endpoint(capture, timer, None);
+            }
+
+            let endpoint_event = endpoint.observe(candidate_detected);
+            match endpoint_event {
+                EndpointEvent::Candidate { speech_end_sample } => {
+                    candidate_speech_end = Some(speech_end_sample);
+                    log::debug!(
+                        "endpoint candidate at {:.3}s",
+                        speech_end_sample as f32 / SAMPLE_RATE as f32
+                    );
+                    if endpoint_strategy == EndpointStrategy::Speculative {
+                        timer.mark_asr_start();
+                        early_transcript = match asr.recognize(&mono_audio, sample_rate) {
+                            Ok(text) if !text.trim().is_empty() => Some(text),
+                            Ok(_) => None,
+                            Err(error) => {
+                                log::warn!(
+                                    "speculative ASR failed; final decode will retry: {error:#}"
+                                );
+                                None
+                            }
+                        };
+                        timer.mark_asr_done();
+                    }
                 }
-            } else if saw_speech {
-                return finish_at_vad_endpoint(capture, timer);
+                EndpointEvent::SpeechResumed => {
+                    log::debug!(
+                        "speech resumed at {:.3}s; invalidating endpoint candidate",
+                        processed_vad_samples as f32 / SAMPLE_RATE as f32
+                    );
+                    candidate_speech_end = None;
+                    if early_transcript.take().is_some() {
+                        log::debug!("speech resumed; discarded speculative transcript");
+                    }
+                }
+                // Local confirmation prevents repeated candidates while the
+                // early detector remains silent. The unchanged confirming
+                // detector below still owns the actual stop decision.
+                EndpointEvent::Confirmed { .. } => {}
+                EndpointEvent::None => {}
+            }
+
+            if endpoint_strategy == EndpointStrategy::Speculative && !detected_now && saw_speech {
+                let speech_end_sample = candidate_speech_end.unwrap_or_else(|| {
+                    let confirmed_silence_samples =
+                        u64::from(CONFIRM_SILENCE_WINDOWS) * u64::from(WINDOW_SAMPLES);
+                    processed_vad_samples.saturating_sub(confirmed_silence_samples)
+                });
+                timer
+                    .mark_speech_end_at_audio_offset(speech_end_sample as f32 / SAMPLE_RATE as f32);
+                return finish_at_vad_endpoint(capture, timer, early_transcript);
             }
 
             if let Some(t) = speech_started_at {
                 if t.elapsed() > Duration::from_secs(crate::vad::MAX_SPEECH_S as u64) {
-                    return finish_at_vad_endpoint(capture, timer);
+                    return finish_at_vad_endpoint(capture, timer, None);
                 }
             }
         }
     }
 }
 
-fn finish_at_vad_endpoint(capture: AudioCapture, mut timer: PhaseTimer) -> Outcome {
+fn finish_at_vad_endpoint(
+    capture: AudioCapture,
+    mut timer: PhaseTimer,
+    early_transcript: Option<String>,
+) -> Outcome {
     timer.mark_vad_endpoint();
-    finish_with_recording(capture, timer)
+    finish_with_recording(capture, timer, early_transcript)
 }
 
 fn run_manual(
@@ -256,7 +418,7 @@ fn run_manual(
             // be excluded from `dur_post_endpoint_ms`.
             Ok(Signal::Finalize) => {
                 timer.mark_vad_endpoint();
-                return finish_with_recording(capture, timer);
+                return finish_with_recording(capture, timer, None);
             }
             Err(_) => {}
         }
@@ -271,13 +433,17 @@ fn run_manual(
             // the cap-hit moment as the endpoint so latency math
             // doesn't include the post-cap stop+join overhead either.
             timer.mark_vad_endpoint();
-            return finish_with_recording(capture, timer);
+            return finish_with_recording(capture, timer, None);
         }
         std::thread::sleep(Duration::from_millis(15));
     }
 }
 
-fn finish_with_recording(capture: AudioCapture, mut timer: PhaseTimer) -> Outcome {
+fn finish_with_recording(
+    capture: AudioCapture,
+    mut timer: PhaseTimer,
+    early_transcript: Option<String>,
+) -> Outcome {
     match capture.stop() {
         Ok(rec) => {
             let Recording {
@@ -305,6 +471,7 @@ fn finish_with_recording(capture: AudioCapture, mut timer: PhaseTimer) -> Outcom
             Outcome::Speech {
                 samples: mono,
                 sample_rate,
+                early_transcript,
                 timer,
             }
         }
