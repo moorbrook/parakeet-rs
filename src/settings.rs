@@ -262,8 +262,9 @@ impl SettingsStore {
             .join("Qwen3.5-4B-Q6_K.gguf")
     }
 
-    /// True iff the polish-pass GGUF is on disk. The polish loader
-    /// gates on this before attempting to call llama.cpp.
+    /// True iff the polish-pass GGUF is on disk. This is an existence-only
+    /// UI/diagnostic helper; the loader calls `ensure_polish_model` and passes
+    /// its integrity gate before llama.cpp can open the file.
     pub fn polish_model_present(&self) -> bool {
         self.polish_model_path().exists()
     }
@@ -434,10 +435,10 @@ mod tests {
     #[test]
     fn download_set_matches_presence_check() {
         // The downloader fetches `model_fetch::ASR_FILES` into
-        // `model_dir()`. Startup then refuses to launch unless all four
-        // `*_path()` accessors point at files that exist. If those two
-        // lists ever drift, first-run reports "Model ready." and the
-        // recogniser fails to load on the next launch.
+        // `model_dir()`. Benchmark/evaluation binaries use the existence-only
+        // `model_present()` preflight, while app startup performs the stronger
+        // downloader integrity gate. If these lists drift, those entry points
+        // disagree about whether the fallback model is installed.
         let store = synthetic_store(tempfile::tempdir().unwrap().keep());
         let model_dir = store.model_dir();
 

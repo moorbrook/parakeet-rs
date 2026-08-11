@@ -553,14 +553,14 @@ impl App {
 
         let on_progress: model_fetch::ProgressFn = Arc::new(fetch_progress_to_menubar);
 
-        if !self.settings.model_present() {
-            if let Err(e) =
-                model_fetch::ensure_model(&model_dir, &vad_path, on_progress.clone()).await
-            {
-                log::error!("model fetch failed: {e:#}");
-                menubar::set_status_text(&format!("Model download failed: {e}"));
-                return;
-            }
+        // `ensure_model` is also the integrity gate for already-present
+        // artifacts. Its verified-metadata cache makes unchanged launches
+        // cheap; skipping it here would trust any stale or replaced file.
+        if let Err(e) = model_fetch::ensure_model(&model_dir, &vad_path, on_progress.clone()).await
+        {
+            log::error!("model fetch failed: {e:#}");
+            menubar::set_status_text(&format!("Model download failed: {e}"));
+            return;
         }
 
         let settings = self.settings.clone();
@@ -796,27 +796,22 @@ fn load_optimized_asr(settings: &SettingsStore) -> anyhow::Result<Asr> {
 /// so the user sees progress through the ~250 ms load + ~150 ms warm.
 fn load_llm_blocking(settings: &SettingsStore) -> anyhow::Result<Arc<dyn PolishBackend>> {
     let model_path = settings.polish_model_path();
-    if !settings.polish_model_present() {
-        // First enable: auto-fetch the GGUF (~3.5 GB). Both callers run
-        // on a dedicated blocking thread (`tokio::spawn_blocking` on the
-        // boot path, supervised `std::thread` on the toggle path), so
-        // driving the async downloader with a throwaway current-thread
-        // runtime here is safe and keeps a single wiring point for both.
-        // The caller's load-slot claim means toggle-spam can't start two
-        // concurrent downloads; on failure the slot finalizes as Failed
-        // and a later toggle retries (the .part cleanup in `download_to`
-        // guarantees no corrupt leftover).
-        use anyhow::Context as _;
-        let on_progress: model_fetch::ProgressFn = Arc::new(fetch_progress_to_menubar);
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("building polish-download runtime")?
-            .block_on(model_fetch::ensure_polish_model(&model_path, on_progress))
-            .with_context(|| {
-                format!("auto-downloading polish model to {}", model_path.display())
-            })?;
-    }
+    // Both first-use download and every later integrity check enter through
+    // this one gate. The caller already runs on a dedicated blocking thread,
+    // and a verified cache hit only reads metadata plus a tiny JSON sidecar.
+    use anyhow::Context as _;
+    let on_progress: model_fetch::ProgressFn = Arc::new(fetch_progress_to_menubar);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building polish-download runtime")?
+        .block_on(model_fetch::ensure_polish_model(&model_path, on_progress))
+        .with_context(|| {
+            format!(
+                "verifying or auto-downloading polish model to {}",
+                model_path.display()
+            )
+        })?;
     menubar::set_status_text("Loading polish model…");
     let llm = LlamaPolish::load(&model_path)?;
     menubar::set_status_text("Warming polish model…");
