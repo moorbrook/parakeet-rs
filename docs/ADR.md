@@ -1411,10 +1411,10 @@ more than one decode during a long utterance with internal pauses; those
 results are discarded and affect energy use, not visible text.
 
 The 10 s and 20 s macOS `say` fixtures include long pauses that the unchanged
-150 ms confirming detector already treats as final. That is a pre-existing
-multi-sentence endpoint-policy limitation, not a speculative-decode
-regression, and remains separate from this representative five-second latency
-gate.
+150 ms confirming detector treats as final. That pre-existing multi-sentence
+endpoint-policy limitation was subsequently resolved by ADR-0025. The
+representative five-second 3× gate remains frozen on the 150 ms Tap Fast policy
+so its before/after comparison stays like-for-like.
 
 ---
 
@@ -1476,12 +1476,70 @@ recording, endpointing, or inference.
 
 ---
 
+## 0025 — Pause-friendly Tap with an explicit low-latency mode
+
+**Status:** **Accepted — implemented and measured.**
+
+**Context.** The original Tap mode committed after 150 ms of VAD silence. A
+14.225 s human LibriSpeech fixture contains a reviewed natural 544 ms pause;
+the old policy stopped during that pause and discarded the rest of the
+utterance. The same failure occurs in the longer synthesized fixtures. Text or
+punctuation cannot reliably resolve this ambiguity: a user may pause after a
+grammatically complete sentence and continue with another.
+
+**Decision.** Keep the early 32 ms candidate detector from ADR-0023, but make
+the independent confirming detector a product policy:
+
+- **Tap** is pause-friendly and waits 750 ms (24 32 ms Silero windows, 768 ms
+  after frame quantization). Existing serialized `"tap"` settings migrate to
+  this safer behavior without a settings-file rewrite.
+- **Tap Fast** is an explicit 150 ms option (five windows, 160 ms after
+  quantization) for short commands. It preserves ADR-0023's matched 3× latency
+  gate exactly.
+- **Hold** remains release-to-paste and does not depend on VAD to stop.
+
+The threshold is centralized in `EndpointPolicy` and passed to both the local
+candidate tracker and the authoritative Silero instance. This avoids a split
+brain where speculation and capture shutdown use different confirmation
+windows.
+
+**Gate.** Two human-speech fixtures from LibriSpeech `test.clean` are versioned
+under `bench/endpointing/`, with immutable source revision, SHA-256 hashes,
+references, conversion method, and CC BY 4.0 attribution. The 3.505 s fixture
+covers an ordinary single sentence; the 14.225 s fixture includes the reviewed
+544 ms pause. `scripts/bench-endpoint-policy.sh` replays both through the
+production Core Audio capture, dual VAD, speculative Core ML inference, and
+shutdown path. It fails if playback does not reach the reviewed acoustic end
+or if final-pause p95 is at least one second. Transcript quality is intentionally
+kept in the separate `asr_diff` gate.
+
+**Evidence.** On M5 Pro 24 GB, release builds with two warmups and 30 measured
+repetitions per fixture produced:
+
+| fixture | false stops | p50 | p95 |
+|---|---:|---:|---:|
+| 3.505 s single sentence | **0/30** | 668.0 ms | 668.0 ms |
+| 14.225 s multi sentence | **0/30** | 637.0 ms | 658.1 ms |
+
+The frozen Tap Fast comparison was re-run after the policy split and retained
+the accepted 3× target: 589.5 → 182.0 ms p50 (**3.24×**) and 644.8 → 203.0 ms
+p95 (**3.18×**), with exact lexical matches across 30 measured repetitions.
+
+**Consequences.** Normal dictation no longer cuts at the representative natural
+pause, while users who prefer the former minimum stop latency retain it as a
+named mode. Speculative decode overlaps ASR with most of the added confirmation
+window, keeping final-pause latency below one second. A pause longer than the
+selected threshold is still indistinguishable from an intended endpoint; Hold
+mode is the unambiguous choice for rehearsals or unusually long pauses.
+
+---
+
 ## Index of open decisions vs targets
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
 |---|---|---|---|
 | **CoreML EP actually present** | [0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage) + [0015](#0015-coreml-ep-verification-protocol) | **Shipped + measured** — 7.8x RTFx on the warmup decode confirms ANE/GPU is engaged | nothing |
-| <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) | **Shipped + measured** — 182.0 ms end-of-speech-to-transcript-ready p50 on the representative 5 s bucket, 3.37× faster than the matched serial baseline | nothing |
+| <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) + [0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) | **Shipped + measured** — Tap Fast is 182.0 ms p50 on the representative 5 s bucket; pause-friendly Tap remains below 1 s on the endpoint corpus | nothing |
 | Live partial transcripts | [0009](#0009-streaming-recognition--vad-auto-stop) | Proposed | switch to streaming Parakeet model |
 | ANE confirmed in use | [0015](#0015-coreml-ep-verification-protocol) | **All three layers green** — layer 1 nm-check, layer 2 init log, layer 3 measured 7.8x RTFx | nothing |
 | ≤1.2 GB resident set | [0014](#0014-tray-only-headless-ux) + [ADR-0006](#0006-apple-silicon-optimization-plan-ds4-playbook-applied) mmap | Tray-only shipped, mmap shipped; lazy webview still Proposed | nothing |
@@ -1496,14 +1554,20 @@ recording, endpointing, or inference.
    [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation)).
 2. [ADR-0015](#0015-coreml-ep-verification-protocol) — wire build-time +
    runtime EP checks; confirm ANE is actually engaged.
-3. [ADR-0009](#0009-streaming-recognition--vad-auto-stop) — streaming +
-   Silero VAD with 150 ms threshold.
+3. [ADR-0009](#0009-streaming-recognition--vad-auto-stop) +
+   [ADR-0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) —
+   Silero VAD with pause-friendly and explicit fast policies.
 4. [ADR-0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority)
    — measure the production capture path and clear the 3× matched p50/p95 gate.
 
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-08-11** — [ADR-0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode)
+  added: 750 ms pause-friendly Tap default, explicit 150 ms Tap Fast, and a
+  versioned real-speech gate coupling zero false stops with sub-second p95
+  final-pause latency.
 
 - **2026-08-10** — [ADR-0024](#0024--immutable-identities-for-rust-managed-model-artifacts)
   added: immutable Hugging Face revisions, pinned length/SHA-256 identities,

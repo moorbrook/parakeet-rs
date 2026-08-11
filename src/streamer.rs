@@ -18,7 +18,7 @@ use sherpa_onnx::LinearResampler;
 use crate::asr::Asr;
 use crate::audio::{AudioCapture, Recording};
 use crate::endpointing::{
-    EndpointEvent, EndpointTracker, CONFIRM_SILENCE_WINDOWS, SAMPLE_RATE, WINDOW_SAMPLES,
+    EndpointEvent, EndpointPolicy, EndpointTracker, SAMPLE_RATE, WINDOW_SAMPLES,
 };
 use crate::performance::{next_session_id, PhaseTimer, PhaseTimerMode};
 use crate::vad::Vad;
@@ -71,8 +71,8 @@ pub enum Outcome {
 }
 
 struct VadSet {
-    /// The unchanged 150 ms detector is the only authority allowed to end a
-    /// recording. This keeps cutoff behavior identical to the serial path.
+    /// The policy-configured detector is the only authority allowed to end a
+    /// recording. Fast and Long-form modes share the same commit path.
     confirming: Vad,
     /// A second low-latency detector may start provisional ASR, but can never
     /// commit a recording by itself.
@@ -84,6 +84,7 @@ struct VadRun {
     vad: VadSet,
     asr: Arc<Asr>,
     endpoint_strategy: EndpointStrategy,
+    endpoint_policy: EndpointPolicy,
     sample_rate: u32,
     tap_rx: Receiver<Vec<f32>>,
     signal_rx: Receiver<Signal>,
@@ -139,8 +140,19 @@ impl Drop for Session {
 /// Returns the command half (kept by `App` so hotkey edges can reach it)
 /// and the outcome half (passed directly to the watcher thread that
 /// waits for the session to finish).
-pub fn start(vad_model: &Path, mode: Mode, asr: Arc<Asr>) -> Result<(Session, OutcomeRx)> {
-    start_with_strategy(vad_model, mode, asr, EndpointStrategy::Speculative)
+pub fn start(
+    vad_model: &Path,
+    mode: Mode,
+    asr: Arc<Asr>,
+    endpoint_policy: EndpointPolicy,
+) -> Result<(Session, OutcomeRx)> {
+    start_with_strategy(
+        vad_model,
+        mode,
+        asr,
+        EndpointStrategy::Speculative,
+        endpoint_policy,
+    )
 }
 
 /// Benchmark seam for comparing the frozen serial pipeline against the
@@ -150,8 +162,16 @@ pub fn start_with_strategy(
     mode: Mode,
     asr: Arc<Asr>,
     endpoint_strategy: EndpointStrategy,
+    endpoint_policy: EndpointPolicy,
 ) -> Result<(Session, OutcomeRx)> {
-    start_with_strategy_on_device(vad_model, mode, asr, endpoint_strategy, None)
+    start_with_strategy_on_device(
+        vad_model,
+        mode,
+        asr,
+        endpoint_strategy,
+        endpoint_policy,
+        None,
+    )
 }
 
 /// Identical to [`start_with_strategy`], with an explicit capture device for
@@ -161,6 +181,7 @@ pub fn start_with_strategy_on_device(
     mode: Mode,
     asr: Arc<Asr>,
     endpoint_strategy: EndpointStrategy,
+    endpoint_policy: EndpointPolicy,
     input_device: Option<&str>,
 ) -> Result<(Session, OutcomeRx)> {
     let (tap_tx, tap_rx) = channel::<Vec<f32>>();
@@ -189,7 +210,7 @@ pub fn start_with_strategy_on_device(
         // Silero is a small RNN; two single-threaded states cost far less than
         // the ASR pass they allow us to hide behind endpoint confirmation.
         Some(VadSet {
-            confirming: Vad::load_confirming(vad_model, 1)
+            confirming: Vad::load_confirming(vad_model, 1, endpoint_policy)
                 .context("loading confirming Silero VAD")?,
             // Also run the early detector in serial benchmark mode so old and
             // new measurements share the exact same acoustic-end anchor. Only
@@ -217,6 +238,7 @@ pub fn start_with_strategy_on_device(
                         vad,
                         asr,
                         endpoint_strategy,
+                        endpoint_policy,
                         sample_rate,
                         tap_rx,
                         signal_rx,
@@ -245,6 +267,7 @@ fn run_vad(run: VadRun) -> Outcome {
         vad,
         asr,
         endpoint_strategy,
+        endpoint_policy,
         sample_rate,
         tap_rx,
         signal_rx,
@@ -260,7 +283,7 @@ fn run_vad(run: VadRun) -> Outcome {
     let mut window_buf: Vec<f32> = Vec::with_capacity(WINDOW_SAMPLES as usize * 4);
     let mut window: Vec<f32> = Vec::with_capacity(WINDOW_SAMPLES as usize);
     let mut mono_audio: Vec<f32> = Vec::with_capacity(sample_rate as usize * 5);
-    let mut endpoint = EndpointTracker::default();
+    let mut endpoint = EndpointTracker::new(endpoint_policy);
     let mut candidate_speech_end: Option<u64> = None;
     let mut processed_vad_samples: u64 = 0;
     let mut early_transcript: Option<String> = None;
@@ -322,7 +345,8 @@ fn run_vad(run: VadRun) -> Outcome {
             if endpoint_strategy == EndpointStrategy::Serial && !detected_now && saw_speech {
                 let speech_end_sample = candidate_speech_end.unwrap_or_else(|| {
                     let confirmed_silence_samples =
-                        u64::from(CONFIRM_SILENCE_WINDOWS) * u64::from(WINDOW_SAMPLES);
+                        u64::from(endpoint_policy.confirmation_windows())
+                            * u64::from(WINDOW_SAMPLES);
                     processed_vad_samples.saturating_sub(confirmed_silence_samples)
                 });
                 timer
@@ -364,8 +388,8 @@ fn run_vad(run: VadRun) -> Outcome {
                     }
                 }
                 // Local confirmation prevents repeated candidates while the
-                // early detector remains silent. The unchanged confirming
-                // detector below still owns the actual stop decision.
+                // early detector remains silent. The policy-configured
+                // confirming detector below still owns the actual stop.
                 EndpointEvent::Confirmed { .. } => {}
                 EndpointEvent::None => {}
             }
@@ -373,7 +397,8 @@ fn run_vad(run: VadRun) -> Outcome {
             if endpoint_strategy == EndpointStrategy::Speculative && !detected_now && saw_speech {
                 let speech_end_sample = candidate_speech_end.unwrap_or_else(|| {
                     let confirmed_silence_samples =
-                        u64::from(CONFIRM_SILENCE_WINDOWS) * u64::from(WINDOW_SAMPLES);
+                        u64::from(endpoint_policy.confirmation_windows())
+                            * u64::from(WINDOW_SAMPLES);
                     processed_vad_samples.saturating_sub(confirmed_silence_samples)
                 });
                 timer

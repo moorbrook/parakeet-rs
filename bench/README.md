@@ -67,7 +67,7 @@ The bench loads pre-recorded WAVs and runs `Asr::recognize()` directly.
 It **does not** exercise:
 
 - `cpal` mic-capture callback latency
-- the Silero VAD endpoint hangover (~150 ms per `src/vad.rs:15`)
+- the Silero VAD endpoint policy (750 ms for Tap; 150 ms for Tap Fast)
 - the `CGEventKeyboardSetUnicodeString` keystroke insertion step
   (sub-ms per chord — see ADR-0019)
 
@@ -98,19 +98,44 @@ measured transcript had an exact lexical match to the reviewed reference.
 
 The optimized path starts ASR from the early 32 ms detector, discards the
 provisional result whenever speech resumes, and lets an independent Silero
-state with the original 150 ms configuration remain the sole stop authority.
-The gate fails unless both p50 and p95 are at least 3.0× and every transcript
-matches:
+state remain the sole stop authority. This frozen comparison explicitly uses
+Tap Fast's original 150 ms policy so the historical 3× result stays
+like-for-like. The gate fails unless both p50 and p95 are at least 3.0× and
+every transcript matches:
 
 ```bash
 REPS=30 WARMUP_REPS=2 scripts/bench-end-to-end.sh
 ```
 
-The longer synthesized fixtures contain pauses that already trigger the
-shipping 150 ms auto-stop policy; they are not valid end-to-end latency
-fixtures until the separate multi-sentence endpoint policy is redesigned.
-They remain in the offline five-file WER/CER gate, which passes at 2.38% WER
-and 2.22% CER.
+## Long-pause endpoint gate
+
+Normal Tap now uses a 750 ms confirmation policy; Tap Fast retains 150 ms for
+short commands. The separate endpoint gate replays versioned human LibriSpeech
+audio through production capture, VAD, speculative Core ML inference, and
+session shutdown. Its 14.225 s fixture includes a reviewed 544 ms natural
+pause that the former policy cut. A pass requires zero early stops and p95
+final-pause latency below one second for both the single- and multi-sentence
+fixtures:
+
+```bash
+REPS=30 WARMUP_REPS=2 scripts/bench-endpoint-policy.sh
+```
+
+M5 Pro 24 GB release results (2026-08-11):
+
+| fixture | repetitions | false stops | p50 | p95 |
+|---|---:|---:|---:|---:|
+| 3.505 s single sentence | 30 | **0** | 668.0 ms | 668.0 ms |
+| 14.225 s multi sentence | 30 | **0** | 637.0 ms | 658.1 ms |
+
+The unchanged Tap Fast comparison was also re-run for 30 repetitions after
+this policy split. It retained **3.24× p50 / 3.18× p95** speedups (589.5 →
+182.0 ms p50; 644.8 → 203.0 ms p95), so the representative no-polish gate
+remains above its accepted 3× target.
+
+The fixture manifest, source revision, hashes, references, and license are in
+[`bench/endpointing/`](endpointing/). This gate isolates endpoint behavior;
+transcript WER/CER remains the responsibility of `asr_diff`.
 
 ## Native Core ML result: M5 Pro 24 GB (2026-08-10)
 

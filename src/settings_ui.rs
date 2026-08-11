@@ -5,8 +5,8 @@
 //! - Pick a new global hotkey by clicking the shortcut button and pressing
 //!   any combo (the window catches the keystroke locally, doesn't fire the
 //!   dictation flow).
-//! - Switch between Tap (current VAD auto-stop) and Hold (press-and-hold,
-//!   release-to-paste) trigger modes.
+//! - Switch among pause-friendly Tap, low-latency Tap Fast, and Hold
+//!   (press-and-hold, release-to-paste) trigger modes.
 //!
 //! Save persists to `~/Library/Application Support/com.parakeet.rs/settings.json`
 //! AND rebinds the global hotkey live without restarting the app.
@@ -229,7 +229,8 @@ impl SettingsController {
         }
         if let Some(popup) = self.ivars().mode_popup.borrow().as_ref() {
             new.trigger_mode = match unsafe { popup.indexOfSelectedItem() } {
-                1 => TriggerMode::Hold,
+                1 => TriggerMode::TapFast,
+                2 => TriggerMode::Hold,
                 _ => TriggerMode::Tap,
             };
         }
@@ -255,15 +256,15 @@ impl SettingsController {
 
     /// Lock or unlock the trigger-mode popup based on the active binding.
     /// Caps Lock only fires a single FlagsChanged event per physical tap,
-    /// so Tap vs Hold can't make a meaningful runtime difference — we
-    /// force Hold semantics and visually grey out the choice.
+    /// so the Tap/Hold distinction cannot make a meaningful runtime difference;
+    /// we force Hold semantics and visually grey out the choice.
     fn refresh_mode_popup_for(&self, token: &str) {
         let Some(popup) = self.ivars().mode_popup.borrow().clone() else {
             return;
         };
         if is_capslock_token(token) {
             unsafe {
-                popup.selectItemAtIndex(1); // 1 = Hold
+                popup.selectItemAtIndex(2); // 2 = Hold
                 popup.setEnabled(false);
             }
         } else {
@@ -418,9 +419,14 @@ pub fn open(mtm: MainThreadMarker) {
 
     let popup = make_popup(
         mtm,
-        &["Tap — VAD auto-stop", "Hold — release to paste"],
+        &[
+            "Tap — pause-friendly auto-stop",
+            "Tap Fast — 150 ms auto-stop",
+            "Hold — release to paste",
+        ],
         match settings.as_ref().map(|s| s.trigger_mode) {
-            Some(TriggerMode::Hold) => 1,
+            Some(TriggerMode::TapFast) => 1,
+            Some(TriggerMode::Hold) => 2,
             _ => 0,
         },
         NSPoint::new(PAD + LABEL_W, row2_y - 4.0),
@@ -440,13 +446,14 @@ pub fn open(mtm: MainThreadMarker) {
     add_hint(
         mtm,
         &content,
-        "Tap: press once to start, Parakeet stops when you finish speaking.\n\
+        "Tap: waits through natural pauses before stopping.\n\
+         Tap Fast: lowest latency for short commands; long pauses may stop.\n\
          Hold: press and hold while speaking, release to paste.\n\
          Caps Lock: tap to start, tap again to paste. Trigger mode locked.",
         PAD,
         row3_y - 50.0,
         WINDOW_W - PAD * 2.0,
-        60.0,
+        76.0,
     );
 
     // --- Section divider: Polish -----------------------------------------

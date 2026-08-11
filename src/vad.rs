@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 
-use crate::endpointing::{CONFIRM_SILENCE_MS, SPECULATIVE_MIN_SILENCE_S};
+use crate::endpointing::{EndpointPolicy, SPECULATIVE_MIN_SILENCE_S};
 
 /// Silero operates at 16 kHz natively.
 pub const VAD_SAMPLE_RATE: i32 = 16_000;
@@ -39,11 +39,15 @@ impl Vad {
         )
     }
 
-    pub fn load_confirming(model: &Path, num_threads: i32) -> Result<Self> {
+    pub fn load_confirming(
+        model: &Path,
+        num_threads: i32,
+        endpoint_policy: EndpointPolicy,
+    ) -> Result<Self> {
         Self::load_with_durations(
             model,
             num_threads,
-            CONFIRM_SILENCE_MS as f32 / 1_000.0,
+            endpoint_policy.confirmation_ms() as f32 / 1_000.0,
             MIN_SPEECH_S,
         )
     }
@@ -62,8 +66,8 @@ impl Vad {
                 model: Some(model.to_string_lossy().into_owned()),
                 threshold: 0.5,
                 // The candidate state exposes an early edge for provisional
-                // decode. The separate confirming state retains the original
-                // 150 ms configuration and alone may stop capture.
+                // decode. The separate confirming state applies the selected
+                // product pause policy and alone may stop capture.
                 min_silence_duration,
                 min_speech_duration,
                 window_size: WINDOW_SIZE,

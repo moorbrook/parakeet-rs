@@ -21,12 +21,25 @@ const BUNDLE_NAMESPACE: &str = "com.parakeet.rs";
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TriggerMode {
-    /// Tap once to start; Silero VAD detects end-of-speech and auto-pastes.
-    /// A second tap during dictation cancels.
+    /// Tap once to start; pause-friendly Silero VAD waits through natural
+    /// clause/sentence pauses before auto-pasting. A second tap cancels.
     #[default]
     Tap,
+    /// Original 150 ms auto-stop for short commands where minimum final-pause
+    /// latency matters more than tolerating a long pause.
+    #[serde(rename = "tap_fast")]
+    TapFast,
     /// Press and hold to dictate; release to immediately paste. No VAD.
     Hold,
+}
+
+impl TriggerMode {
+    pub fn endpoint_policy(self) -> crate::endpointing::EndpointPolicy {
+        match self {
+            Self::Tap => crate::endpointing::EndpointPolicy::LongForm,
+            Self::TapFast | Self::Hold => crate::endpointing::EndpointPolicy::Fast,
+        }
+    }
 }
 
 /// Optional LLM post-processing pass between ASR output and paste. Used to
@@ -314,6 +327,22 @@ mod tests {
             raw.contains("\"trigger_mode\":\"hold\""),
             "expected lowercase enum, got: {raw}"
         );
+    }
+
+    #[test]
+    fn tap_modes_select_their_documented_endpoint_policies() {
+        use crate::endpointing::EndpointPolicy;
+
+        let legacy_tap: TriggerMode = serde_json::from_str("\"tap\"").unwrap();
+        assert_eq!(legacy_tap, TriggerMode::Tap);
+        assert_eq!(legacy_tap.endpoint_policy(), EndpointPolicy::LongForm);
+        assert_eq!(TriggerMode::TapFast.endpoint_policy(), EndpointPolicy::Fast);
+        let raw = serde_json::to_string(&Settings {
+            trigger_mode: TriggerMode::TapFast,
+            ..Settings::default()
+        })
+        .unwrap();
+        assert!(raw.contains("\"trigger_mode\":\"tap_fast\""));
     }
 
     #[test]

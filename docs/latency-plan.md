@@ -22,7 +22,9 @@ Before any plan, the load-bearing facts from this checkout:
 
 - **ASR is offline, not streaming.** `src/asr.rs:72` constructs an `OfflineRecognizer`; `src/asr.rs:122` creates a fresh stream per utterance, feeds the whole captured waveform, then calls `decode` once. There is no partial-transcript path today.
 - **Decode is RTFx-bound, not constant.** [ADR.md](./ADR.md) line 32 measures **7.8× real-time on M5 Pro** (the minimum-spec target), so a 5 s utterance = ~640 ms of ASR decode alone.
-- **VAD hangover is already 150 ms.** `src/vad.rs:15` sets `MIN_SILENCE_S = 0.150`. There is no 500–800 ms threshold to "tighten."
+- **VAD hangover was 150 ms.** At this planning snapshot, `src/vad.rs` used a
+  single 150 ms confirmation window. ADR-0025 later split that into a
+  pause-friendly 750 ms Tap default and an explicit 150 ms Tap Fast mode.
 - **Current pipeline on main is ASR → `claude -p` subprocess → paste.** Main has `src/polish.rs` tracked since commit `c046668`, switched in `5824e20` to spawn `claude -p` per polish request. Its own source comment puts subprocess startup at ~1–3 s on a warm cache (`src/polish.rs:34-36`), which is a structural latency floor we cannot fit under a <1 s p50 target. This plan **replaces that backend** with in-process Rust inference via `llama-cpp-2` + Metal, running Qwen 3.5 2B-it Q4_K_M (see §6). The `claude -p` path is removed. No Python, no subprocess, no HTTP — pure Rust on the call side.
 - **`src/performance.rs` is CPU topology only**, not per-stage latency tracing. There is nothing measuring the budget today.
 - **CoreML cache is not configured.** `src/asr.rs:72` requests `provider="coreml"` but no `ModelCacheDirectory` is set, so the EP recompiles subgraphs on cold start.
@@ -93,7 +95,11 @@ Until a streaming recognizer ships, **speculative polish is impossible** — the
 
 ### 5. VAD tuning (probably no headroom)
 
-Current `MIN_SILENCE_S = 0.150`. Going lower will cut at breath pauses; a single misfire that splits a sentence into two dictations costs the user far more than 50 ms of trimmed silence saves. Do not change without a real measurement showing false-cut rate stays acceptable. Hysteresis on voiced/silent frame counts is fine to add but won't move p50.
+At this planning snapshot, `MIN_SILENCE_S = 0.150`. Going lower would cut at
+breath pauses; a single misfire that splits a sentence into two dictations
+costs the user far more than 50 ms of trimmed silence saves. ADR-0025 resolved
+the broader long-pause problem by making 750 ms the normal Tap policy, keeping
+150 ms as Tap Fast, and adding a real-speech false-stop/latency gate.
 
 Files: `src/vad.rs` (only if benchmark says so).
 
@@ -232,7 +238,7 @@ log stream --process parakeet-rs --predicate 'eventMessage CONTAINS "phase_timer
 - [ADR.md](./ADR.md) — especially ADR-0009 (streaming-model swap rejected), ADR-0012 (CoreML EP shared linkage, 7.8× RTFx measurement).
 - `src/asr.rs:72` — `OfflineRecognizer` construction, CoreML provider.
 - `src/asr.rs:122` — fresh-stream-per-utterance decode path.
-- `src/vad.rs:15` — current 150 ms hangover.
+- `src/endpointing.rs` — current 750 ms Tap and 150 ms Tap Fast policies.
 - `src/app.rs:155` — ASR → paste pipeline.
 - `src/performance.rs` — current CPU-topology-only scope.
 - NVIDIA Parakeet TDT 0.6B v3 model card — punctuation/capitalization claim.

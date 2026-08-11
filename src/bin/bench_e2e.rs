@@ -17,6 +17,7 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use parakeet_rs::asr::{Asr, AsrConfig};
 use parakeet_rs::asr_eval::normalize_lexical;
 use parakeet_rs::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
+use parakeet_rs::endpointing::EndpointPolicy;
 use parakeet_rs::performance;
 use parakeet_rs::settings::SettingsStore;
 use parakeet_rs::streamer::{self, EndpointStrategy, Mode, Outcome};
@@ -34,6 +35,7 @@ struct Args {
     warmup_reps: usize,
     backend: Backend,
     strategy: EndpointStrategy,
+    endpoint_policy: EndpointPolicy,
     device: String,
     expected: Option<String>,
     worker: Option<PathBuf>,
@@ -64,12 +66,21 @@ fn parse_strategy(value: &str) -> anyhow::Result<EndpointStrategy> {
     }
 }
 
+fn parse_endpoint_policy(value: &str) -> anyhow::Result<EndpointPolicy> {
+    match value {
+        "fast" => Ok(EndpointPolicy::Fast),
+        "long-form" => Ok(EndpointPolicy::LongForm),
+        _ => bail!("unknown endpoint policy {value:?}; expected fast or long-form"),
+    }
+}
+
 fn parse_args() -> anyhow::Result<Args> {
     let mut wav = None;
     let mut reps = DEFAULT_REPS;
     let mut warmup_reps = DEFAULT_WARMUP_REPS;
     let mut backend = Backend::Sherpa;
     let mut strategy = EndpointStrategy::Serial;
+    let mut endpoint_policy = EndpointPolicy::LongForm;
     let mut device = DEFAULT_DEVICE.to_string();
     let mut expected = None;
     let mut worker = None;
@@ -107,6 +118,12 @@ fn parse_args() -> anyhow::Result<Args> {
                         .ok_or_else(|| anyhow!("--strategy needs a name"))?,
                 )?;
             }
+            "--endpoint-policy" => {
+                endpoint_policy = parse_endpoint_policy(
+                    &it.next()
+                        .ok_or_else(|| anyhow!("--endpoint-policy needs a name"))?,
+                )?;
+            }
             "--device" => {
                 device = it.next().ok_or_else(|| anyhow!("--device needs a name"))?;
             }
@@ -141,6 +158,7 @@ fn parse_args() -> anyhow::Result<Args> {
         warmup_reps,
         backend,
         strategy,
+        endpoint_policy,
         device,
         expected,
         worker,
@@ -153,6 +171,7 @@ fn print_usage() {
         "usage: bench_e2e --wav PATH [--reps N] [--warmup-reps N]\n\
          \x20                [--backend sherpa|coreml-unified]\n\
          \x20                [--strategy serial|speculative]\n\
+         \x20                [--endpoint-policy fast|long-form]\n\
          \x20                [--device 'BlackHole 2ch']\n\
          \x20                [--expected 'reference transcript']\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\n\
@@ -280,6 +299,7 @@ fn run_one(
         Mode::VadAutoStop,
         asr.clone(),
         args.strategy,
+        args.endpoint_policy,
         Some(&args.device),
     )?;
     let playback = start_playback(&args.device, samples.clone(), sample_rate)?;
