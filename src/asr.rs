@@ -32,6 +32,11 @@ const RTFX_COREML_FLOOR: f32 = 2.0;
 pub trait AsrBackend: Send + Sync {
     fn metadata(&self) -> &AsrBackendMetadata;
     fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded>;
+
+    /// Resident bytes owned by helper processes outside this Rust process.
+    fn auxiliary_resident_bytes(&self) -> Result<u64> {
+        Ok(0)
+    }
 }
 
 /// Identity of the exact model/runtime artifact behind an [`AsrBackend`].
@@ -218,6 +223,10 @@ impl Asr {
 
     pub fn backend_metadata(&self) -> &AsrBackendMetadata {
         self.backend.metadata()
+    }
+
+    pub fn auxiliary_resident_bytes(&self) -> Result<u64> {
+        self.backend.auxiliary_resident_bytes()
     }
 
     pub fn recognize(&self, samples: &[f32], sample_rate: u32) -> Result<String> {

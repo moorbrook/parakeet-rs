@@ -8,37 +8,39 @@ See `docs/latency-plan.md` §1 for design and acceptance criteria.
 
 ## Gold-reference quality gate
 
-The latency fixtures can also gate model, quantization, backend, and hotword
-changes against human-authored transcripts:
+The checked-in real-speech corpus gates model, quantization, backend, and
+hotword changes against human-authored transcripts:
 
 ```bash
-scripts/bench-latency.sh
-cp bench/gold.example.json bench/gold.json
-# Review the references/categories; use recorded speech for a real product gate.
-cargo build --release --bin asr_diff
-./target/release/asr_diff --gold bench/gold.json
+REPETITIONS=10 scripts/bench-gold.sh
 ```
 
-The versioned manifest contains explicit maximum WER and CER percentages.
-`asr_diff` prints per-fixture and per-category summaries, exits non-zero when
-either aggregate threshold fails, and writes `bench/asr-quality.json` with:
+`bench/gold/manifest.json` contains independent absolute and baseline-regression
+WER/CER limits. `asr_diff` applies them to the worst repeated result, prints
+per-fixture and per-category summaries, exits non-zero when either threshold
+fails, and writes schema-v2 machine reports with:
 
-- normalized lexical WER/CER plus exact formatting matches;
+- normalized lexical WER/CER, exact formatting matches, and separate insertion,
+  deletion, and substitution counts;
 - categories such as names, commands, numbers, punctuation, and vocabulary;
-- audio duration, decode time, and real-time factor;
+- repeat-run transcript/WER/CER spread, p50/p95 decode time, and real-time factor;
 - backend/model/quantization/provider labels;
 - app version, macOS version, chip, memory, CPU count, model-load time, and
-  warmup time.
+  warmup, first-result, and full-process-tree peak-resident memory.
 
 Lexical normalization preserves Unicode letters/numbers and accents,
 lowercases them, removes apostrophes without splitting words, and treats other
 punctuation as a separator. Raw reference and hypothesis strings remain in the
 report so capitalization and punctuation changes are still auditable.
 
-The included manifest is only a format and smoke-test example: its audio is
-macOS `say` output. A shipping gate should add consented representative speech,
-proper nouns, commands, numbers, noisy audio, and custom-vocabulary cases, with
-train/tuning data kept out of this evaluation set.
+The representative corpus contains seven real human recordings from pinned,
+licensed LibriSpeech and SLURP revisions, including proper nouns, commands,
+numbers, distant/noisy audio, and custom-vocabulary cases. Sources, hashes, and
+reproduction instructions are under `bench/gold/`. `gold.example.json` remains
+only as the older macOS `say` format/smoke example.
+
+Measured M5 Pro baselines, fairness rules, threshold derivation, known errors,
+and rejected variants live in `docs/asr/{PERF,DISCREPANCIES,NEGATIVE_EVIDENCE}.md`.
 
 ## Quick start
 
@@ -247,7 +249,9 @@ Replay:
 |------------------------------|--------------------------------------------------|
 | `audio/{1,3,5,10,20}s_*.wav` | Generated fixtures (gitignored). Filename includes sample rate (e.g. `5s_16000.wav`). |
 | `raw.log`                    | All `phase_timer` lines from the last ASR run.   |
-| `gold.example.json`         | Reviewed example schema for human gold references. |
+| `gold/manifest.json`       | Shipping real-speech quality manifest and thresholds. |
+| `gold/sources.json`        | Immutable source provenance, licenses, and hashes. |
+| `gold.example.json`        | Historical `say` smoke-example schema. |
 | `asr-quality.json`          | Generated machine-readable quality/latency report (gitignored). |
 | `llm-raw.log`                | All `llm_timer` lines from the last LLM run.     |
 | `baseline.csv`               | Aggregated ASR baseline (pre-CoreML-cache).      |

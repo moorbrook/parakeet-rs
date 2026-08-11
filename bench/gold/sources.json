@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "conversion": "ffmpeg: mono, 48000 Hz, signed 16-bit little-endian PCM; no trimming or normalization",
+  "sources": [
+    {
+      "file": "librispeech-single-6930-75918-0000-48000.wav",
+      "corpus": "OpenSLR SLR12 / LibriSpeech test.clean",
+      "source_id": "6930-75918-0000",
+      "source_revision": "71cacbfb7e2354c4226d01e70d77d5fca3d04ba1",
+      "capture": "read speech",
+      "license": "CC BY 4.0",
+      "sha256": "89deae6d4161c79ca53b67f52655816eccf1b82a8eb8e0eb71af73e5d9cc1df8"
+    },
+    {
+      "file": "librispeech-multi-6930-75918-0001-48000.wav",
+      "corpus": "OpenSLR SLR12 / LibriSpeech test.clean",
+      "source_id": "6930-75918-0001",
+      "source_revision": "71cacbfb7e2354c4226d01e70d77d5fca3d04ba1",
+      "capture": "read speech",
+      "license": "CC BY 4.0",
+      "sha256": "bc56fd4d8f36350323fa2e8805376903d97439e3b316596af02609448f40b6eb"
+    },
+    {
+      "file": "slurp-calendar-amy-close-1490262086-48000.wav",
+      "corpus": "SLURP train",
+      "source_id": "audio-1490262086-headset.flac",
+      "source_row": 10,
+      "slurp_id": 7874,
+      "source_revision": "91b0abfee2e735282967ee00d631d6d5f0fb7ff9",
+      "capture": "close-talk headset",
+      "license": "CC BY-NC 4.0",
+      "source_sha256": "05cc96a6dfbcb41d86565da00ea5818cbf28add9a77617ff5d38b07903932c7f",
+      "sha256": "4b2b98dccee53696a83946882a847c36682115def85138537076b8a67080d6e2"
+    },
+    {
+      "file": "slurp-calendar-amy-distant-1490262086-48000.wav",
+      "corpus": "SLURP train",
+      "source_id": "audio-1490262086.flac",
+      "source_row": 11,
+      "slurp_id": 7874,
+      "source_revision": "91b0abfee2e735282967ee00d631d6d5f0fb7ff9",
+      "capture": "distant microphone",
+      "license": "CC BY-NC 4.0",
+      "source_sha256": "e96cd7176b5ed5143157d4bb9d8c0ad382a8422fcbc9f0bd7085e08764c11390",
+      "sha256": "b081b211cb606c2f7da7449eb08bf9f6d94dfd57d301c35a8f46f6c5ae0c227d"
+    },
+    {
+      "file": "slurp-alarm-seven-thirty-close-1497886326-48000.wav",
+      "corpus": "SLURP train",
+      "source_id": "audio-1497886326-headset.flac",
+      "source_row": 44,
+      "slurp_id": 5172,
+      "source_revision": "91b0abfee2e735282967ee00d631d6d5f0fb7ff9",
+      "capture": "close-talk headset",
+      "license": "CC BY-NC 4.0",
+      "source_sha256": "a0d30d128aee6eb99ade2798c26d7cd8fd5c483bceea92e391ea246faa02ac28",
+      "sha256": "1c66857a118e1c0b4748623e14a1b2ba1d9edb12bf40cf06b4bd90969e40a982"
+    },
+    {
+      "file": "slurp-stock-ibm-close-1502199029-48000.wav",
+      "corpus": "SLURP train",
+      "source_id": "audio-1502199029-headset.flac",
+      "source_row": 60,
+      "slurp_id": 15135,
+      "source_revision": "91b0abfee2e735282967ee00d631d6d5f0fb7ff9",
+      "capture": "close-talk headset",
+      "license": "CC BY-NC 4.0",
+      "source_sha256": "3f914b920349aafc19f91c73ae4ca2841f7865311afcc2102530cad46c1ce47c",
+      "sha256": "12132d0354ff8284bff5de79f9a907bc05ea5937c42ac49496f58cbabbd8d3c1"
+    },
+    {
+      "file": "slurp-music-olly-tactics-close-1490194280-48000.wav",
+      "corpus": "SLURP train",
+      "source_id": "audio-1490194280-headset.flac",
+      "source_row": 73,
+      "slurp_id": 5311,
+      "source_revision": "91b0abfee2e735282967ee00d631d6d5f0fb7ff9",
+      "capture": "close-talk headset",
+      "license": "CC BY-NC 4.0",
+      "source_sha256": "56539b7dbd3f1d993f7fc55a0c92034ca6b473da3443816093dcdec43cd1167f",
+      "sha256": "a22cc5d122fba275bac0f2d9dfa3953e8b18762caf2af1599d4469d8f2216a71"
+    }
+  ]
+}

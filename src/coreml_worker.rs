@@ -192,6 +192,12 @@ impl AsrBackend for CoreMlWorkerBackend {
             decode_seconds: decode_seconds as f32,
         })
     }
+
+    fn auxiliary_resident_bytes(&self) -> Result<u64> {
+        let pid = self.process.lock().child.id();
+        crate::performance::resident_bytes(pid)
+            .with_context(|| format!("reading Core ML worker {pid} resident set"))
+    }
 }
 
 struct WorkerProcess {

@@ -1,0 +1,48 @@
+{
+  "version": 2,
+  "thresholds": {
+    "max_wer_percent": 8.0,
+    "max_cer_percent": 5.0,
+    "baseline_wer_percent": 5.434782608695652,
+    "baseline_cer_percent": 3.5714285714285716,
+    "max_wer_regression_percent": 0.0,
+    "max_cer_regression_percent": 0.0
+  },
+  "fixtures": [
+    {
+      "file": "librispeech-single-6930-75918-0000-48000.wav",
+      "reference": "Concord returned to its place amidst the tents.",
+      "categories": ["general", "proper-nouns", "punctuation"]
+    },
+    {
+      "file": "librispeech-multi-6930-75918-0001-48000.wav",
+      "reference": "The English forwarded to the French baskets of flowers, of which they had made a plentiful provision, to greet the arrival of the young princess. The French, in return, invited the English to a supper, which was to be given the next day.",
+      "categories": ["general", "long", "proper-nouns", "punctuation"]
+    },
+    {
+      "file": "slurp-calendar-amy-close-1490262086-48000.wav",
+      "reference": "I need an event three days from now scheduled with Amy.",
+      "categories": ["commands", "numbers", "proper-nouns", "punctuation"]
+    },
+    {
+      "file": "slurp-calendar-amy-distant-1490262086-48000.wav",
+      "reference": "I need an event three days from now scheduled with Amy.",
+      "categories": ["commands", "noisy", "numbers", "proper-nouns", "punctuation"]
+    },
+    {
+      "file": "slurp-alarm-seven-thirty-close-1497886326-48000.wav",
+      "reference": "Please wake me up at seven thirty AM.",
+      "categories": ["commands", "numbers", "punctuation"]
+    },
+    {
+      "file": "slurp-stock-ibm-close-1502199029-48000.wav",
+      "reference": "Is IBM up today?",
+      "categories": ["commands", "custom-vocabulary", "proper-nouns", "punctuation"]
+    },
+    {
+      "file": "slurp-music-olly-tactics-close-1490194280-48000.wav",
+      "reference": "Hey Olly, play playlist Tactics from music.",
+      "categories": ["commands", "custom-vocabulary", "proper-nouns", "punctuation"]
+    }
+  ]
+}

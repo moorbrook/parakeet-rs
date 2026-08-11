@@ -50,6 +50,7 @@ struct Args {
     backend: Backend,
     worker: Option<PathBuf>,
     model_dir: Option<PathBuf>,
+    repetitions: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +81,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut backend = Backend::Sherpa;
     let mut worker = None;
     let mut model_dir = None;
+    let mut repetitions = 1usize;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -135,6 +137,13 @@ fn parse_args() -> anyhow::Result<Args> {
                         .ok_or_else(|| anyhow!("--model-dir needs a path"))?,
                 ));
             }
+            "--repetitions" => {
+                repetitions = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--repetitions needs a positive integer"))?
+                    .parse()
+                    .context("--repetitions")?;
+            }
             "--record" => record = true,
             "-h" | "--help" => {
                 print_usage();
@@ -145,6 +154,12 @@ fn parse_args() -> anyhow::Result<Args> {
     }
     if record && gold.is_some() {
         bail!("--record and --gold are mutually exclusive");
+    }
+    if repetitions == 0 {
+        bail!("--repetitions must be at least 1");
+    }
+    if repetitions != 1 && gold.is_none() {
+        bail!("--repetitions is supported only with --gold");
     }
     Ok(Args {
         audio_dir,
@@ -157,6 +172,7 @@ fn parse_args() -> anyhow::Result<Args> {
         backend,
         worker,
         model_dir,
+        repetitions,
     })
 }
 
@@ -166,6 +182,7 @@ fn print_usage() {
         \x20               [--baseline JSON] [--json-out JSON]\n\
         \x20               [--backend sherpa|coreml-unified]\n\
         \x20               [--worker PATH] [--model-dir DIR]\n\
+        \x20               [--repetitions N]\n\
         \x20               [--vocabulary FILE] [--hotword-score N]\n\
          \n\
          Without --gold, decodes every *.wav in DIR (default\n\
@@ -175,6 +192,7 @@ fn print_usage() {
          With --gold, decodes the manifest's fixtures, prints WER/CER and\n\
          category summaries, and writes a machine report (default\n\
          {DEFAULT_QUALITY_REPORT}). Exits 1 when a manifest threshold fails.\n\
+         Repetitions expose transcript/quality spread and p50/p95 latency.\n\
          \n\
          The model must already be downloaded (launch Parakeet.app once)."
     );
@@ -257,6 +275,7 @@ fn run(args: &Args) -> anyhow::Result<bool> {
         None => eprintln!("biasing OFF (greedy decoding)"),
     }
 
+    let run_started = Instant::now();
     let model_load_started = Instant::now();
     let asr = match args.backend {
         Backend::Sherpa => Asr::load(&AsrConfig {
@@ -282,6 +301,7 @@ fn run(args: &Args) -> anyhow::Result<bool> {
         }
     };
     let model_load_seconds = model_load_started.elapsed().as_secs_f64();
+    let mut peak_resident_bytes = process_tree_resident_bytes(&asr)?;
 
     let warmup_started = Instant::now();
     if args.backend == Backend::Sherpa {
@@ -289,6 +309,7 @@ fn run(args: &Args) -> anyhow::Result<bool> {
     }
     warmup::dummy_decode(&asr)?;
     let warmup_seconds = warmup_started.elapsed().as_secs_f64();
+    peak_resident_bytes = peak_resident_bytes.max(process_tree_resident_bytes(&asr)?);
 
     let wavs = match &gold {
         Some(manifest) => manifest
@@ -305,22 +326,45 @@ fn run(args: &Args) -> anyhow::Result<bool> {
         );
     }
 
+    let wav_inputs = wavs
+        .iter()
+        .map(|wav| {
+            let (samples, sample_rate) = read_wav_mono(wav)?;
+            let name = wav.file_name().map_or_else(
+                || "unknown".into(),
+                |name| name.to_string_lossy().to_string(),
+            );
+            Ok((name, samples, sample_rate))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let mut transcripts: BTreeMap<String, String> = BTreeMap::new();
-    let mut decoded: BTreeMap<String, Decoded> = BTreeMap::new();
-    for wav in &wavs {
-        let (samples, sample_rate) = read_wav_mono(wav)?;
-        let result = asr.recognize_with_metrics(&samples, sample_rate)?;
-        let name = wav
-            .file_name()
-            .map_or_else(|| "unknown".into(), |n| n.to_string_lossy().to_string());
-        eprintln!(
-            "  {name}: {:?} ({:.3}s, {:.1}x real time)",
-            result.text,
-            result.decode_seconds,
-            result.rtfx()
-        );
-        transcripts.insert(name.clone(), result.text.clone());
-        decoded.insert(name, result);
+    let mut decoded: BTreeMap<String, Vec<Decoded>> = wav_inputs
+        .iter()
+        .map(|(name, _, _)| (name.clone(), Vec::with_capacity(args.repetitions)))
+        .collect();
+    let mut first_result_seconds = None;
+    for repetition in 0..args.repetitions {
+        if args.repetitions > 1 {
+            eprintln!("repetition {}/{}", repetition + 1, args.repetitions);
+        }
+        for (name, samples, sample_rate) in &wav_inputs {
+            let result = asr.recognize_with_metrics(samples, *sample_rate)?;
+            peak_resident_bytes = peak_resident_bytes.max(process_tree_resident_bytes(&asr)?);
+            first_result_seconds.get_or_insert_with(|| run_started.elapsed().as_secs_f64());
+            if repetition == 0 {
+                eprintln!(
+                    "  {name}: {:?} ({:.3}s, {:.1}x real time)",
+                    result.text,
+                    result.decode_seconds,
+                    result.rtfx()
+                );
+                transcripts.insert(name.clone(), result.text.clone());
+            }
+            decoded
+                .get_mut(name)
+                .expect("decoded map was initialized from the same fixture list")
+                .push(result);
+        }
     }
 
     if let Some(manifest) = &gold {
@@ -331,7 +375,11 @@ fn run(args: &Args) -> anyhow::Result<bool> {
                 asr.backend_metadata().clone(),
                 model_load_seconds,
                 warmup_seconds,
-            ),
+                first_result_seconds
+                    .ok_or_else(|| anyhow::anyhow!("no fixture produced a first result"))?,
+                peak_resident_bytes
+                    .max(performance::peak_resident_bytes()? + asr.auxiliary_resident_bytes()?),
+            )?,
         )?;
         write_quality_report(&args.json_out, &quality)?;
         print_quality_report(&quality, &args.json_out);
@@ -413,6 +461,21 @@ fn print_quality_report(report: &QualityReport, json_path: &Path) {
             println!("      reference : {:?}", fixture.reference);
             println!("      hypothesis: {:?}", fixture.hypothesis);
         }
+        if fixture.word_edits > 0 {
+            println!(
+                "      word edits: {} insertion(s), {} deletion(s), {} substitution(s)",
+                fixture.word_insertions, fixture.word_deletions, fixture.word_substitutions
+            );
+        }
+        if fixture.repetitions > 1 {
+            println!(
+                "      repeats: {} output(s), {} unique; decode p50 {:.3}s, p95 {:.3}s",
+                fixture.repetitions,
+                fixture.unique_hypotheses,
+                fixture.decode_seconds_p50,
+                fixture.decode_seconds_p95
+            );
+        }
     }
 
     if !report.categories.is_empty() {
@@ -431,13 +494,40 @@ fn print_quality_report(report: &QualityReport, json_path: &Path) {
 
     println!();
     println!(
-        "overall: WER {} (limit {:.2}%), CER {} (limit {:.2}%), exact {}, {:.1}x real time",
-        format_percent(report.overall.wer_percent),
+        "overall: worst WER {} (absolute {:.2}%, regression cap {:.2}%), worst CER {} (absolute {:.2}%, regression cap {:.2}%), exact {}, {:.1}x first-pass real time",
+        format_percent(report.repeatability.wer_percent_max),
         report.thresholds.max_wer_percent,
-        format_percent(report.overall.cer_percent),
+        report.thresholds.baseline_wer_percent + report.thresholds.max_wer_regression_percent,
+        format_percent(report.repeatability.cer_percent_max),
         report.thresholds.max_cer_percent,
+        report.thresholds.baseline_cer_percent + report.thresholds.max_cer_regression_percent,
         format_percent(report.overall.exact_match_percent),
         report.overall.rtfx.unwrap_or(0.0)
+    );
+    println!(
+        "repeatability: {} run(s), {} nondeterministic fixture(s), {} changed output(s), WER spread {}, CER spread {}",
+        report.repeatability.repetitions,
+        report.repeatability.nondeterministic_fixtures,
+        report.repeatability.nondeterministic_outputs,
+        format_percent(report.repeatability.wer_spread_percent),
+        format_percent(report.repeatability.cer_spread_percent)
+    );
+    println!(
+        "performance: load {:.3}s, warmup {:.3}s, first result {:.3}s, corpus decode p50 {:.3}s / p95 {:.3}s, peak RSS {:.2} GiB",
+        report.metadata.model_load_seconds,
+        report.metadata.warmup_seconds,
+        report.metadata.first_result_seconds,
+        report.repeatability.corpus_decode_seconds_p50,
+        report.repeatability.corpus_decode_seconds_p95,
+        report.metadata.peak_resident_bytes as f64 / 1024.0 / 1024.0 / 1024.0
+    );
+    println!(
+        "hardware: {}, {} GiB, {} logical CPUs, {} ({})",
+        report.metadata.chip,
+        report.metadata.memory_bytes / 1024 / 1024 / 1024,
+        report.metadata.logical_cpus,
+        report.metadata.operating_system,
+        report.metadata.architecture
     );
     println!(
         "{} — machine report: {}",
@@ -457,27 +547,42 @@ fn run_metadata(
     backend: AsrBackendMetadata,
     model_load_seconds: f64,
     warmup_seconds: f64,
-) -> RunMetadata {
+    first_result_seconds: f64,
+    peak_resident_bytes: u64,
+) -> anyhow::Result<RunMetadata> {
+    use anyhow::Context;
+
     let os_name = command_output("sw_vers", &["-productName"])
         .unwrap_or_else(|| std::env::consts::OS.to_string());
     let os_version = command_output("sw_vers", &["-productVersion"]);
     let operating_system =
         os_version.map_or(os_name.clone(), |version| format!("{os_name} {version}"));
 
-    RunMetadata {
+    Ok(RunMetadata {
         application_version: env!("CARGO_PKG_VERSION").to_string(),
         backend,
         operating_system,
         architecture: std::env::consts::ARCH.to_string(),
-        chip: command_output("sysctl", &["-n", "machdep.cpu.brand_string"]),
-        memory_bytes: command_output("sysctl", &["-n", "hw.memsize"])
-            .and_then(|value| value.parse().ok()),
+        chip: performance::sysctl_string("machdep.cpu.brand_string")
+            .context("reading chip name with sysctl")?,
+        memory_bytes: performance::sysctl_u64("hw.memsize")
+            .context("reading physical memory with sysctl")?,
         logical_cpus: std::thread::available_parallelism()
-            .ok()
-            .map(std::num::NonZeroUsize::get),
+            .context("reading logical CPU count")?
+            .get(),
         model_load_seconds,
         warmup_seconds,
-    }
+        first_result_seconds,
+        peak_resident_bytes,
+    })
+}
+
+fn process_tree_resident_bytes(asr: &Asr) -> anyhow::Result<u64> {
+    use anyhow::Context;
+
+    let parent = performance::resident_bytes(std::process::id())
+        .context("reading benchmark resident set")?;
+    Ok(parent + asr.auxiliary_resident_bytes()?)
 }
 
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
