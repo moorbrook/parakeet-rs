@@ -10,6 +10,7 @@ use std::path::Path;
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
+use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
 
 use crate::asr::{AsrBackendMetadata, Decoded};
 
@@ -318,23 +319,33 @@ fn ratio(numerator: usize, denominator: usize) -> Option<f64> {
     (denominator > 0).then(|| 100.0 * numerator as f64 / denominator as f64)
 }
 
-/// Case-fold and remove formatting for lexical WER/CER.
+/// NFC-normalize, lowercase, and remove formatting for lexical WER/CER.
 ///
-/// Unicode letters and numbers are preserved and lowercased. Apostrophes are
+/// Canonically equivalent text scores identically. Unicode letters, numbers,
+/// and their combining marks are preserved and lowercased. Apostrophes are
 /// removed without splitting a word (`don't` → `dont`); other punctuation and
-/// whitespace become one separator. We intentionally do not transliterate or
-/// strip accents. Exact reference/hypothesis strings are retained separately
-/// so capitalization and punctuation regressions remain visible.
+/// whitespace become one separator. We intentionally do not transliterate,
+/// apply compatibility folding, or strip accents. Exact reference/hypothesis
+/// strings are retained separately so capitalization and punctuation
+/// regressions remain visible.
 pub fn normalize_lexical(input: &str) -> String {
     let mut normalized = String::new();
     let mut separator_pending = false;
-    for character in input.chars().flat_map(char::to_lowercase) {
+    // Normalize before lowercasing so decomposed accents cannot be mistaken
+    // for punctuation. Normalize again because Unicode lowercase mappings may
+    // themselves emit decomposed sequences.
+    for character in input.nfc().flat_map(char::to_lowercase).nfc() {
         if character.is_alphanumeric() {
             if separator_pending && !normalized.is_empty() {
                 normalized.push(' ');
             }
             normalized.push(character);
             separator_pending = false;
+        } else if is_combining_mark(character) && !normalized.is_empty() && !separator_pending {
+            // Some canonically valid marks have no precomposed form. Keep them
+            // attached to the current word rather than dropping the accent or
+            // manufacturing a word boundary.
+            normalized.push(character);
         } else if character == '\'' || character == '’' {
             // Apostrophes do not create a word boundary for lexical scoring.
         } else if !normalized.is_empty() {
@@ -422,6 +433,54 @@ mod tests {
             normalize_lexical("  HéLLO—don't stop, CNC’s ready!  "),
             "héllo dont stop cncs ready"
         );
+    }
+
+    #[test]
+    fn canonical_unicode_forms_normalize_to_the_same_lexical_text() {
+        let composed = "café résumé";
+        let decomposed = "cafe\u{301} re\u{301}sume\u{301}";
+
+        assert_eq!(normalize_lexical(composed), "café résumé");
+        assert_eq!(normalize_lexical(decomposed), "café résumé");
+    }
+
+    #[test]
+    fn composed_reference_and_decomposed_hypothesis_score_zero_errors() {
+        let report = evaluate(
+            &manifest("café résumé", 0.0, 0.0),
+            &decoded("cafe\u{301} re\u{301}sume\u{301}"),
+            metadata(),
+        )
+        .unwrap();
+
+        assert!(report.passed);
+        assert_eq!(report.overall.word_edits, 0);
+        assert_eq!(report.overall.char_edits, 0);
+    }
+
+    #[test]
+    fn decomposed_reference_and_composed_hypothesis_score_zero_errors() {
+        let report = evaluate(
+            &manifest("cafe\u{301} re\u{301}sume\u{301}", 0.0, 0.0),
+            &decoded("café résumé"),
+            metadata(),
+        )
+        .unwrap();
+
+        assert!(report.passed);
+        assert_eq!(report.overall.word_edits, 0);
+        assert_eq!(report.overall.char_edits, 0);
+    }
+
+    #[test]
+    fn lowercasing_does_not_drop_uncomposed_marks() {
+        assert_eq!(normalize_lexical("İSTANBUL"), "i\u{307}stanbul");
+    }
+
+    #[test]
+    fn compatibility_characters_are_not_folded() {
+        assert_eq!(normalize_lexical("①"), "①");
+        assert_ne!(normalize_lexical("①"), normalize_lexical("1"));
     }
 
     #[test]

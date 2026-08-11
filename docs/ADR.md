@@ -1288,6 +1288,15 @@ fails loudly. The harness was validated against known-bad
 configurations — ADR-0020 measurement 4, an added fixture, and an
 unencodable vocabulary term — rather than only against the happy path.
 
+**Unicode-normalization amendment (2026-08-11).** Gold WER/CER scoring now
+canonicalizes both sides to NFC before lowercasing and preserves combining
+marks that have no precomposed form. This makes visually identical NFC and NFD
+transcripts score identically without the broader character changes of NFKC.
+The `unicode-normalization` 0.1.25 crate is the narrow dependency for Unicode
+Standard Annex #15 behavior; it is MIT OR Apache-2.0, supports Rust 1.36 (below
+this crate's Rust 1.77 floor), and avoids adding ICU or an OS-dependent text
+runtime.
+
 ---
 
 ## 0022 — Resident native Core ML Parakeet Unified backend
