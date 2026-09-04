@@ -1886,6 +1886,14 @@ release is the endpoint and nothing overlaps it; the serial fallback; and any
 utterance long enough that its decode would otherwise outrun the window. It also
 stops the work from being done twice on every utterance in every mode.
 
+Hold shows it. Release-to-transcript p50 falls from 54.0 to 48.0 ms at the
+shortest bucket, 106.5 to 72.5 ms at 5 s, and 231.5 to 192.5 ms at the longest,
+though the two runs' captured durations differ by up to 0.8 s per bucket so this
+is a trend rather than a controlled comparison. Capture shutdown also rounds to
+0 ms now, against about 1 ms before: `finish_with_recording` no longer folds the
+recording to mono, since capture did that per callback, and only the resampler's
+tail flush remains after the stream is dropped.
+
 ---
 
 ## Target status index

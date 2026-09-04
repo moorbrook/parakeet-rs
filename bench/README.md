@@ -259,8 +259,8 @@ against the ASR-only p50 column from the same run.
 
 The encoder cost does not depend on utterance length. `UnifiedAsrManager`
 zero-pads every window to a fixed 15 s buffer (240,000 samples, 1,501 mel
-frames) and runs the full offline encoder graph on it, so a 0.74 s utterance
-pays the same 25.5 ms as an 8.15 s one. The 15.691 s fixture exceeds the 15 s
+frames) and runs the full offline encoder graph on it, so a 0.816 s utterance
+pays the same 26.0 ms as an 8.062 s one. The 16.513 s fixture exceeds the 15 s
 window and needs a second one, which doubles both mel and encoder.
 `chunkStarts` adds that second window only past 240,000 samples, so a 14 s
 utterance still runs a single encoder pass.
@@ -382,15 +382,23 @@ there, and stops the clock at transcript-ready. Releasing at the acoustic end
 is the earliest a user could, so these are floor numbers for the mode.
 
 30 measured repetitions per bucket, two warmups, `BlackHole 2ch` loopback,
-resident Core ML worker (`bench/hold.csv`):
+resident Core ML worker (`bench/hold.csv`). Re-measured 2026-09-04 after
+ADR-0030; the 2026-09-04 pre-ADR-0030 column is kept beside it because Hold,
+unlike Tap, has nothing overlapping the decode and so collects the saving in
+full.
 
-| bucket | captured audio | n | mean | p50 | p95 | p99 |
-|---|---:|---:|---:|---:|---:|---:|
-| 1 s | 0.800 s | 30 | 58.0 ms | **54.0 ms** | 79.5 ms | 80.7 ms |
-| 3 s | 2.571 s | 30 | 71.5 ms | **67.0 ms** | 97.7 ms | 108.5 ms |
-| 5 s | 5.035 s | 30 | 117.9 ms | **106.5 ms** | 158.6 ms | 160.4 ms |
-| 10 s | 8.213 s | 30 | 144.1 ms | **137.5 ms** | 184.5 ms | 190.4 ms |
-| 20 s | 15.755 s | 30 | 238.5 ms | **231.5 ms** | 280.6 ms | 288.8 ms |
+| bucket | captured audio | n | mean | p50 | p95 | p99 | p50 before |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 s | 0.885 s | 30 | 49.0 ms | **48.0 ms** | 55.0 ms | 117.5 ms | 54.0 ms |
+| 3 s | 2.901 s | 30 | 56.6 ms | **55.0 ms** | 76.0 ms | 90.7 ms | 67.0 ms |
+| 5 s | 4.922 s | 30 | 84.5 ms | **72.5 ms** | 137.6 ms | 141.1 ms | 106.5 ms |
+| 10 s | 8.128 s | 30 | 117.7 ms | **125.0 ms** | 161.2 ms | 166.6 ms | 137.5 ms |
+| 20 s | 16.587 s | 30 | 204.4 ms | **192.5 ms** | 240.0 ms | 352.9 ms | 231.5 ms |
+
+The before column came from a run whose captured durations differ by up to
+0.8 s per bucket, so treat it as a trend rather than a controlled comparison;
+the controlled before/after is the ASR-only table under "Retiring the resample
+stage".
 
 Bucket labels are nominal. The captured-audio column is the median measured
 duration, and it is what these latencies belong to: the "20 s" row is a 15.755 s
@@ -401,17 +409,20 @@ Medians of the parts, from the same `phase_timer` lines:
 
 | bucket | captured audio | release to observed | capture stop and join | ASR | total p50 |
 |---|---:|---:|---:|---:|---:|
-| 1 s | 0.800 s | 8.0 ms | 0.0 ms | 44.5 ms | 54.0 ms |
-| 3 s | 2.571 s | 8.0 ms | 0.0 ms | 53.5 ms | 67.0 ms |
-| 5 s | 5.035 s | 9.5 ms | 1.0 ms | 95.0 ms | 106.5 ms |
-| 10 s | 8.213 s | 9.5 ms | 1.0 ms | 122.0 ms | 137.5 ms |
-| 20 s | 15.755 s | 12.0 ms | 1.0 ms | 219.5 ms | 231.5 ms |
+| 1 s | 0.885 s | 14.5 ms | 0.0 ms | 33.0 ms | 48.0 ms |
+| 3 s | 2.901 s | 12.0 ms | 0.0 ms | 40.0 ms | 55.0 ms |
+| 5 s | 4.922 s | 12.0 ms | 0.0 ms | 61.0 ms | 72.5 ms |
+| 10 s | 8.128 s | 12.5 ms | 0.0 ms | 115.5 ms | 125.0 ms |
+| 20 s | 16.587 s | 14.0 ms | 0.0 ms | 181.0 ms | 192.5 ms |
 
-`run_manual` polls its signal channel every 15 ms, which is the 8 to 12 ms
-median seen in the first column and up to 15 ms in the tail. Capture shutdown
-and the mono fold cost about 1 ms. Everything else is ASR, which runs 9 to 42%
-slower here than in the isolated bench, not monotonically in length, because the
-capture stream is still live in the same process. Hold also never sets `early_transcript`, so unlike Tap it
+`run_manual` polls its signal channel every 15 ms, which is the 12 to 14 ms
+median seen in the first column. Capture shutdown now rounds to 0 ms at every
+bucket, where it used to cost about 1 ms: `finish_with_recording` no longer
+folds the whole recording to mono, because capture did that per callback, and
+all that remains after the stream is dropped is the resampler's tail flush.
+Everything else is ASR, which runs slower here than in the isolated bench, not
+monotonically in length, because the capture stream is still live in the same
+process. Hold also never sets `early_transcript`, so unlike Tap it
 cannot overlap any decode with the tail of the utterance.
 
 ```bash
