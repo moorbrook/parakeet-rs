@@ -16,7 +16,8 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parakeet_dictation::asr::{Asr, AsrConfig, StageReport};
 use parakeet_dictation::coreml_worker::{
@@ -39,6 +40,54 @@ struct Args {
     model_dir: Option<PathBuf>,
     compute_units: CoreMlComputeUnits,
     stage_timings: bool,
+    arm: Arm,
+    idle_gap_ms: u64,
+    /// Interval between the idle gap and the measured decode, standing in for
+    /// the time the user spends speaking. `None` means "as long as the
+    /// fixture", which is what a real utterance of this length costs.
+    record_gap_ms: Option<u64>,
+    keepalive_ms: u64,
+}
+
+/// Which idle/keep-warm treatment a repetition gets before its measured decode.
+///
+/// Every arm except `Warm` pays `--idle-gap-ms` of silence first, then the
+/// simulated recording interval, so the arms differ only in what happens
+/// during that interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Arm {
+    /// Back-to-back decodes: no idle gap at all. The engine never gates off,
+    /// so this is the floor every other arm is measured against.
+    Warm,
+    /// Idle gap, then nothing. What a user gets today after a pause.
+    Cold,
+    /// Idle gap, one prime dispatch at the simulated hotkey-down edge, then
+    /// the recording interval, then the decode.
+    Prime,
+    /// Idle gap, then a keep-alive dispatch every `--keepalive-ms` through the
+    /// recording interval. Joined before the measured decode starts.
+    Cadence,
+}
+
+impl Arm {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "warm" => Ok(Self::Warm),
+            "cold" => Ok(Self::Cold),
+            "prime" => Ok(Self::Prime),
+            "cadence" => Ok(Self::Cadence),
+            _ => anyhow::bail!("unknown arm {value:?}; expected warm, cold, prime, or cadence"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::Cold => "cold",
+            Self::Prime => "prime",
+            Self::Cadence => "cadence",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +116,10 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut model_dir = None;
     let mut compute_units = CoreMlComputeUnits::default();
     let mut stage_timings = false;
+    let mut arm = Arm::Warm;
+    let mut idle_gap_ms: u64 = 0;
+    let mut record_gap_ms: Option<u64> = None;
+    let mut keepalive_ms: u64 = 250;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -114,6 +167,31 @@ fn parse_args() -> anyhow::Result<Args> {
             "--stage-timings" => {
                 stage_timings = true;
             }
+            "--arm" => {
+                arm = Arm::parse(&it.next().ok_or_else(|| anyhow!("--arm needs a name"))?)?;
+            }
+            "--idle-gap-ms" => {
+                idle_gap_ms = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--idle-gap-ms needs a number"))?
+                    .parse()
+                    .context("--idle-gap-ms")?;
+            }
+            "--record-gap-ms" => {
+                record_gap_ms = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--record-gap-ms needs a number"))?
+                        .parse()
+                        .context("--record-gap-ms")?,
+                );
+            }
+            "--keepalive-ms" => {
+                keepalive_ms = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--keepalive-ms needs a number"))?
+                    .parse()
+                    .context("--keepalive-ms")?;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -131,6 +209,10 @@ fn parse_args() -> anyhow::Result<Args> {
         model_dir,
         compute_units,
         stage_timings,
+        arm,
+        idle_gap_ms,
+        record_gap_ms,
+        keepalive_ms,
     })
 }
 
@@ -141,6 +223,15 @@ fn print_usage() {
          \x20                [--worker PATH] [--model-dir DIR]\n\
          \x20                [--compute-units all|cpu-and-gpu|cpu-and-neural-engine|cpu-only]\n\
          \x20                [--stage-timings]\n\
+         \x20                [--arm warm|cold|prime|cadence]\n\
+         \x20                [--idle-gap-ms N] [--record-gap-ms N] [--keepalive-ms N]\n\
+         \n\
+         `--arm` selects the idle treatment applied before each measured\n\
+         decode. `warm` runs them back to back; every other arm sleeps\n\
+         `--idle-gap-ms` first and then `--record-gap-ms` (default: the\n\
+         fixture's own length) standing in for the user speaking. `prime`\n\
+         fires one dispatch where the hotkey-down edge would be; `cadence`\n\
+         re-primes every `--keepalive-ms` through that interval.\n\
          \n\
          Runs the loaded Parakeet recognizer over WAV PATH `--reps` times,\n\
          emitting one `phase_timer` log line per iteration on stderr.\n\
@@ -171,9 +262,65 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Put the engine into the idle state this arm is meant to measure, then
+/// return how many keep-alive dispatches the cadence fired.
+///
+/// The arms differ only in how long the engine has been without a dispatch
+/// when the measured decode starts:
+///
+/// | arm     | silence before the decode |
+/// |---------|---------------------------|
+/// | warm    | none — back-to-back decodes |
+/// | cold    | `idle_gap + record_gap` |
+/// | prime   | `record_gap` (one dispatch at the simulated hotkey-down) |
+/// | cadence | at most `keepalive_ms` |
+///
+/// `record_gap` stands in for the user speaking. Priming synchronously rather
+/// than on a thread makes the prime-to-decode separation exactly `record_gap`
+/// instead of `record_gap` minus the prime's own duration, which errs toward
+/// a colder engine and keeps the measured decode free of any contention for
+/// the worker's pipe.
+fn apply_arm(args: &Args, asr: &Arc<Asr>, audio_s: f32) -> anyhow::Result<u64> {
+    let idle_gap = Duration::from_millis(args.idle_gap_ms);
+    let record_gap = Duration::from_millis(
+        args.record_gap_ms
+            .unwrap_or_else(|| (audio_s * 1_000.0) as u64),
+    );
+    match args.arm {
+        Arm::Warm => Ok(0),
+        Arm::Cold => {
+            std::thread::sleep(idle_gap + record_gap);
+            Ok(0)
+        }
+        Arm::Prime => {
+            std::thread::sleep(idle_gap);
+            warmup::prime_engine(asr)?;
+            std::thread::sleep(record_gap);
+            // Zero because the return value counts keep-alive dispatches. The
+            // prime arm fires exactly one by construction, which the arm
+            // marker already says.
+            Ok(0)
+        }
+        Arm::Cadence => {
+            std::thread::sleep(idle_gap);
+            let keep_alive = warmup::KeepAlive::start(
+                Arc::clone(asr),
+                Duration::from_millis(args.keepalive_ms),
+            );
+            std::thread::sleep(record_gap);
+            // `stop` joins. The worker serializes on one pipe, so an unjoined
+            // cadence could put a whole encoder pass inside the measurement.
+            Ok(keep_alive.stop())
+        }
+    }
+}
+
 fn run(args: &Args) -> anyhow::Result<()> {
+    if args.arm == Arm::Cadence && args.keepalive_ms == 0 {
+        anyhow::bail!("--arm cadence needs a nonzero --keepalive-ms");
+    }
     let store = SettingsStore::new()?;
-    let asr = load_backend(args, &store)?;
+    let asr = Arc::new(load_backend(args, &store)?);
 
     // CoreML graph compile happens on first inference. The aggregator
     // ignores the warmup reps so steady-state numbers aren't contaminated.
@@ -214,15 +361,29 @@ fn run(args: &Args) -> anyhow::Result<()> {
             stages.compute_units
         );
     }
-    // Measured reps. session_id has no `warmup-` prefix → aggregator counts it.
+    // Measured reps. session_id has no `warmup-` prefix → aggregator counts
+    // it, and it carries the arm and gap so `scripts/bench-idle.py` can split
+    // one log into per-arm rows without a new phase_timer field.
+    let arm = args.arm.as_str();
+    let gap = args.idle_gap_ms;
+    log::info!(
+        "idle_arm arm={arm} idle_gap_ms={gap} record_gap_ms={} keepalive_ms={}",
+        args.record_gap_ms
+            .map_or_else(|| "audio".to_string(), |ms| ms.to_string()),
+        args.keepalive_ms
+    );
     for i in 0..args.reps {
+        let dispatches = apply_arm(args, &asr, audio_s)?;
         run_one(
             &asr,
             &samples,
             sample_rate,
             audio_s,
-            &format!("bench-{stem}-r{i:03}"),
+            &format!("bench-{stem}-{arm}-g{gap}-r{i:03}"),
         )?;
+        if dispatches > 0 {
+            log::info!("idle_keepalive arm={arm} idle_gap_ms={gap} dispatches={dispatches}");
+        }
     }
     Ok(())
 }

@@ -367,6 +367,51 @@ cannot overlap any decode with the tail of the utterance.
 REPS=30 WARMUP_REPS=2 BACKEND=coreml-unified scripts/bench-hold.sh
 ```
 
+## ANE idle re-wake A/B: cold, prime, keep-alive (kata snx0)
+
+The Neural Engine hard power-gates when idle. Published measurements put the
+cold re-wake after an idle gap at tens to hundreds of milliseconds, with
+per-dispatch cost climbing once the gap reaches about 100 ms (arXiv 2606.22283,
+p.58-59 and p.84). Between dictations this app is idle for seconds to minutes,
+so the endpoint decode may be paying that re-wake on every utterance.
+
+`scripts/bench-idle.sh` measures four arms. They differ only in how long the
+engine has gone without a dispatch when the measured decode starts:
+
+| arm | silence before the decode |
+|---|---|
+| `warm` | none - repetitions run back to back |
+| `cold` | the idle gap plus the recording interval |
+| `prime` | the recording interval; one dispatch fires at the hotkey-down edge |
+| `cadence` | at most `KEEPALIVE_MS` |
+
+The recording interval stands in for the user speaking, and it is the whole
+point of the ladder: a hotkey-down prime helps only if the engine's warmth
+survives the 1 s or 5 s of talking that follows it. `bench_asr` simulates that
+interval with `--record-gap-ms` (default: the fixture's own length); in
+`bench_e2e --mode hold` it is real, because the fixture plays through the
+loopback in the time it takes.
+
+Arms are tagged with an `idle_arm` log marker rather than a new `phase_timer`
+field, so nothing in the production timing path changes.
+`scripts/bench-idle.py` attributes each timed line to the marker above it,
+warns about any line it cannot label, and carries `encoder_ms` from the stage
+profiler alongside the latency percentiles - the encoder is the only stage on
+the engine, so its delta separates a Neural Engine re-wake from a cold CPU.
+
+```bash
+# Find the cool-down knee first. If it sits well below 60 s, the matrix runs
+# at that gap instead and takes minutes rather than hours.
+scripts/bench-idle.sh sweep
+
+IDLE_GAP_MS=60000 REPS=20 scripts/bench-idle.sh tap
+IDLE_GAP_MS=60000 REPS=20 scripts/bench-idle.sh hold
+scripts/bench-idle.sh energy
+```
+
+Results and the ship/no-ship decision are recorded in
+[`../docs/asr/PERF.md`](../docs/asr/PERF.md).
+
 ## Baseline: M5 Pro 24 GB (2026-05-16, pre-§2 CoreML cache)
 
 | length | n  | mean ms | p50 ms | p95 ms | p99 ms |
@@ -459,6 +504,7 @@ Replay:
 | `*-boundary.csv`             | Generated Rust/worker boundary measurements.    |
 | `*-stages.csv`               | Generated per-stage breakdown and Core ML dispatch counts. |
 | `hold.{log,csv}`             | Generated Hold-mode release-to-transcript runs. |
+| `idle-*.{log,csv}`           | Generated ANE idle re-wake A/B runs (sweep, tap, hold, energy). |
 | `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |
 | `endpoint-*.{log,csv}`       | Generated pause-friendly endpoint gate runs.   |
 | `polish-backends.csv`        | Historical §6 Phase-0 2B polish measurements.  |

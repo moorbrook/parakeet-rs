@@ -9,6 +9,9 @@
 //!    the first user press feels instant.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use memmap2::Mmap;
@@ -51,4 +54,242 @@ pub fn dummy_decode(asr: &Asr) -> Result<()> {
     let measured = vec![0.0_f32; 16_000 * 2];
     let _ = asr.recognize(&measured, 16_000)?;
     Ok(())
+}
+
+/// Sample rate the priming buffers are built at. The worker resamples anything
+/// else, so generating at 16 kHz keeps the prime off the resampler.
+const PRIME_SAMPLE_RATE: u32 = 16_000;
+
+/// Length of one priming buffer.
+///
+/// The encoder runs over a fixed window regardless of how short the input is,
+/// so a shorter buffer buys nothing on the engine and only trims the pipe
+/// write. 0.5 s matches the throwaway pass of [`dummy_decode`], which is the
+/// shape already known to compile and run cleanly on this model.
+pub const PRIME_SECONDS: f32 = 0.5;
+
+/// Run one minimal dispatch through the recognizer.
+///
+/// The Apple Neural Engine hard power-gates when idle, so the first dispatch
+/// after a gap of seconds to minutes pays a re-wake the user feels as endpoint
+/// latency. This is the cheapest program that still touches the encoder, which
+/// is the only stage this pipeline places on the engine.
+pub fn prime_engine(asr: &Asr) -> Result<()> {
+    let samples = vec![0.0_f32; (PRIME_SAMPLE_RATE as f32 * PRIME_SECONDS) as usize];
+    let _ = asr.recognize_silent_warmup(&samples, PRIME_SAMPLE_RATE)?;
+    Ok(())
+}
+
+/// Fires [`prime_engine`] on a worker thread, at most one at a time.
+///
+/// The hotkey-down edge runs on the AppKit main thread under a hard ~250 ms
+/// budget before macOS disables the event tap, so the prime can never run
+/// inline. The in-flight flag matters because the Core ML worker serializes on
+/// one pipe: a second prime queued behind the first would make a fast
+/// press-release wait for both.
+#[derive(Clone, Debug, Default)]
+pub struct EnginePrimer {
+    in_flight: Arc<AtomicBool>,
+}
+
+impl EnginePrimer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Spawn a prime unless one is still running.
+    ///
+    /// Returns `true` when a thread was spawned. A `false` return is the
+    /// normal outcome of a rapid second press, not an error.
+    pub fn prime_in_background(&self, asr: Arc<Asr>) -> bool {
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            log::debug!("engine prime skipped: one is already in flight");
+            return false;
+        }
+        let in_flight = Arc::clone(&self.in_flight);
+        std::thread::spawn(move || {
+            if let Err(error) = prime_engine(&asr) {
+                log::warn!("engine prime failed; the next decode pays the re-wake: {error:#}");
+            }
+            in_flight.store(false, Ordering::Release);
+        });
+        true
+    }
+
+    /// True while a spawned prime has not yet returned.
+    pub fn is_in_flight(&self) -> bool {
+        self.in_flight.load(Ordering::Acquire)
+    }
+}
+
+/// A background thread that re-primes the engine on a fixed cadence.
+///
+/// [`Self::stop`] joins the thread. Callers must join before the decode they
+/// are about to measure or serve: the worker's pipe is a single mutex, so an
+/// unjoined keep-alive can put a whole encoder pass in front of the real
+/// request.
+#[derive(Debug)]
+pub struct KeepAlive {
+    stop: Arc<AtomicBool>,
+    dispatches: Arc<AtomicU64>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl KeepAlive {
+    pub fn start(asr: Arc<Asr>, period: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let dispatches = Arc::new(AtomicU64::new(0));
+        let thread_stop = Arc::clone(&stop);
+        let thread_dispatches = Arc::clone(&dispatches);
+        let handle = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match prime_engine(&asr) {
+                    Ok(()) => {
+                        thread_dispatches.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        log::warn!("keep-alive dispatch failed, stopping cadence: {error:#}");
+                        break;
+                    }
+                }
+                // Sleep in short slices so `stop` is observed promptly rather
+                // than one full period late.
+                let mut remaining = period;
+                let slice = Duration::from_millis(10);
+                while remaining > Duration::ZERO && !thread_stop.load(Ordering::Acquire) {
+                    let step = remaining.min(slice);
+                    std::thread::sleep(step);
+                    remaining -= step;
+                }
+            }
+        });
+        Self {
+            stop,
+            dispatches,
+            handle: Some(handle),
+        }
+    }
+
+    /// Signal the cadence to stop, wait for its in-flight dispatch to finish,
+    /// and report how many dispatches it fired.
+    pub fn stop(mut self) -> u64 {
+        self.signal_and_join();
+        self.dispatches.load(Ordering::Relaxed)
+    }
+
+    fn signal_and_join(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            // A panicking keep-alive thread has already been reported by the
+            // default hook; losing its count is not worth propagating a panic
+            // into a caller that is about to serve a real utterance.
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for KeepAlive {
+    fn drop(&mut self) {
+        self.signal_and_join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::asr::{AsrBackend, AsrBackendMetadata, Decoded};
+
+    /// Counts dispatches and holds each one for a fixed time, so a test can
+    /// tell the difference between "signalled" and "actually finished".
+    struct CountingBackend {
+        metadata: AsrBackendMetadata,
+        calls: Arc<AtomicU64>,
+        hold: Duration,
+    }
+
+    impl CountingBackend {
+        fn new(hold: Duration) -> (Arc<Self>, Arc<AtomicU64>) {
+            let calls = Arc::new(AtomicU64::new(0));
+            let backend = Arc::new(Self {
+                metadata: AsrBackendMetadata {
+                    backend: "counting".into(),
+                    model: "none".into(),
+                    quantization: "none".into(),
+                    execution_provider: "test".into(),
+                },
+                calls: Arc::clone(&calls),
+                hold,
+            });
+            (backend, calls)
+        }
+    }
+
+    impl AsrBackend for CountingBackend {
+        fn metadata(&self) -> &AsrBackendMetadata {
+            &self.metadata
+        }
+
+        fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
+            std::thread::sleep(self.hold);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Decoded {
+                text: String::new(),
+                audio_seconds: samples.len() as f32 / sample_rate as f32,
+                decode_seconds: 0.0,
+            })
+        }
+    }
+
+    #[test]
+    fn the_prime_buffer_is_silent_and_nonempty() {
+        // An empty buffer short-circuits inside `Asr::recognize_with_timing`
+        // and never reaches the backend, which would make the prime a no-op
+        // that still reads as success.
+        let (backend, calls) = CountingBackend::new(Duration::ZERO);
+        let asr = Asr::from_backend(backend);
+        prime_engine(&asr).expect("prime must succeed");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(PRIME_SECONDS > 0.0);
+    }
+
+    #[test]
+    fn a_second_prime_is_dropped_while_the_first_is_in_flight() {
+        let (backend, calls) = CountingBackend::new(Duration::from_millis(200));
+        let asr = Arc::new(Asr::from_backend(backend));
+        let primer = EnginePrimer::new();
+
+        assert!(primer.prime_in_background(Arc::clone(&asr)));
+        // The first prime holds the fake backend for 200 ms, so this second
+        // request lands squarely inside its window.
+        assert!(!primer.prime_in_background(Arc::clone(&asr)));
+
+        while primer.is_in_flight() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // Once the first one has drained, priming is available again.
+        assert!(primer.prime_in_background(asr));
+    }
+
+    #[test]
+    fn stopping_the_keep_alive_waits_for_its_in_flight_dispatch() {
+        let (backend, calls) = CountingBackend::new(Duration::from_millis(120));
+        let asr = Arc::new(Asr::from_backend(backend));
+        let keep_alive = KeepAlive::start(asr, Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(30));
+
+        let reported = keep_alive.stop();
+        // `stop` joins, so no dispatch can still be running: the count the
+        // caller was handed is final. Without the join the backend would keep
+        // incrementing after this read and the assert below would flake.
+        let after_stop = calls.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(calls.load(Ordering::Relaxed), after_stop);
+        assert_eq!(reported, after_stop);
+        assert!(reported >= 1, "the cadence must fire at least once");
+    }
 }
