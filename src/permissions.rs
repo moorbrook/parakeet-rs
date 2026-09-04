@@ -468,7 +468,10 @@ fn perform_action(permission: Permission, status: PermissionStatus, scope: Dashb
             }
             Permission::InputMonitoring => {
                 arm_refresh_when_active(scope);
-                handle_input_monitoring_request(permission, request_input_monitoring(), scope);
+                let requested_before = input_monitoring_requested_before();
+                let granted_now = request_input_monitoring();
+                mark_input_monitoring_requested();
+                handle_input_monitoring_request(permission, granted_now, requested_before, scope);
             }
         },
     }
@@ -560,45 +563,112 @@ fn request_input_monitoring() -> bool {
 }
 
 /// What the Grant path must do after `CGRequestListenEventAccess` answers.
+/// The call returns the *current* access state, not whether it prompted: on
+/// the first request from an install macOS shows the consent alert and the
+/// call still returns false while the user has not answered. A false return
+/// therefore only means "will not prompt from here on" once we know a
+/// request was already made — denied, or the stored decision went stale
+/// because the app was rebuilt under a different signature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputMonitoringRequestOutcome {
-    /// The request path is live: macOS prompted, or the grant registered.
-    /// Refreshing the dashboard is enough.
-    Prompted,
-    /// TCC already decided for this code signature and will not prompt —
-    /// previously denied, or the stored decision went stale because the app
-    /// was rebuilt under a different signature. Open the Input Monitoring
-    /// pane and refresh so the click is never a silent no-op.
+    /// Access is granted. No prompt is involved; refresh the dashboard so
+    /// the granted state (and any relaunch notice) shows.
+    Granted,
+    /// First request from this install: the system consent prompt is up.
+    /// Leave it in front; the return-from-prompt refresh is already armed.
+    PromptShown,
+    /// Asked before and still not granted: macOS will not prompt. Open the
+    /// Input Monitoring pane so the click is never a silent no-op.
     NeedsSettingsFallback,
 }
 
-fn input_monitoring_request_outcome(prompted: bool) -> InputMonitoringRequestOutcome {
-    if prompted {
-        InputMonitoringRequestOutcome::Prompted
-    } else {
-        InputMonitoringRequestOutcome::NeedsSettingsFallback
+fn input_monitoring_request_outcome(
+    granted_now: bool,
+    requested_before: bool,
+) -> InputMonitoringRequestOutcome {
+    match (granted_now, requested_before) {
+        (true, _) => InputMonitoringRequestOutcome::Granted,
+        (false, false) => InputMonitoringRequestOutcome::PromptShown,
+        (false, true) => InputMonitoringRequestOutcome::NeedsSettingsFallback,
     }
 }
 
 fn input_monitoring_fallback_warning() -> &'static str {
-    "Input Monitoring request returned without a prompt (TCC already decided \
-     for this build, or the stored grant went stale after a rebuild); opening \
-     Privacy & Security > Input Monitoring"
+    "Input Monitoring was requested before and is still not granted (denied, \
+     or the stored decision went stale after a rebuild); opening Privacy & \
+     Security > Input Monitoring"
 }
 
-fn handle_input_monitoring_request(permission: Permission, prompted: bool, scope: DashboardScope) {
-    match input_monitoring_request_outcome(prompted) {
-        InputMonitoringRequestOutcome::Prompted => schedule_dashboard(scope),
+fn handle_input_monitoring_request(
+    permission: Permission,
+    granted_now: bool,
+    requested_before: bool,
+    scope: DashboardScope,
+) {
+    match input_monitoring_request_outcome(granted_now, requested_before) {
+        InputMonitoringRequestOutcome::Granted => {
+            log::info!("Input Monitoring granted; refreshing the dashboard");
+            schedule_dashboard(scope);
+        }
+        InputMonitoringRequestOutcome::PromptShown => {
+            log::info!(
+                "first Input Monitoring request: the system consent prompt is \
+                 up; refresh is armed for the return"
+            );
+        }
         InputMonitoringRequestOutcome::NeedsSettingsFallback => {
             log::warn!("{}", input_monitoring_fallback_warning());
+            // Mirror the OpenSettings branch: refresh only when the deep link
+            // fails, so the modal never covers the pane the user needs — the
+            // armed activation refresh covers the successful-open path.
             if !open_settings(permission) {
                 log::error!(
                     "failed to open {} or generic Privacy & Security settings",
                     permission.label()
                 );
+                schedule_dashboard(scope);
             }
-            schedule_dashboard(scope);
         }
+    }
+}
+
+/// Marker recording that this install has called the Input Monitoring
+/// request at least once, so a later false return can be read as "will not
+/// prompt" rather than "the consent prompt just went up". Best-effort: if
+/// the marker cannot be written, the next Grant click is treated as a first
+/// request again, which at worst re-routes through the prompt.
+fn input_monitoring_request_marker_path() -> Option<std::path::PathBuf> {
+    dirs::data_dir().map(|data_dir| {
+        data_dir
+            .join(crate::settings::BUNDLE_NAMESPACE)
+            .join("tcc")
+            .join("input-monitoring-requested")
+    })
+}
+
+fn input_monitoring_requested_before() -> bool {
+    input_monitoring_request_marker_path().is_some_and(|path| path.exists())
+}
+
+fn mark_input_monitoring_requested() {
+    let Some(path) = input_monitoring_request_marker_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            log::warn!(
+                "cannot create TCC marker directory {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    if let Err(error) = std::fs::write(&path, b"") {
+        log::warn!(
+            "cannot write TCC marker {}: {error}; the next Grant click will be \
+             treated as a first request",
+            path.display()
+        );
     }
 }
 
@@ -814,17 +884,25 @@ mod tests {
     }
 
     #[test]
-    fn input_monitoring_request_answered_without_a_prompt_falls_back_to_settings() {
-        // A false return from CGRequestListenEventAccess means macOS will not
-        // prompt for this build; the Grant click must still do something
-        // visible instead of the historic silent no-op.
+    fn input_monitoring_grant_path_distinguishes_prompt_from_no_prompt() {
+        // CGRequestListenEventAccess returns the current access state, not
+        // whether it prompted: a first request shows the consent alert and
+        // still returns false, which must NOT open Settings over the prompt.
         assert_eq!(
-            input_monitoring_request_outcome(false),
-            InputMonitoringRequestOutcome::NeedsSettingsFallback
+            input_monitoring_request_outcome(true, false),
+            InputMonitoringRequestOutcome::Granted
         );
         assert_eq!(
-            input_monitoring_request_outcome(true),
-            InputMonitoringRequestOutcome::Prompted
+            input_monitoring_request_outcome(true, true),
+            InputMonitoringRequestOutcome::Granted
+        );
+        assert_eq!(
+            input_monitoring_request_outcome(false, false),
+            InputMonitoringRequestOutcome::PromptShown
+        );
+        assert_eq!(
+            input_monitoring_request_outcome(false, true),
+            InputMonitoringRequestOutcome::NeedsSettingsFallback
         );
     }
 
@@ -833,6 +911,12 @@ mod tests {
         let warning = input_monitoring_fallback_warning();
         assert!(warning.contains("Input Monitoring"));
         assert!(warning.contains("Privacy & Security"));
-        assert!(warning.contains("without a prompt"));
+        assert!(warning.contains("still not granted"));
+    }
+
+    #[test]
+    fn input_monitoring_request_marker_lives_under_the_bundle_namespace() {
+        let path = input_monitoring_request_marker_path().expect("data dir resolves");
+        assert!(path.ends_with("com.parakeet.rs/tcc/input-monitoring-requested"));
     }
 }

@@ -18,7 +18,7 @@ use crate::windows::HoldWindowConfig;
 /// Bundle-id-style namespace for our on-disk state. Matches what the previous
 /// Tauri build wrote (`tauri.conf.json` `identifier`), so the model files
 /// downloaded under that name still resolve.
-const BUNDLE_NAMESPACE: &str = "com.parakeet.rs";
+pub(crate) const BUNDLE_NAMESPACE: &str = "com.parakeet.rs";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
