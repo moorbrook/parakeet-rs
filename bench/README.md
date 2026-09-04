@@ -214,17 +214,25 @@ Worker total is resample plus the profiled transcribe interval; it sits 0.7 to
 the Swift work outside the profiled window. IPC is unchanged from the
 2026-08-11 boundary measurement and remains under 0.6% of the call.
 
-Enabling the profiler costs under 0.2 ms per utterance. Matched 30-repetition
-runs of the 1 s and 5 s buckets with and without `--stage-timings` measured
-35.51 against 35.51 ms and 67.09 against 66.92 ms of worker-internal time. The
-interception itself is two clock reads and a lock per dispatch; the class sweep
-that finds the entry points runs only until all three stages have dispatched.
+Enabling the profiler costs nothing measurable. Matched 30-repetition runs with
+and without `--stage-timings` measured 35.51 against 35.51 ms at 1 s and 67.09
+against 66.92 ms at 5 s. The 10 s bucket, which has the most dispatches of any
+single-window fixture, was measured with eight interleaved on/off blocks of 15
+repetitions so that machine drift hits both arms equally: the per-block delta
+has a median of -0.17 ms and a mean of -0.38 ms, and its sign flips across
+blocks, so the effect is below the noise. The interception is two clock reads
+and a lock per dispatch; the class sweep that finds the entry points stops once
+all three stages have dispatched, and the model placement is read once per stage
+rather than per call.
 
-These absolute numbers need a quiet machine. A repeat with background CPU load
-reproduced the dispatch counts exactly and kept the encoder flat at 26.4 to
-28.5 ms, but the CPU-side stages (resample and the decode loop) came in 10 to
-20% higher. The shape of the breakdown is stable; the millisecond values are
-not, so compare against the ASR-only p50 column from the same run.
+These absolute numbers need a quiet machine, which matters more than the
+profiler does. Against the 2026-08-11 published baseline the 1, 3, 5, and 20 s
+buckets land within about 2 ms, and 10 s is roughly 5 ms higher; the interleaved
+A/B above rules the profiler out as the cause. A separate repeat under a
+competing job reproduced the dispatch counts exactly and kept the encoder flat
+at 26.4 to 28.5 ms, with resample and the decode loop 10 to 20% higher. The
+shape of the breakdown is stable; the millisecond values are not, so compare
+against the ASR-only p50 column from the same run.
 
 The encoder cost does not depend on utterance length. `UnifiedAsrManager`
 zero-pads every window to a fixed 15 s buffer (240,000 samples, 1,501 mel
@@ -248,8 +256,16 @@ Decoded frames are `joint_calls - (decoder_calls - windows)`, since the greedy
 loop issues one joint per frame plus one per emitted token, and one decoder call
 per window plus one per emitted token. Every bucket matches its 80 ms frame
 arithmetic: 4.967 s of audio decodes 62 frames. That agreement is what
-validates the counts, so a future pipeline change that breaks it will show up
-as a mismatch rather than as a plausible-looking number.
+validates the counts.
+
+The agreement is also checked at runtime, because a stage whose Core ML entry
+point stops being intercepted reports zero cost while every other number stays
+plausible. `bench_asr` fails the run when a report has no encoder dispatches,
+when `windows` and `encoder_calls` disagree, or when any prediction goes
+unattributed, and `scripts/bench-stages.py` repeats those checks before writing
+a CSV. The encoder is the stage worth naming here: losing it also drives
+`windows` to zero, which leaves the frame identity intact and the row
+believable.
 
 Per-frame loop cost is flat at roughly 0.25 ms across all lengths. The dispatch
 floor of about 100 µs per joint call is the dominant term inside the loop:
@@ -317,23 +333,28 @@ is the earliest a user could, so these are floor numbers for the mode.
 30 measured repetitions per bucket, two warmups, `BlackHole 2ch` loopback,
 resident Core ML worker (`bench/hold.csv`):
 
-| bucket | n | mean | p50 | p95 | p99 |
-|---|---:|---:|---:|---:|---:|
-| 1 s | 30 | 58.0 ms | **54.0 ms** | 79.5 ms | 80.7 ms |
-| 3 s | 30 | 71.5 ms | **67.0 ms** | 97.7 ms | 108.5 ms |
-| 5 s | 30 | 117.9 ms | **106.5 ms** | 158.6 ms | 160.4 ms |
-| 10 s | 30 | 144.1 ms | **137.5 ms** | 184.5 ms | 190.4 ms |
-| 20 s | 30 | 238.5 ms | **231.5 ms** | 280.6 ms | 288.8 ms |
+| bucket | captured audio | n | mean | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 s | 0.800 s | 30 | 58.0 ms | **54.0 ms** | 79.5 ms | 80.7 ms |
+| 3 s | 2.571 s | 30 | 71.5 ms | **67.0 ms** | 97.7 ms | 108.5 ms |
+| 5 s | 5.035 s | 30 | 117.9 ms | **106.5 ms** | 158.6 ms | 160.4 ms |
+| 10 s | 8.213 s | 30 | 144.1 ms | **137.5 ms** | 184.5 ms | 190.4 ms |
+| 20 s | 15.755 s | 30 | 238.5 ms | **231.5 ms** | 280.6 ms | 288.8 ms |
+
+Bucket labels are nominal. The captured-audio column is the median measured
+duration, and it is what these latencies belong to: the "20 s" row is a 15.755 s
+utterance, which is only just over the 15 s encoder window, and the "10 s" row is
+8.2 s. Budget against the captured column, not the label.
 
 Medians of the parts, from the same `phase_timer` lines:
 
-| bucket | release to observed | capture stop and join | ASR | total p50 |
-|---|---:|---:|---:|---:|
-| 1 s | 8.0 ms | 0.0 ms | 44.5 ms | 54.0 ms |
-| 3 s | 8.0 ms | 0.0 ms | 53.5 ms | 67.0 ms |
-| 5 s | 9.5 ms | 1.0 ms | 95.0 ms | 106.5 ms |
-| 10 s | 9.5 ms | 1.0 ms | 122.0 ms | 137.5 ms |
-| 20 s | 12.0 ms | 1.0 ms | 219.5 ms | 231.5 ms |
+| bucket | captured audio | release to observed | capture stop and join | ASR | total p50 |
+|---|---:|---:|---:|---:|---:|
+| 1 s | 0.800 s | 8.0 ms | 0.0 ms | 44.5 ms | 54.0 ms |
+| 3 s | 2.571 s | 8.0 ms | 0.0 ms | 53.5 ms | 67.0 ms |
+| 5 s | 5.035 s | 9.5 ms | 1.0 ms | 95.0 ms | 106.5 ms |
+| 10 s | 8.213 s | 9.5 ms | 1.0 ms | 122.0 ms | 137.5 ms |
+| 20 s | 15.755 s | 12.0 ms | 1.0 ms | 219.5 ms | 231.5 ms |
 
 `run_manual` polls its signal channel every 15 ms, which is the 8 to 12 ms
 median seen in the first column and up to 15 ms in the tail. Capture shutdown

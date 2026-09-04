@@ -491,14 +491,14 @@ mod tests {
         let stages = response.stages.expect("stages present");
         assert_eq!(stages.windows, 1);
         assert_eq!(stages.joint_calls, 96);
-        // One joint per decoded frame plus one per emitted token; one decoder
-        // call per window plus one per emitted token. 4.967 s of audio is 62
-        // frames at the model's 80 ms frame rate.
-        assert_eq!(
-            stages.joint_calls - (stages.decoder_calls - stages.windows),
-            62
-        );
+        assert_eq!(stages.encoder_calls, 1);
+        assert_eq!(stages.other_calls, 0);
         assert!(stages.compute_units.contains("decoder=cpu-only"));
+        // This is a wire-format test over a captured payload, so it pins the
+        // field names and types only. Whether a live pipeline still satisfies
+        // the frame identity is checked at runtime by
+        // `bench_asr::validate_stage_report`, which is where a moved Core ML
+        // entry point gets caught.
     }
 
     #[test]

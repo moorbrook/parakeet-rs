@@ -124,11 +124,19 @@ median 8 to 12 ms, capture shutdown about 1 ms, and the remainder is ASR, which
 runs 9 to 42% slower than the isolated bench, not monotonically in length,
 because capture is still live in the same process.
 
-Enabling the profiler costs under 0.2 ms per utterance, measured by matched
-30-repetition runs with and without `--stage-timings`. Absolute stage times need
-a quiet machine: a repeat under background CPU load reproduced the dispatch
-counts exactly and kept the encoder flat, with the CPU-side stages 10 to 20%
-higher.
+Enabling the profiler costs nothing measurable: matched 30-repetition runs at
+1 s and 5 s are within 0.2 ms, and at 10 s an interleaved eight-block on/off A/B
+puts the per-block delta at -0.17 ms median with the sign flipping between
+blocks. Absolute stage times need a quiet machine, which is the larger effect: a
+repeat under a competing job reproduced the dispatch counts exactly and kept the
+encoder flat, with the CPU-side stages 10 to 20% higher.
+
+The stage split is validated at runtime, not just by construction. `bench_asr`
+fails a run whose report has no encoder dispatches, whose `windows` and
+`encoder_calls` disagree, or that contains an unattributed prediction, and
+`scripts/bench-stages.py` repeats those checks before writing a CSV. Without
+that, a moved Core ML entry point would report the affected stage as free while
+leaving every other number plausible.
 
 Full tables, dispatch counts, and method are in
 [`bench/README.md`](../../bench/README.md).

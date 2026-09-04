@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use parakeet_dictation::asr::{Asr, AsrConfig};
+use parakeet_dictation::asr::{Asr, AsrConfig, StageReport};
 use parakeet_dictation::coreml_worker::{
     load_coreml_worker, CoreMlComputeUnits, CoreMlWorkerConfig,
 };
@@ -274,6 +274,61 @@ fn load_backend(args: &Args, store: &SettingsStore) -> anyhow::Result<Asr> {
     }
 }
 
+/// Reject a stage report that cannot describe the Parakeet Unified pipeline.
+///
+/// Installation failure is already loud, but per-stage failure is not: if a
+/// future Core ML release moves an entry point the way the encoder's already
+/// differs from the decoder's, that stage's dispatches stop being intercepted
+/// and its cost silently reads as zero while every other number stays
+/// plausible. The encoder is the exposed one, because losing it also drives
+/// `windows` to zero, and the frame identity keeps holding.
+///
+/// A broken profile invalidates the run it belongs to, so this fails the bench
+/// rather than warning into a log nobody reads.
+fn validate_stage_report(stages: &StageReport) -> anyhow::Result<()> {
+    if stages.encoder_calls == 0 {
+        anyhow::bail!(
+            "stage profiler recorded no encoder dispatches: its Core ML entry point was not \
+             intercepted, so encoder and mel time are missing from every stage row. See \
+             StageProfiler.install()."
+        );
+    }
+    if stages.windows != stages.encoder_calls {
+        anyhow::bail!(
+            "stage profiler recorded {} windows against {} encoder calls; the offline path \
+             runs exactly one encoder prediction per window",
+            stages.windows,
+            stages.encoder_calls
+        );
+    }
+    if stages.decoder_calls < stages.windows {
+        anyhow::bail!(
+            "stage profiler recorded {} decoder calls against {} windows; the greedy loop \
+             runs at least one decoder prediction per window",
+            stages.decoder_calls,
+            stages.windows
+        );
+    }
+    if stages.joint_calls < stages.decoder_calls - stages.windows {
+        anyhow::bail!(
+            "stage profiler recorded {} joint calls against {} decoder calls over {} windows, \
+             which implies a negative decoded-frame count",
+            stages.joint_calls,
+            stages.decoder_calls,
+            stages.windows
+        );
+    }
+    if stages.other_calls != 0 {
+        anyhow::bail!(
+            "stage profiler saw {} Core ML predictions it could not attribute to the encoder, \
+             decoder, or joint; the pipeline's inputs changed and the stage split is no longer \
+             trustworthy",
+            stages.other_calls
+        );
+    }
+    Ok(())
+}
+
 fn run_one(
     asr: &Asr,
     samples: &[f32],
@@ -300,7 +355,15 @@ fn run_one(
         wall_seconds * 1_000.0,
         boundary_seconds * 1_000.0
     );
+    t.mark_asr_done();
+    // No paste in bench mode — mark it equal to asr_done so the
+    // `dur_post_endpoint_ms` field cleanly reads as "ASR-only latency".
+    t.mark_paste_done();
+    t.emit();
+    // Emitted after the clock stops: formatting this line is real work and
+    // must not land inside the latency the bench publishes.
     if let Some(stages) = asr.last_stage_report() {
+        validate_stage_report(&stages)?;
         log::info!(
             "asr_stages session_id={sid} audio_s={audio_s:.3} resample_ms={:.3} windows={} \
              encoder_calls={} decoder_calls={} joint_calls={} other_calls={} \
@@ -326,10 +389,76 @@ fn run_one(
             stages.compute_units.replace(' ', ","),
         );
     }
-    t.mark_asr_done();
-    // No paste in bench mode — mark it equal to asr_done so the
-    // `dur_post_endpoint_ms` field cleanly reads as "ASR-only latency".
-    t.mark_paste_done();
-    t.emit();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn healthy() -> StageReport {
+        StageReport {
+            resample_ms: 22.9,
+            windows: 1,
+            encoder_calls: 1,
+            decoder_calls: 35,
+            joint_calls: 96,
+            other_calls: 0,
+            mel_ms: 3.0,
+            encoder_ms: 25.5,
+            decode_loop_ms: 15.2,
+            decode_loop_dispatch_ms: 14.5,
+            decoder_dispatch_ms: 5.0,
+            joint_dispatch_ms: 9.5,
+            post_ms: 0.06,
+            total_ms: 43.8,
+            compute_units: "encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only"
+                .to_string(),
+        }
+    }
+
+    #[test]
+    fn a_healthy_report_passes() {
+        validate_stage_report(&healthy()).expect("a complete pipeline must validate");
+    }
+
+    #[test]
+    fn a_silently_unintercepted_encoder_fails() {
+        // The exact shape a moved Core ML entry point produces: the encoder
+        // vanishes, windows follows it to zero, and every other field stays
+        // plausible. This is what the check exists for.
+        let mut stages = healthy();
+        stages.encoder_calls = 0;
+        stages.windows = 0;
+        stages.encoder_ms = 0.0;
+        stages.mel_ms = 0.0;
+        let error = validate_stage_report(&stages).expect_err("a missing encoder must fail");
+        assert!(error.to_string().contains("no encoder dispatches"));
+    }
+
+    #[test]
+    fn windows_must_match_encoder_calls() {
+        let mut stages = healthy();
+        stages.windows = 2;
+        let error = validate_stage_report(&stages).expect_err("mismatched windows must fail");
+        assert!(error.to_string().contains("2 windows"));
+    }
+
+    #[test]
+    fn unattributed_predictions_fail() {
+        let mut stages = healthy();
+        stages.other_calls = 3;
+        let error = validate_stage_report(&stages).expect_err("unattributed calls must fail");
+        assert!(error.to_string().contains("could not attribute"));
+    }
+
+    #[test]
+    fn fewer_decoder_calls_than_windows_fails() {
+        let mut stages = healthy();
+        stages.windows = 2;
+        stages.encoder_calls = 2;
+        stages.decoder_calls = 1;
+        let error = validate_stage_report(&stages).expect_err("too few decoder calls must fail");
+        assert!(error.to_string().contains("decoder calls"));
+    }
 }

@@ -81,6 +81,41 @@ def parse_log(path: Path):
     return rows
 
 
+def validate(by_bucket: dict[int, list[dict]]) -> list[str]:
+    """Reject rows that cannot describe the Parakeet Unified pipeline.
+
+    A stage whose Core ML entry point stops being intercepted reports zero cost
+    while every other number stays plausible, so the invariants are checked here
+    as well as in `bench_asr`: aggregating a broken run into a CSV is how a
+    wrong baseline gets published.
+    """
+    problems = []
+    for bucket, group in sorted(by_bucket.items()):
+        for row in group:
+            if row["encoder_calls"] < 1:
+                problems.append(
+                    f"{bucket}s bucket: no encoder dispatches were intercepted, so encoder "
+                    f"and mel time are missing"
+                )
+                break
+            if row["windows"] != row["encoder_calls"]:
+                problems.append(
+                    f"{bucket}s bucket: {row['windows']} windows against "
+                    f"{row['encoder_calls']} encoder calls"
+                )
+                break
+            if row["other_calls"] != 0:
+                problems.append(
+                    f"{bucket}s bucket: {row['other_calls']} unattributed Core ML predictions"
+                )
+                break
+            frames = row["joint_calls"] - (row["decoder_calls"] - row["windows"])
+            if frames < 1:
+                problems.append(f"{bucket}s bucket: implied decoded-frame count {frames}")
+                break
+    return problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -101,6 +136,12 @@ def main() -> int:
     by_bucket: dict[int, list[dict]] = {}
     for row in rows:
         by_bucket.setdefault(bucket_for(row["audio_s"]), []).append(row)
+
+    problems = validate(by_bucket)
+    if problems:
+        for problem in problems:
+            print(f"stage report is not trustworthy: {problem}", file=sys.stderr)
+        return 1
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     header = ["target_length_s", "n"] + COUNT_FIELDS + TIME_FIELDS + ["compute_units"]

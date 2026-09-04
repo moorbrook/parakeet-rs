@@ -139,13 +139,20 @@ final class StageProfiler: @unchecked Sendable {
     }
 
     fileprivate func record(_ event: Event, model: AnyObject) {
+        // `MLModel.configuration` returns a fresh copy per call, so reading it
+        // on every dispatch would land inside `decode_loop_ms` while sitting
+        // outside `decode_loop_dispatch_ms` and inflate the residual between
+        // them. The placement cannot change for a loaded model, so it is read
+        // once per stage.
+        let needsPlacement = observedComputeUnits[event.stage] == nil
         if Self.trace {
             FileHandle.standardError.write(
                 Data(
                     "trace stage=\(Self.name(of: event.stage)) class=\(NSStringFromClass(type(of: model)))\n"
                         .utf8))
         }
-        let placement = (model as? MLModel)?.configuration.computeUnits
+        let placement =
+            needsPlacement ? (model as? MLModel)?.configuration.computeUnits : nil
         lock.lock()
         if recording, events.count < Self.maximumEvents {
             events.append(event)
@@ -562,24 +569,43 @@ extension StageProfiler {
         return true
     }
 
+    /// Property names a Core ML prediction request might carry its input under.
+    ///
+    /// macOS 26 uses `MLGenericPredictionRequest.inputFeatures`; the rest are
+    /// plausible neighbours kept so an SDK rename degrades to one unclassified
+    /// dispatch rather than to silence. Probing is deliberately restricted to
+    /// this list: `value(forKey:)` runs a getter, and an arbitrary private
+    /// property's getter may assert, which raises an Objective-C exception that
+    /// Swift cannot catch and that would abort the worker. Every name is also
+    /// checked against the class's own property list first, so an absent key
+    /// never reaches `valueForUndefinedKey:`.
+    ///
+    /// This whole path is bench-only. It runs only under
+    /// `--emit-stage-timings`, never on the dictation path.
+    private static let requestInputKeys = [
+        "inputFeatures", "input", "features", "featureProvider", "inputProvider",
+    ]
+
     /// The `MLFeatureProvider` carried by a private prediction-request object.
     fileprivate static func inputProvider(of request: AnyObject) -> MLFeatureProvider? {
         if let direct = request as? MLFeatureProvider { return direct }
+        guard let object = request as? NSObject else { return nil }
         let requestClass: AnyClass = type(of: request)
         let key = ObjectIdentifier(requestClass)
         if let cached = providerKeys.withLock({ $0[key] }) {
-            return (request as? NSObject)?.value(forKey: cached) as? MLFeatureProvider
+            return object.value(forKey: cached) as? MLFeatureProvider
         }
-        guard let object = request as? NSObject else { return nil }
-        var count: UInt32 = 0
-        guard let properties = class_copyPropertyList(requestClass, &count) else { return nil }
-        defer { free(properties) }
-        for index in 0..<Int(count) {
-            let propertyName = String(cString: property_getName(properties[index]))
-            guard let value = object.value(forKey: propertyName) as? MLFeatureProvider else {
-                continue
+        for candidate in requestInputKeys {
+            guard class_getProperty(requestClass, candidate) != nil,
+                let value = object.value(forKey: candidate) as? MLFeatureProvider
+            else { continue }
+            providerKeys.withLock { $0[key] = candidate }
+            if trace {
+                FileHandle.standardError.write(
+                    Data(
+                        "requestkey class=\(NSStringFromClass(requestClass)) key=\(candidate)\n"
+                            .utf8))
             }
-            providerKeys.withLock { $0[key] = propertyName }
             return value
         }
         return nil
