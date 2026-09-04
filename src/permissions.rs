@@ -468,9 +468,7 @@ fn perform_action(permission: Permission, status: PermissionStatus, scope: Dashb
             }
             Permission::InputMonitoring => {
                 arm_refresh_when_active(scope);
-                if request_input_monitoring() {
-                    schedule_dashboard(scope);
-                }
+                handle_input_monitoring_request(permission, request_input_monitoring(), scope);
             }
         },
     }
@@ -559,6 +557,49 @@ fn request_input_monitoring() -> bool {
     // SAFETY: this public CoreGraphics request has no pointer arguments. It is
     // invoked from the main-thread permission dashboard action.
     unsafe { CGRequestListenEventAccess() }
+}
+
+/// What the Grant path must do after `CGRequestListenEventAccess` answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputMonitoringRequestOutcome {
+    /// The request path is live: macOS prompted, or the grant registered.
+    /// Refreshing the dashboard is enough.
+    Prompted,
+    /// TCC already decided for this code signature and will not prompt —
+    /// previously denied, or the stored decision went stale because the app
+    /// was rebuilt under a different signature. Open the Input Monitoring
+    /// pane and refresh so the click is never a silent no-op.
+    NeedsSettingsFallback,
+}
+
+fn input_monitoring_request_outcome(prompted: bool) -> InputMonitoringRequestOutcome {
+    if prompted {
+        InputMonitoringRequestOutcome::Prompted
+    } else {
+        InputMonitoringRequestOutcome::NeedsSettingsFallback
+    }
+}
+
+fn input_monitoring_fallback_warning() -> &'static str {
+    "Input Monitoring request returned without a prompt (TCC already decided \
+     for this build, or the stored grant went stale after a rebuild); opening \
+     Privacy & Security > Input Monitoring"
+}
+
+fn handle_input_monitoring_request(permission: Permission, prompted: bool, scope: DashboardScope) {
+    match input_monitoring_request_outcome(prompted) {
+        InputMonitoringRequestOutcome::Prompted => schedule_dashboard(scope),
+        InputMonitoringRequestOutcome::NeedsSettingsFallback => {
+            log::warn!("{}", input_monitoring_fallback_warning());
+            if !open_settings(permission) {
+                log::error!(
+                    "failed to open {} or generic Privacy & Security settings",
+                    permission.label()
+                );
+            }
+            schedule_dashboard(scope);
+        }
+    }
 }
 
 fn open_settings(permission: Permission) -> bool {
@@ -770,5 +811,28 @@ mod tests {
             GENERIC_PRIVACY_SETTINGS_URL,
             "x-apple.systempreferences:com.apple.preference.security"
         );
+    }
+
+    #[test]
+    fn input_monitoring_request_answered_without_a_prompt_falls_back_to_settings() {
+        // A false return from CGRequestListenEventAccess means macOS will not
+        // prompt for this build; the Grant click must still do something
+        // visible instead of the historic silent no-op.
+        assert_eq!(
+            input_monitoring_request_outcome(false),
+            InputMonitoringRequestOutcome::NeedsSettingsFallback
+        );
+        assert_eq!(
+            input_monitoring_request_outcome(true),
+            InputMonitoringRequestOutcome::Prompted
+        );
+    }
+
+    #[test]
+    fn input_monitoring_fallback_warning_names_the_pane_and_the_recovery_route() {
+        let warning = input_monitoring_fallback_warning();
+        assert!(warning.contains("Input Monitoring"));
+        assert!(warning.contains("Privacy & Security"));
+        assert!(warning.contains("without a prompt"));
     }
 }
