@@ -40,6 +40,25 @@ struct Args {
     expected: Option<String>,
     worker: Option<PathBuf>,
     model_dir: Option<PathBuf>,
+    mode: BenchMode,
+}
+
+/// Which dictation UX the harness reproduces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BenchMode {
+    /// Tap: Silero VAD owns the endpoint.
+    VadAutoStop,
+    /// Hold: the hotkey release owns the endpoint. The harness releases at the
+    /// fixture's measured acoustic end, which is the earliest a user could.
+    Hold,
+}
+
+fn parse_mode(value: &str) -> anyhow::Result<BenchMode> {
+    match value {
+        "vad" => Ok(BenchMode::VadAutoStop),
+        "hold" => Ok(BenchMode::Hold),
+        _ => bail!("unknown mode {value:?}; expected vad or hold"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +104,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut expected = None;
     let mut worker = None;
     let mut model_dir = None;
+    let mut mode = BenchMode::VadAutoStop;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -144,6 +164,9 @@ fn parse_args() -> anyhow::Result<Args> {
                         .ok_or_else(|| anyhow!("--model-dir needs a path"))?,
                 ));
             }
+            "--mode" => {
+                mode = parse_mode(&it.next().ok_or_else(|| anyhow!("--mode needs a name"))?)?;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -163,6 +186,7 @@ fn parse_args() -> anyhow::Result<Args> {
         expected,
         worker,
         model_dir,
+        mode,
     })
 }
 
@@ -174,7 +198,8 @@ fn print_usage() {
          \x20                [--endpoint-policy fast|long-form]\n\
          \x20                [--device 'BlackHole 2ch']\n\
          \x20                [--expected 'reference transcript']\n\
-         \x20                [--worker PATH] [--model-dir DIR]\n\n\
+         \x20                [--worker PATH] [--model-dir DIR]\n\
+         \x20                [--mode vad|hold]\n\n\
          Plays WAV through the named loopback device and measures the\n\
          production capture -> VAD -> ASR path. The device must expose\n\
          both input and output at the WAV sample rate."
@@ -294,9 +319,13 @@ fn run_one(
     rep: usize,
     emit: bool,
 ) -> anyhow::Result<()> {
+    let streamer_mode = match args.mode {
+        BenchMode::VadAutoStop => Mode::VadAutoStop,
+        BenchMode::Hold => Mode::Manual,
+    };
     let (session, outcome_rx) = streamer::start_with_strategy_on_device(
         &store.vad_path(),
-        Mode::VadAutoStop,
+        streamer_mode,
         asr.clone(),
         args.strategy,
         args.endpoint_policy,
@@ -305,11 +334,29 @@ fn run_one(
     let playback = start_playback(&args.device, samples.clone(), sample_rate)?;
     let audio_s = samples.len() as f32 / sample_rate as f32;
     let timeout = Duration::from_secs_f32(audio_s + 15.0);
+
+    // Hold mode has no VAD: the harness plays the fixture, waits for the
+    // predicted instant of its last audible sample, and releases there. That
+    // release is the endpoint, so `dur_end_to_end_ms` is exactly the
+    // release-to-transcript-ready latency the user feels.
+    let hold_release = if args.mode == BenchMode::Hold {
+        let acoustic_end = wait_for_acoustic_end(&playback, timeout)
+            .with_context(|| format!("waiting for playback end on repetition {rep}"))?;
+        if let Some(remaining) = acoustic_end.checked_duration_since(Instant::now()) {
+            std::thread::sleep(remaining);
+        }
+        let release = Instant::now();
+        session.finalize();
+        Some(release)
+    } else {
+        None
+    };
+
     let outcome = outcome_rx
         .0
         .recv_timeout(timeout)
         .with_context(|| format!("waiting for endpoint on repetition {rep}"))?;
-    let acoustic_end = playback.acoustic_end()?;
+    let acoustic_end = hold_release.map_or_else(|| playback.acoustic_end(), Ok)?;
     drop(playback);
     drop(session);
 
@@ -361,6 +408,21 @@ fn run_one(
         args.strategy
     );
     Ok(())
+}
+
+/// Block until the output stream reports the predicted instant of the
+/// fixture's last audible sample. Polled rather than signalled because the
+/// marker is written from the Core Audio render callback.
+fn wait_for_acoustic_end(playback: &Playback, timeout: Duration) -> anyhow::Result<Instant> {
+    const POLL: Duration = Duration::from_millis(2);
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(end) = playback.acoustic_end() {
+            return Ok(end);
+        }
+        std::thread::sleep(POLL);
+    }
+    bail!("playback never reported an acoustic-end marker")
 }
 
 struct Playback {

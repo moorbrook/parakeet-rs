@@ -15,6 +15,7 @@
 #   bench/audio/{1,3,5,10,20}s.wav     — synthesized once, kept on rerun.
 #   bench/raw.log                       — every iteration's phase_timer line.
 #   bench/baseline.csv (or $OUT_CSV)    — per-mode-per-length percentile table.
+#   bench/*-stages.csv                  — per-stage breakdown (coreml-unified only).
 #
 # Usage:
 #   scripts/bench-latency.sh                   # defaults
@@ -39,6 +40,10 @@ WAV_DIR="bench/audio"
 RAW_LOG="bench/raw.log"
 OUT_CSV="${OUT_CSV:-bench/baseline.csv}"
 BACKEND="${BACKEND:-sherpa}"
+# The native worker can report where its decode time went (resample, mel,
+# encoder, RNNT loop) plus its Core ML dispatch counts. sherpa has no
+# equivalent seam, so the flag is only passed to the native backend.
+STAGE_TIMINGS="${STAGE_TIMINGS:-1}"
 
 case "$BACKEND" in
     sherpa|coreml-unified) ;;
@@ -98,8 +103,12 @@ BENCH_BIN="./target/release/bench_asr"
 for len in "${LENGTHS[@]}"; do
     wav="$WAV_DIR/${len}s_${SAMPLE_RATE}.wav"
     echo "Benching $wav (backend=$BACKEND, warmup=$WARMUP_REPS, reps=$REPS)…"
+    stage_args=()
+    if [[ "$BACKEND" == "coreml-unified" && "$STAGE_TIMINGS" != "0" ]]; then
+        stage_args=(--stage-timings)
+    fi
     "$BENCH_BIN" --backend "$BACKEND" --wav "$wav" \
-        --reps "$REPS" --warmup-reps "$WARMUP_REPS" \
+        --reps "$REPS" --warmup-reps "$WARMUP_REPS" "${stage_args[@]+"${stage_args[@]}"}" \
         2>>"$RAW_LOG" \
         || echo "  ↑ bench failed for $wav (see $RAW_LOG)"
 done
@@ -115,3 +124,11 @@ cat "$OUT_CSV"
 echo
 echo "Wrote $BOUNDARY_CSV"
 cat "$BOUNDARY_CSV"
+
+if [[ "$BACKEND" == "coreml-unified" && "$STAGE_TIMINGS" != "0" ]]; then
+    STAGES_CSV="${OUT_CSV%.csv}-stages.csv"
+    uv run --quiet scripts/bench-stages.py --log "$RAW_LOG" --out "$STAGES_CSV"
+    echo
+    echo "Wrote $STAGES_CSV"
+    cat "$STAGES_CSV"
+fi

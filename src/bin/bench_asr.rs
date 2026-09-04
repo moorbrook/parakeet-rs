@@ -38,6 +38,7 @@ struct Args {
     worker: Option<PathBuf>,
     model_dir: Option<PathBuf>,
     compute_units: CoreMlComputeUnits,
+    stage_timings: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +66,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut worker = None;
     let mut model_dir = None;
     let mut compute_units = CoreMlComputeUnits::default();
+    let mut stage_timings = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -109,6 +111,9 @@ fn parse_args() -> anyhow::Result<Args> {
                         .ok_or_else(|| anyhow!("--compute-units needs a name"))?,
                 )?;
             }
+            "--stage-timings" => {
+                stage_timings = true;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -125,6 +130,7 @@ fn parse_args() -> anyhow::Result<Args> {
         worker,
         model_dir,
         compute_units,
+        stage_timings,
     })
 }
 
@@ -134,6 +140,7 @@ fn print_usage() {
          \x20                [--backend sherpa|coreml-unified]\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\
          \x20                [--compute-units all|cpu-and-gpu|cpu-and-neural-engine|cpu-only]\n\
+         \x20                [--stage-timings]\n\
          \n\
          Runs the loaded Parakeet recognizer over WAV PATH `--reps` times,\n\
          emitting one `phase_timer` log line per iteration on stderr.\n\
@@ -201,6 +208,12 @@ fn run(args: &Args) -> anyhow::Result<()> {
             &format!("warmup-{stem}-r{i:03}"),
         )?;
     }
+    if let Some(stages) = asr.last_stage_report() {
+        log::info!(
+            "stage profiler active: compute units {}",
+            stages.compute_units
+        );
+    }
     // Measured reps. session_id has no `warmup-` prefix → aggregator counts it.
     for i in 0..args.reps {
         run_one(
@@ -248,6 +261,7 @@ fn load_backend(args: &Args, store: &SettingsStore) -> anyhow::Result<Asr> {
                 config.set_existing_model_directory(model_dir);
             }
             config.set_compute_units(args.compute_units);
+            config.set_emit_stage_timings(args.stage_timings);
             log::info!(
                 "loading Core ML worker {} with {:?}",
                 config.worker_path.display(),
@@ -286,6 +300,32 @@ fn run_one(
         wall_seconds * 1_000.0,
         boundary_seconds * 1_000.0
     );
+    if let Some(stages) = asr.last_stage_report() {
+        log::info!(
+            "asr_stages session_id={sid} audio_s={audio_s:.3} resample_ms={:.3} windows={} \
+             encoder_calls={} decoder_calls={} joint_calls={} other_calls={} \
+             mel_ms={:.3} encoder_ms={:.3} decode_loop_ms={:.3} \
+             decode_loop_dispatch_ms={:.3} decoder_dispatch_ms={:.3} \
+             joint_dispatch_ms={:.3} post_ms={:.3} total_ms={:.3} \
+             boundary_ms={:.3} compute_units={}",
+            stages.resample_ms,
+            stages.windows,
+            stages.encoder_calls,
+            stages.decoder_calls,
+            stages.joint_calls,
+            stages.other_calls,
+            stages.mel_ms,
+            stages.encoder_ms,
+            stages.decode_loop_ms,
+            stages.decode_loop_dispatch_ms,
+            stages.decoder_dispatch_ms,
+            stages.joint_dispatch_ms,
+            stages.post_ms,
+            stages.total_ms,
+            boundary_seconds * 1_000.0,
+            stages.compute_units.replace(' ', ","),
+        );
+    }
     t.mark_asr_done();
     // No paste in bench mode — mark it equal to asr_done so the
     // `dur_post_endpoint_ms` field cleanly reads as "ASR-only latency".

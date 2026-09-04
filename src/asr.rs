@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sherpa_onnx::{
     OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
 };
@@ -37,6 +37,47 @@ pub trait AsrBackend: Send + Sync {
     fn auxiliary_resident_bytes(&self) -> Result<u64> {
         Ok(0)
     }
+
+    /// Per-stage breakdown of the most recent `transcribe`, when the backend
+    /// was asked to collect one. Only the native Core ML worker reports this,
+    /// and only when the bench enables its stage profiler.
+    fn last_stage_report(&self) -> Option<StageReport> {
+        None
+    }
+}
+
+/// Where one utterance's decode time went inside the recognizer.
+///
+/// The native worker derives these from its Core ML dispatch timeline, so the
+/// call counts are exact and the durations partition the worker-internal decode
+/// interval: `mel_ms + encoder_ms + decode_loop_ms + post_ms == total_ms`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct StageReport {
+    /// 48 kHz to 16 kHz conversion inside the worker, before any model runs.
+    pub resample_ms: f64,
+    /// Fixed 15 s encoder windows the utterance was split into.
+    pub windows: u32,
+    pub encoder_calls: u32,
+    pub decoder_calls: u32,
+    pub joint_calls: u32,
+    /// Core ML predictions that matched none of the three known input shapes.
+    /// A nonzero value means the pipeline changed and the split is suspect.
+    pub other_calls: u32,
+    /// Swift log-mel extraction, measured as the gap before each encoder call.
+    pub mel_ms: f64,
+    pub encoder_ms: f64,
+    /// Wall time inside the greedy RNNT loop, dispatch plus loop overhead.
+    pub decode_loop_ms: f64,
+    /// The Core ML dispatches alone, without the Swift-side loop overhead.
+    pub decode_loop_dispatch_ms: f64,
+    pub decoder_dispatch_ms: f64,
+    pub joint_dispatch_ms: f64,
+    /// Tokenizer decode and overlap merge after the last dispatch.
+    pub post_ms: f64,
+    pub total_ms: f64,
+    /// Compute units read off each live model, e.g.
+    /// `encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only`.
+    pub compute_units: String,
 }
 
 /// Identity of the exact model/runtime artifact behind an [`AsrBackend`].
@@ -227,6 +268,11 @@ impl Asr {
 
     pub fn auxiliary_resident_bytes(&self) -> Result<u64> {
         self.backend.auxiliary_resident_bytes()
+    }
+
+    /// Stage breakdown of the most recent decode, when the backend collects one.
+    pub fn last_stage_report(&self) -> Option<StageReport> {
+        self.backend.last_stage_report()
     }
 
     pub fn recognize(&self, samples: &[f32], sample_rate: u32) -> Result<String> {
