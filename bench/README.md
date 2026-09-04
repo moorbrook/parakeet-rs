@@ -559,7 +559,10 @@ overlapping intervals, so they double-count and stop partitioning the decode
 interval: the parallel run reported 100.10 ms of decode-loop dispatch inside a
 52.93 ms wall interval. `StageProfiler` now measures that overlap directly and
 both `bench_asr` and `scripts/bench-stages.py` refuse a report containing any,
-rather than publishing a split that does not add up.
+rather than publishing a split that does not add up. The guard is checked in
+both directions: at concurrency 1 the identity holds
+(15.111 + 2.093 + 48.789 + 105.172 + 19.542 == 190.708 ms) and at
+`--tdt-chunk-concurrency 4` the run is rejected with 85.550 ms of overlap.
 
 Serial is also the honest default for this workload. A dictation utterance is
 decoded on its own, chunking only engages past 15 s, and the long-regime

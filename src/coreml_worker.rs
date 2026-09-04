@@ -32,6 +32,8 @@ const MAX_AUDIO_SECONDS: u64 = 30 * 60;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_LONG_REGIME_SECONDS: u32 = 8;
 pub const MAX_LONG_REGIME_SECONDS: u32 = 60;
+/// Matches the worker's own `--tdt-chunk-concurrency` bound.
+pub const MAX_TDT_CHUNK_CONCURRENCY: u32 = 16;
 const WORKER_NAME: &str = "parakeet-coreml-worker";
 pub const COREML_MODEL_FOLDER: &str = "parakeet-unified-en-0.6b";
 pub const COREML_TDT_V3_MODEL_FOLDER: &str = "parakeet-tdt-0.6b-v3";
@@ -91,6 +93,10 @@ pub struct CoreMlWorkerConfig {
     pub worker_path: PathBuf,
     pub model_source: CoreMlModelSource,
     pub model_variant: CoreMlModelVariant,
+    /// Long-form chunks the TDT path may decode at once. The worker defaults
+    /// to 1; raising it measures FluidAudio's parallel arm, whose overlapping
+    /// dispatch the stage profiler reports as un-partitionable.
+    pub tdt_chunk_concurrency: u32,
     pub short_compute_units: CoreMlComputeUnits,
     pub long_compute_units: CoreMlComputeUnits,
     pub long_regime_seconds: u32,
@@ -157,6 +163,7 @@ impl CoreMlWorkerConfig {
             worker_path: worker_path.into(),
             model_source: CoreMlModelSource::ExistingDirectory(model_directory.into()),
             model_variant: CoreMlModelVariant::Unified,
+            tdt_chunk_concurrency: 1,
             short_compute_units: CoreMlComputeUnits::default(),
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
@@ -169,6 +176,7 @@ impl CoreMlWorkerConfig {
             worker_path: worker_path.into(),
             model_source: CoreMlModelSource::DownloadRoot(model_root.into()),
             model_variant: CoreMlModelVariant::Unified,
+            tdt_chunk_concurrency: 1,
             short_compute_units: CoreMlComputeUnits::default(),
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
@@ -196,6 +204,17 @@ impl CoreMlWorkerConfig {
             );
         }
         self.model_variant = variant;
+        Ok(())
+    }
+
+    /// Raise TDT's long-form chunk concurrency above the worker's serial
+    /// default. Anything but 1 makes the per-stage columns overlap, which the
+    /// bench then refuses, so this is for wall-clock arms only.
+    pub fn set_tdt_chunk_concurrency(&mut self, chunks: u32) -> Result<()> {
+        if !(1..=MAX_TDT_CHUNK_CONCURRENCY).contains(&chunks) {
+            bail!("TDT chunk concurrency must be between 1 and {MAX_TDT_CHUNK_CONCURRENCY}");
+        }
+        self.tdt_chunk_concurrency = chunks;
         Ok(())
     }
 
@@ -322,6 +341,11 @@ impl CoreMlWorkerBackend {
             command
                 .arg("--model-variant")
                 .arg(config.model_variant.as_str());
+        }
+        if config.tdt_chunk_concurrency != 1 {
+            command
+                .arg("--tdt-chunk-concurrency")
+                .arg(config.tdt_chunk_concurrency.to_string());
         }
         if config.emit_stage_timings {
             command.arg("--emit-stage-timings");
@@ -643,6 +667,18 @@ mod tests {
             CoreMlModelVariant::TdtV3.folder_name(),
             COREML_TDT_V3_MODEL_FOLDER
         );
+    }
+
+    #[test]
+    fn tdt_chunk_concurrency_defaults_to_serial_and_is_bounded() {
+        let mut config = CoreMlWorkerConfig::new("worker", "model");
+        assert_eq!(config.tdt_chunk_concurrency, 1);
+        config.set_tdt_chunk_concurrency(4).unwrap();
+        assert_eq!(config.tdt_chunk_concurrency, 4);
+        assert!(config.set_tdt_chunk_concurrency(0).is_err());
+        assert!(config
+            .set_tdt_chunk_concurrency(MAX_TDT_CHUNK_CONCURRENCY + 1)
+            .is_err());
     }
 
     #[test]
