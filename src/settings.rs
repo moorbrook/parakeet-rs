@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::windows::HoldWindowConfig;
+
 /// Bundle-id-style namespace for our on-disk state. Matches what the previous
 /// Tauri build wrote (`tauri.conf.json` `identifier`), so the model files
 /// downloaded under that name still resolve.
@@ -81,11 +83,50 @@ pub struct Settings {
     /// missed, and re-check with `asr_diff` that nothing else moved.
     #[serde(default = "default_hotword_score")]
     pub hotword_score: f32,
+    /// Turn off to restore the original Hold behaviour: nothing is decoded
+    /// until the key is released.
+    #[serde(default = "default_hold_windows_enabled")]
+    pub hold_windows_enabled: bool,
+    /// Hold mode decodes the recording in windows closed at pauses while the
+    /// key is still held, so release-to-text is only the tail window. This is
+    /// the shortest window a pause may close.
+    #[serde(default = "default_hold_window_min_seconds")]
+    pub hold_window_min_seconds: f32,
+    /// Longest window Hold mode will accumulate before cutting anyway. It
+    /// bounds the tail the user waits for on release, so it is the number that
+    /// sets the release-to-text ceiling for a long utterance.
+    #[serde(default = "default_hold_window_max_seconds")]
+    pub hold_window_max_seconds: f32,
 }
 
 /// Default contextual-biasing boost. See [`Settings::hotword_score`].
 fn default_hotword_score() -> f32 {
     2.0
+}
+
+fn default_hold_windows_enabled() -> bool {
+    HoldWindowConfig::default().enabled
+}
+
+fn default_hold_window_min_seconds() -> f32 {
+    HoldWindowConfig::default().min_seconds
+}
+
+fn default_hold_window_max_seconds() -> f32 {
+    HoldWindowConfig::default().max_seconds
+}
+
+impl Settings {
+    /// Hold-mode windowing policy. An out-of-range pair is rejected by
+    /// [`HoldWindowConfig::validate`] at session start, which turns windowing
+    /// off rather than failing the session.
+    pub fn hold_windows(&self) -> HoldWindowConfig {
+        HoldWindowConfig {
+            enabled: self.hold_windows_enabled,
+            min_seconds: self.hold_window_min_seconds,
+            max_seconds: self.hold_window_max_seconds,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -96,6 +137,9 @@ impl Default for Settings {
             language: String::new(),
             polish_mode: PolishMode::default(),
             hotword_score: default_hotword_score(),
+            hold_windows_enabled: default_hold_windows_enabled(),
+            hold_window_min_seconds: default_hold_window_min_seconds(),
+            hold_window_max_seconds: default_hold_window_max_seconds(),
         }
     }
 }

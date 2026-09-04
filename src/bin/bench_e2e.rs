@@ -23,6 +23,7 @@ use parakeet_dictation::settings::SettingsStore;
 use parakeet_dictation::streamer::{self, EndpointStrategy, Mode, Outcome};
 use parakeet_dictation::warmup;
 use parakeet_dictation::wav::read_wav_mono;
+use parakeet_dictation::windows::HoldWindowConfig;
 
 const DEFAULT_REPS: usize = 30;
 const DEFAULT_WARMUP_REPS: usize = 2;
@@ -36,6 +37,7 @@ struct Args {
     backend: Backend,
     strategy: EndpointStrategy,
     endpoint_policy: EndpointPolicy,
+    hold_windows: HoldWindowConfig,
     device: String,
     expected: Option<String>,
     worker: Option<PathBuf>,
@@ -85,6 +87,27 @@ fn parse_strategy(value: &str) -> anyhow::Result<EndpointStrategy> {
     }
 }
 
+/// `off`, or `MIN,MAX` in seconds. The Hold table needs both the windowed and
+/// the original serial path measured through the same binary on the same run.
+fn parse_hold_windows(value: &str) -> anyhow::Result<HoldWindowConfig> {
+    if value == "off" {
+        return Ok(HoldWindowConfig {
+            enabled: false,
+            ..HoldWindowConfig::default()
+        });
+    }
+    let (min, max) = value
+        .split_once(',')
+        .ok_or_else(|| anyhow!("--hold-windows expects off or MIN,MAX in seconds"))?;
+    let config = HoldWindowConfig {
+        enabled: true,
+        min_seconds: min.trim().parse().context("--hold-windows minimum")?,
+        max_seconds: max.trim().parse().context("--hold-windows maximum")?,
+    };
+    config.validate().map_err(|reason| anyhow!(reason))?;
+    Ok(config)
+}
+
 fn parse_endpoint_policy(value: &str) -> anyhow::Result<EndpointPolicy> {
     match value {
         "fast" => Ok(EndpointPolicy::Fast),
@@ -100,6 +123,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut backend = Backend::Sherpa;
     let mut strategy = EndpointStrategy::Serial;
     let mut endpoint_policy = EndpointPolicy::LongForm;
+    let mut hold_windows = HoldWindowConfig::default();
     let mut device = DEFAULT_DEVICE.to_string();
     let mut expected = None;
     let mut worker = None;
@@ -144,6 +168,12 @@ fn parse_args() -> anyhow::Result<Args> {
                         .ok_or_else(|| anyhow!("--endpoint-policy needs a name"))?,
                 )?;
             }
+            "--hold-windows" => {
+                hold_windows = parse_hold_windows(
+                    &it.next()
+                        .ok_or_else(|| anyhow!("--hold-windows needs off or MIN,MAX"))?,
+                )?;
+            }
             "--device" => {
                 device = it.next().ok_or_else(|| anyhow!("--device needs a name"))?;
             }
@@ -182,6 +212,7 @@ fn parse_args() -> anyhow::Result<Args> {
         backend,
         strategy,
         endpoint_policy,
+        hold_windows,
         device,
         expected,
         worker,
@@ -199,7 +230,8 @@ fn print_usage() {
          \x20                [--device 'BlackHole 2ch']\n\
          \x20                [--expected 'reference transcript']\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\
-         \x20                [--mode vad|hold]\n\n\
+         \x20                [--mode vad|hold]\n\
+         \x20                [--hold-windows off|MIN,MAX]\n\n\
          Plays WAV through the named loopback device and measures the\n\
          production capture -> VAD -> ASR path. The device must expose\n\
          both input and output at the WAV sample rate."
@@ -329,6 +361,7 @@ fn run_one(
         asr.clone(),
         args.strategy,
         args.endpoint_policy,
+        args.hold_windows,
         Some(&args.device),
     )?;
     let playback = start_playback(&args.device, samples.clone(), sample_rate)?;

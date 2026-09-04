@@ -52,7 +52,9 @@ impl Resampler {
         let input = i32::try_from(input_rate)
             .map_err(|_| anyhow!("input sample rate {input_rate} does not fit in i32"))?;
         if input <= 0 {
-            return Err(anyhow!("input sample rate must be positive; got {input_rate}"));
+            return Err(anyhow!(
+                "input sample rate must be positive; got {input_rate}"
+            ));
         }
         let target = i32::try_from(TARGET_SAMPLE_RATE)
             .map_err(|_| anyhow!("target sample rate does not fit in i32"))?;
@@ -136,7 +138,9 @@ mod tests {
     #[test]
     fn chunked_resampling_equals_one_shot() {
         let signal = tone(440.0, 48_000, 0.5);
-        let one_shot = to_target_rate(&signal, 48_000).expect("48k resampler").into_owned();
+        let one_shot = to_target_rate(&signal, 48_000)
+            .expect("48k resampler")
+            .into_owned();
 
         // Irregular sizes on purpose: Core Audio callback lengths are not a
         // constant, and 512 is the VAD window so it must not be special.
