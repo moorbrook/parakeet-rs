@@ -1,0 +1,6 @@
+target_length_s,n,windows,preprocessor_calls,encoder_calls,decoder_calls,joint_calls,other_calls,resample_ms,mel_ms,preprocessor_ms,encoder_ms,decode_loop_ms,decode_loop_dispatch_ms,decoder_dispatch_ms,joint_dispatch_ms,post_ms,overlapped_dispatch_ms,total_ms,boundary_ms,compute_units
+1,30,1,1,1,5,13,0,0.001,0.239,1.036,23.929,5.113,4.734,0.869,3.856,14.720,0.000,45.007,0.105,"preprocessor=cpu-only,encoder=cpu-and-neural-engine,decoder=cpu-and-neural-engine,joint=cpu-and-neural-engine"
+3,30,1,1,1,17,22,0,0.001,0.247,1.033,23.981,10.727,10.104,2.846,7.220,15.061,0.000,51.410,0.158,"preprocessor=cpu-only,encoder=cpu-and-neural-engine,decoder=cpu-and-neural-engine,joint=cpu-and-neural-engine"
+5,30,1,1,1,30,42,0,0.001,0.242,1.020,23.822,18.778,17.846,4.922,12.923,15.057,0.000,58.895,0.210,"preprocessor=cpu-only,encoder=cpu-and-neural-engine,decoder=cpu-and-neural-engine,joint=cpu-and-neural-engine"
+10,30,1,1,1,52,59,0,0.001,0.241,1.027,23.875,28.000,26.659,8.542,18.126,15.156,0.000,68.489,0.268,"preprocessor=cpu-only,encoder=cpu-and-neural-engine,decoder=cpu-and-neural-engine,joint=cpu-and-neural-engine"
+20,30,2,2,2,187,201,0,0.001,15.802,2.048,48.082,97.085,92.804,30.948,61.971,19.575,0.000,182.251,0.420,"preprocessor=cpu-only,encoder=cpu-and-neural-engine,decoder=cpu-and-neural-engine,joint=cpu-and-neural-engine"

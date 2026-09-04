@@ -8,9 +8,10 @@
 
     [...] INFO  bench_asr asr_stages session_id=bench-5s_48000-r000-... \\
                 audio_s=4.967 resample_ms=22.976 windows=1 encoder_calls=1 \\
-                decoder_calls=35 joint_calls=96 native_decoder_steps=0 \\
-                native_joint_steps=0 other_calls=0 mel_ms=3.080 \\
-                encoder_ms=25.959 decode_loop_ms=15.840 \\
+                preprocessor_calls=0 decoder_calls=35 joint_calls=96 \\
+                native_decoder_steps=0 native_joint_steps=0 other_calls=0 \\
+                mel_ms=3.080 preprocessor_ms=0.000 encoder_ms=25.959 \\
+                decode_loop_ms=15.840 \\
                 decode_loop_dispatch_ms=15.135 decoder_dispatch_ms=5.359 \\
                 decode_loop_native_ms=0.000 \\
                 joint_dispatch_ms=9.776 post_ms=0.066 total_ms=44.944 \\
@@ -37,6 +38,7 @@ TARGETS_S = [1, 3, 5, 10, 20]
 
 COUNT_FIELDS = [
     "windows",
+    "preprocessor_calls",
     "encoder_calls",
     "decoder_calls",
     "joint_calls",
@@ -47,6 +49,7 @@ COUNT_FIELDS = [
 TIME_FIELDS = [
     "resample_ms",
     "mel_ms",
+    "preprocessor_ms",
     "encoder_ms",
     "decode_loop_ms",
     "decode_loop_dispatch_ms",
@@ -54,9 +57,13 @@ TIME_FIELDS = [
     "joint_dispatch_ms",
     "decode_loop_native_ms",
     "post_ms",
+    "overlapped_dispatch_ms",
     "total_ms",
     "boundary_ms",
 ]
+# Emitted only since the TDT v3 comparison added a graph mel front end. A log
+# captured before that is still aggregatable; Unified reports zero for both.
+OPTIONAL_FIELDS = {"preprocessor_calls", "preprocessor_ms", "overlapped_dispatch_ms"}
 
 
 def bucket_for(audio_s: float) -> int:
@@ -76,8 +83,14 @@ def parse_log(path: Path):
         try:
             record = {"audio_s": float(kv["audio_s"])}
             for field in COUNT_FIELDS:
+                if field in OPTIONAL_FIELDS and field not in kv:
+                    record[field] = 0
+                    continue
                 record[field] = int(kv[field])
             for field in TIME_FIELDS:
+                if field in OPTIONAL_FIELDS and field not in kv:
+                    record[field] = 0.0
+                    continue
                 record[field] = float(kv[field])
         except (KeyError, ValueError):
             continue
@@ -87,7 +100,7 @@ def parse_log(path: Path):
 
 
 def validate(by_bucket: dict[int, list[dict]]) -> list[str]:
-    """Reject rows that cannot describe the Parakeet Unified pipeline.
+    """Reject rows that cannot describe a Parakeet Core ML pipeline.
 
     A stage whose Core ML entry point stops being intercepted reports zero cost
     while every other number stays plausible, so the invariants are checked here
@@ -107,6 +120,18 @@ def validate(by_bucket: dict[int, list[dict]]) -> list[str]:
                 problems.append(
                     f"{bucket}s bucket: {row['windows']} windows against "
                     f"{row['encoder_calls']} encoder calls"
+                )
+                break
+            if row["preprocessor_calls"] not in (0, row["windows"]):
+                problems.append(
+                    f"{bucket}s bucket: {row['preprocessor_calls']} mel front-end dispatches "
+                    f"against {row['windows']} windows"
+                )
+                break
+            if row["overlapped_dispatch_ms"] > 0:
+                problems.append(
+                    f"{bucket}s bucket: {row['overlapped_dispatch_ms']:.3f} ms of overlapping "
+                    f"Core ML dispatch, so the per-stage columns double-count"
                 )
                 break
             if row["other_calls"] != 0:

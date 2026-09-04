@@ -15,7 +15,7 @@
 #   bench/audio/{1,3,5,10,20}s.wav     — synthesized once, kept on rerun.
 #   bench/raw.log                       — every iteration's phase_timer line.
 #   bench/baseline.csv (or $OUT_CSV)    — per-mode-per-length percentile table.
-#   bench/*-stages.csv                  — per-stage breakdown (coreml-unified only).
+#   bench/*-stages.csv                  — per-stage breakdown (Core ML backends only).
 #
 # Usage:
 #   scripts/bench-latency.sh                   # defaults
@@ -26,6 +26,10 @@
 #   BACKEND=coreml-unified RNNT_ENGINE=coreml \
 #       MODEL_DIR=~/.cache/parakeet-bucket-encoders/model-dir-buckets-2-5-8 \
 #       scripts/bench-latency.sh                # bucketed encoders, CoreML decode loop
+#   BACKEND=coreml-tdt-v3 \
+#       OUT_CSV=bench/coreml-tdt-v3.csv \
+#       MODEL_DIR="$HOME/Library/Application Support/com.parakeet.rs/models/coreml/parakeet-tdt-0.6b-v3" \
+#       scripts/bench-latency.sh                # the TDT v3 challenger (kata f0zg)
 #   OUT_CSV=bench/experiment.csv \
 #       scripts/bench-latency.sh                # name an experiment output
 
@@ -47,7 +51,7 @@ OUT_CSV="${OUT_CSV:-bench/baseline.csv}"
 BACKEND="${BACKEND:-sherpa}"
 # The native worker can report where its decode time went (resample, mel,
 # encoder, RNNT loop) plus its Core ML dispatch counts. sherpa has no
-# equivalent seam, so the flag is only passed to the native backend.
+# equivalent seam, so the flag is only passed to the native backends.
 STAGE_TIMINGS="${STAGE_TIMINGS:-1}"
 # Model directory for the native backend. Unset means the worker's own default,
 # which holds only the 15 s encoder; point this at a directory carrying bucket
@@ -55,13 +59,18 @@ STAGE_TIMINGS="${STAGE_TIMINGS:-1}"
 MODEL_DIR="${MODEL_DIR:-}"
 # Which implementation of the RNNT decode loop the worker runs: `native` reads
 # the decoder and joint weights and runs them in process, `coreml` keeps
-# FluidAudio's dispatch per step.
+# FluidAudio's dispatch per step. Unified only; the TDT path has no native
+# decode loop.
 RNNT_ENGINE="${RNNT_ENGINE:-native}"
+# Extra flags appended verbatim to every bench_asr invocation, for arms that
+# differ only by a backend knob (e.g. --tdt-decode-compute-units cpu-only).
+# Word-split on purpose; keep the values shell-safe.
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 case "$BACKEND" in
-    sherpa|coreml-unified) ;;
+    sherpa|coreml-unified|coreml-tdt-v3) ;;
     *)
-        echo "unknown BACKEND=$BACKEND (expected sherpa or coreml-unified)" >&2
+        echo "unknown BACKEND=$BACKEND (expected sherpa, coreml-unified, or coreml-tdt-v3)" >&2
         exit 2
         ;;
 esac
@@ -103,7 +112,7 @@ for len in "${LENGTHS[@]}"; do
 done
 
 # Step 2 — release build (debug numbers are useless for latency comparison).
-if [[ "$BACKEND" == "coreml-unified" ]]; then
+if [[ "$BACKEND" != "sherpa" ]]; then
     echo "Building native Core ML worker…"
     scripts/build-coreml-worker.sh
 fi
@@ -125,9 +134,18 @@ for len in "${LENGTHS[@]}"; do
         if [[ -n "$MODEL_DIR" ]]; then
             stage_args+=(--model-dir "$MODEL_DIR")
         fi
+    elif [[ "$BACKEND" == "coreml-tdt-v3" ]]; then
+        # No --rnnt-engine: the native decode loop is a Unified-only path.
+        if [[ "$STAGE_TIMINGS" != "0" ]]; then
+            stage_args=(--stage-timings)
+        fi
+        if [[ -n "$MODEL_DIR" ]]; then
+            stage_args+=(--model-dir "$MODEL_DIR")
+        fi
     fi
     "$BENCH_BIN" --backend "$BACKEND" --wav "$wav" \
         --reps "$REPS" --warmup-reps "$WARMUP_REPS" "${stage_args[@]+"${stage_args[@]}"}" \
+        ${EXTRA_ARGS} \
         2>>"$RAW_LOG" \
         || echo "  ↑ bench failed for $wav (see $RAW_LOG)"
 done
@@ -144,7 +162,7 @@ echo
 echo "Wrote $BOUNDARY_CSV"
 cat "$BOUNDARY_CSV"
 
-if [[ "$BACKEND" == "coreml-unified" && "$STAGE_TIMINGS" != "0" ]]; then
+if [[ "$BACKEND" != "sherpa" && "$STAGE_TIMINGS" != "0" ]]; then
     STAGES_CSV="${OUT_CSV%.csv}-stages.csv"
     uv run --quiet scripts/bench-stages.py --log "$RAW_LOG" --out "$STAGES_CSV"
     echo

@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 
 use parakeet_dictation::asr::{Asr, AsrConfig, StageReport};
 use parakeet_dictation::coreml_worker::{
-    load_coreml_worker, CoreMlComputeUnits, CoreMlRnntEngine, CoreMlWorkerConfig,
+    load_coreml_worker, CoreMlComputeUnits, CoreMlModelVariant, CoreMlRnntEngine,
+    CoreMlWorkerConfig,
 };
 use parakeet_dictation::performance::{self, next_session_id, PhaseTimer, PhaseTimerMode};
 use parakeet_dictation::resample::{to_target_rate, TARGET_SAMPLE_RATE};
@@ -40,6 +41,8 @@ struct Args {
     worker: Option<PathBuf>,
     model_dir: Option<PathBuf>,
     compute_units: CoreMlComputeUnits,
+    tdt_chunk_concurrency: u32,
+    tdt_decode_compute_units: Option<CoreMlComputeUnits>,
     stage_timings: bool,
     rnnt_engine: CoreMlRnntEngine,
     arm: Arm,
@@ -96,6 +99,8 @@ impl Arm {
 enum Backend {
     Sherpa,
     CoreMlUnified,
+    /// The TDT 0.6B v3 challenger, through the same worker (kata f0zg).
+    CoreMlTdtV3,
 }
 
 impl Backend {
@@ -103,7 +108,18 @@ impl Backend {
         match value {
             "sherpa" => Ok(Self::Sherpa),
             "coreml-unified" => Ok(Self::CoreMlUnified),
-            _ => anyhow::bail!("unknown backend {value:?}; expected sherpa or coreml-unified"),
+            "coreml-tdt-v3" => Ok(Self::CoreMlTdtV3),
+            _ => anyhow::bail!(
+                "unknown backend {value:?}; expected sherpa, coreml-unified, or coreml-tdt-v3"
+            ),
+        }
+    }
+
+    fn model_variant(self) -> Option<CoreMlModelVariant> {
+        match self {
+            Self::Sherpa => None,
+            Self::CoreMlUnified => Some(CoreMlModelVariant::Unified),
+            Self::CoreMlTdtV3 => Some(CoreMlModelVariant::TdtV3),
         }
     }
 }
@@ -117,6 +133,8 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut worker = None;
     let mut model_dir = None;
     let mut compute_units = CoreMlComputeUnits::default();
+    let mut tdt_chunk_concurrency = 1;
+    let mut tdt_decode_compute_units = None;
     let mut stage_timings = false;
     let mut rnnt_engine = CoreMlRnntEngine::default();
     let mut arm = Arm::Warm;
@@ -166,6 +184,19 @@ fn parse_args() -> anyhow::Result<Args> {
                     &it.next()
                         .ok_or_else(|| anyhow!("--compute-units needs a name"))?,
                 )?;
+            }
+            "--tdt-chunk-concurrency" => {
+                tdt_chunk_concurrency = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--tdt-chunk-concurrency needs a count"))?
+                    .parse()
+                    .context("parsing --tdt-chunk-concurrency")?;
+            }
+            "--tdt-decode-compute-units" => {
+                tdt_decode_compute_units = Some(CoreMlComputeUnits::parse(
+                    &it.next()
+                        .ok_or_else(|| anyhow!("--tdt-decode-compute-units needs a name"))?,
+                )?);
             }
             "--stage-timings" => {
                 stage_timings = true;
@@ -217,6 +248,8 @@ fn parse_args() -> anyhow::Result<Args> {
         worker,
         model_dir,
         compute_units,
+        tdt_chunk_concurrency,
+        tdt_decode_compute_units,
         stage_timings,
         rnnt_engine,
         arm,
@@ -229,7 +262,9 @@ fn parse_args() -> anyhow::Result<Args> {
 fn print_usage() {
     eprintln!(
         "usage: bench_asr --wav PATH [--reps N] [--warmup-reps N]\n\
-         \x20                [--backend sherpa|coreml-unified]\n\
+         \x20                [--backend sherpa|coreml-unified|coreml-tdt-v3]\n\
+        \x20                [--tdt-chunk-concurrency N]\n\
+        \x20                [--tdt-decode-compute-units NAME]\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\
          \x20                [--compute-units all|cpu-and-gpu|cpu-and-neural-engine|cpu-only]\n\
          \x20                [--stage-timings] [--rnnt-engine native|coreml]\n\
@@ -427,7 +462,11 @@ fn load_backend(args: &Args, store: &SettingsStore) -> anyhow::Result<Asr> {
                 hotwords_score: 0.0,
             })
         }
-        Backend::CoreMlUnified => {
+        Backend::CoreMlUnified | Backend::CoreMlTdtV3 => {
+            let variant = args
+                .backend
+                .model_variant()
+                .expect("a Core ML backend names a model variant");
             let mut config = CoreMlWorkerConfig::discover()?;
             if let Some(worker) = &args.worker {
                 config.worker_path.clone_from(worker);
@@ -435,6 +474,9 @@ fn load_backend(args: &Args, store: &SettingsStore) -> anyhow::Result<Asr> {
             if let Some(model_dir) = &args.model_dir {
                 config.set_existing_model_directory(model_dir);
             }
+            config.set_model_variant(variant)?;
+            config.set_tdt_chunk_concurrency(args.tdt_chunk_concurrency)?;
+            config.set_tdt_decode_compute_units(args.tdt_decode_compute_units);
             config.set_compute_units(args.compute_units);
             config.set_emit_stage_timings(args.stage_timings);
             config.set_rnnt_engine(args.rnnt_engine);
@@ -477,6 +519,14 @@ fn validate_stage_report(stages: &StageReport) -> anyhow::Result<()> {
             stages.encoder_calls
         );
     }
+    if stages.preprocessor_calls != 0 && stages.preprocessor_calls != stages.windows {
+        anyhow::bail!(
+            "stage profiler recorded {} mel front-end dispatches against {} windows; a graph \
+             front end runs exactly once per window",
+            stages.preprocessor_calls,
+            stages.windows
+        );
+    }
     // The decode loop runs either through Core ML or natively, never both, so
     // the frame identity is checked against whichever engine reported steps.
     if stages.decoder_calls != 0 && stages.native_decoder_steps != 0 {
@@ -501,6 +551,15 @@ fn validate_stage_report(stages: &StageReport) -> anyhow::Result<()> {
             "stage profiler recorded {joint_steps} joint steps against {decoder_steps} decoder \
              steps over {} windows, which implies a negative decoded-frame count",
             stages.windows
+        );
+    }
+    if stages.overlapped_dispatch_ms > 0.0 {
+        anyhow::bail!(
+            "stage profiler saw {:.3} ms of Core ML dispatch overlapping other dispatch, so the \
+             per-stage columns double-count and do not partition the decode interval. The TDT \
+             long-form path decodes chunks concurrently; pass --tdt-chunk-concurrency 1 to the \
+             worker for a per-stage run, and read wall totals for a parallel one",
+            stages.overlapped_dispatch_ms
         );
     }
     if stages.other_calls != 0 {
@@ -551,15 +610,16 @@ fn run_one(
         validate_stage_report(&stages)?;
         log::info!(
             "asr_stages session_id={sid} audio_s={audio_s:.3} resample_ms={:.3} windows={} \
-             encoder_calls={} decoder_calls={} joint_calls={} \
+             preprocessor_calls={} encoder_calls={} decoder_calls={} joint_calls={} \
              native_decoder_steps={} native_joint_steps={} other_calls={} \
-             mel_ms={:.3} encoder_ms={:.3} decode_loop_ms={:.3} \
+             mel_ms={:.3} preprocessor_ms={:.3} encoder_ms={:.3} decode_loop_ms={:.3} \
              decode_loop_dispatch_ms={:.3} decoder_dispatch_ms={:.3} \
              joint_dispatch_ms={:.3} decode_loop_native_ms={:.3} \
-             post_ms={:.3} total_ms={:.3} \
+             post_ms={:.3} overlapped_dispatch_ms={:.3} total_ms={:.3} \
              boundary_ms={:.3} compute_units={}",
             stages.resample_ms,
             stages.windows,
+            stages.preprocessor_calls,
             stages.encoder_calls,
             stages.decoder_calls,
             stages.joint_calls,
@@ -567,6 +627,7 @@ fn run_one(
             stages.native_joint_steps,
             stages.other_calls,
             stages.mel_ms,
+            stages.preprocessor_ms,
             stages.encoder_ms,
             stages.decode_loop_ms,
             stages.decode_loop_dispatch_ms,
@@ -574,6 +635,7 @@ fn run_one(
             stages.joint_dispatch_ms,
             stages.decode_loop_native_ms,
             stages.post_ms,
+            stages.overlapped_dispatch_ms,
             stages.total_ms,
             boundary_seconds * 1_000.0,
             stages.compute_units.replace(' ', ","),
@@ -590,6 +652,7 @@ mod tests {
         StageReport {
             resample_ms: 22.9,
             windows: 1,
+            preprocessor_calls: 0,
             encoder_calls: 1,
             decoder_calls: 35,
             joint_calls: 96,
@@ -597,6 +660,7 @@ mod tests {
             native_joint_steps: 0,
             other_calls: 0,
             mel_ms: 3.0,
+            preprocessor_ms: 0.0,
             encoder_ms: 25.5,
             decode_loop_ms: 15.2,
             decode_loop_dispatch_ms: 14.5,
@@ -604,6 +668,7 @@ mod tests {
             joint_dispatch_ms: 9.5,
             decode_loop_native_ms: 0.0,
             post_ms: 0.06,
+            overlapped_dispatch_ms: 0.0,
             total_ms: 43.8,
             compute_units: "encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only"
                 .to_string(),
@@ -627,6 +692,50 @@ mod tests {
         stages.mel_ms = 0.0;
         let error = validate_stage_report(&stages).expect_err("a missing encoder must fail");
         assert!(error.to_string().contains("no encoder dispatches"));
+    }
+
+    #[test]
+    fn overlapping_dispatch_fails_because_the_split_double_counts() {
+        // FluidAudio's TDT long-form path decodes chunks concurrently, which
+        // makes the stage durations timeline sums over overlapping intervals.
+        // Publishing that split would report more dispatch than wall time.
+        let mut stages = healthy();
+        stages.overlapped_dispatch_ms = 85.55;
+        let error =
+            validate_stage_report(&stages).expect_err("overlapping dispatch must fail the run");
+        let message = error.to_string();
+        assert!(message.contains("overlapping other dispatch"));
+        assert!(message.contains("--tdt-chunk-concurrency 1"));
+    }
+
+    #[test]
+    fn a_mel_graph_that_did_not_run_once_per_window_fails() {
+        // TDT runs Preprocessor.mlmodelc exactly once per window. Any other
+        // count means the front end changed and the mel/encoder split is no
+        // longer describing what ran.
+        let mut stages = healthy();
+        stages.windows = 2;
+        stages.encoder_calls = 2;
+        stages.preprocessor_calls = 3;
+        let error = validate_stage_report(&stages)
+            .expect_err("a mismatched mel front-end count must fail");
+        assert!(error.to_string().contains("mel front-end dispatches"));
+    }
+
+    #[test]
+    fn a_unified_report_without_a_mel_graph_still_validates() {
+        // Zero is the Unified shape, not a mismatch: its mel is Swift.
+        let mut stages = healthy();
+        stages.preprocessor_calls = 0;
+        validate_stage_report(&stages).expect("Unified reports no mel dispatches");
+    }
+
+    #[test]
+    fn a_tdt_report_with_one_mel_graph_call_per_window_validates() {
+        let mut stages = healthy();
+        stages.preprocessor_calls = stages.windows;
+        stages.preprocessor_ms = 1.04;
+        validate_stage_report(&stages).expect("one mel dispatch per window is the TDT shape");
     }
 
     #[test]
