@@ -48,10 +48,10 @@ introspection on this machine and by Orion's `core/ane_runtime.m`:
    over `_ANEIOSurfaceObject` wrappers, then `-evaluateWithQoS:options:request:error:`.
 
 Weights are BLOBFILE: a 128-byte container whose chunk header sits at byte 64 (sentinel
-`0xDEADBEEF`, dtype 1 for fp16, payload size at 72, data offset 128 at byte 80). MIL references it
-as `BLOBFILE(path=..., offset=uint64(64))`, pointing at the chunk header rather than the payload
-(#8, p.5). I verified this byte-for-byte against the shipped Parakeet decoder's `weights/weight.bin`.
-Tensors are fp16 in a `[1, C, 1, S]` layout over IOSurface-backed memory (p.3). Multi-input and
+`0xDEADBEEF`, dtype 1 for fp16, payload size at 72, data offset 128 at byte 80), which MIL
+references as `BLOBFILE(path=..., offset=uint64(64))`, pointing at the chunk header rather than the
+payload (#8, p.5). I verified that layout byte-for-byte against the shipped Parakeet decoder's
+`weights/weight.bin`. Tensors are fp16 `[1, C, 1, S]` over IOSurface memory (p.3). Multi-input and
 multi-output programs need uniform allocation sizes and alphabetically ordered names (#2, #3, #18,
 #19), and evaluation needs roughly 49 KB of surface regardless of tensor size (#4).
 
@@ -70,19 +70,18 @@ Yes, and the C route is the easier one.
 
 No entitlement is required for compute. The compiler and dispatch path are reachable from ordinary
 user space, and the entitlement family gates loader-tier features instead (2606.22283, §6.3 p.40
-and §8.1 p.47). The hard limit is elsewhere: a self-built program binary is rejected at load with
-`0xe00002e2`, so the daemon must compile and sign on your behalf, and the reachable surface is
-whatever the daemon's compiler accepts (§8.5, p.49).
+and §8.1 p.47). The hard limit sits elsewhere: a self-built program binary is rejected at load with
+`0xe00002e2`, so the daemon compiles and signs on your behalf and the reachable surface is whatever
+its compiler accepts (§8.5, p.49).
 
 My prototype is an ad-hoc, linker-signed `clang` binary with no entitlements and no Team ID.
-Compile, load and evaluate all returned success. That is the empirical answer for a personal build.
+Compile, load and evaluate all returned success, which is the empirical answer for a personal
+build. Whether a Developer ID or notarized bundle behaves the same is unknown; I only tested ad-hoc.
 
-For Rust: `e5rt_api.h` in ANEForge (MIT) is a recovered header of plain C signatures returning
-`int64_t`, which binds directly with `libloading` or a `#[link]` block and needs no `objc2` at all.
-The Objective-C route is also reachable through the `objc2` 0.6 already in our `Cargo.toml`, though
+For Rust, `e5rt_api.h` in ANEForge (MIT) is a recovered header of plain C signatures returning
+`int64_t`, which binds with `libloading` or a `#[link]` block and needs no `objc2`. The
+Objective-C route is reachable through the `objc2` 0.6 already in our `Cargo.toml`, though
 `_ANERequest`'s seven-argument class method is more comfortable through raw `objc_msgSend` casts.
-
-Unknown: whether a Developer ID or notarized bundle behaves the same. I only tested ad-hoc.
 
 ## 3. The prototype
 
