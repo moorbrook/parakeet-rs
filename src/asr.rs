@@ -1,9 +1,11 @@
 //! Stable local-ASR facade and the sherpa fallback backend.
 //!
 //! The app prefers the resident native Core ML Parakeet Unified worker and
-//! selects sherpa-onnx when contextual vocabulary is active or specialized
-//! model setup fails. Each backend remains resident across hotkey presses so
-//! model loading and Core ML graph compilation stay off the dictation path.
+//! selects sherpa-onnx only when specialized model setup fails or the
+//! environment asks for it explicitly. Custom vocabulary no longer forces that
+//! choice: the worker biases natively. Each backend remains resident across
+//! hotkey presses so model loading and Core ML graph compilation stay off the
+//! dictation path.
 //!
 //! ADR-0015 layer 3: every `recognize` call records decode-time vs audio-time
 //! (RTFx). On this M5 Pro, CoreML-resident execution should sit comfortably
@@ -67,6 +69,46 @@ pub trait AsrBackend: Send + Sync {
     fn last_stage_report(&self) -> Option<StageReport> {
         None
     }
+
+    /// What the backend made of a custom vocabulary it was given, or `None`
+    /// when it was given none. The sherpa fallback returns `None` because its
+    /// hotword graph reports nothing back — its equivalent diagnostic is
+    /// `crate::vocabulary`'s token validation, which runs before the model.
+    fn contextual_vocabulary(&self) -> Option<VocabularyStatus> {
+        None
+    }
+}
+
+/// A backend's verdict on the custom vocabulary it was asked to bias toward.
+///
+/// `encoded` and `rejected` carry the user's own words, so they are for logs
+/// and for anything that shows the user what happened to their vocabulary;
+/// quality reports record only the counts.
+///
+/// Acceptance is weaker than it looks. The worker splits each term with the
+/// model bundle's piece inventory by longest match, because the bundle ships
+/// the inventory but not the merge ranks a faithful BPE encoder would need. A
+/// term whose longest-match split differs from the segmentation the model
+/// actually emits is *accepted* and biases a path the joint never walks, and
+/// nothing downstream detects that. `encoded` is the only handle on it: it
+/// reports the split the worker chose, per term, so a term that is doing
+/// nothing can at least be recognized by eye.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VocabularyStatus {
+    /// Terms the model's token inventory could represent.
+    pub accepted: u32,
+    /// Each accepted term and the pieces it was split into.
+    pub encoded: Vec<EncodedTerm>,
+    /// Terms it could not represent at all, which are therefore boosting
+    /// nothing.
+    pub rejected: Vec<String>,
+}
+
+/// One accepted vocabulary term, and the pieces the worker split it into.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct EncodedTerm {
+    pub term: String,
+    pub pieces: Vec<String>,
 }
 
 /// Where one utterance's decode time went inside the recognizer.
@@ -328,6 +370,11 @@ impl Asr {
     /// Stage breakdown of the most recent decode, when the backend collects one.
     pub fn last_stage_report(&self) -> Option<StageReport> {
         self.backend.last_stage_report()
+    }
+
+    /// The active contextual vocabulary, when this backend has one.
+    pub fn contextual_vocabulary(&self) -> Option<VocabularyStatus> {
+        self.backend.contextual_vocabulary()
     }
 
     pub fn recognize(&self, samples: &[f32], sample_rate: u32) -> Result<String> {

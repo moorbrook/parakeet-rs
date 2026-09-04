@@ -1,0 +1,60 @@
+# 50-entry vocabulary fixture for the latency gate (kata p94q).
+#
+# Sized, not curated: the acceptance criterion is that a 50-entry list costs
+# the Core ML decode loop no more than 15% at five seconds, and what the terms
+# are does not affect that — the boost is applied to the same joint logits
+# whatever they spell. Generic technology and place names only; a fixture in a
+# public repository must not carry personal or customer names.
+#
+# The three terms the gold corpus's custom-vocabulary category needs come
+# first, so this file can also stand in for bench/gold/vocabulary.txt.
+IBM
+Olly
+Tactics
+Kubernetes
+Ghostty
+PostgreSQL
+Redis
+Terraform
+Grafana
+Prometheus
+Nginx
+Kafka
+Cassandra
+Elasticsearch
+Jenkins
+Ansible
+Helm
+Istio
+Envoy
+Wireshark
+Btrfs
+ZFS
+Xcode
+Swift
+Rust
+WebAssembly
+Cargo
+Clippy
+Tokio
+Serde
+Metal
+CoreML
+Parakeet
+Whisper
+Transducer
+Conformer
+SentencePiece
+Neural Engine
+Apple Silicon
+New York
+San Francisco
+Reykjavik
+Trondheim
+Valparaiso
+Guadalajara
+Thessaloniki
+Ljubljana
+Bratislava
+Nuremberg
+Eindhoven

@@ -3,6 +3,14 @@ import FluidAudio
 import Foundation
 
 private let protocolMagic = Data([0x50, 0x52, 0x4b, 0x54]) // "PRKT"
+/// Control frame carrying the user's custom vocabulary. A separate magic
+/// rather than a protocol version bump: the audio frame is unchanged, and a
+/// worker that does not know this frame refuses it by magic instead of
+/// misreading a sample rate.
+private let vocabularyMagic = Data([0x50, 0x52, 0x4b, 0x56]) // "PRKV"
+/// A vocabulary of 500 terms is already flagged as large by the app; this is
+/// the structural cap on a length read off the wire.
+private let maximumVocabularyBytes = 1 << 20
 private let protocolVersion: UInt32 = 1
 private let requestHeaderBytes = 16
 private let maximumAudioSeconds: UInt64 = 30 * 60
@@ -17,6 +25,10 @@ enum WorkerError: LocalizedError {
     case invalidSampleRate(UInt32)
     case invalidSampleCount(UInt32)
     case oversizedResponse(Int)
+    case oversizedVocabulary(Int)
+    case malformedVocabulary(String)
+    case vocabularyNeedsNativeRnnt
+    case vocabularyNeedsUnified
 
     var errorDescription: String? {
         switch self {
@@ -27,6 +39,15 @@ enum WorkerError: LocalizedError {
         case .invalidSampleRate(let rate): "invalid sample rate \(rate)"
         case .invalidSampleCount(let count): "invalid sample count \(count)"
         case .oversizedResponse(let bytes): "response is too large (\(bytes) bytes)"
+        case .oversizedVocabulary(let bytes):
+            "vocabulary payload is too large (\(bytes) bytes, limit \(maximumVocabularyBytes))"
+        case .malformedVocabulary(let reason): "malformed vocabulary request: \(reason)"
+        case .vocabularyNeedsNativeRnnt:
+            "contextual vocabulary needs --rnnt-engine native; the CoreML decode loop "
+                + "has no biasing hook and would silently ignore it"
+        case .vocabularyNeedsUnified:
+            "contextual vocabulary needs --model-variant unified; the TDT decode loop "
+                + "has no biasing hook and would silently ignore it"
         }
     }
 }
@@ -256,6 +277,16 @@ private struct WorkerResponse: Encodable {
     let decodeSeconds: Double?
     let resampleSeconds: Double?
     let stages: StageProfiler.Report?
+    /// Vocabulary terms the model's token inventory could represent.
+    let vocabularyAccepted: Int?
+    /// Terms it could not, so the app can tell the user which of their words
+    /// are doing nothing rather than dropping them silently.
+    let vocabularyRejected: [String]?
+    /// Each accepted term and the pieces it was split into. A term can
+    /// tokenize successfully and still bias a path the model never emits, and
+    /// nothing detects that; echoing the segmentation is what makes it
+    /// inspectable.
+    let vocabularyEncoded: [EncodedTerm]?
     let tokenSpans: [TokenSpan]?
 
     static func ready(loadSeconds: Double) -> Self {
@@ -268,6 +299,28 @@ private struct WorkerResponse: Encodable {
             decodeSeconds: nil,
             resampleSeconds: nil,
             stages: nil,
+            vocabularyAccepted: nil,
+            vocabularyRejected: nil,
+            vocabularyEncoded: nil,
+            tokenSpans: nil
+        )
+    }
+
+    static func vocabulary(_ report: ContextBiasStore.Report) -> Self {
+        Self(
+            kind: "vocabulary",
+            ok: true,
+            text: nil,
+            error: nil,
+            loadSeconds: nil,
+            decodeSeconds: nil,
+            resampleSeconds: nil,
+            stages: nil,
+            vocabularyAccepted: report.accepted,
+            vocabularyRejected: report.rejected,
+            vocabularyEncoded: report.encoded.map {
+                EncodedTerm(term: $0.term, pieces: $0.pieces)
+            },
             tokenSpans: nil
         )
     }
@@ -288,6 +341,9 @@ private struct WorkerResponse: Encodable {
             decodeSeconds: decodeSeconds,
             resampleSeconds: resampleSeconds,
             stages: stages,
+            vocabularyAccepted: nil,
+            vocabularyRejected: nil,
+            vocabularyEncoded: nil,
             tokenSpans: tokenSpans
         )
     }
@@ -302,9 +358,26 @@ private struct WorkerResponse: Encodable {
             decodeSeconds: nil,
             resampleSeconds: nil,
             stages: nil,
+            vocabularyAccepted: nil,
+            vocabularyRejected: nil,
+            vocabularyEncoded: nil,
             tokenSpans: nil
         )
     }
+}
+
+/// One accepted vocabulary term as the worker tokenized it.
+private struct EncodedTerm: Encodable {
+    let term: String
+    let pieces: [String]
+}
+
+/// The `PRKV` control frame's JSON body.
+private struct VocabularyRequest: Decodable {
+    let terms: [String]
+    /// Per-token log-probability boost; sherpa's `hotwords_score` is the
+    /// reference for what the number means.
+    let score: Float
 }
 
 @main
@@ -322,9 +395,14 @@ private struct ParakeetCoreMLWorker {
 
     private static func run(options: WorkerOptions) async throws {
         let loadStart = ContinuousClock.now
+        // One store shared by every decoder the worker builds — the bucketed
+        // encoders each own one — so a vocabulary set once is in force
+        // everywhere, whichever manager serves the next utterance.
+        let bias = ContextBiasStore()
         let shortManager = try await loadManager(
             computeUnits: options.shortComputeUnits,
-            options: options
+            options: options,
+            bias: bias
         )
         let longManager: TranscriptionEngine?
         if options.longComputeUnits == options.shortComputeUnits {
@@ -332,7 +410,8 @@ private struct ParakeetCoreMLWorker {
         } else {
             longManager = try await loadManager(
                 computeUnits: options.longComputeUnits,
-                options: options
+                options: options,
+                bias: bias
             )
         }
         let modelDirectory =
@@ -355,7 +434,7 @@ private struct ParakeetCoreMLWorker {
                     directory: modelDirectory,
                     computeUnits: options.shortComputeUnits,
                     precision: .int8,
-                    rnntDecoderFactory: rnntDecoderFactory(options)
+                    rnntDecoderFactory: rnntDecoderFactory(options, bias: bias)
                 )
             }
         }
@@ -393,7 +472,31 @@ private struct ParakeetCoreMLWorker {
 
         let input = FileHandle.standardInput
         let converter = AudioConverter()
+        // Parsed on first use: a worker with no vocabulary never reads it.
+        var pieces: PieceVocabulary?
         while let header = try readExactly(requestHeaderBytes, from: input) {
+            if header.prefix(vocabularyMagic.count) == vocabularyMagic {
+                do {
+                    let report = try applyVocabulary(
+                        header: header,
+                        input: input,
+                        options: options,
+                        bias: bias,
+                        modelDirectory: modelDirectory,
+                        pieces: &pieces
+                    )
+                    for entry in report.encoded {
+                        let pieces = entry.pieces.joined(separator: " ")
+                        let line =
+                            "parakeet-coreml-worker: vocabulary \(entry.term) -> \(pieces)\n"
+                        FileHandle.standardError.write(Data(line.utf8))
+                    }
+                    try writeResponse(.vocabulary(report))
+                } catch {
+                    try writeResponse(.failure(kind: "vocabulary", error: error))
+                }
+                continue
+            }
             do {
                 let request = try parseHeader(header)
                 let payloadBytes = request.sampleCount * MemoryLayout<Float>.size
@@ -461,17 +564,84 @@ private struct ParakeetCoreMLWorker {
     /// silently falling back would hide a model swap behind a latency
     /// regression.
     private static func rnntDecoderFactory(
-        _ options: WorkerOptions
+        _ options: WorkerOptions, bias: ContextBiasStore
     ) -> UnifiedAsrManager.UnifiedRnntDecoderFactory? {
         guard options.nativeRnnt else { return nil }
         return { directory, config in
-            try NativeRnntDecoder(modelDirectory: directory, config: config)
+            // The blank id is a property of the loaded model, and the biasing
+            // hook needs it to know which logit is the blank.
+            bias.blankIndex = config.blankIdx
+            return try NativeRnntDecoder(modelDirectory: directory, config: config, bias: bias)
         }
+    }
+
+    /// Build the context graph for a `PRKV` frame.
+    ///
+    /// Rejected terms come back to the caller rather than being logged into a
+    /// stderr the bundled app discards: a term the model's inventory cannot
+    /// represent boosts nothing, and silence about it is the exact failure
+    /// `crate::vocabulary`'s token validation was written to prevent.
+    private static func applyVocabulary(
+        header: Data,
+        input: FileHandle,
+        options: WorkerOptions,
+        bias: ContextBiasStore,
+        modelDirectory: URL?,
+        pieces: inout PieceVocabulary?
+    ) throws -> ContextBiasStore.Report {
+        let version = readUInt32(header, at: 4)
+        guard version == protocolVersion else {
+            throw WorkerError.unsupportedVersion(version)
+        }
+        let length = Int(readUInt32(header, at: 8))
+        guard length <= maximumVocabularyBytes else {
+            throw WorkerError.oversizedVocabulary(length)
+        }
+        let payload = length == 0 ? Data() : (try readExactly(length, from: input) ?? Data())
+        guard payload.count == length else { throw WorkerError.truncatedRequest }
+        let request: VocabularyRequest
+        do {
+            request = try JSONDecoder().decode(VocabularyRequest.self, from: payload)
+        } catch {
+            throw WorkerError.malformedVocabulary(error.localizedDescription)
+        }
+        guard request.score.isFinite, request.score >= 0 else {
+            throw WorkerError.malformedVocabulary("score must be finite and non-negative")
+        }
+        // Refused rather than ignored: the CoreML decode loop has no hook to
+        // add the boost, so accepting the terms would claim biasing the worker
+        // is not doing.
+        guard options.nativeRnnt || request.terms.isEmpty else {
+            throw WorkerError.vocabularyNeedsNativeRnnt
+        }
+        // The native decode loop this hooks into is a Unified-only path, so the
+        // TDT variant would take the terms and ignore them.
+        guard options.modelVariant == .unified || request.terms.isEmpty else {
+            throw WorkerError.vocabularyNeedsUnified
+        }
+        guard let blankIndex = bias.blankIndex else {
+            throw WorkerError.malformedVocabulary("no native decoder loaded to bias")
+        }
+        if pieces == nil, let modelDirectory {
+            pieces = try PieceVocabulary(
+                vocabularyFile: modelDirectory.appendingPathComponent(
+                    ModelNames.ParakeetUnified.vocab))
+        }
+        guard let vocabulary = pieces else {
+            throw WorkerError.malformedVocabulary("the model directory is unknown")
+        }
+        return bias.set(
+            terms: request.terms,
+            score: request.score,
+            vocabulary: vocabulary,
+            blankIndex: blankIndex
+        )
     }
 
     private static func loadManager(
         computeUnits: MLComputeUnits,
-        options: WorkerOptions
+        options: WorkerOptions,
+        bias: ContextBiasStore
     ) async throws -> TranscriptionEngine {
         let configuration = MLModelConfiguration()
         configuration.computeUnits = computeUnits
@@ -480,7 +650,7 @@ private struct ParakeetCoreMLWorker {
             let manager = UnifiedAsrManager(
                 configuration: configuration,
                 encoderPrecision: .int8,
-                rnntDecoderFactory: rnntDecoderFactory(options)
+                rnntDecoderFactory: rnntDecoderFactory(options, bias: bias)
             )
             if let modelDirectory = options.modelDirectory {
                 try await manager.loadModels(from: modelDirectory)

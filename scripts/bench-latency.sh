@@ -23,6 +23,9 @@
 #   BACKEND=coreml-unified \
 #       OUT_CSV=bench/coreml-unified.csv \
 #       scripts/bench-latency.sh                # shipping native Core ML backend
+#   BACKEND=coreml-unified VOCABULARY=bench/gold/vocabulary-50.txt \
+#       OUT_CSV=bench/coreml-unified-vocabulary.csv \
+#       scripts/bench-latency.sh                # 50-entry contextual biasing
 #   BACKEND=coreml-unified RNNT_ENGINE=coreml \
 #       MODEL_DIR=~/.cache/parakeet-bucket-encoders/model-dir-buckets-2-5-8 \
 #       scripts/bench-latency.sh                # bucketed encoders, CoreML decode loop
@@ -62,6 +65,12 @@ MODEL_DIR="${MODEL_DIR:-}"
 # FluidAudio's dispatch per step. Unified only; the TDT path has no native
 # decode loop.
 RNNT_ENGINE="${RNNT_ENGINE:-native}"
+# Custom vocabulary for the native Unified backend, biased toward with
+# HOTWORD_SCORE. Empty means the unbiased path, which is what every published
+# baseline row measured. `bench/gold/vocabulary-50.txt` is the 50-entry latency
+# fixture.
+VOCABULARY="${VOCABULARY:-}"
+HOTWORD_SCORE="${HOTWORD_SCORE:-2.0}"
 # Extra flags appended verbatim to every bench_asr invocation, for arms that
 # differ only by a backend knob (e.g. --tdt-decode-compute-units cpu-only).
 # Word-split on purpose; keep the values shell-safe.
@@ -133,6 +142,9 @@ for len in "${LENGTHS[@]}"; do
         stage_args+=(--rnnt-engine "$RNNT_ENGINE")
         if [[ -n "$MODEL_DIR" ]]; then
             stage_args+=(--model-dir "$MODEL_DIR")
+        fi
+        if [[ -n "$VOCABULARY" ]]; then
+            stage_args+=(--vocabulary "$VOCABULARY" --hotword-score "$HOTWORD_SCORE")
         fi
     elif [[ "$BACKEND" == "coreml-tdt-v3" ]]; then
         # No --rnnt-engine: the native decode loop is a Unified-only path.

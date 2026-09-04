@@ -833,6 +833,110 @@ wall-clock arm; the per-stage rows are correctly refused at anything above 1.
 shell that already exports `PARAKEET_COREML_MODEL_DIR` for the shipping pack
 does not have to be unset to run the challenger.
 
+## Contextual vocabulary on the Core ML path: M5 Pro 24 GB (2026-09-04)
+
+A non-empty custom vocabulary used to route the whole app to the sherpa
+fallback, because sherpa owned the only contextual-biasing implementation. The
+native worker now builds an Aho-Corasick trie over the vocabulary's token ids
+and adds a shallow-fusion boost to the joint logits before the argmax
+(ADR-0033), so the vocabulary no longer costs the Neural Engine.
+
+```bash
+# quality, biased vs unbiased, on the human gold corpus
+COREML_WORKER=target/release/parakeet-coreml-worker REPETITIONS=10 scripts/bench-gold.sh
+
+# one configuration by hand
+./target/release/asr_diff --gold bench/gold/manifest.json \
+    --audio-dir bench/gold/audio --repetitions 1 \
+    --backend coreml-unified --worker target/release/parakeet-coreml-worker \
+    --vocabulary bench/gold/vocabulary.txt --hotword-score 2
+
+# latency with the 50-entry fixture
+BACKEND=coreml-unified VOCABULARY=bench/gold/vocabulary-50.txt \
+    OUT_CSV=bench/coreml-unified-vocabulary.csv scripts/bench-latency.sh
+```
+
+`COREML_WORKER` matters: `bench-gold.sh` defaults to the installed app's
+worker, which predates the `PRKV` vocabulary frame and would measure stale code.
+The reports and CSVs behind the tables below are kept under
+`bench/vocabulary-biasing/`.
+
+### Quality: ten repetitions
+
+`bench/gold/vocabulary.txt` — IBM, Olly, Tactics — all three accepted by the
+model's own tokenizer. Every row produced one unique transcript per fixture
+across its ten runs, so the WER and CER spreads are zero.
+
+| backend | decoding | WER | CER | custom-vocabulary WER / CER | exact | corpus p50 | RTFx p50 | peak RSS | load |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Core ML | greedy, no vocabulary | 5.43% | 3.57% | 27.27% / 8.93% | 28.57% | 0.245 s | 139.2× | 0.103 GiB | 0.150 s |
+| Core ML | greedy + biasing, score 2.0 | **3.26%** | **2.94%** | **9.09% / 3.57%** | 42.86% | 0.245 s | 139.1× | 0.103 GiB | 0.090 s |
+| sherpa | greedy | 10.87% | 5.46% | 54.55% / 12.50% | 28.57% | 3.045 s | 11.2× | 4.455 GiB | 4.216 s |
+| sherpa | `modified_beam_search` + hotwords, score 2.0 | 10.87% | 5.46% | 54.55% / 12.50% | 28.57% | 3.330 s | 10.2× | 4.678 GiB | 4.060 s |
+
+The last row is the configuration a custom vocabulary used to select. It costs
+13.6× the corpus decode time and 45× the resident set of the biased native
+path and returns the identical transcript set as sherpa greedy, so the beam is
+9.4% slower for no lexical effect at all — ADR-0028's finding, reproduced here
+against the row that replaces it.
+
+Single runs at scores 3.0 and 4.0 matched score 2.0 on every aggregate,
+changing only capitalization inside already-correct words, so the shipped
+`hotword_score` default of 2.0 stands.
+
+Per-category delta against the unbiased Core ML row, negative better:
+
+| category | Δ WER points | Δ CER points |
+|---|---:|---:|
+| commands | -4.88 | -1.50 |
+| custom vocabulary | -18.18 | -5.36 |
+| general | 0.00 | 0.00 |
+| long | 0.00 | 0.00 |
+| noisy | 0.00 | 0.00 |
+| numbers | 0.00 | 0.00 |
+| proper nouns | -2.38 | -0.69 |
+| punctuation-tagged corpus | -2.17 | -0.63 |
+
+`Is IPM up today?` becomes `Is IBM up today?` and `Hey Ollie` becomes
+`Hey Olly`. Nothing else in the corpus moves — including the noisy `Amy`
+fixture that sherpa's first effective score turned into `80`. The residual
+custom-vocabulary error is `from` → `for`, which no vocabulary can reach.
+Scores 3.0 and 4.0 only change capitalization inside already-correct words, so
+the shipped `hotword_score` default of 2.0 stands.
+
+With an empty vocabulary the ten-repetition run reproduces
+`bench/qwen3-asr/shipping-coreml-baseline.json` to the full float on the
+overall and every per-category WER/CER (5.434782608695652% /
+3.5714285714285716%), with zero spread and zero nondeterministic outputs. The
+frozen baseline carries no per-fixture transcripts, so that is agreement on
+every published number rather than a transcript diff; the decode is unchanged
+by construction, since the sparse boost loops are empty and the argmax is the
+one already shipped.
+
+### Latency: 30 repetitions, 3 warmups
+
+Biased with the 50-entry `bench/gold/vocabulary-50.txt` at score 2.0. Wall p50
+is identical to the millisecond at every length, so the worker-internal p50 —
+which resolves below that — is the column that says anything.
+
+| audio | no vocabulary p50 | 50-entry vocabulary p50 | Δ | p95 without / with |
+|---|---:|---:|---:|---:|
+| 1 s | 30.571 ms | 30.627 ms | +0.2% | 31.189 / 31.368 ms |
+| 3 s | 33.030 ms | 33.004 ms | -0.1% | 34.470 / 34.093 ms |
+| 5 s | 35.747 ms | 36.620 ms | **+2.4%** | 38.557 / 39.015 ms |
+| 10 s | 39.927 ms | 39.904 ms | -0.1% | 42.516 / 42.540 ms |
+| 20 s | 81.199 ms | 81.323 ms | +0.2% | 87.856 / 87.952 ms |
+
+The acceptance criterion was 15% at five seconds. The 5 s row is the only
+latency that moves, and the stage CSVs say it is not biasing overhead: the
+biased decode emitted 40 prediction steps and 101 joint evaluations against 35
+and 96 unbiased, because the boost changed the transcript on that TTS fixture.
+Five extra steps at the measured ~0.18 ms each account for the whole 0.87 ms.
+The 20 s fixture's transcript changed too — 123 steps against 122 — but one
+extra step is below the noise on an 81 ms decode. The per-call cost of biasing
+is a few dozen adds and subtractions on a 1025-wide logit vector, against a
+1025×640 matrix-vector product, and does not register.
+
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 
 Hold (press-and-hold) had no measured release-to-text number; the tables above

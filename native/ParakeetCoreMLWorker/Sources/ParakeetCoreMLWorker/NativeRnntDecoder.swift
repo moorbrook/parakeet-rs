@@ -41,6 +41,16 @@ final class NativeRnntDecoder {
     private var cellState: [Float]
     private var lastToken: Int
 
+    /// The user's custom vocabulary, or nil when there is none. Read once per
+    /// window in `reset()` so a mid-utterance change cannot split one decode
+    /// between two graphs.
+    private let biasStore: ContextBiasStore?
+    private var contextGraph: ContextGraph?
+    private var contextState: ContextGraph.Node?
+    /// `contextState`'s sparse logit boosts, recomputed only when the state
+    /// moves — which is once per emitted token, not once per joint call.
+    private var contextBias: [ContextGraph.BiasEntry] = []
+
     /// Shared, immutable weights. Bucketed encoders mean several
     /// `UnifiedAsrManager` instances over one model directory, and each would
     /// otherwise hold its own 15 MB copy.
@@ -66,7 +76,8 @@ final class NativeRnntDecoder {
         return fallback
     }
 
-    init(modelDirectory: URL, config: UnifiedConfig) throws {
+    init(modelDirectory: URL, config: UnifiedConfig, bias: ContextBiasStore? = nil) throws {
+        biasStore = bias
         let key = modelDirectory.standardizedFileURL.path
         Self.cacheLock.lock()
         let cached = Self.cache[key]
@@ -118,6 +129,18 @@ extension NativeRnntDecoder: UnifiedRnntDecoding {
             cellState[index] = 0
         }
         lastToken = blankIndex
+        contextGraph = biasStore?.graph
+        contextState = contextGraph?.root
+        contextBias = biasedState(contextState)
+    }
+
+    /// The boosts in force at a context state. Empty at the root of a graph
+    /// with nothing matched, and empty for every utterance when no vocabulary
+    /// is set — which is the default, and the case the no-vocabulary gate
+    /// measures.
+    private func biasedState(_ state: ContextGraph.Node?) -> [ContextGraph.BiasEntry] {
+        guard let contextGraph, let state else { return [] }
+        return contextGraph.bias(from: state)
     }
 
     func decode(
@@ -155,6 +178,10 @@ extension NativeRnntDecoder: UnifiedRnntDecoding {
                 currentToken = decision.token
                 currentHidden = step.hidden
                 currentCell = step.cell
+                if let contextGraph, let state = contextState {
+                    contextState = contextGraph.advance(from: state, token: decision.token)
+                    contextBias = biasedState(contextState)
+                }
                 step = predictionStep(
                     token: currentToken, hidden: currentHidden, cell: currentCell)
             }
@@ -202,7 +229,8 @@ extension NativeRnntDecoder: UnifiedRnntDecoding {
         let decision = joint.decide(
             encoderProjection: encoderProjection,
             decoderProjection: decoderProjection,
-            blankIndex: blankIndex
+            blankIndex: blankIndex,
+            bias: contextBias
         )
         StageProfiler.shared.recordNative(.nativeJoint, since: start)
         return decision
@@ -566,10 +594,26 @@ final class RnntJointNetwork {
     /// the loop discards it on a blank, so it is computed on emission only. The
     /// compiled model computes it every call because a Core ML program has no
     /// way to skip an operation.
+    ///
+    /// `bias` is the contextual-biasing hook: a sparse set of log-probability
+    /// boosts added to the logits before the argmax, and removed again before
+    /// the probability, so the confidence a biased emission reports is still
+    /// the model's own. See `ContextBias.swift` for where the numbers come
+    /// from. An empty `bias` — the no-vocabulary default — leaves the
+    /// arithmetic below byte-for-byte what it was.
+    ///
+    /// Adding and subtracting the boost is not exactly invertible in fp32: a
+    /// biased token's logit can come back an ULP from where it started, which
+    /// moves that token's reported confidence in the last bit. The argmax is
+    /// unaffected, since it runs on the biased values by design, and the
+    /// confidence is a diagnostic. Restoring from a saved copy instead would
+    /// cost a 1025-float copy on every joint call to protect a bit nothing
+    /// reads.
     func decide(
         encoderProjection: UnsafePointer<Float>,
         decoderProjection: [Float],
-        blankIndex: Int
+        blankIndex: Int,
+        bias: [ContextGraph.BiasEntry] = []
     ) -> Decision {
         var activated = [Float](repeating: 0, count: decoderDimension)
         decoderProjection.withUnsafeBufferPointer { decoder in
@@ -599,6 +643,9 @@ final class RnntJointNetwork {
             }
         }
 
+        for entry in bias where entry.token >= 0 && entry.token < vocabulary {
+            logits[entry.token] += entry.boost
+        }
         // First index wins, which is what `ios17.reduce_argmax` does. The
         // logits are rounded to fp16, so exact ties between two tokens are not
         // a theoretical case, and vDSP's own tie-breaking is unspecified.
@@ -611,7 +658,23 @@ final class RnntJointNetwork {
                 token = index
             }
         }
+        for entry in bias where entry.token >= 0 && entry.token < vocabulary {
+            logits[entry.token] -= entry.boost
+        }
         guard token != blankIndex else { return Decision(token: token, probability: 0) }
+
+        if !bias.isEmpty {
+            // The biased winner need not be the unbiased maximum, and the
+            // softmax below shifts by the maximum for range rather than for its
+            // value.
+            best = -Float.greatestFiniteMagnitude
+            logits.withUnsafeBufferPointer { values in
+                let base = values.baseAddress!
+                for index in 0..<vocabulary where base[index] > best {
+                    best = base[index]
+                }
+            }
+        }
 
         var shifted = logits
         var negatedBest = -best

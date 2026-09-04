@@ -3,7 +3,7 @@
 ## Decision
 
 **No-go for the production backend.** Keep native Core ML Parakeet Unified as
-the default and sherpa-onnx as the contextual-vocabulary/load-failure fallback.
+the default and sherpa-onnx as the load-failure fallback.
 Qwen3-ASR q8 is an interesting offline multilingual model, but it does not
 clear this app's streaming-quality, latency, memory, packaging, or native-build
 gates on the target Mac. No Qwen or Python dependency enters Parakeet.app.

@@ -37,8 +37,12 @@ away to repair a name.
 
 ## Contextual-vocabulary sweep
 
-All rows use the int8 sherpa fallback because the native Core ML backend does
-not expose contextual decoding. Each checked row is a release build, one
+All rows use the int8 sherpa fallback, which at the time owned the only
+implementation of contextual decoding. ADR-0033 later moved biasing onto the
+native Core ML path, so these rows are the sherpa reference rather than the
+shipping configuration; their conclusion about a global score change stands,
+and the per-token scores do not transfer, because sherpa tokenized each term
+per character and the native path uses the model's own BPE pieces. Each checked row is a release build, one
 warmup, and ten corpus repetitions, run serially on an M5 Pro. All produced one
 unique transcript per fixture. The complete per-category rows and provenance
 are in `bench/domain-adaptation/raw/`.

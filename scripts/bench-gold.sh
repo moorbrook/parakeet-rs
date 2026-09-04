@@ -4,6 +4,9 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 REPETITIONS=${REPETITIONS:-10}
+# The installed app's worker by default, so a gold run measures what shipped.
+# Point this at target/release/parakeet-coreml-worker to measure the working
+# tree — required whenever the worker protocol or decode loop has changed.
 WORKER=${COREML_WORKER:-/Applications/Parakeet.app/Contents/MacOS/parakeet-coreml-worker}
 MODEL_DIR=${COREML_MODEL_DIR:-$HOME/Library/Application Support/com.parakeet.rs/models/coreml/parakeet-unified-en-0.6b}
 # The TDT 0.6B v3 challenger (kata f0zg). Fetch it with
@@ -48,6 +51,14 @@ if [[ -d "$TDT_MODEL_DIR" ]]; then
 else
     echo "skipping the TDT v3 challenger: $TDT_MODEL_DIR is missing" >&2
 fi
+
+"$BINARY" "${common[@]}" \
+    --backend coreml-unified \
+    --worker "$WORKER" \
+    --model-dir "$MODEL_DIR" \
+    --vocabulary "$VOCABULARY" \
+    --hotword-score "${HOTWORD_SCORE:-2.0}" \
+    --json-out "$ROOT/bench/coreml-vocabulary-gold-quality.json" || true
 
 "$BINARY" "${common[@]}" \
     --backend sherpa \
