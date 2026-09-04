@@ -186,28 +186,35 @@ int8 encoder's weight blob is 595 MB.
 
 `parakeet-encoder-probe` loads a compiled encoder, reads its declared shapes,
 and times predictions on zero-filled inputs with `mel_length` set to the full
-window. Comparing the 15 s offline encoder against the `70_13_13` streaming
-export, which carries the same int8 weights at a 769-frame window:
+window. The first comparison used the `70_13_13` streaming export, which carries
+the same int8 weights at a 769-frame window and needed no conversion; the rest
+are the buckets `scripts/build-bucket-encoder.py` produced from the same NVIDIA
+checkpoint. Ten measured predictions after three warmups,
+`cpu-and-neural-engine`, min-max spread under 0.5 ms in every row.
 
-| encoder | mel frames | encoder frames | weights | load | predict p50 |
-|---|---:|---:|---:|---:|---:|
-| `parakeet_unified_encoder_int8` | 1501 | 188 | 595 MB | 11.4 s | **26.11 ms** |
-| `parakeet_unified_encoder_streaming_70_13_13_int8` | 769 | 97 | 591 MB | 8.9 s | **12.84 ms** |
+| encoder | window | mel frames | encoder frames | predict p50 |
+|---|---:|---:|---:|---:|
+| `parakeet_unified_encoder_2s_int8` | 2 s | 201 | 26 | **7.70 ms** |
+| `parakeet_unified_encoder_5s_int8` | 5 s | 501 | 63 | **9.64 ms** |
+| `parakeet_unified_encoder_8s_int8` | 8 s | 801 | 101 | **12.21 ms** |
+| `parakeet_unified_encoder_12s_int8` | 12 s | 1201 | 151 | **24.48 ms** |
+| `parakeet_unified_encoder_int8` (shipped) | 15 s | 1501 | 188 | **26.11 ms** |
+| `parakeet_unified_encoder_streaming_70_13_13_int8` | 7.68 s | 769 | 97 | 12.84 ms |
 
-Ten measured predictions after three warmups, `cpu-and-neural-engine`, min-max
-spread under 0.3 ms in both rows. Load times are a cold Core ML plan compile.
+The cost is arithmetic, not weight streaming: all six carry about 590 MB of
+int8 weights and range over 3.4× in time. The curve is not one straight line
+though. From 201 to 801 frames it rises 7.5 µs per frame; from 801 to 1201 it
+rises 30.7 µs per frame, four times as steep; from 1201 to 1501 it flattens
+again to 5.4 µs. The streaming export lands 0.9 ms above where the 201-to-801
+line puts 769 frames, close enough that its chunked attention mask is not the
+difference, so full attention is not what bends the curve either. Something
+about how Core ML partitions the graph changes between 801 and 1201 frames.
+That is unexplained, and it is also where the win is: an 8 s window costs less than half
+a 15 s one, while a 12 s window saves only 1.6 ms and is not worth its 594 MB.
 
-A 1.95× frame ratio gives a 2.03× time ratio. The cost is arithmetic and close
-to linear in the compiled window; there is no weight-streaming floor visible at
-769 frames, which puts an upper bound of roughly 1 ms on the resident-weight
-term. Extrapolating the line, a 4 s window (401 mel frames) would cost about
-7 ms and a 2 s window about 3.5 ms, against 25.5 ms today.
+Extrapolating from the short end would have been wrong. The 2 s bucket is
+7.70 ms rather than the 3.5 ms a line through the 769-frame point predicts:
+about 6 ms of the encoder is fixed cost that no shorter window removes.
 
-Two caveats on that extrapolation. The streaming export's attention mask is
-baked to a `[70 | 13 | 13]` chunk rather than full attention, so it does less
-attention work than a full-attention encoder compiled at 769 frames would; a
-real short-window offline encoder will land above this line, not below. And the
-offline row was measured while the machine was at 79% user CPU, yet it still
-reproduced the quiet-machine 25.5 ms from `bench/README.md`, which is evidence
-the ANE path is not competing for CPU.
-
+`scripts/build-bucket-encoder.py --seconds N` builds a bucket; the worker picks
+one up by filename. See `docs/asr/PERF.md` for the end-to-end effect.
