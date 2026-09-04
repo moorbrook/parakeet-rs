@@ -67,9 +67,9 @@ PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
    menu. On the first attempt Parakeet explains and requests **Microphone** and
    **Accessibility**; neither is requested merely because the app launched.
    **Tap mode** waits through natural
-   clause and sentence pauses before auto-stopping. **Tap Fast** preserves the
-   original 150 ms stop window for short commands where latency matters more
-   than pause tolerance. **Hold mode** stops on release.
+   clause and sentence pauses before auto-stopping. **Tap Fast** uses a 90 ms stop
+   window for short commands where latency matters more than pause
+   tolerance. **Hold mode** stops on release.
 
 While listening, a large-display HUD shows an animated pastel-iridescent
 waveform on a 70%-alpha glass panel. macOS 26 and later use

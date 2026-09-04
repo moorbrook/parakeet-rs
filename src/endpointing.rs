@@ -4,7 +4,7 @@
 //! begin speculatively. This tracker invalidates a provisional transcript if
 //! speech resumes and locally suppresses duplicate candidates after the
 //! selected confirmation window. It never owns the production stop decision:
-//! an independent Silero state with the same policy is the sole authority
+//! an independent Silero state with the same window is the sole authority
 //! allowed to commit the recording.
 
 /// Silero's native sample rate.
@@ -14,11 +14,17 @@ pub const WINDOW_SAMPLES: u32 = 512;
 /// Make the candidate detector expose an edge after one silent frame.
 pub const SPECULATIVE_MIN_SILENCE_S: f32 = WINDOW_SAMPLES as f32 / SAMPLE_RATE as f32;
 
+/// Tap Fast confirmation window. Below roughly this value the synchronous
+/// speculative decode, not the window, sets the floor; see ADR-0031.
+pub const FAST_CONFIRMATION_MS: u32 = 90;
+/// Pause-friendly Tap confirmation window.
+pub const LONG_FORM_CONFIRMATION_MS: u32 = 750;
+
 /// Product-level pause policy for tap-to-dictate sessions.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum EndpointPolicy {
-    /// Preserve the original low-latency 150 ms behavior. Useful for short
-    /// commands, but may split prose at an intra-sentence pause.
+    /// Low-latency mode for short commands. May split prose at an
+    /// intra-sentence pause.
     Fast,
     /// Wait through a natural clause/sentence pause before committing. This
     /// is the default because a false stop loses speech; speculative ASR hides
@@ -30,15 +36,20 @@ pub enum EndpointPolicy {
 impl EndpointPolicy {
     pub const fn confirmation_ms(self) -> u32 {
         match self {
-            Self::Fast => 150,
-            Self::LongForm => 750,
+            Self::Fast => FAST_CONFIRMATION_MS,
+            Self::LongForm => LONG_FORM_CONFIRMATION_MS,
         }
     }
 
     pub const fn confirmation_windows(self) -> u32 {
-        let samples = SAMPLE_RATE * self.confirmation_ms() / 1_000;
-        samples.div_ceil(WINDOW_SAMPLES)
+        confirmation_windows(self.confirmation_ms())
     }
+}
+
+/// Silero frames covering `confirmation_ms`, rounded up.
+pub const fn confirmation_windows(confirmation_ms: u32) -> u32 {
+    let samples = SAMPLE_RATE * confirmation_ms / 1_000;
+    samples.div_ceil(WINDOW_SAMPLES)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,14 +81,18 @@ pub struct EndpointTracker {
 
 impl Default for EndpointTracker {
     fn default() -> Self {
-        Self::new(EndpointPolicy::default())
+        Self::new(EndpointPolicy::default().confirmation_ms())
     }
 }
 
 impl EndpointTracker {
-    pub fn new(policy: EndpointPolicy) -> Self {
+    /// `confirmation_ms` is the session's resolved silence window, not a
+    /// policy: the sweep benchmark drives values the two shipping policies do
+    /// not name, and the confirming Silero state is loaded from the same value
+    /// so speculation and capture shutdown cannot disagree.
+    pub fn new(confirmation_ms: u32) -> Self {
         Self {
-            confirmation_windows: policy.confirmation_windows(),
+            confirmation_windows: confirmation_windows(confirmation_ms),
             processed_samples: 0,
             saw_speech: false,
             candidate_speech_end: None,
@@ -137,14 +152,14 @@ mod tests {
             assert!(windows * window_samples >= confirmation_samples);
             assert!((windows - 1) * window_samples < confirmation_samples);
         }
-        assert_eq!(EndpointPolicy::Fast.confirmation_windows(), 5);
+        assert_eq!(EndpointPolicy::Fast.confirmation_windows(), 3);
         assert_eq!(EndpointPolicy::LongForm.confirmation_windows(), 24);
     }
 
     #[test]
-    fn candidate_is_early_but_fast_commit_waits_for_five_silent_frames() {
+    fn candidate_is_early_but_fast_commit_waits_for_the_whole_window() {
         let policy = EndpointPolicy::Fast;
-        let mut tracker = EndpointTracker::new(policy);
+        let mut tracker = EndpointTracker::new(policy.confirmation_ms());
         assert_eq!(tracker.observe(true), EndpointEvent::None);
         assert_eq!(
             tracker.observe(false),
@@ -164,8 +179,26 @@ mod tests {
     }
 
     #[test]
+    fn the_sweep_window_is_honored_independently_of_the_shipping_policies() {
+        // 150 ms is the pre-ADR-0031 Fast window and names no policy now.
+        let mut tracker = EndpointTracker::new(150);
+        tracker.observe(true);
+        assert!(matches!(
+            tracker.observe(false),
+            EndpointEvent::Candidate { .. }
+        ));
+        for _ in 2..5 {
+            assert_eq!(tracker.observe(false), EndpointEvent::None);
+        }
+        assert!(matches!(
+            tracker.observe(false),
+            EndpointEvent::Confirmed { .. }
+        ));
+    }
+
+    #[test]
     fn resumed_speech_invalidates_the_candidate() {
-        let mut tracker = EndpointTracker::new(EndpointPolicy::Fast);
+        let mut tracker = EndpointTracker::new(EndpointPolicy::Fast.confirmation_ms());
         tracker.observe(true);
         assert!(matches!(
             tracker.observe(false),
@@ -181,7 +214,7 @@ mod tests {
     #[test]
     fn silence_before_first_speech_never_ends_the_session() {
         let policy = EndpointPolicy::LongForm;
-        let mut tracker = EndpointTracker::new(policy);
+        let mut tracker = EndpointTracker::new(policy.confirmation_ms());
         for _ in 0..(policy.confirmation_windows() * 3) {
             assert_eq!(tracker.observe(false), EndpointEvent::None);
         }
@@ -190,7 +223,7 @@ mod tests {
     #[test]
     fn long_form_waits_through_a_640ms_pause() {
         let policy = EndpointPolicy::LongForm;
-        let mut tracker = EndpointTracker::new(policy);
+        let mut tracker = EndpointTracker::new(policy.confirmation_ms());
         tracker.observe(true);
         assert!(matches!(
             tracker.observe(false),

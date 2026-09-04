@@ -235,8 +235,9 @@ impl App {
             return;
         }
         let vad_path = self.settings.vad_path();
+        let hold_windows = self.settings.load().hold_windows();
         self.spawn_supervised("session-starter", move |app| {
-            app.start_session_blocking(mode, endpoint_policy, vad_path);
+            app.start_session_blocking(mode, endpoint_policy, vad_path, hold_windows);
         });
     }
 
@@ -249,6 +250,7 @@ impl App {
         mode: StreamerMode,
         endpoint_policy: crate::endpointing::EndpointPolicy,
         vad_path: std::path::PathBuf,
+        hold_windows: crate::windows::HoldWindowConfig,
     ) {
         let Some(asr) = self.asr.lock().clone() else {
             log::error!("start session failed: recognizer unavailable");
@@ -257,16 +259,17 @@ impl App {
             self.announce_state(next);
             return;
         };
-        let (session, outcome_rx) = match streamer::start(&vad_path, mode, asr, endpoint_policy) {
-            Ok(pair) => pair,
-            Err(e) => {
-                log::error!("start session failed: {e:#}");
-                let next = self.resting_state();
-                self.fsm.abort_starter(next);
-                self.announce_state(next);
-                return;
-            }
-        };
+        let (session, outcome_rx) =
+            match streamer::start(&vad_path, mode, asr, endpoint_policy, hold_windows) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    log::error!("start session failed: {e:#}");
+                    let next = self.resting_state();
+                    self.fsm.abort_starter(next);
+                    self.announce_state(next);
+                    return;
+                }
+            };
 
         // Install the freshly-built session and atomically drain any
         // press/release edge that arrived during the cold-start gap.

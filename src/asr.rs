@@ -23,6 +23,8 @@ use sherpa_onnx::{
     OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
 };
 
+use crate::windows::{words_from_tokens, TokenSpan, Word};
+
 /// Below this real-time factor we assume CoreML is not engaged.
 const RTFX_COREML_FLOOR: f32 = 2.0;
 
@@ -34,6 +36,27 @@ const RTFX_COREML_FLOOR: f32 = 2.0;
 pub trait AsrBackend: Send + Sync {
     fn metadata(&self) -> &AsrBackendMetadata;
     fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded>;
+
+    /// Whether [`AsrBackend::transcribe_with_token_spans`] reports real spans.
+    ///
+    /// Hold-mode incremental windowing needs word boundaries to join two
+    /// windows on their overlap, so it asks this before it starts cutting and
+    /// otherwise leaves the session on the plain single-decode path.
+    fn reports_token_spans(&self) -> bool {
+        false
+    }
+
+    /// Decode, and additionally report the span of every RNNT emission on the
+    /// clip's own timeline. Backends that cannot report them return an empty
+    /// vector; callers must check [`AsrBackend::reports_token_spans`] rather
+    /// than reading an empty result as "no speech".
+    fn transcribe_with_token_spans(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<(Decoded, Vec<TokenSpan>)> {
+        Ok((self.transcribe(samples, sample_rate)?, Vec::new()))
+    }
 
     /// Resident bytes owned by helper processes outside this Rust process.
     fn auxiliary_resident_bytes(&self) -> Result<u64> {
@@ -332,6 +355,34 @@ impl Asr {
     pub fn recognize_silent_warmup(&self, samples: &[f32], sample_rate: u32) -> Result<String> {
         let decoded = self.recognize_with_timing(samples, sample_rate, /* warmup = */ true)?;
         Ok(decoded.text)
+    }
+
+    /// Whether this recognizer can report word boundaries, which is what
+    /// Hold-mode incremental windowing needs to join two windows.
+    pub fn reports_token_spans(&self) -> bool {
+        self.backend.reports_token_spans()
+    }
+
+    /// Decode one window of a longer recording and return its words placed on
+    /// the recording's timeline, `offset_s` being where the window starts.
+    ///
+    /// Deliberately not routed through `recognize_with_timing`: a window is a
+    /// fragment, so its RTFx is not the utterance's and the CoreML-fallback
+    /// warning would fire on short tails. The session logs window timings
+    /// itself.
+    pub fn recognize_window(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        offset_s: f32,
+    ) -> Result<Vec<Word>> {
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (_, spans) = self
+            .backend
+            .transcribe_with_token_spans(samples, sample_rate)?;
+        Ok(words_from_tokens(&spans, offset_s))
     }
 
     fn recognize_with_timing(

@@ -1,6 +1,7 @@
 import CoreML
 import Foundation
 import ObjectiveC
+import ParakeetRnntKernels
 
 /// Per-utterance Core ML dispatch accounting for the Parakeet Unified pipeline.
 ///
@@ -122,11 +123,13 @@ final class StageProfiler: @unchecked Sendable {
         events.removeAll(keepingCapacity: true)
         recording = true
         lock.unlock()
+        parakeet_rnnt_set_recording(1)
         return Self.now()
     }
 
     /// Close the timeline and reduce it to per-stage durations.
     func endUtterance(startNanoseconds: UInt64, endNanoseconds: UInt64) -> Report {
+        parakeet_rnnt_set_recording(0)
         lock.lock()
         recording = false
         let timeline = events.sorted { $0.startNanoseconds < $1.startNanoseconds }
@@ -187,12 +190,10 @@ final class StageProfiler: @unchecked Sendable {
     ///
     /// The natively run decode loop has no Core ML dispatch to intercept, so it
     /// reports its own steps. Called on the shipping path too, where the
-    /// profiler is never installed and this is one uncontended lock.
+    /// profiler is never installed, so the question is answered by one relaxed
+    /// atomic load rather than by taking the timeline's lock.
     func nativeStart() -> UInt64 {
-        lock.lock()
-        let active = recording
-        lock.unlock()
-        return active ? Self.now() : 0
+        parakeet_rnnt_recording() != 0 ? Self.now() : 0
     }
 
     func recordNative(_ stage: Stage, since start: UInt64) {

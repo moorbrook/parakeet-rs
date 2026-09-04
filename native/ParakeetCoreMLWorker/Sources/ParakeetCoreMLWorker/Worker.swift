@@ -199,6 +199,16 @@ private struct WorkerOptions {
     }
 }
 
+/// One RNNT emission on the request's own timeline. `text` is the detokenized
+/// piece with the SentencePiece word-start marker already rendered as a leading
+/// space, so the Rust side can group tokens into words without a vocabulary.
+/// Rust's Hold-mode window merge aligns neighbouring windows on these.
+private struct TokenSpan: Encodable {
+    let text: String
+    let startS: Double
+    let endS: Double
+}
+
 private struct WorkerResponse: Encodable {
     let kind: String
     let ok: Bool
@@ -213,6 +223,7 @@ private struct WorkerResponse: Encodable {
     /// Terms it could not, so the app can tell the user which of their words
     /// are doing nothing rather than dropping them silently.
     let vocabularyRejected: [String]?
+    let tokenSpans: [TokenSpan]?
 
     static func ready(loadSeconds: Double) -> Self {
         Self(
@@ -225,7 +236,8 @@ private struct WorkerResponse: Encodable {
             resampleSeconds: nil,
             stages: nil,
             vocabularyAccepted: nil,
-            vocabularyRejected: nil
+            vocabularyRejected: nil,
+            tokenSpans: nil
         )
     }
 
@@ -240,7 +252,8 @@ private struct WorkerResponse: Encodable {
             resampleSeconds: nil,
             stages: nil,
             vocabularyAccepted: accepted,
-            vocabularyRejected: rejected
+            vocabularyRejected: rejected,
+            tokenSpans: nil
         )
     }
 
@@ -248,7 +261,8 @@ private struct WorkerResponse: Encodable {
         text: String,
         decodeSeconds: Double,
         resampleSeconds: Double,
-        stages: StageProfiler.Report?
+        stages: StageProfiler.Report?,
+        tokenSpans: [TokenSpan]
     ) -> Self {
         Self(
             kind: "result",
@@ -260,7 +274,8 @@ private struct WorkerResponse: Encodable {
             resampleSeconds: resampleSeconds,
             stages: stages,
             vocabularyAccepted: nil,
-            vocabularyRejected: nil
+            vocabularyRejected: nil,
+            tokenSpans: tokenSpans
         )
     }
 
@@ -275,7 +290,8 @@ private struct WorkerResponse: Encodable {
             resampleSeconds: nil,
             stages: nil,
             vocabularyAccepted: nil,
-            vocabularyRejected: nil
+            vocabularyRejected: nil,
+            tokenSpans: nil
         )
     }
 }
@@ -417,7 +433,12 @@ private struct ParakeetCoreMLWorker {
                 let decodeStart = ContinuousClock.now
                 let profileStart =
                     options.emitStageTimings ? StageProfiler.shared.beginUtterance() : 0
-                let text = try await manager.transcribe(modelSamples)
+                // `transcribeWithTimings` runs the same decode as
+                // `transcribe` and reads the emission frames the greedy RNNT
+                // decoder already recorded, so the token spans cost nothing
+                // beyond the frame→seconds conversion.
+                let transcription = try await manager.transcribeWithTimings(modelSamples)
+                let text = transcription.text
                 var stages =
                     options.emitStageTimings
                     ? StageProfiler.shared.endUtterance(
@@ -431,7 +452,10 @@ private struct ParakeetCoreMLWorker {
                         text: text,
                         decodeSeconds: decodeSeconds,
                         resampleSeconds: resampleSeconds,
-                        stages: stages
+                        stages: stages,
+                        tokenSpans: transcription.tokenTimings.map {
+                            TokenSpan(text: $0.token, startS: $0.startTime, endS: $0.endTime)
+                        }
                     )
                 )
             } catch {
