@@ -143,16 +143,23 @@ Full tables, dispatch counts, and method are in
 
 ## Short-utterance encoder cost — 2026-09-04
 
-The offline encoder is compiled at a fixed 15 s mel window and every utterance
-is zero-padded to it, so short dictation paid a flat 25.5 ms of encoder plus
-3.1 ms of mel however little was said. Compiling the same NVIDIA checkpoint at
-shorter windows and dispatching each utterance to the narrowest one that holds
-it removes most of that. **A one-second utterance now costs 7.7 ms of encoder
-and 0.7 ms of mel instead of 26.0 and 3.2, and the whole ASR call falls from
-36.0 to 15.0 ms p50.** At 2.8 s the encoder is 9.7 ms against 25.3, at 4.9 s
-9.98 against 25.4, and at 7.0 s 12.5 against 25.6; utterances past the longest
-bucket are unchanged. Buckets of 2, 5 and 8 seconds cost 1.77 GB of disk and
-take peak RSS from 0.10 to 0.19 GiB.
+With the resample retired by ADR-0030, the encoder is the whole of the
+short-utterance floor: it is compiled at a fixed 15 s mel window and every
+utterance is zero-padded to it, so a one-second utterance paid 26.0 ms of
+encoder and 3.2 ms of mel out of a 32.7 ms result. Compiling the same NVIDIA
+checkpoint at shorter windows and dispatching each utterance to the narrowest
+one that holds it removes most of that. **A one-second utterance now costs
+7.7 ms of encoder and 0.7 ms of mel instead of 26.0 and 3.2, taking the
+worker-internal call from 32.4 to 11.3 ms.** At 2.8 s the encoder is 9.7 ms
+against 25.3, at 4.9 s 9.98 against 25.4, and at 7.0 s 12.5 against 25.6;
+utterances past the longest bucket are unchanged. Buckets of 2, 5 and 8 seconds
+cost 1.77 GB of disk and take peak RSS from 0.10 to 0.19 GiB.
+
+The bucket runs predate the ADR-0030 merge, so both arms still paid the
+worker-side resample, which is why the numbers above are worker totals excluding
+it rather than end-to-end p50. The unchanged arm's encoder and mel reproduce the
+post-ADR-0030 per-stage table within 0.7 ms and its worker totals within 1.1 ms
+at every fixture, which is what makes the two comparable.
 
 Quality is unchanged and checked at the transcript, not the score: matched
 ten-repetition gold runs differing only in model directory both give 5.434783%
@@ -170,10 +177,31 @@ the full tables are in [`bench/README.md`](../../bench/README.md).
 
 This needed a three-file change to FluidAudio, which hardcodes the 15 s window.
 The package is a local path override reconstituted by
-`scripts/build-coreml-worker.sh` from the pinned upstream revision plus
+`scripts/reconstitute-fluidaudio.sh` from the pinned upstream revision plus
 `native/ParakeetCoreMLWorker/patches/fluidaudio-offline-window.patch`; nothing
 of FluidAudio is checked in but the patch, and the change is written to be
 offered upstream.
+
+## Mel and resample cost — 2026-09-04
+
+Both sub-checks the encoder-bucketing work carried are now answered, and neither
+leaves a follow-up.
+
+The native Swift mel cost 3.1 ms at every utterance length, for the same reason
+the encoder was flat: `UnifiedMelExtractor` is built at the batch layout's
+window and computed 1501 frames whether or not the audio filled them. Bucketing
+fixed it as a side effect — a 2 s bucket computes 201 frames and mel drops to
+0.71 ms, a 5 s bucket to 1.34 ms. At those numbers mel is 6% of the remaining
+one-second call and moving log-mel into the Core ML graph, which Voz does, would
+be arguing over half a millisecond. Not worth doing on this evidence.
+
+The double resample is gone, retired by ADR-0030 rather than by this work: Rust
+already converted the same audio to 16 kHz for Silero VAD, so converting again
+in the worker was the redundant copy and it was on the critical path after the
+endpoint. Converting once in the capture callback took the worker's resample
+stage from 4.6 ms per second of 48 kHz input to 0.001 ms and halved measured IPC
+by shrinking the payload. There is nothing left to file: the stage no longer
+exists.
 
 ## Core ML runtime-plan tuner — 2026-08-11
 

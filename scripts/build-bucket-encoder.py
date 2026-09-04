@@ -116,7 +116,11 @@ def directory_sha256(root: Path) -> str:
 
 
 def prepare_mobius(work_dir: Path) -> Path:
-    checkout = work_dir / "mobius"
+    # Keyed by commit: a bare "mobius" directory left from an earlier pin would
+    # be checked out to the new commit but keep the old commit's resolved
+    # environment, which is the kind of stale mix that produces an artifact
+    # nobody can reproduce.
+    checkout = work_dir / f"mobius-{MOBIUS_COMMIT[:12]}"
     if not checkout.exists():
         run(["git", "clone", "--quiet", MOBIUS_REPO, str(checkout)])
     run(["git", "-C", str(checkout), "fetch", "--quiet", "origin", MOBIUS_COMMIT])
@@ -124,7 +128,9 @@ def prepare_mobius(work_dir: Path) -> Path:
     run(["git", "-C", str(checkout), "checkout", "--quiet", "--", "."])
 
     project = checkout / MOBIUS_SUBDIR
-    run(["uv", "sync"], cwd=project)
+    # --frozen: build against the committed lockfile rather than re-resolving,
+    # so the environment matches the pinned commit.
+    run(["uv", "sync", "--frozen"], cwd=project)
     # NeMo main is required for this checkpoint's attention config, and its own
     # pyproject pins torch to an index uv will not resolve against, hence
     # --no-deps. `uv run --no-sync` afterwards keeps the overlay in place.
@@ -157,7 +163,10 @@ def fetch_checkpoint(project: Path) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--seconds", type=int, required=True, help="encoder window in whole seconds"
+        "--seconds",
+        type=int,
+        required=True,
+        help="encoder window in whole seconds, 1 to 14",
     )
     parser.add_argument(
         "--work-dir",
@@ -166,8 +175,13 @@ def main() -> None:
         help="where the mobius checkout, checkpoint and build products live",
     )
     arguments = parser.parse_args()
-    if not 1 <= arguments.seconds <= 15:
-        sys.exit("--seconds must be between 1 and 15")
+    if not 1 <= arguments.seconds <= 14:
+        # 15 is the published window, not a bucket: the worker's discovery scans
+        # 1..14 and would ignore a 15 s artifact, and the stock encoder already
+        # covers it.
+        sys.exit(
+            "--seconds must be between 1 and 14; 15 s is the shipped encoder, not a bucket"
+        )
 
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
     work_dir = arguments.work_dir.expanduser()

@@ -1,5 +1,5 @@
 diff --git a/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedAsrManager.swift b/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedAsrManager.swift
-index 04d4f7f0..9b3e79f4 100644
+index 04d4f7f0..252cf6b8 100644
 --- a/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedAsrManager.swift
 +++ b/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedAsrManager.swift
 @@ -11,8 +11,8 @@ import Foundation
@@ -35,17 +35,40 @@ index 04d4f7f0..9b3e79f4 100644
      }
  
      /// Download models from HuggingFace (if needed) and load them.
-@@ -168,7 +172,9 @@ public actor UnifiedAsrManager {
+@@ -162,17 +166,27 @@ public actor UnifiedAsrManager {
+ 
+         let cacheDir = modelsBaseDir.appendingPathComponent(repo.folderName)
+ 
++        // Only the 15 s offline encoder is published, so a shorter window is
++        // something the caller built and placed itself. Asking ModelHub for it
++        // would fail the download on a file the repository does not have, so
++        // the required set names the encoder only for the published window; a
++        // missing short-window bundle surfaces as a load error below instead.
++        var requiredFiles: Set<String> = [
++            ModelNames.ParakeetUnified.decoderFile,
++            ModelNames.ParakeetUnified.jointDecisionFile,
++            ModelNames.ParakeetUnified.vocab,
++        ]
++        if config.offlineWindowSeconds == 15 {
++            requiredFiles.insert(
++                ModelNames.ParakeetUnified.offlineEncoderFile(precision: encoderPrecision))
++        }
++
+         // Completeness-checked download + purge-and-retry on load failure: a
+         // bare directory-existence gate mistook an interrupted encoder fetch
+         // for a warm cache and bricked loading permanently (issue #819).
          try await ModelHub.loadWithRecovery(
              repo, directory: modelsBaseDir,
-             requiredFiles: [
+-            requiredFiles: [
 -                ModelNames.ParakeetUnified.offlineEncoderFile(precision: encoderPrecision),
-+                ModelNames.ParakeetUnified.offlineEncoderFile(
-+                    precision: encoderPrecision,
-+                    windowSeconds: config.offlineWindowSeconds),
-                 ModelNames.ParakeetUnified.decoderFile,
-                 ModelNames.ParakeetUnified.jointDecisionFile,
-                 ModelNames.ParakeetUnified.vocab,
+-                ModelNames.ParakeetUnified.decoderFile,
+-                ModelNames.ParakeetUnified.jointDecisionFile,
+-                ModelNames.ParakeetUnified.vocab,
+-            ],
++            requiredFiles: requiredFiles,
+             variant: encoderPrecision == .fp16 ? "offline-fp16" : "offline",
+             progressHandler: progressHandler
+         ) {
 diff --git a/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedConfig.swift b/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedConfig.swift
 index 3cb7d7c0..7abe6616 100644
 --- a/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedConfig.swift

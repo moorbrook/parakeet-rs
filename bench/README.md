@@ -377,13 +377,14 @@ the 22.5 ms measured. Every other stage held: mel 3.19 against 3.23 ms, encoder
 
 ## Bucketed short-window encoders: M5 Pro 24 GB (2026-09-04)
 
-The offline encoder is compiled at one fixed 15 s mel window and
-`UnifiedAsrManager` zero-pads every utterance to it, so the 25.5 ms above was
-length-independent. `scripts/build-bucket-encoder.py` exports the same NVIDIA
-checkpoint at shorter windows through FluidInference's `mobius` pipeline, and
-the worker sends each utterance to the narrowest compiled window that holds it.
-Buckets are discovered by filename in the model directory, so the two arms below
-differ only in which `--model-dir` the worker was given.
+With the resample retired, the encoder is the whole of the short-utterance
+floor: 26.0 ms of a 32.7 ms one-second result, and flat, because the offline
+encoder is compiled at one fixed 15 s mel window and `UnifiedAsrManager`
+zero-pads every utterance to it. `scripts/build-bucket-encoder.py` exports the
+same NVIDIA checkpoint at shorter windows through FluidInference's `mobius`
+pipeline, and the worker sends each utterance to the narrowest compiled window
+that holds it. Buckets are discovered by filename in the model directory, so the
+two arms below differ only in which `--model-dir` the worker was given.
 
 Encoder cost against compiled window, `parakeet-encoder-probe` on zero inputs,
 ten predictions after three warmups:
@@ -403,8 +404,8 @@ would have been wrong: about 6 ms of the encoder is fixed cost no shorter window
 removes. Derivation and method are in
 [`docs/asr/COMPUTE_PLAN.md`](../docs/asr/COMPUTE_PLAN.md).
 
-Matched 30-repetition runs, three warmups, 48 kHz fixtures, release build,
-buckets 2/5/8 (`bench/coreml-unified-rerun-stages.csv` against
+Matched 30-repetition runs, three warmups, release build
+(`bench/coreml-unified-rerun-stages.csv` against
 `bench/coreml-unified-buckets-stages.csv`). Machine 80 to 92% idle throughout.
 
 | fixture | captured | bucket taken | encoder before | encoder after | mel before | mel after |
@@ -419,6 +420,34 @@ buckets 2/5/8 (`bench/coreml-unified-rerun-stages.csv` against
 Mel falls with the encoder because `UnifiedMelExtractor` is built at the
 layout's window, so a 2 s bucket computes 201 mel frames instead of 1501.
 
+These runs predate the merge of ADR-0030, so both arms still paid the
+worker-side resample. That does not touch these two columns, and the check is in
+the table: the "before" arm's encoder and mel reproduce the post-ADR-0030
+per-stage table above within 0.7 ms at every fixture, which is what licenses
+reading the two tables together.
+
+Worker total, which excludes resample in both arms and is therefore directly
+comparable to the post-ADR-0030 numbers above:
+
+| fixture | captured | worker total before | after | saved |
+|---|---:|---:|---:|---:|
+| `1s_48000` | 0.816 s | 32.40 ms | **11.26 ms** | −21.1 ms |
+| `3s_48000` | 2.828 s | 37.08 ms | **19.78 ms** | −17.3 ms |
+| `5s_48000` | 4.854 s | 43.98 ms | **27.01 ms** | −17.0 ms |
+| 7 s cut | 7.000 s | 49.70 ms | **35.61 ms** | −14.1 ms |
+| `10s_48000` | 8.062 s | 52.91 ms | 52.89 ms | 0.0 ms |
+| `20s_48000` | 15.755 s | 112.61 ms | 110.77 ms | −1.8 ms |
+
+The "before" column agrees with the independently measured post-ADR-0030 worker
+totals in the per-stage table above to within 1.1 ms at every fixture, and the
+"after" column was checked directly on the merged code: a single 4.854 s
+decode with ADR-0030's 16 kHz capture path reports resample 0.001 ms, mel
+1.43 ms, encoder 10.01 ms and worker total 27.17 ms, against the 27.01 ms in
+the table. ASR p50 is worker total plus IPC, which is 0.11 to 0.27 ms across
+this range, so a one-second utterance goes from about 32 ms to about 11 ms of
+ASR. Repeated end-to-end p50 on the merged code has not been re-measured; when
+it is, it belongs in the per-stage table above rather than here.
+
 The 8.062 s fixture is unchanged twice over: it is 128,992 samples against the
 8 s bucket's 128,000, missing by 62 ms of audio, and it is also past the 8 s
 long-regime threshold. No stock fixture lands between 5 and 8 seconds, so the
@@ -430,20 +459,11 @@ Every row has identical Core ML dispatch counts in both arms, which is what says
 the decode path did not change: 7/17, 20/55, 36/96, 48/135, 55/155 and 119/349
 decoder/joint calls respectively.
 
-ASR-only p50 through the same runs:
-
-| bucket | captured | p50 before | p50 after | speedup |
-|---|---:|---:|---:|---:|
-| 1 s | 0.816 s | 36.0 ms | **15.0 ms** | **2.40×** |
-| 3 s | 2.828 s | 50.0 ms | **33.0 ms** | **1.52×** |
-| 5 s | 4.854 s | 66.0 ms | **49.0 ms** | **1.35×** |
-| 10 s | 8.062 s | 90.0 ms | 90.0 ms | 1.00× |
-| 20 s | 15.755 s | 193.0 ms | 188.0 ms | 1.03× |
-
-The one-second result is now 15 ms, of which 3.8 ms is resample and 7.7 ms is
-encoder. What used to be 80% length-independent encoder-plus-mel work is 56%,
-and the resample another agent owns (kata fajz) is the next largest term at
-every length.
+At one second the remaining 11.3 ms is encoder 7.71, decode loop 2.83, mel 0.71
+and post 0.03. The length-independent encoder-and-mel share of the ASR call
+falls from 91% to 75%; what is left is a smaller fixed cost of the same kind,
+and the decode loop, which grows at 0.25 ms per 80 ms frame and now dominates
+past about 3 seconds of audio.
 
 Quality is unchanged. Matched ten-repetition gold runs, same corpus and worker,
 differing only in model directory:
@@ -459,17 +479,19 @@ exactly on the frozen baseline and passes its 0.00-point regression cap. Every
 hypothesis is byte-identical between the two arms, checked field by field rather
 than inferred from equal scores. The gold corpus routes one fixture to the 2 s
 bucket, five to the 5 s, and the 14.225 s fixture to the unbucketed path; the
-7 s cut covers the 8 s bucket, and it is byte-identical too.
+7 s cut covers the 8 s bucket, and it is byte-identical too. Those corpus
+timings also predate ADR-0030 in both arms.
 
 Each bucket is a separate 590 MB compiled program, so 2/5/8 costs 1.77 GB of
 disk on top of the shipped 569 MB encoder. Resident memory is far cheaper
 because Core ML maps the weights: 0.10 to 0.19 GiB. The first load of a bucket
 compiles a Core ML plan and takes about 6 s; the plan cache is persistent, so
-warm load is 0.495 s against 0.107 s. The ANE's ~128 loaded-program cap is not
-close at three buckets.
+warm load is 0.495 s against 0.107 s. That cold cost is behind a blocking read
+in the Rust worker handshake and is tracked as kata hrs0. The ANE's ~128
+loaded-program cap is not close at three buckets.
 
 ```bash
-scripts/build-bucket-encoder.py --seconds 5    # ~90 s per bucket
+scripts/build-bucket-encoder.py --seconds 5    # ~90 s per bucket, 1 to 14
 BACKEND=coreml-unified OUT_CSV=bench/coreml-unified-buckets.csv \
     PARAKEET_COREML_MODEL_DIR=<dir with bucket encoders> scripts/bench-latency.sh
 REPETITIONS=10 COREML_WORKER=target/release/parakeet-coreml-worker \
@@ -478,7 +500,7 @@ REPETITIONS=10 COREML_WORKER=target/release/parakeet-coreml-worker \
 
 Bucket artifacts are not on Hugging Face and the Rust download and verification
 path knows nothing about them, so a stock model directory has no buckets and
-behaves exactly as the tables above the fold describe.
+behaves exactly as the tables above describe.
 
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 
