@@ -1969,3 +1969,113 @@ Anything not on this table is either accepted-and-done or out of scope.
     which the current shipped build already meets (~840 ms p50 on a 5 s
     utterance: 150 ms VAD hangover + 640 ms offline encoder + ~50 ms
     finalize).
+
+## 0030 — Polish latency: the target was met, the measurement was not
+
+**Status:** Accepted. Kata 0tpp.
+
+**Context.** [docs/latency-plan.md](./latency-plan.md) acceptance row 4
+recorded "5 s with-polish p50 ≤ 1.0 s" as **NOT MET**, citing
+**1225 ms p50** for Qwen 3.5 4B Q6_K. That number came from
+`bench_llm` running **one** hardcoded transcript — `SAMPLE_INPUT`, a
+deliberately worst-case 240-character filler-laden string producing 55
+output tokens. At the model's measured 43.4 tok/s that is the
+structural bound of the configuration, and it is arithmetic, not a
+percentile. There was no polish eval set, so neither "p50" nor the
+plan's "no measurable quality regression" had a population to refer to.
+
+**Decision.** Build the eval set first, then re-read the verdict.
+
+`bench/polish/eval.json` holds 26 transcripts with the polished text
+each should produce, across seven categories: clean input, sub-4-word
+utterances, light filler, heavy filler, inline editing commands,
+technical terms, and one long transcript. It retains `SAMPLE_INPUT`
+verbatim as `legacy-bench-sample` so the historical number stays
+anchored. `bench_llm --eval` scores word-level error rate against
+`expected` — casing and punctuation included, because those are two of
+the three things polish exists to fix — and reports latency and quality
+over the same items.
+
+Measured on it (3 reps × 26 items, M5 Pro 24 GB, `bench/README.md`
+§6 follow-up):
+
+| Configuration | p50 | p95 | `legacy-bench-sample` | mean WER | exact |
+|---|---|---|---|---|---|
+| **4B Q6_K full-text (shipping)** | **444 ms** | 1219 ms | 1209 ms | **0.139** | 17/26 |
+| 4B + skip < 4 words | 446 ms | 1222 ms | 1221 ms | 0.139 | 17/26 |
+| 4B + context reuse | 424 ms | 1220 ms | 1198 ms | 0.139 | 17/26 |
+| 4B edits-only | 600 ms | 2438 ms | 2421 ms | 0.321 | 9/26 |
+| 2B Q6_K full-text | 230 ms | 572 ms | 571 ms | 0.185 | 13/26 |
+| 0.8B Q6_K full-text | 141 ms | 338 ms | 330 ms | 0.249 | 11/26 |
+
+**The shipping code already meets the target.** A fixed-sample replay in
+the same session reproduces 1202 ms against the 1225 ms on record, so
+the harness measures the same path; the 444 ms and the 1209 ms are the
+same run, described over a population and over one item.
+
+The latency-plan row is amended from **NOT MET** to **MET on the eval
+set, with the single-transcript bound recorded separately**. Both
+numbers are published because both are true, and the composition of the
+eval set — nine of 26 items are zero-change by construction — is a
+judgement I made. Per-category latency and quality are published so the
+blended figure can be re-weighted.
+
+**Polish remains opt-in.** `PolishMode` already defaults to `Off` and
+that does not change. The reason is no longer latency; it is that the
+`technical` category scores WER 0.847 on the 4B — spoken version numbers
+and identifiers are where polish does real damage. That is a quality
+defect deserving its own issue, and it is the strongest current argument
+for the default.
+
+**Rejected, with reasons.**
+
+- **Edits-only output** (`OLD ==> NEW` span replacements instead of full
+  text). Worse on both axes: p50 600 ms, WER 0.321. The 4B answers with
+  the corrected transcript rather than an edit list in 17 of 26 items,
+  despite an explicit prohibition and a worked example. The arithmetic
+  never favoured it: full-text averages 18.7 output tokens on this set,
+  an edit line costs 5–8 tokens per fix because the search text must
+  carry enough context to be unique, and the variant measured 26.3. A
+  GBNF grammar (`LlamaSampler::grammar`; the `sampler` feature is on)
+  would force the separator but cannot prevent
+  `<whole input> ==> <corrected>`, which parses cleanly and doubles the
+  tokens. Kept behind `PolishStrategy::EditsOnly`, default off.
+- **Prompt caching the system prompt's KV state.** Architecturally
+  unavailable. Qwen 3.5 is a hybrid Gated-DeltaNet model (ADR-0018);
+  its recurrent state carries no per-token position, so
+  `llama_memory_seq_rm` **refuses** partial sequence removal and leaves
+  the cache untouched. `mean_reused_prompt_tokens=0.0` on every run.
+  Bounded above by the 29 ms TTFT regardless. What survives is context
+  reuse — not re-allocating a `LlamaContext` per call — worth 20 ms.
+- **Draft-model speculative decoding.** Blocked by the same refusal: the
+  verification step needs exactly the partial KV rollback the memory
+  module will not do. llama-cpp-2 also exposes no helper for it.
+- **Smaller polisher as the default.** The 2B is a genuine tail fix —
+  p95 1219 → 572 ms, structural-bound item 1209 → 571 ms — but at WER
+  0.185 vs 0.139 and 13/26 vs 17/26 exact. That is a measurable
+  regression, matching this ADR-0018's original finding about the 2B's
+  instruction following, now with a number. Available as a config
+  option, not a default. The 0.8B is faster and clearly worse.
+
+**Accepted as options, default off.**
+
+- `SkipPolicy { min_words: 4 }` bypasses the model for utterances the
+  system prompt already tells it to return unchanged. Quality identical,
+  fires on 3/26, moves the mean 591 → 556 ms. It does **not** move the
+  p50, because the items it removes were already the fastest — worth
+  having, not worth claiming as a latency win.
+- `polish::Speculation` runs polish on the provisional transcript during
+  the VAD confirmation window and keeps the result only if the confirmed
+  transcript matches. This hides latency rather than reducing it: at
+  most one confirmation window, 750 ms LongForm and 150 ms Fast. Output
+  is buffered, never streamed, because a speculative transcript can
+  still be wrong and pasted text cannot be recalled. The `streamer.rs`
+  hook is not wired; end-to-end measurement is a follow-up. This
+  supersedes the latency plan's claim that speculative polish requires a
+  streaming recognizer — [ADR-0023](#0023--speculative-decode-on-the-endpoint-candidate)'s
+  speculative ASR already produces the provisional transcript.
+
+**Follow-ups filed by this work.** Polish quality on technical terms
+(WER 0.847, the worst category on every model measured); grammar-
+constrained edits-only for a long-form mode; end-to-end measurement of
+speculative polish once the streamer hook lands.

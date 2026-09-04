@@ -443,6 +443,111 @@ Replay:
     --reps 30 --warmup-reps 3 2> bench/llm-4b-raw.log
 ```
 
+## §6 follow-up: polish latency and quality on an eval set (2026-09-04, M5 Pro 24 GB)
+
+Kata 0tpp. Everything above measures **one** transcript — the hardcoded
+`SAMPLE_INPUT`, 55 output tokens at the model's decode rate. That is the
+structural bound, not a p50 over anything a user dictates, and it is
+what the "1000 ms NOT MET" verdict was recorded against.
+
+`bench/polish/eval.json` is a 26-item eval set with the polished text
+each item should produce. `bench_llm --eval` runs it, scores word-level
+error rate against `expected` (casing and punctuation included — those
+are two of the three things polish exists to fix), and reports latency
+and quality over the same population.
+
+Machine load before each run: `Load Avg` 1.0–2.3, CPU ≥ 87 % idle.
+3 repetitions × 26 items = 78 measured decodes per row. Repetitions are
+low deliberately: within-item variance is negligible (§6's p99/p50 =
+1.04), so the percentiles are driven by *which item* it is, not by
+run-to-run noise. `p99` over 78 samples is a single item and is not
+quoted below.
+
+| Variant | p50 | p95 | `legacy-bench-sample` | mean WER | exact | mean out tokens |
+|---|---|---|---|---|---|---|
+| **4B Q6_K full-text (shipping)** | **444 ms** | 1219 ms | 1209 ms | **0.139** | 17/26 | 18.7 |
+| 4B full-text + skip < 4 words | 446 ms | 1222 ms | 1221 ms | 0.139 | 17/26 | 18.3 |
+| 4B full-text + context reuse | 424 ms | 1220 ms | 1198 ms | 0.139 | 17/26 | 18.7 |
+| 4B edits-only | 600 ms | 2438 ms | 2421 ms | 0.321 | 9/26 | 26.3 |
+| 2B Q6_K full-text | 230 ms | 572 ms | 571 ms | 0.185 | 13/26 | 20.5 |
+| 0.8B Q6_K full-text | 141 ms | 338 ms | 330 ms | 0.249 | 11/26 | 21.6 |
+
+**The shipping configuration meets the <1000 ms p50 target on the eval
+set.** The `legacy-bench-sample` column shows why the two verdicts
+differ: that one item costs 1209 ms in the same run whose p50 is 444 ms.
+
+### Composition caveat — read this before quoting the p50
+
+The eval set's composition was a judgement call, and composition
+determines the blended p50. Nine of 26 items are zero-change by
+construction. Per-category numbers are published so the blended figure
+can be re-weighted against a different view of what real dictation looks
+like:
+
+| Category | n | 4B p50 | 4B max | 4B WER | 2B p50 | 2B WER |
+|---|---|---|---|---|---|---|
+| clean | 6 | 429 ms | 514 ms | 0.000 | 197 ms | 0.000 |
+| short | 3 | 299 ms | 326 ms | 0.000 | 147 ms | 0.000 |
+| filler-light | 6 | 446 ms | 492 ms | 0.042 | 212 ms | 0.173 |
+| command | 4 | 439 ms | 503 ms | 0.000 | 251 ms | 0.211 |
+| technical | 3 | 609 ms | 652 ms | 0.847 | 298 ms | 0.681 |
+| filler-heavy | 3 | 857 ms | 1219 ms | 0.257 | 391 ms | 0.258 |
+| long | 1 | 2812 ms | 2812 ms | 0.060 | 1400 ms | 0.103 |
+
+Latency tracks output length almost exactly; quality does not. The
+`technical` category is the worst on both models — spoken version
+numbers and identifiers ("one point zero point two one nine",
+`PolishMode colon colon On`) are where polish does real damage, and that
+is a quality bug worth its own issue, not a latency one.
+
+### Findings per avenue
+
+- **Edits-only is worse on both axes.** The model answers with the
+  corrected transcript instead of an edit list in 17 of 26 items, on the
+  4B, with an explicit prohibition and a worked example in the prompt.
+  The arithmetic does not favour it even when it works: full-text
+  averages 18.7 output tokens, an `OLD ==> NEW` line costs 5–8 tokens
+  per fix because `OLD` must carry enough context to be unique, and the
+  variant measured 26.3. A GBNF grammar (`LlamaSampler::grammar`, and
+  the `sampler` feature is already on) would force the `==>` structure
+  but cannot stop `<whole input> ==> <corrected>`, which parses cleanly
+  and doubles the tokens.
+- **Prompt caching is unavailable on this model family.** Qwen 3.5 is a
+  hybrid Gated-DeltaNet architecture (ADR-0018); its recurrent state
+  carries no per-token position, so `llama_memory_seq_rm` refuses
+  partial sequence removal. `mean_reused_prompt_tokens=0.0` on every
+  run. The same refused operation is what draft-model speculative
+  decoding would need for rollback, so that avenue is blocked too. What
+  the `--prompt-cache` row actually measures is **context reuse** — not
+  re-allocating a `LlamaContext` per call — worth 20 ms (444 → 424),
+  consistent with the 29 ms TTFT bounding it.
+- **Skipping short utterances helps the mean, not the p50.** It fires on
+  3/26 items with identical quality, and moves the mean 591 → 556 ms.
+  The p50 is unchanged (444 → 446) because the items it removes were
+  already the fastest ones; taking three items off the bottom does not
+  move the middle.
+- **Neither smaller model is a free swap.** The 2B cuts p95 from 1219 to
+  572 ms and the structural-bound item from 1209 to 571 ms, at WER 0.185
+  vs 0.139 and 13/26 vs 17/26 exact. It is a tail fix bought with
+  quality. The 0.8B is faster still and clearly worse.
+
+Fixed-sample replays for cross-checking against §6 above (15 reps):
+4B Q6_K **p50 1202 ms** (§6 recorded 1225), 2B Q6_K p50 565 ms.
+
+Replay:
+
+```bash
+LLM="$HOME/Library/Application Support/com.parakeet.rs/llm"
+./target/release/bench_llm \
+    --model "$LLM/qwen3.5-4b-q6_k/Qwen3.5-4B-Q6_K.gguf" \
+    --eval bench/polish/eval.json --variant full-text \
+    --reps 3 --tag qwen3.5-4b-q6_k --csv bench/polish/variants.csv \
+    2> bench/llm-4b-fulltext-raw.log
+```
+
+Swap `--variant edits-only`, `--skip-min-words 4`, `--prompt-cache`, or
+`--model` for the other rows.
+
 ## Files
 
 | Path                         | Purpose                                          |
@@ -462,3 +567,6 @@ Replay:
 | `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |
 | `endpoint-*.{log,csv}`       | Generated pause-friendly endpoint gate runs.   |
 | `polish-backends.csv`        | Historical §6 Phase-0 2B polish measurements.  |
+| `polish/eval.json`           | Polish quality eval set: 26 transcripts with expected output. |
+| `polish/variants.csv`        | Generated per-variant polish latency/quality summary. |
+| `llm-*-raw.log`              | Generated `llm_timer` / `llm_eval_*` lines per polish variant run. |
