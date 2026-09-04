@@ -409,6 +409,34 @@ IDLE_GAP_MS=60000 REPS=20 scripts/bench-idle.sh hold
 scripts/bench-idle.sh energy
 ```
 
+### Cool-down knee: M5 Pro 24 GB (2026-09-04)
+
+`scripts/bench-idle.sh sweep`, 1 s fixture, 8 repetitions per gap, three
+warmups, `--record-gap-ms 0` so the decode follows the idle interval directly
+and the measured cost is the re-wake alone. Machine at 87.6% idle, load average
+6.35 (`bench/idle-sweep.csv`):
+
+| idle gap | n | p50 | p95 | encoder p50 | encoder p95 |
+|---|---:|---:|---:|---:|---:|
+| 0 (back to back) | 8 | **37.0 ms** | 38.3 ms | **25.59 ms** | 26.33 ms |
+| 100 ms | 8 | 37.0 ms | 40.3 ms | 25.63 ms | 29.00 ms |
+| 500 ms | 8 | 38.0 ms | 39.6 ms | 26.30 ms | 29.05 ms |
+| 2 s | 8 | 40.0 ms | 43.3 ms | 29.38 ms | 32.81 ms |
+| 5 s | 8 | 52.5 ms | 59.6 ms | 41.15 ms | 49.67 ms |
+| 10 s | 8 | 55.5 ms | 109.5 ms | 44.75 ms | 75.38 ms |
+| 60 s | 8 | **63.5 ms** | 90.7 ms | **51.00 ms** | 62.13 ms |
+
+The re-wake is real and it is on the engine. A fully cold decode costs 26.5 ms
+more than a back-to-back one at p50, and the encoder - the only stage this
+pipeline places on the Neural Engine - accounts for 25.4 ms of that. The other
+stages are flat across the whole sweep.
+
+The decay is gradual rather than a cliff: nothing measurable at 100 ms, about
+3 ms by 2 s, half the total by 5 s, and the plateau by 10 s. That shape is what
+decides whether a hotkey-down prime can work, because the prime has to survive
+the user talking. The 10 s and 60 s rows are within noise of each other at
+n=8, so the matrices below use a 10 s gap as fully cold.
+
 Results and the ship/no-ship decision are recorded in
 [`../docs/asr/PERF.md`](../docs/asr/PERF.md).
 
