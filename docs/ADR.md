@@ -2506,17 +2506,22 @@ adding the app by hand — and they expired on the next rebuild.
 2. `src/permissions.rs` distinguishes what a `CGRequestListenEventAccess()`
    false return means. The call reports the *current* access state, not
    whether it prompted: a first request shows the consent alert and still
-   returns false. The Grant path therefore consults a persisted
-   requested-once marker
-   (`~/Library/Application Support/com.parakeet.rs/tcc/input-monitoring-requested`):
-   granted → refresh; first request → leave the prompt in front with the
-   return-from-prompt refresh already armed; requested before and still
-   not granted → log at warn level and open System Settings → Privacy &
-   Security → Input Monitoring through the existing per-permission
-   deep-link with generic fallback, refreshing the dashboard only when
-   that deep link fails — exactly mirroring the `OpenSettings` branch,
-   so the modal never covers the pane. The decision and warning text are
-   pure functions, unit-tested without TCC calls.
+   returns false. The Grant path therefore re-checks on the main thread
+   ~1.5 s later: the consent alert takes focus away from the app, so
+   granted-at-re-check → refresh; app inactive → the alert is live and the
+   armed activation refresh handles the return; still not granted and the
+   app never lost focus → no prompt appeared (denied, or the stored
+   decision went stale after a rebuild) — log at warn level and open
+   System Settings → Privacy & Security → Input Monitoring through the
+   existing per-permission deep-link with generic fallback, refreshing
+   the dashboard only when that deep link fails — exactly mirroring the
+   `OpenSettings` branch, so the modal never covers the pane. The re-check
+   decision and warning text are pure functions, unit-tested without TCC
+   calls. An earlier revision used a persisted requested-once marker file
+   as the prompt oracle; review rejected it because the marker survives
+   `tccutil reset` (Settings would open over a genuine re-prompt), a
+   failed write silences every later click, and a pre-marker cached
+   denial gets one silent click.
 
 **Consequences.** A rebuilt-and-reinstalled Parakeet.app keeps its TCC
 identity, so an existing Input Monitoring grant keeps working and
@@ -2580,11 +2585,11 @@ Anything not on this table is either accepted-and-done or out of scope.
   Input Monitoring / Microphone / Accessibility grants keep matching — the
   root cause of the Input Monitoring Grant button silently doing nothing
   on rebuilt installs. Ad-hoc remains as a loud-warned fallback when the
-  identity is absent. The Grant path additionally distinguishes a first
-  request (the system consent prompt appears and the call still returns
-  false) from an already-requested-but-not-granted state, where it warns
-  and opens the Input Monitoring settings pane, refreshing the dashboard
-  only when the pane fails to open — never a silent no-op.
+  identity is absent. The Grant path additionally distinguishes a live
+  consent prompt from a suppressed one via a ~1.5 s main-thread re-check
+  (the alert takes focus; a suppressed request does not): a suppressed
+  request warns and opens the Input Monitoring settings pane, refreshing
+  the dashboard only when the pane fails to open — never a silent no-op.
 
 - **2026-09-04** — [ADR-0033](#0033--contextual-biasing-on-the-native-core-ml-path)
   accepted and implemented. Contextual biasing moved onto the native Core ML

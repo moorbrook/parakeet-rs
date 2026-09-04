@@ -27,8 +27,8 @@ unexplained generic restart instruction.
 | Microphone | Denied | Open the Microphone privacy pane |
 | Microphone | Restricted | Open the Microphone privacy pane; explain that macOS/device policy controls it |
 | Microphone | Granted | Open the Microphone privacy pane so it can be reviewed or changed |
-| Input Monitoring | Not granted, first request from this install | Grant/register with `CGRequestListenEventAccess`; the system consent prompt appears and the call returns not-granted while it waits |
-| Input Monitoring | Not granted, already requested before (denied, or stale after a rebuild changed the signature) | Warn, open the Input Monitoring privacy pane; refresh only if the pane fails to open |
+| Input Monitoring | Not granted | Grant/register with `CGRequestListenEventAccess`; a first request shows the system consent prompt while the call returns not-granted |
+| Input Monitoring | Not granted, and a ~1.5 s re-check finds the app still active and still not granted (no prompt appeared: denied, or stale after a rebuild changed the signature) | Warn, open the Input Monitoring privacy pane; refresh only if the pane fails to open |
 | Input Monitoring | Granted | Open the Input Monitoring privacy pane |
 | Accessibility | Not granted | Grant/register with `AXIsProcessTrustedWithOptions` and the prompt option |
 | Accessibility | Granted | Open the Accessibility privacy pane |

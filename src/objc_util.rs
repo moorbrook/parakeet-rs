@@ -71,6 +71,21 @@ pub fn dispatch_to_main<F: FnOnce() + Send + 'static>(f: F) {
     }
 }
 
+/// Run `f` on the main dispatch queue after `delay`. Unlike
+/// [`dispatch_to_main`] there is no run-immediately shortcut: a delay only
+/// makes sense relative to the caller's now, and routing back through the
+/// main queue lets the run loop drain first. Used by the permission
+/// dashboard's Input Monitoring re-check, which must observe focus changes
+/// caused by a system consent alert before deciding what the Grant click
+/// should do about a suppressed prompt.
+pub fn dispatch_to_main_after<F: FnOnce() + Send + 'static>(delay: std::time::Duration, f: F) {
+    let when = dispatch2::DispatchTime::try_from(delay)
+        .expect("delay fits the dispatch time representation");
+    if let Err(error) = dispatch2::DispatchQueue::main().after(when, f) {
+        log::error!("failed to schedule delayed main-thread work: {error:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Lint-as-test: architectural invariants the compiler can't see.
