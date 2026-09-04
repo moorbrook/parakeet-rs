@@ -107,8 +107,9 @@ fixture: encoder 25.5 ms, resample 22.7 ms, RNNT decode loop 15.2 ms, mel
 
 Two of those stages have since moved and this section is the record of the
 measurement, not of current cost. ADR-0030 retired the resample, and short-window
-encoder buckets cut encoder and mel on utterances under 8 s; the two sections
-below carry the current numbers.
+encoder buckets cut encoder and mel on utterances under 8 s wherever the buckets
+are built — they are not provisioned yet, see below; the two sections below carry
+the current numbers.
 
 Two structural facts came out of it. The offline path zero-pads every utterance
 to the fixed 15 s encoder window, so encoder time was 25.5 ms whether the audio
@@ -154,12 +155,18 @@ short-utterance floor: it is compiled at a fixed 15 s mel window and every
 utterance is zero-padded to it, so a one-second utterance paid 26.0 ms of
 encoder and 3.2 ms of mel out of a 32.7 ms result. Compiling the same NVIDIA
 checkpoint at shorter windows and dispatching each utterance to the narrowest
-one that holds it removes most of that. **A one-second utterance now costs
-7.7 ms of encoder and 0.7 ms of mel instead of 26.0 and 3.2, taking the
-worker-internal call from 32.4 to 11.3 ms.** At 2.8 s the encoder is 9.7 ms
-against 25.3, at 4.9 s 9.98 against 25.4, and at 7.0 s 12.5 against 25.6;
-utterances past the longest bucket are unchanged. Buckets of 2, 5 and 8 seconds
-cost 1.77 GB of disk and take peak RSS from 0.10 to 0.19 GiB.
+one that holds it removes most of that. **On the bucketed model directory a
+one-second utterance measured 7.7 ms of encoder and 0.7 ms of mel against 26.0
+and 3.2, taking the worker-internal call from 32.4 to 11.3 ms.** At 2.8 s the
+encoder is 9.7 ms against 25.3, at 4.9 s 9.98 against 25.4, and at 7.0 s 12.5
+against 25.6; utterances past the longest bucket are unchanged. Buckets of 2, 5
+and 8 seconds cost 1.77 GB of disk and take peak RSS from 0.10 to 0.19 GiB.
+
+These are measurements against buckets compiled locally, not what a fresh
+install runs. `COREML_ARTIFACTS` in
+[`src/model_fetch.rs`](../../src/model_fetch.rs) provisions the 15 s encoder
+alone, so an installed build still pays the 26.0 ms encoder and 3.2 ms mel on a
+one-second utterance. Shipping the bucket artifacts is kata htdr.
 
 The bucket runs predate the ADR-0030 merge, so both arms still paid the
 worker-side resample, which is why the numbers above are worker totals excluding
