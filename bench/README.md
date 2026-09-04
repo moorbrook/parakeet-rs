@@ -672,6 +672,206 @@ cannot overlap any decode with the tail of the utterance.
 REPS=30 WARMUP_REPS=2 BACKEND=coreml-unified scripts/bench-hold.sh
 ```
 
+## ANE idle re-wake A/B: cold, prime, keep-alive (kata snx0)
+
+The Neural Engine hard power-gates when idle. Published measurements put the
+cold re-wake after an idle gap at tens to hundreds of milliseconds, with
+per-dispatch cost climbing once the gap reaches about 100 ms (arXiv 2606.22283,
+p.58-59 and p.84). Between dictations this app is idle for seconds to minutes,
+so the endpoint decode may be paying that re-wake on every utterance.
+
+`scripts/bench-idle.sh` measures four arms. They differ only in how long the
+engine has gone without a dispatch when the measured decode starts:
+
+| arm | silence before the decode |
+|---|---|
+| `warm` | none - repetitions run back to back |
+| `cold` | the idle gap plus the recording interval |
+| `prime` | the recording interval; one dispatch fires at the hotkey-down edge |
+| `cadence` | at most `KEEPALIVE_MS` |
+
+The recording interval stands in for the user speaking, and it is the whole
+point of the ladder: a hotkey-down prime helps only if the engine's warmth
+survives the 1 s or 5 s of talking that follows it. `bench_asr` simulates that
+interval with `--record-gap-ms` (default: the fixture's own length); in
+`bench_e2e --mode hold` it is real, because the fixture plays through the
+loopback in the time it takes.
+
+Arms are tagged with an `idle_arm` log marker rather than a new `phase_timer`
+field, so nothing in the production timing path changes.
+
+The shipping prime drops a second request while one is in flight rather than
+queueing it. It cannot cancel the first, so a press-release short enough to end
+while a prime is still running puts that endpoint decode behind one dispatch on
+the worker's single pipe, about 30 to 50 ms. It is bounded at one dispatch and
+only reachable on a press that found the engine cold - the case that was going
+to pay a re-wake regardless.
+`scripts/bench-idle.py` attributes each timed line to the marker above it,
+warns about any line it cannot label, and carries `encoder_ms` from the stage
+profiler alongside the latency percentiles - the encoder is the only stage on
+the engine, so its delta separates a Neural Engine re-wake from a cold CPU.
+
+```bash
+# Find the cool-down knee first. If it sits well below 60 s, the matrix runs
+# at that gap instead and takes minutes rather than hours.
+scripts/bench-idle.sh sweep
+
+IDLE_GAP_MS=60000 REPS=20 scripts/bench-idle.sh tap
+IDLE_GAP_MS=60000 REPS=20 scripts/bench-idle.sh hold
+scripts/bench-idle.sh energy
+```
+
+**The numbers in the four tables below were measured before fajz moved
+resampling into the capture callbacks and before fgzt's bucketed short-window
+encoders landed.** They were taken with one 15 s encoder and with the 48 kHz to
+16 kHz conversion still inside the measured decode, so the absolute
+milliseconds no longer describe the current path and should not be compared
+against any table elsewhere in this file. Every arm within a table paid the
+same conditions, so the comparisons between arms - which are what the decision
+rests on - still hold. Re-run `scripts/bench-idle.sh` to refresh the absolute
+figures.
+
+One interaction to know about if bucket artifacts are installed. The prime
+sends 0.5 s of silence, and `EncoderBuckets.select` routes a request to the
+narrowest window that holds it, so with buckets present the prime warms the
+narrowest bucket's encoder rather than the one a 5 s utterance will use. The
+engine's power gate is a hardware unit and any dispatch lifts it, so the
+re-wake this experiment measured should still be paid by the prime; a
+per-program load cost, which a single 15 s encoder could not expose, would not
+be. No bucket artifacts were installed on the machine that produced these
+tables, so the worker used the stock encoder throughout and the numbers are
+unaffected. Worth re-measuring once buckets ship.
+
+### Cool-down knee: M5 Pro 24 GB (2026-09-04)
+
+`scripts/bench-idle.sh sweep`, 1 s fixture, 8 repetitions per gap, three
+warmups, `--record-gap-ms 0` so the decode follows the idle interval directly
+and the measured cost is the re-wake alone. Machine at 87.6% idle, load average
+6.35 (`bench/idle-sweep.csv`):
+
+| idle gap | n | p50 | p95 | encoder p50 | encoder p95 |
+|---|---:|---:|---:|---:|---:|
+| 0 (back to back) | 8 | **37.0 ms** | 38.3 ms | **25.59 ms** | 26.33 ms |
+| 100 ms | 8 | 37.0 ms | 40.3 ms | 25.63 ms | 29.00 ms |
+| 500 ms | 8 | 38.0 ms | 39.6 ms | 26.30 ms | 29.05 ms |
+| 2 s | 8 | 40.0 ms | 43.3 ms | 29.38 ms | 32.81 ms |
+| 5 s | 8 | 52.5 ms | 59.6 ms | 41.15 ms | 49.67 ms |
+| 10 s | 8 | 55.5 ms | 109.5 ms | 44.75 ms | 75.38 ms |
+| 60 s | 8 | **63.5 ms** | 90.7 ms | **51.00 ms** | 62.13 ms |
+
+The re-wake is real and it is on the engine. A fully cold decode costs 26.5 ms
+more than a back-to-back one at p50, and the encoder - the only stage this
+pipeline places on the Neural Engine - accounts for 25.4 ms of that. The other
+stages are flat across the whole sweep.
+
+The decay is gradual rather than a cliff: nothing measurable at 100 ms, about
+3 ms by 2 s, half the total by 5 s, and the plateau by 10 s. That shape is what
+decides whether a hotkey-down prime can work, because the prime has to survive
+the user talking. The 10 s and 60 s rows are within noise of each other at
+n=8, so the matrices below use a 10 s gap as fully cold.
+
+### Tap Fast: M5 Pro 24 GB (2026-09-04)
+
+`IDLE_GAP_MS=10000 REPS=15 scripts/bench-idle.sh tap`, three warmups, ASR
+decode only. Machine at 79.4% idle, load average 4.07 (`bench/idle-tap.csv`):
+
+| fixture | arm | n | p50 | p95 | encoder p50 |
+|---|---|---:|---:|---:|---:|
+| 1 s | warm | 15 | **36.0 ms** | **37.0 ms** | 25.84 ms |
+| 1 s | cold | 15 | 63.0 ms | 102.5 ms | 51.91 ms |
+| 1 s | prime | 15 | **39.0 ms** | **41.6 ms** | 28.52 ms |
+| 1 s | cadence | 15 | 37.0 ms | 65.2 ms | 26.62 ms |
+| 5 s | warm | 15 | **65.0 ms** | **71.4 ms** | 25.36 ms |
+| 5 s | cold | 15 | 102.0 ms | 144.7 ms | 49.64 ms |
+| 5 s | prime | 15 | **80.0 ms** | **117.3 ms** | 30.77 ms |
+| 5 s | cadence | 15 | 90.0 ms | 138.2 ms | 29.17 ms |
+
+Against cold, the hotkey-down prime removes 60.9 ms at p95 and 24.0 ms at p50
+on the 1 s fixture, and 27.4 ms at p95 and 22.0 ms at p50 on the 5 s fixture.
+The encoder is where it comes from: 51.9 ms cold against 28.5 ms primed at 1 s.
+
+At 1 s the prime lands within 4.6 ms of the back-to-back floor at p95, because
+only about a second passes between it and the decode. At 5 s it recovers most
+but not all of the gap, which the sweep predicts: five seconds of talking is
+already half the cool-down.
+
+The cadence arm has the warmest encoder of the three treated arms at both
+lengths and still loses to the prime on total latency, badly in the tail: 65.2
+against 41.6 ms at p95 on the 1 s fixture. Its dispatches contend for the
+worker's single pipe and for the CPU with the decode that follows them, and
+that costs more than the engine warmth it buys.
+
+### Hold: M5 Pro 24 GB (2026-09-04)
+
+`IDLE_GAP_MS=10000 REPS=12 scripts/bench-idle.sh hold`, two warmups,
+`BlackHole 2ch` loopback, release-to-transcript. Machine at 89.8% idle, load
+average 2.66 (`bench/idle-hold.csv`). `bench_e2e` does not run the stage
+profiler, so there is no encoder column here:
+
+| fixture | arm | n | p50 | p95 |
+|---|---|---:|---:|---:|
+| 1 s | warm | 12 | 53.0 ms | 70.0 ms |
+| 1 s | cold | 12 | 126.0 ms | 140.6 ms |
+| 1 s | prime | 12 | **53.0 ms** | **70.0 ms** |
+| 1 s | cadence | 12 | 50.0 ms | 69.6 ms |
+| 5 s | warm | 12 | 122.0 ms | 160.0 ms |
+| 5 s | cold | 12 | 117.0 ms | 188.2 ms |
+| 5 s | prime | 12 | **94.5 ms** | **146.6 ms** |
+| 5 s | cadence | 12 | 121.5 ms | 136.7 ms |
+
+The 1 s row is the clean one and it is the largest effect measured anywhere in
+this experiment: the prime removes 73.0 ms at p50 and 70.6 ms at p95, matching
+the warm arm exactly.
+
+That 73 ms is larger than the mechanism accounts for. The sweep prices the
+encoder re-wake at 25.4 ms, and Tap Fast's cold penalty at 1 s is 27.0 ms at
+p50, which matches it. Hold's is nearly three times that, and `bench_e2e` does
+not run the stage profiler, so there is no encoder column here to attribute the
+remainder to. Something else in the Hold path is also paying for the idle gap -
+the capture stream, the loopback device, or CPU frequency, none of which the
+isolated ASR bench exercises. The direction and the ordering are not in doubt,
+and the prime removes whatever it is along with the encoder cost, but the 25.4
+ms re-wake explains only about a third of the Hold number. Running
+`bench_e2e` with stage timings would settle it.
+
+Read the `warm` column here differently than in the Tap Fast table. `warm`
+skips the idle gap but still plays the fixture, so each of its decodes follows
+the previous one by the playback plus session setup - the same gap structure
+the `prime` arm has. That is why warm and prime are identical at 1 s, and it
+means the Hold `warm` column is not the back-to-back floor the Tap Fast one is.
+
+It also explains the 5 s rows, which should not be read as a ranking. Warm
+there sits about 5 s from its previous dispatch, which the sweep prices at
+roughly 15 ms of encoder, so the expected cold-to-warm separation is only about
+10 ms - inside the spread the p95 column shows at n=12. Cold landing below warm
+at p50 is noise around a small expected difference, not a contradiction. Only
+the 1 s Hold row and the Tap Fast table above carry the decision, and the
+acceptance metric is prime against cold, which separates cleanly in every row
+that counts.
+
+### Cadence energy: M5 Pro 24 GB (2026-09-04)
+
+`ENERGY_WINDOW_S=60 scripts/bench-idle.sh energy`. Two matched 60 s windows
+differing only in whether the 250 ms keep-alive is dispatching, measured as the
+resident worker's cumulative CPU time:
+
+| window | worker CPU over 60 s |
+|---|---:|
+| idle control | **0.00 s** |
+| 250 ms keep-alive | **2.41 s** |
+
+The cadence costs 2.41 seconds of worker CPU per minute it runs - about 4% of
+one core, continuously, against a genuine zero when the app is idle. At roughly
+240 dispatches per window that is about 10 ms of host CPU per keep-alive.
+
+**The Neural Engine's own power draw was not measured.** `powermetrics
+--samplers ane_power` requires root and no interactive sudo was available on
+this machine, so the figure above is the host-side cost only and the true cost
+of the cadence is higher by whatever the engine draws to stay awake.
+
+Results and the ship/no-ship decision are recorded in
+[`../docs/asr/PERF.md`](../docs/asr/PERF.md).
+
 ## Baseline: M5 Pro 24 GB (2026-05-16, pre-§2 CoreML cache)
 
 | length | n  | mean ms | p50 ms | p95 ms | p99 ms |
@@ -923,6 +1123,7 @@ Swap `--variant edits-only`, `--skip-min-words 4`, `--prompt-cache`, or
 | `*-stages.csv`               | Generated per-stage breakdown and Core ML dispatch counts. |
 | `coreml-unified-buckets*.csv` | Generated bucketed short-window encoder runs. |
 | `hold.{log,csv}`             | Generated Hold-mode release-to-transcript runs. |
+| `idle-*.{log,csv}`           | Generated ANE idle re-wake A/B runs (sweep, tap, hold, energy). |
 | `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |
 | `endpoint-*.{log,csv}`       | Generated pause-friendly endpoint gate runs.   |
 | `polish-backends.csv`        | Historical §6 Phase-0 2B polish measurements.  |
