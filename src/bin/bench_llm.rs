@@ -670,9 +670,23 @@ fn report(args: &Args, model_tag: &str, set: &EvalSet, results: &[ItemResult]) -
         let rows: Vec<&ItemResult> = first_rep.iter().filter(|r| r.category == cat).collect();
         let wer = rows.iter().map(|r| r.wer).sum::<f64>() / rows.len() as f64;
         let ex = rows.iter().filter(|r| r.exact).count();
+        // Latency over EVERY rep of this category, not just the scored
+        // one. The whole-set p50 is a function of how many items of
+        // each category the eval set happens to contain, and that
+        // composition was a judgement call — so publish the per-category
+        // numbers and let the reader weigh them against their own
+        // dictation mix instead of trusting one blended figure.
+        let mut cat_ms: Vec<u128> = results
+            .iter()
+            .filter(|r| r.category == cat)
+            .map(|r| r.total.as_millis())
+            .collect();
+        cat_ms.sort_unstable();
+        let cat_p50 = percentile(&cat_ms, 0.50);
+        let cat_max = cat_ms.last().copied().unwrap_or(0);
         log::info!(
             "llm_eval_category model={model_tag} variant={} category={cat} n={} \
-             mean_wer={wer:.4} exact={ex}/{}",
+             mean_wer={wer:.4} exact={ex}/{} p50_ms={cat_p50} max_ms={cat_max}",
             strategy_name(args.strategy),
             rows.len(),
             rows.len()
@@ -689,6 +703,26 @@ fn report(args: &Args, model_tag: &str, set: &EvalSet, results: &[ItemResult]) -
             r.id,
             r.wer,
             r.edit_fallback
+        );
+    }
+
+    // The item the 1225 ms on record was measured from. Reported on its
+    // own line because it is the structural bound — 55 output tokens at
+    // the model's decode rate — and no amount of eval-set composition
+    // changes it.
+    let mut legacy_ms: Vec<u128> = results
+        .iter()
+        .filter(|r| r.id == "legacy-bench-sample")
+        .map(|r| r.total.as_millis())
+        .collect();
+    legacy_ms.sort_unstable();
+    if !legacy_ms.is_empty() {
+        log::info!(
+            "llm_eval_legacy model={model_tag} variant={} n={} p50_ms={} max_ms={}",
+            strategy_name(args.strategy),
+            legacy_ms.len(),
+            percentile(&legacy_ms, 0.50),
+            legacy_ms.last().copied().unwrap_or(0)
         );
     }
 

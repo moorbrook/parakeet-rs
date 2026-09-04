@@ -525,9 +525,23 @@ const SPECULATION_CANCELLED: &str = "speculative polish cancelled";
 impl Speculation {
     /// Start polishing `provisional` on a worker thread.
     ///
-    /// The worker takes `backend`'s polish lock for the duration, so a
-    /// confirmed polish that needs to overtake it waits for the
-    /// cancellation to land — one token, about 23 ms on the 4B.
+    /// The worker holds `backend`'s polish lock for the duration, and
+    /// cancellation is only noticed where the polish path calls back:
+    ///
+    /// - [`PolishStrategy::FullText`] flushes about every 16 characters,
+    ///   so the flag lands within roughly four or five tokens (~100 ms
+    ///   on the 4B).
+    /// - [`PolishStrategy::EditsOnly`] calls back exactly once, after
+    ///   the whole reply is decoded, so the flag is never seen early. A
+    ///   mispredicted speculation there makes the confirmed polish wait
+    ///   out the entire speculative decode — **slower than not
+    ///   speculating at all**.
+    ///
+    /// That asymmetry is why speculation ships coupled to the full-text
+    /// strategy. Making it safe for edits-only needs a cancellation
+    /// token threaded through [`PolishBackend::polish_into`] into the
+    /// decode loop, which is a follow-up, not something the callback
+    /// signature can express today.
     pub fn start(backend: Arc<dyn PolishBackend>, settings: Settings, provisional: String) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let worker = {
@@ -829,7 +843,7 @@ where
     let partial_removed = ctx
         .clear_kv_cache_seq(Some(0), Some(reuse_u32), None)
         .context("trim kv cache to reusable prefix")?;
-    let reuse = if partial_removed || reuse == 0 {
+    let reuse = if partial_removed {
         reuse
     } else {
         ctx.clear_kv_cache_seq(Some(0), None, None)
