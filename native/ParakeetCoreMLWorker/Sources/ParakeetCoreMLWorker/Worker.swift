@@ -35,6 +35,12 @@ private struct WorkerOptions {
     let modelDirectory: URL?
     let modelRoot: URL?
     let modelVariant: ModelVariant
+    /// How many long-form chunks the TDT path may decode at once. FluidAudio
+    /// defaults to 4; this worker defaults to 1 because a dictation utterance
+    /// is decoded on its own and only audio past 15 s is chunked at all, and
+    /// because concurrent dispatch makes the stage profiler's timeline stop
+    /// being a partition. Raise it to measure the parallel arm deliberately.
+    let tdtChunkConcurrency: Int
     let shortComputeUnits: MLComputeUnits
     let longComputeUnits: MLComputeUnits
     let longRegimeSeconds: UInt32
@@ -48,6 +54,7 @@ private struct WorkerOptions {
         var modelDirectory: URL?
         var modelRoot: URL?
         var modelVariant: ModelVariant = .unified
+        var tdtChunkConcurrency = 1
         var shortComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
         var longComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
         var longRegimeSeconds: UInt32 = 8
@@ -74,6 +81,16 @@ private struct WorkerOptions {
                     throw WorkerError.invalidArgument("--model-variant needs a name")
                 }
                 modelVariant = try ModelVariant.parse(arguments[index])
+            case "--tdt-chunk-concurrency":
+                index += 1
+                guard index < arguments.count,
+                    let count = Int(arguments[index]), (1...16).contains(count)
+                else {
+                    throw WorkerError.invalidArgument(
+                        "--tdt-chunk-concurrency must be between 1 and 16"
+                    )
+                }
+                tdtChunkConcurrency = count
             case "--compute-units":
                 index += 1
                 guard index < arguments.count else {
@@ -118,7 +135,7 @@ private struct WorkerOptions {
             case "-h", "--help":
                 let usage =
                     "usage: parakeet-coreml-worker [--model-dir DIR | --model-root DIR] "
-                    + "[--model-variant unified|tdt-v3] "
+                    + "[--model-variant unified|tdt-v3] [--tdt-chunk-concurrency N] "
                     + "[--compute-units NAME | --short-compute-units NAME "
                     + "--long-compute-units NAME --long-regime-seconds N] "
                     + "[--encoder-buckets auto|none|N,N,...] [--emit-stage-timings]\n"
@@ -148,6 +165,7 @@ private struct WorkerOptions {
             modelDirectory: modelDirectory,
             modelRoot: modelRoot,
             modelVariant: modelVariant,
+            tdtChunkConcurrency: tdtChunkConcurrency,
             shortComputeUnits: shortComputeUnits,
             longComputeUnits: longComputeUnits,
             longRegimeSeconds: longRegimeSeconds,
@@ -408,7 +426,9 @@ private struct ParakeetCoreMLWorker {
                 version: .v3,
                 encoderPrecision: .int8
             )
-            let manager = AsrManager()
+            let manager = AsrManager(
+                config: ASRConfig(parallelChunkConcurrency: options.tdtChunkConcurrency)
+            )
             try await manager.loadModels(models)
             return .tdt(
                 TdtSession(manager: manager, decoderLayers: AsrModelVersion.v3.decoderLayers)

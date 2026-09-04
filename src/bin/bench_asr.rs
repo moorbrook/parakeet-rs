@@ -353,6 +353,15 @@ fn validate_stage_report(stages: &StageReport) -> anyhow::Result<()> {
             stages.windows
         );
     }
+    if stages.overlapped_dispatch_ms > 0.0 {
+        anyhow::bail!(
+            "stage profiler saw {:.3} ms of Core ML dispatch overlapping other dispatch, so the \
+             per-stage columns double-count and do not partition the decode interval. The TDT \
+             long-form path decodes chunks concurrently; pass --tdt-chunk-concurrency 1 to the \
+             worker for a per-stage run, and read wall totals for a parallel one",
+            stages.overlapped_dispatch_ms
+        );
+    }
     if stages.other_calls != 0 {
         anyhow::bail!(
             "stage profiler saw {} Core ML predictions it could not attribute to the encoder, \
@@ -405,7 +414,8 @@ fn run_one(
              other_calls={} \
              mel_ms={:.3} preprocessor_ms={:.3} encoder_ms={:.3} decode_loop_ms={:.3} \
              decode_loop_dispatch_ms={:.3} decoder_dispatch_ms={:.3} \
-             joint_dispatch_ms={:.3} post_ms={:.3} total_ms={:.3} \
+             joint_dispatch_ms={:.3} post_ms={:.3} overlapped_dispatch_ms={:.3} \
+             total_ms={:.3} \
              boundary_ms={:.3} compute_units={}",
             stages.resample_ms,
             stages.windows,
@@ -422,6 +432,7 @@ fn run_one(
             stages.decoder_dispatch_ms,
             stages.joint_dispatch_ms,
             stages.post_ms,
+            stages.overlapped_dispatch_ms,
             stages.total_ms,
             boundary_seconds * 1_000.0,
             stages.compute_units.replace(' ', ","),
@@ -451,6 +462,7 @@ mod tests {
             decoder_dispatch_ms: 5.0,
             joint_dispatch_ms: 9.5,
             post_ms: 0.06,
+            overlapped_dispatch_ms: 0.0,
             total_ms: 43.8,
             compute_units: "encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only"
                 .to_string(),

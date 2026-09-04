@@ -535,18 +535,35 @@ One 14.225 s fixture, one 15 s window, one repetition each, release build,
 | TDT v3 | 1 | 1 | 82 | **92** | 26.27 ms |
 
 The frame skipping is real: 92 joint predictions against Unified's 261, a 2.84×
-reduction on identical audio. It buys nothing. `JointDecisionv3` also emits
-`top_k_ids` and `top_k_logits` at K=64 for script-aware filtering, and
-FluidAudio's TDT loader places the decoder and joint on CPU+ANE where the
-Unified loader pins them CPU-only. Per-call joint cost rises by about the same
-factor the call count falls, and total joint dispatch lands within 1% of
-Unified.
+reduction on identical audio. It buys nothing — per-call joint cost rises by
+about the same factor the count falls, and total joint dispatch lands within 1%
+of Unified. Two differences could produce that and these runs do not separate
+them: `JointDecisionv3` also emits `top_k_ids` and `top_k_logits` at K=64 for
+script-aware filtering, and FluidAudio's TDT loader places the decoder and joint
+on CPU+ANE where the Unified loader pins them CPU-only.
 
 The rest of the stage split moves against TDT as well. Its mel front end is a
 Core ML graph (`Preprocessor.mlmodelc`, CPU-only) rather than Swift, which is
 1.04 ms of dispatch plus 0.24 ms of marshalling against Unified's 3.18 ms — a
 small win. The tail is not: post-dispatch work is 14.83 ms for TDT against
 0.11 ms for Unified, and worker total is 81.42 ms against 67.79 ms.
+
+### Long-form chunk concurrency
+
+FluidAudio's TDT path decodes long-form chunks four at a time; Unified's
+offline windowing is serial. On the two-window 20 s fixture (15.691 s captured)
+that is a real wall-clock win — 121.29 ms parallel against 183.85 ms serial —
+and it is also why the worker defaults TDT to `--tdt-chunk-concurrency 1`. Two
+Core ML predictions in flight make the stage columns timeline sums over
+overlapping intervals, so they double-count and stop partitioning the decode
+interval: the parallel run reported 100.10 ms of decode-loop dispatch inside a
+52.93 ms wall interval. `StageProfiler` now measures that overlap directly and
+both `bench_asr` and `scripts/bench-stages.py` refuse a report containing any,
+rather than publishing a split that does not add up.
+
+Serial is also the honest default for this workload. A dictation utterance is
+decoded on its own, chunking only engages past 15 s, and the long-regime
+threshold is 8 s. Raise the flag to measure the parallel arm deliberately.
 
 ### Quality: a hard fail on the English gate
 

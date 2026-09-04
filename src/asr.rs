@@ -88,6 +88,13 @@ pub struct StageReport {
     pub joint_dispatch_ms: f64,
     /// Tokenizer decode and overlap merge after the last dispatch.
     pub post_ms: f64,
+    /// Dispatch time counted more than once because two Core ML predictions
+    /// were in flight at once. The stage durations are timeline sums, so they
+    /// partition the decode interval only while dispatch is serial; FluidAudio's
+    /// TDT long-form path can decode chunks concurrently. Nonzero means the
+    /// wall totals are still right and the per-stage split is not.
+    #[serde(default)]
+    pub overlapped_dispatch_ms: f64,
     pub total_ms: f64,
     /// Compute units read off each live model, e.g.
     /// `encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only`.

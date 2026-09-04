@@ -51,12 +51,13 @@ TIME_FIELDS = [
     "decoder_dispatch_ms",
     "joint_dispatch_ms",
     "post_ms",
+    "overlapped_dispatch_ms",
     "total_ms",
     "boundary_ms",
 ]
 # Emitted only since the TDT v3 comparison added a graph mel front end. A log
 # captured before that is still aggregatable; Unified reports zero for both.
-OPTIONAL_FIELDS = {"preprocessor_calls", "preprocessor_ms"}
+OPTIONAL_FIELDS = {"preprocessor_calls", "preprocessor_ms", "overlapped_dispatch_ms"}
 
 
 def bucket_for(audio_s: float) -> int:
@@ -119,6 +120,12 @@ def validate(by_bucket: dict[int, list[dict]]) -> list[str]:
                 problems.append(
                     f"{bucket}s bucket: {row['preprocessor_calls']} mel front-end dispatches "
                     f"against {row['windows']} windows"
+                )
+                break
+            if row["overlapped_dispatch_ms"] > 0:
+                problems.append(
+                    f"{bucket}s bucket: {row['overlapped_dispatch_ms']:.3f} ms of overlapping "
+                    f"Core ML dispatch, so the per-stage columns double-count"
                 )
                 break
             if row["other_calls"] != 0:

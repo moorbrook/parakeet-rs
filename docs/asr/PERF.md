@@ -288,12 +288,13 @@ not open a switch issue.
 
 The latency case that motivated the trial does not survive measurement either.
 TDT's duration head does cut joint predictions 2.84× on a 14.225 s fixture —
-92 against Unified's 261 — but `JointDecisionv3` also computes K=64 top-K
-outputs and FluidAudio's TDT loader places the decoder and joint on CPU+ANE
-where the Unified loader pins them CPU-only, so per-call cost rises by about
-the factor the count falls and total joint dispatch lands within 1% of Unified.
-Worker total on that fixture is 81.42 ms against 67.79 ms, and post-dispatch
-work is 14.83 ms against 0.11 ms.
+92 against Unified's 261 — but per-call cost rises by about the factor the
+count falls, so total joint dispatch lands within 1% of Unified. Two
+differences could produce that and these runs do not separate them:
+`JointDecisionv3` also computes K=64 top-K outputs, and FluidAudio's TDT loader
+places the decoder and joint on CPU+ANE where the Unified loader pins them
+CPU-only. Worker total on that fixture is 81.42 ms against 67.79 ms, and
+post-dispatch work is 14.83 ms against 0.11 ms.
 
 TDT's published Core ML encoder takes a fixed `[1, 128, 1501]` mel, the same
 15 s window the Unified offline encoder takes, so the bucketed short-window
@@ -306,7 +307,9 @@ a future conversion: `--model-variant tdt-v3` on the worker,
 `scripts/fetch-tdt-v3-model.py` for the pinned artifact. It is deliberately not
 reachable from the shipping download path: TDT has no Rust integrity gate, so
 the worker refuses `--model-root` for it and forbids FluidAudio's downloader.
-Reopen if a conversion appears that is EN-competitive on this corpus, or if the
-top-K outputs become optional in the joint graph. Full tables, the artifact
+Reopen if a conversion appears that is EN-competitive on this corpus. The
+latency case is worth one more measurement first: a TDT arm with the decoder
+and joint pinned CPU-only, which is what would separate top-K cost from
+placement cost. Full tables, the artifact
 manifest and the replay commands are in
 [`../../bench/README.md`](../../bench/README.md).

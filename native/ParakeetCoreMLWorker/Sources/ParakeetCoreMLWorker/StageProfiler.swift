@@ -65,6 +65,13 @@ final class StageProfiler: @unchecked Sendable {
         let decoderDispatchMs: Double
         let jointDispatchMs: Double
         let postMs: Double
+        /// How much dispatch time overlapped other dispatch time. The stage
+        /// durations below are sums over a timeline, so they only partition
+        /// the decode interval while dispatch is serial. FluidAudio's TDT
+        /// long-form path can decode chunks concurrently, and then the
+        /// per-stage columns double-count. Nonzero means read the wall totals
+        /// and ignore the split.
+        let overlappedDispatchMs: Double
         let totalMs: Double
         /// `MLModelConfiguration.computeUnits` read off the live model object
         /// each stage dispatched to, e.g. "encoder=cpu-and-neural-engine
@@ -288,9 +295,39 @@ final class StageProfiler: @unchecked Sendable {
             decoderDispatchMs: milliseconds(decoderNanoseconds),
             jointDispatchMs: milliseconds(jointNanoseconds),
             postMs: milliseconds(endNanoseconds &- max(lastEnd, startNanoseconds)),
+            overlappedDispatchMs: milliseconds(overlap(in: timeline)),
             totalMs: milliseconds(endNanoseconds &- startNanoseconds),
             computeUnits: computeUnits
         )
+    }
+
+    /// Total dispatch time counted more than once: the sum of every event's
+    /// duration less the length of their union. Zero for a serial pipeline.
+    /// `timeline` is already sorted by start.
+    private static func overlap(in timeline: [Event]) -> UInt64 {
+        var summed: UInt64 = 0
+        var union: UInt64 = 0
+        var mergedStart: UInt64?
+        var mergedEnd: UInt64 = 0
+        for event in timeline {
+            summed &+= event.endNanoseconds &- event.startNanoseconds
+            guard let start = mergedStart else {
+                mergedStart = event.startNanoseconds
+                mergedEnd = event.endNanoseconds
+                continue
+            }
+            if event.startNanoseconds > mergedEnd {
+                union &+= mergedEnd &- start
+                mergedStart = event.startNanoseconds
+                mergedEnd = event.endNanoseconds
+            } else {
+                mergedEnd = max(mergedEnd, event.endNanoseconds)
+            }
+        }
+        if let start = mergedStart {
+            union &+= mergedEnd &- start
+        }
+        return summed > union ? summed &- union : 0
     }
 
     // MARK: - Classification
