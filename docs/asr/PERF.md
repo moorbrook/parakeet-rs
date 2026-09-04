@@ -251,4 +251,7 @@ remainder needs a dispatch nearer the endpoint, which is what the cadence was,
 and the cadence costs more than it returns.
 
 The 5 s Hold rows are omitted from the table above because they do not separate
-at n=12; `bench/README.md` records them and why.
+at n=12. Hold's `warm` arm still plays the fixture, so it sits about one
+utterance from its own previous dispatch rather than back to back, which at 5 s
+leaves an expected cold-to-warm separation of roughly 10 ms - inside the noise
+at that sample size. `bench/README.md` records the rows and the reasoning.

@@ -487,17 +487,23 @@ profiler, so there is no encoder column here:
 | 5 s | cadence | 12 | 121.5 ms | 136.7 ms |
 
 The 1 s row is the clean one and it is the largest effect measured anywhere in
-this experiment: the prime removes 73.0 ms at p50 and 70.6 ms at p95, landing
-exactly on the back-to-back floor.
+this experiment: the prime removes 73.0 ms at p50 and 70.6 ms at p95, matching
+the warm arm exactly.
 
-The 5 s rows do not separate at n=12 and should not be read as a ranking. Cold
-comes in below warm at p50 there, which cannot be true, and the four arms sit
-inside a spread the p95 column shows to be about 50 ms wide. Hold carries
-variance that the isolated ASR bench does not - Core Audio session setup and
-teardown per repetition, loopback playback, and `run_manual`'s 15 ms signal
-poll - and the warm arm gets the worst of it, because its repetitions run back
-to back with no idle gap to let the previous session's teardown finish. Only
-the 1 s Hold row and the Tap Fast table above carry the decision.
+Read the `warm` column here differently than in the Tap Fast table. `warm`
+skips the idle gap but still plays the fixture, so each of its decodes follows
+the previous one by the playback plus session setup - the same gap structure
+the `prime` arm has. That is why warm and prime are identical at 1 s, and it
+means the Hold `warm` column is not the back-to-back floor the Tap Fast one is.
+
+It also explains the 5 s rows, which should not be read as a ranking. Warm
+there sits about 5 s from its previous dispatch, which the sweep prices at
+roughly 15 ms of encoder, so the expected cold-to-warm separation is only about
+10 ms - inside the spread the p95 column shows at n=12. Cold landing below warm
+at p50 is noise around a small expected difference, not a contradiction. Only
+the 1 s Hold row and the Tap Fast table above carry the decision, and the
+acceptance metric is prime against cold, which separates cleanly in every row
+that counts.
 
 ### Cadence energy: M5 Pro 24 GB (2026-09-04)
 
