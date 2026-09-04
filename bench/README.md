@@ -437,6 +437,88 @@ decides whether a hotkey-down prime can work, because the prime has to survive
 the user talking. The 10 s and 60 s rows are within noise of each other at
 n=8, so the matrices below use a 10 s gap as fully cold.
 
+### Tap Fast: M5 Pro 24 GB (2026-09-04)
+
+`IDLE_GAP_MS=10000 REPS=15 scripts/bench-idle.sh tap`, three warmups, ASR
+decode only. Machine at 79.4% idle, load average 4.07 (`bench/idle-tap.csv`):
+
+| fixture | arm | n | p50 | p95 | encoder p50 |
+|---|---|---:|---:|---:|---:|
+| 1 s | warm | 15 | **36.0 ms** | **37.0 ms** | 25.84 ms |
+| 1 s | cold | 15 | 63.0 ms | 102.5 ms | 51.91 ms |
+| 1 s | prime | 15 | **39.0 ms** | **41.6 ms** | 28.52 ms |
+| 1 s | cadence | 15 | 37.0 ms | 65.2 ms | 26.62 ms |
+| 5 s | warm | 15 | **65.0 ms** | **71.4 ms** | 25.36 ms |
+| 5 s | cold | 15 | 102.0 ms | 144.7 ms | 49.64 ms |
+| 5 s | prime | 15 | **80.0 ms** | **117.3 ms** | 30.77 ms |
+| 5 s | cadence | 15 | 90.0 ms | 138.2 ms | 29.17 ms |
+
+Against cold, the hotkey-down prime removes 60.9 ms at p95 and 24.0 ms at p50
+on the 1 s fixture, and 27.4 ms at p95 and 22.0 ms at p50 on the 5 s fixture.
+The encoder is where it comes from: 51.9 ms cold against 28.5 ms primed at 1 s.
+
+At 1 s the prime lands within 4.6 ms of the back-to-back floor at p95, because
+only about a second passes between it and the decode. At 5 s it recovers most
+but not all of the gap, which the sweep predicts: five seconds of talking is
+already half the cool-down.
+
+The cadence arm has the warmest encoder of the three treated arms at both
+lengths and still loses to the prime on total latency, badly in the tail: 65.2
+against 41.6 ms at p95 on the 1 s fixture. Its dispatches contend for the
+worker's single pipe and for the CPU with the decode that follows them, and
+that costs more than the engine warmth it buys.
+
+### Hold: M5 Pro 24 GB (2026-09-04)
+
+`IDLE_GAP_MS=10000 REPS=12 scripts/bench-idle.sh hold`, two warmups,
+`BlackHole 2ch` loopback, release-to-transcript. Machine at 89.8% idle, load
+average 2.66 (`bench/idle-hold.csv`). `bench_e2e` does not run the stage
+profiler, so there is no encoder column here:
+
+| fixture | arm | n | p50 | p95 |
+|---|---|---:|---:|---:|
+| 1 s | warm | 12 | 53.0 ms | 70.0 ms |
+| 1 s | cold | 12 | 126.0 ms | 140.6 ms |
+| 1 s | prime | 12 | **53.0 ms** | **70.0 ms** |
+| 1 s | cadence | 12 | 50.0 ms | 69.6 ms |
+| 5 s | warm | 12 | 122.0 ms | 160.0 ms |
+| 5 s | cold | 12 | 117.0 ms | 188.2 ms |
+| 5 s | prime | 12 | **94.5 ms** | **146.6 ms** |
+| 5 s | cadence | 12 | 121.5 ms | 136.7 ms |
+
+The 1 s row is the clean one and it is the largest effect measured anywhere in
+this experiment: the prime removes 73.0 ms at p50 and 70.6 ms at p95, landing
+exactly on the back-to-back floor.
+
+The 5 s rows do not separate at n=12 and should not be read as a ranking. Cold
+comes in below warm at p50 there, which cannot be true, and the four arms sit
+inside a spread the p95 column shows to be about 50 ms wide. Hold carries
+variance that the isolated ASR bench does not - Core Audio session setup and
+teardown per repetition, loopback playback, and `run_manual`'s 15 ms signal
+poll - and the warm arm gets the worst of it, because its repetitions run back
+to back with no idle gap to let the previous session's teardown finish. Only
+the 1 s Hold row and the Tap Fast table above carry the decision.
+
+### Cadence energy: M5 Pro 24 GB (2026-09-04)
+
+`ENERGY_WINDOW_S=60 scripts/bench-idle.sh energy`. Two matched 60 s windows
+differing only in whether the 250 ms keep-alive is dispatching, measured as the
+resident worker's cumulative CPU time:
+
+| window | worker CPU over 60 s |
+|---|---:|
+| idle control | **0.00 s** |
+| 250 ms keep-alive | **2.41 s** |
+
+The cadence costs 2.41 seconds of worker CPU per minute it runs - about 4% of
+one core, continuously, against a genuine zero when the app is idle. At roughly
+240 dispatches per window that is about 10 ms of host CPU per keep-alive.
+
+**The Neural Engine's own power draw was not measured.** `powermetrics
+--samplers ane_power` requires root and no interactive sudo was available on
+this machine, so the figure above is the host-side cost only and the true cost
+of the cadence is higher by whatever the engine draws to stay awake.
+
 Results and the ship/no-ship decision are recorded in
 [`../docs/asr/PERF.md`](../docs/asr/PERF.md).
 

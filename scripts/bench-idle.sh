@@ -173,7 +173,7 @@ energy)
         ./target/release/bench_asr --backend "$BACKEND" --wav "$wav" \
             --reps 1 --warmup-reps 1 \
             --arm "$arm" --idle-gap-ms 0 \
-            --record-gap-ms "$((ENERGY_WINDOW_S * 1000))" \
+            --record-gap-ms "$(((ENERGY_WINDOW_S + 30) * 1000))" \
             --keepalive-ms "$KEEPALIVE_MS" >>"$LOG" 2>&1 &
         local bench_pid=$!
 
@@ -196,8 +196,13 @@ energy)
         fi
         # Let the warmup rep finish before the window opens.
         sleep 5
+        # The window must close while the worker is still alive, so the run
+        # is given 30 s more than the window. Both reads are still guarded:
+        # a dead worker must report `unknown`, not abort the phase and lose
+        # the measurement that already succeeded.
         local before after
-        before="$(ps -o cputime= -p "$worker_pid" | tr -d ' ')"
+        before="$(ps -o cputime= -p "$worker_pid" 2>/dev/null | tr -d ' ' || true)"
+        before="${before:-unknown}"
         # `grep` on an unexpected sampler name would yield nothing AND return
         # before the window elapsed, which would quietly turn a 60 s
         # measurement into a 0 s one. Sample into a file for the full window
@@ -218,7 +223,8 @@ energy)
                 | tee -a "$LOG"
             sleep "$ENERGY_WINDOW_S"
         fi
-        after="$(ps -o cputime= -p "$worker_pid" | tr -d ' ')"
+        after="$(ps -o cputime= -p "$worker_pid" 2>/dev/null | tr -d ' ' || true)"
+        after="${after:-unknown}"
         echo "energy_sample label=$label worker_pid=$worker_pid cputime_before=$before cputime_after=$after" \
             | tee -a "$LOG"
         wait "$bench_pid" || true

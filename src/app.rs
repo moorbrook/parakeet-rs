@@ -56,6 +56,9 @@ pub struct App {
     /// `on_session_finished`. Without it a vocabulary edit saved during
     /// a dictation stayed unapplied until the *next* Settings Save.
     reload_pending: std::sync::atomic::AtomicBool,
+    /// Wakes the Neural Engine at hotkey-down so the endpoint decode does not
+    /// pay its idle re-wake. See `warmup::EnginePrimer`.
+    engine_primer: warmup::EnginePrimer,
 }
 
 /// The biasing inputs a recogniser was built from. Two recognisers with
@@ -102,7 +105,24 @@ impl App {
             hotkey: Mutex::new(None),
             loaded_biasing: Mutex::new(None),
             reload_pending: std::sync::atomic::AtomicBool::new(false),
+            engine_primer: warmup::EnginePrimer::new(),
         }
+    }
+
+    /// Fire one throwaway dispatch so the Neural Engine is awake by the
+    /// endpoint. Spawns; never blocks the caller.
+    ///
+    /// This runs on the main thread from the event-tap callback, which macOS
+    /// disables if it takes longer than about 250 ms, so the dispatch itself
+    /// must happen on `EnginePrimer`'s thread and not here.
+    fn prime_engine(self: &Arc<Self>) {
+        if !self.settings.load().prime_engine_on_keydown {
+            return;
+        }
+        let Some(asr) = self.asr.lock().clone() else {
+            return;
+        };
+        self.engine_primer.prime_in_background(asr);
     }
 
     /// Hotkey-press edge. Behaviour depends on the configured TriggerMode:
@@ -125,6 +145,10 @@ impl App {
     /// menu bar.
     pub fn on_hotkey_press(self: &Arc<Self>) {
         let mode = effective_trigger_mode(&self.settings.load());
+        // Before the FSM, so the engine starts waking even on the press that
+        // cancels a session: the user who taps twice is usually about to
+        // dictate again.
+        self.prime_engine();
         match mode {
             TriggerMode::Tap | TriggerMode::TapFast => match self.fsm.on_press_tap() {
                 TapPressOutcome::ClaimedListening => {

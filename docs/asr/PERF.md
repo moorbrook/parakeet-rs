@@ -207,3 +207,48 @@ therefore rejected as a production backend. Full artifact identities,
 per-category rows, native-build evidence, replay commands, and packaging
 analysis are in [`QWEN3_ASR_EVALUATION.md`](QWEN3_ASR_EVALUATION.md). The raw
 reports and machine-verifiable summary are under `bench/qwen3-asr/`.
+
+## Neural Engine idle re-wake — 2026-09-04 (kata snx0)
+
+The Neural Engine power-gates when idle, and between dictations this app is
+idle for seconds to minutes. Measured on an M5 Pro at `bench/idle-*.csv`, a
+fully cold decode of the 1 s fixture costs 26.5 ms more than a back-to-back one
+at p50, and the encoder — the only stage on the engine — accounts for 25.4 ms
+of it. Warmth decays gradually: nothing measurable at a 100 ms gap, about 3 ms
+by 2 s, half the total by 5 s, plateau by 10 s.
+
+Three treatments were measured against cold at 1 s and 5 s in both Tap Fast and
+Hold. Deltas are the arm against `cold`, positive meaning faster:
+
+| mode | fixture | prime p50 | prime p95 | cadence p50 | cadence p95 |
+|---|---|---:|---:|---:|---:|
+| Tap Fast | 1 s | +24.0 ms | **+60.9 ms** | +26.0 ms | +37.3 ms |
+| Tap Fast | 5 s | +22.0 ms | **+27.4 ms** | +12.0 ms | +6.5 ms |
+| Hold | 1 s | +73.0 ms | **+70.6 ms** | +76.0 ms | +71.0 ms |
+
+**Decision: ship the hotkey-down prime, reject the keep-alive cadence.**
+
+The prime clears the 10 ms p95 bar by a wide margin everywhere it was measured
+cleanly, and it costs one silent 0.5 s dispatch per hotkey press. It ships on
+by default behind `Settings::prime_engine_on_keydown`, fired from
+`App::on_hotkey_press` through `warmup::EnginePrimer`, which spawns so the
+event-tap callback never blocks and drops a second request while the first is
+in flight.
+
+The cadence is rejected on two counts. It buys the warmest encoder of the three
+arms and still loses to the prime on total latency, badly in the tail — 65.2
+against 41.6 ms at p95 on the 1 s Tap Fast fixture — because its dispatches
+contend with the decode that follows them for the worker's single pipe. And it
+costs 2.41 s of worker CPU per minute against a measured zero when idle, which
+is the "measurable battery cost" the issue set as its rejection condition. The
+engine's own draw is on top of that and was not measured: `powermetrics
+--samplers ane_power` needs root and no interactive sudo was available.
+
+The prime recovers less at 5 s than at 1 s, and that is inherent rather than a
+tuning problem: five seconds of talking is already half the cool-down, so a
+dispatch fired at the press has partly decayed by the endpoint. Closing that
+remainder needs a dispatch nearer the endpoint, which is what the cadence was,
+and the cadence costs more than it returns.
+
+The 5 s Hold rows are omitted from the table above because they do not separate
+at n=12; `bench/README.md` records them and why.

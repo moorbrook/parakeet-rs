@@ -81,6 +81,22 @@ pub struct Settings {
     /// missed, and re-check with `asr_diff` that nothing else moved.
     #[serde(default = "default_hotword_score")]
     pub hotword_score: f32,
+    /// Fire one throwaway dispatch at hotkey-down so the Neural Engine is
+    /// awake by the time the endpoint arrives.
+    ///
+    /// The engine power-gates when idle and a cold encoder costs about 25 ms
+    /// more than a warm one. Measured on an M5 Pro, the prime removes 60.9 ms
+    /// at p95 on a 1 s Tap Fast utterance and 27.4 ms at 5 s; see
+    /// `bench/README.md`. Off makes every dictation after a pause pay the
+    /// re-wake.
+    #[serde(default = "default_prime_engine_on_keydown")]
+    pub prime_engine_on_keydown: bool,
+}
+
+/// Default for [`Settings::prime_engine_on_keydown`]. On: the measured win is
+/// far outside noise and the cost is one silent dispatch per press.
+fn default_prime_engine_on_keydown() -> bool {
+    true
 }
 
 /// Default contextual-biasing boost. See [`Settings::hotword_score`].
@@ -96,6 +112,7 @@ impl Default for Settings {
             language: String::new(),
             polish_mode: PolishMode::default(),
             hotword_score: default_hotword_score(),
+            prime_engine_on_keydown: default_prime_engine_on_keydown(),
         }
     }
 }
@@ -306,6 +323,30 @@ mod tests {
             data_dir,
             cache: Arc::new(Mutex::new(Settings::default())),
         }
+    }
+
+    #[test]
+    fn an_existing_settings_file_keeps_the_engine_prime_on() {
+        // The field was added after users already had a settings.json. Without
+        // the serde default, every existing install would silently read it as
+        // false and go on paying the Neural Engine re-wake on every dictation.
+        let existing = r#"{
+            "hotkey": "CmdOrCtrl+Shift+Space",
+            "language": "",
+            "hotword_score": 2.0
+        }"#;
+        let settings: Settings = serde_json::from_str(existing).expect("old file must load");
+        assert!(settings.prime_engine_on_keydown);
+        assert!(Settings::default().prime_engine_on_keydown);
+    }
+
+    #[test]
+    fn the_engine_prime_flag_round_trips_when_turned_off() {
+        let mut settings = Settings::default();
+        settings.prime_engine_on_keydown = false;
+        let json = serde_json::to_string(&settings).expect("serialise");
+        let back: Settings = serde_json::from_str(&json).expect("deserialise");
+        assert!(!back.prime_engine_on_keydown);
     }
 
     #[test]
