@@ -11,3 +11,4 @@ asr-quality.json
 *-quality.json
 *.csv
 !cleanup-backends.csv
+endpoint-sweep/
