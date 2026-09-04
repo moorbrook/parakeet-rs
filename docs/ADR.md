@@ -1334,7 +1334,9 @@ FluidAudio commit `00a9aa771900ea09c485659663be31019e293e47`.
   complete app bundle.
 - A non-empty custom vocabulary deliberately selects sherpa, whose modified
   beam-search hotword graph preserves ADR-0020. Empty vocabulary selects the
-  optimized backend.
+  optimized backend. **Amended 2026-09-04:** the vocabulary condition is removed
+  by [ADR-0033](#0033--contextual-biasing-on-the-native-core-ml-path), which
+  biases inside the worker; sherpa is now the load-failure fallback only.
 - Specialized model download/load failure falls back to sherpa. The fallback
   remains downloaded on first launch so the app does not become unusable when
   a hardware-specific plan cannot load.
@@ -2167,8 +2169,7 @@ so the seam merge is held to the same WER as the plain decode.
 
 ## 0033 — Contextual biasing on the native Core ML path
 
-**Status:** **Accepted — implemented; single-run functional evidence, ten-repetition
-evidence pending a bench turn.**
+**Status:** **Accepted — implemented and measured.**
 
 **Context.** [ADR-0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list)
 put contextual biasing in sherpa-onnx because sherpa owned the only
@@ -2223,18 +2224,25 @@ selection. sherpa remains reachable through Core ML load failure and
 - The boost is removed from the logits again before the softmax, so the
   confidence a biased emission reports is still the model's own.
 
-**Evidence (single run, rep=1, M5 Pro, release worker).** The seven-fixture
-human gold corpus, `bench/gold/vocabulary.txt` (IBM, Olly, Tactics), all three
-terms accepted by the tokenizer.
+**Evidence.** M5 Pro, 24 GB, macOS 26.5.1, release worker and binaries built
+from this tree. Quality is the seven-fixture human gold corpus at ten
+repetitions with `bench/gold/vocabulary.txt` (IBM, Olly, Tactics), all three
+accepted by the tokenizer; every row produced one unique transcript per fixture
+across its ten runs.
 
-| configuration | overall WER | overall CER | custom-vocabulary WER / CER |
-|---|---:|---:|---:|
-| Core ML, no vocabulary | 5.43% | 3.57% | 27.27% / 8.93% |
-| Core ML, biased, score 2.0 | **3.26%** | **2.94%** | **9.09% / 3.57%** |
-| Core ML, biased, score 3.0 | 3.26% | 2.94% | 9.09% / 3.57% |
-| Core ML, biased, score 4.0 | 3.26% | 2.94% | 9.09% / 3.57% |
-| sherpa, `modified_beam_search`, score 2.0 (ADR-0028) | 10.87% | 5.46% | 54.55% / 12.50% |
-| sherpa, `modified_beam_search`, score 2.75 (ADR-0028) | 8.70% | 6.09% | 27.27% / 12.50% |
+| backend | decoding | WER | CER | custom-vocabulary WER / CER | corpus p50 | RTFx p50 | peak RSS | load |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Core ML | greedy, no vocabulary | 5.43% | 3.57% | 27.27% / 8.93% | 0.245 s | 139.2× | 0.103 GiB | 0.150 s |
+| Core ML | greedy + biasing, score 2.0 | **3.26%** | **2.94%** | **9.09% / 3.57%** | 0.245 s | 139.1× | 0.103 GiB | 0.090 s |
+| sherpa | greedy | 10.87% | 5.46% | 54.55% / 12.50% | 3.045 s | 11.2× | 4.455 GiB | 4.216 s |
+| sherpa | `modified_beam_search` + hotwords, score 2.0 | 10.87% | 5.46% | 54.55% / 12.50% | 3.330 s | 10.2× | 4.678 GiB | 4.060 s |
+
+The bottom row is what a custom vocabulary used to cost: 13.6× the corpus
+decode time and 45× the resident set of the biased native path, for a
+custom-vocabulary WER six times worse. It reproduces ADR-0028's finding that
+sherpa's hotword graph has no lexical effect at the shipped score — beam search
+and greedy return the identical transcript set, the beam being 9.4% slower for
+nothing.
 
 Per-category against the unbiased Core ML baseline, negative better:
 
@@ -2249,28 +2257,52 @@ Per-category against the unbiased Core ML baseline, negative better:
 | proper nouns | -2.38 | -0.69 |
 | punctuation-tagged corpus | -2.17 | -0.63 |
 
-No category regresses at any measured score, which is what the sherpa sweep
-could not achieve — `IBM` and `Olly` are both repaired while the noisy `Amy`
-fixture, which sherpa's first effective score turned into `80`, stays exact.
-The residual custom-vocabulary error is `from` → `for`, an acoustic
-substitution the vocabulary has no bearing on. Scores 3.0 and 4.0 change only
-capitalization inside already-correct words, so the shipped
-`hotword_score` default of 2.0 is unchanged.
+No category regresses, which is what the sherpa sweep could not achieve —
+`IBM` and `Olly` are both repaired while the noisy `Amy` fixture, which
+sherpa's first effective score turned into `80`, stays exact. The residual
+custom-vocabulary error is `from` → `for`, an acoustic substitution the
+vocabulary has no bearing on. Single runs at scores 3.0 and 4.0 changed only
+capitalization inside already-correct words, so the shipped `hotword_score`
+default of 2.0 is unchanged.
+
+Latency is `bench_asr` at 30 repetitions after 3 warmups per length, biased
+with the 50-entry `bench/gold/vocabulary-50.txt` at score 2.0. Wall p50 is
+identical to the millisecond at every length; the worker-internal p50, which
+resolves below that, is the honest column:
+
+| audio | no vocabulary p50 | 50-entry vocabulary p50 | Δ | p95 without / with |
+|---|---:|---:|---:|---:|
+| 1 s | 30.571 ms | 30.627 ms | +0.2% | 31.189 / 31.368 ms |
+| 3 s | 33.030 ms | 33.004 ms | -0.1% | 34.470 / 34.093 ms |
+| 5 s | 35.747 ms | 36.620 ms | **+2.4%** | 38.557 / 39.015 ms |
+| 10 s | 39.927 ms | 39.904 ms | -0.1% | 42.516 / 42.540 ms |
+| 20 s | 81.199 ms | 81.323 ms | +0.2% | 87.856 / 87.952 ms |
+
+The 15% budget holds with a factor of six to spare. The 5 s row is the only one
+that moves, and the stage breakdown says why it is not biasing overhead: the
+biased decode emitted 40 prediction steps and 101 joint evaluations where the
+unbiased one emitted 35 and 96, because the boost changed the transcript on
+that fixture. Five more steps at the measured ~0.18 ms each account for the
+whole 0.87 ms. The per-call cost is a few dozen adds and subtractions on a
+1025-wide logit vector, and it does not register.
 
 With an empty vocabulary the decode is unchanged by construction — the sparse
 boost loops are empty and the argmax is byte-for-byte the one ADR-0032 shipped
-— and the run reproduces the frozen baseline's aggregate and every per-category
-WER/CER to the full float:
-5.434782608695652% / 3.5714285714285716%. The frozen baseline records no
-per-fixture transcripts, so that is agreement on every published number rather
-than a transcript diff.
+— and the ten-repetition run reproduces the frozen baseline's aggregate and
+every per-category WER/CER to the full float:
+5.434782608695652% / 3.5714285714285716%, zero spread, zero nondeterministic
+outputs. The frozen baseline records no per-fixture transcripts, so that is
+agreement on every published number rather than a transcript diff.
 
 **Consequences.** ADR-0020's format and its silent-drop trap survive only on
 the sherpa fallback, which now needs an explicit environment variable or a load
 failure to reach. `crate::vocabulary::has_terms` is gone; backend selection no
-longer reads the vocabulary at all. The 15% latency budget for a 50-entry
-vocabulary, and the ten-repetition gold numbers with the vocabulary set, are
-the remaining measurements.
+longer reads the vocabulary at all. A user who sets a vocabulary keeps the
+Neural Engine, the 0.10 GiB resident set, and the sub-100 ms decode, and gets
+biasing that measurably works rather than biasing that measurably did not.
+`bench-gold.sh` still defaults to the installed app's worker, so a gold run
+against a changed worker protocol needs `COREML_WORKER` set or it measures
+stale code.
 
 ---
 
@@ -2285,7 +2317,7 @@ the remaining measurements.
 | ≤5 GB resident set with polish On | [0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation) + [0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped** — native tray shell, resident Core ML worker, and Qwen mmap/lifecycle | nothing |
 | Smart formatting parity with Wispr Flow | [0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) | **Shipped** — optional local Qwen polish streams on word boundaries | strict last-token latency remains above the original target |
 | Clipboard not clobbered | [0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) | **Shipped** on the normal path; clipboard is rescue-only for observable delivery failure | `CGEventPost` has no delivery receipt |
-| Custom vocabulary | [0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list) + [0028](#0028--generic-asr-base-with-evidence-gated-domain-and-user-adaptation) + [0033](#0033--contextual-biasing-on-the-native-core-ml-path) | **Shipped + measured** — the native worker biases over its own joint output, repairing both custom-vocabulary fixtures with no category regression and no fallback | ten-repetition and 50-entry latency evidence |
+| Custom vocabulary | [0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list) + [0028](#0028--generic-asr-base-with-evidence-gated-domain-and-user-adaptation) + [0033](#0033--contextual-biasing-on-the-native-core-ml-path) | **Shipped + measured** — the native worker biases over its own joint output: 5.43% to 3.26% WER, custom-vocabulary 27.27% to 9.09%, no category regression, and 2.4% decode cost at five seconds with fifty terms | nothing |
 
 **Completed path to the ADR-0007 latency claim:**
 1. [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend) — move
@@ -2307,9 +2339,12 @@ Anything not on this table is either accepted-and-done or out of scope.
   accepted and implemented. Contextual biasing moved onto the native Core ML
   path as an Aho-Corasick shallow-fusion boost over the joint logits, and the
   sherpa fallback stopped being what a custom vocabulary selects. On the human
-  gold corpus at the shipped score the biased path measured 3.26% WER / 2.94%
+  gold corpus at ten repetitions the biased path measured 3.26% WER / 2.94%
   CER against 5.43% / 3.57% unbiased, with custom-vocabulary WER 27.27% to
-  9.09% and no category regression.
+  9.09%, no category regression, and no measurable decode cost — 2.4% at five
+  seconds with a fifty-term vocabulary, against 15% allowed. The sherpa row it
+  replaces measured 10.87% / 5.46% at 13.6× the corpus decode time and 45× the
+  resident set.
 
 - **2026-09-04** — [ADR-0031](#0031--tap-fast-confirms-at-90-ms-punctuation-rejected-as-an-endpoint-signal)
   accepted and implemented. Tap Fast confirms after 90 ms of Silero silence
