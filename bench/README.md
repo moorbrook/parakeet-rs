@@ -610,6 +610,27 @@ IDLE_GAP_MS=60000 REPS=20 scripts/bench-idle.sh hold
 scripts/bench-idle.sh energy
 ```
 
+**The numbers in the four tables below were measured before fajz moved
+resampling into the capture callbacks and before fgzt's bucketed short-window
+encoders landed.** They were taken with one 15 s encoder and with the 48 kHz to
+16 kHz conversion still inside the measured decode, so the absolute
+milliseconds no longer describe the current path and should not be compared
+against any table elsewhere in this file. Every arm within a table paid the
+same conditions, so the comparisons between arms - which are what the decision
+rests on - still hold. Re-run `scripts/bench-idle.sh` to refresh the absolute
+figures.
+
+One interaction to know about if bucket artifacts are installed. The prime
+sends 0.5 s of silence, and `EncoderBuckets.select` routes a request to the
+narrowest window that holds it, so with buckets present the prime warms the
+narrowest bucket's encoder rather than the one a 5 s utterance will use. The
+engine's power gate is a hardware unit and any dispatch lifts it, so the
+re-wake this experiment measured should still be paid by the prime; a
+per-program load cost, which a single 15 s encoder could not expose, would not
+be. No bucket artifacts were installed on the machine that produced these
+tables, so the worker used the stock encoder throughout and the numbers are
+unaffected. Worth re-measuring once buckets ship.
+
 ### Cool-down knee: M5 Pro 24 GB (2026-09-04)
 
 `scripts/bench-idle.sh sweep`, 1 s fixture, 8 repetitions per gap, three

@@ -278,6 +278,11 @@ reports and machine-verifiable summary are under `bench/qwen3-asr/`.
 
 ## Neural Engine idle re-wake — 2026-09-04 (kata snx0)
 
+Measured before fajz moved resampling into the capture callbacks and before
+fgzt's bucketed encoders landed, so the absolute milliseconds below describe
+the pre-merge path. Every arm paid the same conditions and the arm-to-arm
+comparisons the decision rests on are unaffected.
+
 The Neural Engine power-gates when idle, and between dictations this app is
 idle for seconds to minutes. Measured on an M5 Pro at `bench/idle-*.csv`, a
 fully cold decode of the 1 s fixture costs 26.5 ms more than a back-to-back one
