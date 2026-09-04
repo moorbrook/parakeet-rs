@@ -48,6 +48,39 @@ pub struct CoreMlWorkerConfig {
     /// bench turns this on; the dictation path leaves the worker's Core ML
     /// dispatch path untouched.
     pub emit_stage_timings: bool,
+    /// Which implementation of the greedy RNNT loop the worker runs.
+    pub rnnt_engine: CoreMlRnntEngine,
+}
+
+/// The two implementations of the transducer decode loop the worker can run.
+///
+/// They decode the same weights. The Core ML one pays a dispatch per
+/// prediction-network step and per joint evaluation; the native one reads the
+/// weights out of the same bundles and runs the arithmetic in process. Both
+/// stay reachable so a measurement can name which produced it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoreMlRnntEngine {
+    #[default]
+    Native,
+    CoreMl,
+}
+
+impl CoreMlRnntEngine {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::CoreMl => "coreml",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "native" => Ok(Self::Native),
+            "coreml" => Ok(Self::CoreMl),
+            other => bail!("unknown RNNT engine: {other} (expected native or coreml)"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +143,7 @@ impl CoreMlWorkerConfig {
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
             emit_stage_timings: false,
+            rnnt_engine: CoreMlRnntEngine::default(),
         }
     }
 
@@ -121,6 +155,7 @@ impl CoreMlWorkerConfig {
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
             emit_stage_timings: false,
+            rnnt_engine: CoreMlRnntEngine::default(),
         }
     }
 
@@ -134,6 +169,10 @@ impl CoreMlWorkerConfig {
 
     pub fn set_emit_stage_timings(&mut self, emit: bool) {
         self.emit_stage_timings = emit;
+    }
+
+    pub fn set_rnnt_engine(&mut self, engine: CoreMlRnntEngine) {
+        self.rnnt_engine = engine;
     }
 
     pub fn set_compute_units(&mut self, compute_units: CoreMlComputeUnits) {
@@ -232,7 +271,9 @@ impl CoreMlWorkerBackend {
             .arg("--long-compute-units")
             .arg(config.long_compute_units.as_str())
             .arg("--long-regime-seconds")
-            .arg(config.long_regime_seconds.to_string());
+            .arg(config.long_regime_seconds.to_string())
+            .arg("--rnnt-engine")
+            .arg(config.rnnt_engine.as_str());
         if config.emit_stage_timings {
             command.arg("--emit-stage-timings");
         }
@@ -270,10 +311,11 @@ impl CoreMlWorkerBackend {
                 model: "Parakeet Unified EN 0.6B offline 15s".to_string(),
                 quantization: "int8 encoder".to_string(),
                 execution_provider: format!(
-                    "Core ML short={} long={} threshold={}s",
+                    "Core ML short={} long={} threshold={}s rnnt={}",
                     config.short_compute_units.as_str(),
                     config.long_compute_units.as_str(),
-                    config.long_regime_seconds
+                    config.long_regime_seconds,
+                    config.rnnt_engine.as_str()
                 ),
             },
             load_seconds,
@@ -561,10 +603,12 @@ mod tests {
             "decode_seconds": 0.044, "resample_seconds": 0.023,
             "stages": {
                 "resample_ms": 22.976, "windows": 1, "encoder_calls": 1,
-                "decoder_calls": 35, "joint_calls": 96, "other_calls": 0,
+                "decoder_calls": 35, "joint_calls": 96,
+                "native_decoder_steps": 0, "native_joint_steps": 0, "other_calls": 0,
                 "mel_ms": 3.08, "encoder_ms": 25.959, "decode_loop_ms": 15.84,
                 "decode_loop_dispatch_ms": 15.135, "decoder_dispatch_ms": 5.359,
-                "joint_dispatch_ms": 9.776, "post_ms": 0.066, "total_ms": 44.944,
+                "joint_dispatch_ms": 9.776, "decode_loop_native_ms": 0.0,
+                "post_ms": 0.066, "total_ms": 44.944,
                 "compute_units": "encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only"
             }
         }"#;

@@ -23,6 +23,9 @@
 #   BACKEND=coreml-unified \
 #       OUT_CSV=bench/coreml-unified.csv \
 #       scripts/bench-latency.sh                # shipping native Core ML backend
+#   BACKEND=coreml-unified RNNT_ENGINE=coreml \
+#       MODEL_DIR=~/.cache/parakeet-bucket-encoders/model-dir-buckets-2-5-8 \
+#       scripts/bench-latency.sh                # bucketed encoders, CoreML decode loop
 #   OUT_CSV=bench/experiment.csv \
 #       scripts/bench-latency.sh                # name an experiment output
 
@@ -46,6 +49,14 @@ BACKEND="${BACKEND:-sherpa}"
 # encoder, RNNT loop) plus its Core ML dispatch counts. sherpa has no
 # equivalent seam, so the flag is only passed to the native backend.
 STAGE_TIMINGS="${STAGE_TIMINGS:-1}"
+# Model directory for the native backend. Unset means the worker's own default,
+# which holds only the 15 s encoder; point this at a directory carrying bucket
+# encoders to measure the bucketed path.
+MODEL_DIR="${MODEL_DIR:-}"
+# Which implementation of the RNNT decode loop the worker runs: `native` reads
+# the decoder and joint weights and runs them in process, `coreml` keeps
+# FluidAudio's dispatch per step.
+RNNT_ENGINE="${RNNT_ENGINE:-native}"
 
 case "$BACKEND" in
     sherpa|coreml-unified) ;;
@@ -106,8 +117,14 @@ for len in "${LENGTHS[@]}"; do
     wav="$WAV_DIR/${len}s_${SAMPLE_RATE}.wav"
     echo "Benching $wav (backend=$BACKEND, warmup=$WARMUP_REPS, reps=$REPS)…"
     stage_args=()
-    if [[ "$BACKEND" == "coreml-unified" && "$STAGE_TIMINGS" != "0" ]]; then
-        stage_args=(--stage-timings)
+    if [[ "$BACKEND" == "coreml-unified" ]]; then
+        if [[ "$STAGE_TIMINGS" != "0" ]]; then
+            stage_args=(--stage-timings)
+        fi
+        stage_args+=(--rnnt-engine "$RNNT_ENGINE")
+        if [[ -n "$MODEL_DIR" ]]; then
+            stage_args+=(--model-dir "$MODEL_DIR")
+        fi
     fi
     "$BENCH_BIN" --backend "$BACKEND" --wav "$wav" \
         --reps "$REPS" --warmup-reps "$WARMUP_REPS" "${stage_args[@]+"${stage_args[@]}"}" \

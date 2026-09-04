@@ -85,6 +85,13 @@ pub struct StageReport {
     pub encoder_calls: u32,
     pub decoder_calls: u32,
     pub joint_calls: u32,
+    /// Prediction-network steps run natively, without a Core ML dispatch. The
+    /// native and Core ML counts are kept apart so a row cannot claim both
+    /// engines ran; exactly one of each pair is nonzero.
+    pub native_decoder_steps: u32,
+    /// Native joint evaluations: one decoder-side projection per step, plus one
+    /// decision per frame and per emitted token.
+    pub native_joint_steps: u32,
     /// Core ML predictions that matched none of the three known input shapes.
     /// A nonzero value means the pipeline changed and the split is suspect.
     pub other_calls: u32,
@@ -97,11 +104,15 @@ pub struct StageReport {
     pub decode_loop_dispatch_ms: f64,
     pub decoder_dispatch_ms: f64,
     pub joint_dispatch_ms: f64,
+    /// Wall time inside the native steps, the counterpart of
+    /// `decode_loop_dispatch_ms` when the loop runs without Core ML.
+    pub decode_loop_native_ms: f64,
     /// Tokenizer decode and overlap merge after the last dispatch.
     pub post_ms: f64,
     pub total_ms: f64,
     /// Compute units read off each live model, e.g.
-    /// `encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only`.
+    /// `encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only`. A
+    /// natively run stage reports `native`, which is not a Core ML placement.
     pub compute_units: String,
 }
 

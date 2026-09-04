@@ -38,6 +38,10 @@ private struct WorkerOptions {
     let longComputeUnits: MLComputeUnits
     let longRegimeSeconds: UInt32
     let emitStageTimings: Bool
+    /// Run the RNNT prediction network and joint natively instead of through a
+    /// CoreML dispatch per step. On by default; the CoreML path stays reachable
+    /// so the two can be compared on the same build.
+    let nativeRnnt: Bool
     /// Short-window encoder buckets: `nil` means discover them in the model
     /// directory, an empty array disables them, and an explicit list is used
     /// verbatim.
@@ -50,6 +54,7 @@ private struct WorkerOptions {
         var longComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
         var longRegimeSeconds: UInt32 = 8
         var emitStageTimings = false
+        var nativeRnnt = true
         var encoderBuckets: [Int]?
         var index = 0
         while index < arguments.count {
@@ -107,12 +112,21 @@ private struct WorkerOptions {
                 encoderBuckets = try parseEncoderBuckets(arguments[index])
             case "--emit-stage-timings":
                 emitStageTimings = true
+            case "--rnnt-engine":
+                index += 1
+                guard index < arguments.count,
+                    ["native", "coreml"].contains(arguments[index])
+                else {
+                    throw WorkerError.invalidArgument("--rnnt-engine must be native or coreml")
+                }
+                nativeRnnt = arguments[index] == "native"
             case "-h", "--help":
                 let usage =
                     "usage: parakeet-coreml-worker [--model-dir DIR | --model-root DIR] "
                     + "[--compute-units NAME | --short-compute-units NAME "
                     + "--long-compute-units NAME --long-regime-seconds N] "
-                    + "[--encoder-buckets auto|none|N,N,...] [--emit-stage-timings]\n"
+                    + "[--encoder-buckets auto|none|N,N,...] [--rnnt-engine native|coreml] "
+                    + "[--emit-stage-timings]\n"
                 FileHandle.standardError.write(
                     Data(usage.utf8)
                 )
@@ -132,6 +146,7 @@ private struct WorkerOptions {
             longComputeUnits: longComputeUnits,
             longRegimeSeconds: longRegimeSeconds,
             emitStageTimings: emitStageTimings,
+            nativeRnnt: nativeRnnt,
             encoderBuckets: encoderBuckets
         )
     }
@@ -281,7 +296,8 @@ private struct ParakeetCoreMLWorker {
                     windows: windows,
                     directory: modelDirectory,
                     computeUnits: options.shortComputeUnits,
-                    precision: .int8
+                    precision: .int8,
+                    rnntDecoderFactory: rnntDecoderFactory(options)
                 )
             }
         }
@@ -371,6 +387,21 @@ private struct ParakeetCoreMLWorker {
         }
     }
 
+    /// The native decode loop, or nil to keep FluidAudio's CoreML one.
+    ///
+    /// A failure to build it is thrown rather than swallowed: it means the
+    /// compiled decoder or joint is not the program this reimplements, and
+    /// silently falling back would hide a model swap behind a latency
+    /// regression.
+    private static func rnntDecoderFactory(
+        _ options: WorkerOptions
+    ) -> UnifiedAsrManager.UnifiedRnntDecoderFactory? {
+        guard options.nativeRnnt else { return nil }
+        return { directory, config in
+            try NativeRnntDecoder(modelDirectory: directory, config: config)
+        }
+    }
+
     private static func loadManager(
         computeUnits: MLComputeUnits,
         options: WorkerOptions
@@ -379,7 +410,8 @@ private struct ParakeetCoreMLWorker {
         configuration.computeUnits = computeUnits
         let manager = UnifiedAsrManager(
             configuration: configuration,
-            encoderPrecision: .int8
+            encoderPrecision: .int8,
+            rnntDecoderFactory: rnntDecoderFactory(options)
         )
         if let modelDirectory = options.modelDirectory {
             try await manager.loadModels(from: modelDirectory)
