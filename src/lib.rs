@@ -19,6 +19,7 @@ pub mod endpointing;
 pub mod llm_manager;
 pub mod objc_util;
 pub mod performance;
+pub mod resample;
 pub mod permissions;
 pub mod polish;
 pub mod settings;

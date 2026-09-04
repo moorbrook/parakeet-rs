@@ -1783,6 +1783,140 @@ map are maintained in [`docs/macos-permissions.md`](macos-permissions.md).
 
 ---
 
+## 0030 — One 16 kHz resampler in Rust, run during capture
+
+**Status:** **Accepted — implemented.**
+
+**Context.** The [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend)
+worker received audio at the capture device's native rate and handed it to
+FluidAudio's `AudioConverter`, which builds a fresh `AVAudioConverter` per call.
+The g38m stage profiler priced that conversion at a linear 4.6 ms per second of
+48 kHz input: 22.7 ms of the 66.5 ms a 5 s utterance spent inside the worker,
+more than the entire RNNT decode loop at every measured length, and all of it
+after the endpoint. The Rust side was already converting the same audio to
+16 kHz for Silero VAD with a separate resampler, so the work happened twice and
+the copy that mattered was the one nobody could overlap.
+
+**Rejected: capture at 16 kHz from Core Audio.** Zero conversion would be
+cheapest, and the loopback device advertises 16 kHz. The built-in microphone
+does not. Its `supported_input_configs` list is 44100, 48000, 88200, and 96000
+at one channel; `Microsoft Teams Audio` offers only 48000. Requesting a rate a
+device does not list makes cpal's Core Audio host write
+`kAudioDevicePropertyNominalSampleRate`, which is a system-wide change other
+applications and Audio MIDI Setup observe. The option fails on the hardware
+before the side effect is even argued.
+
+**Decision.** Convert once, in `src/resample.rs`, and do it inside the cpal
+capture callback. `AudioCapture` folds each callback to mono, pushes it through
+a streaming resampler, and both accumulates and taps the 16 kHz result, so
+`Recording` and the VAD tap carry model-rate audio and `Recording.channels` is
+gone. `streamer.rs` no longer owns a resampler; the tap it already reads is what
+the recognizer receives. `CoreMlWorkerBackend::transcribe` converts anything
+that still arrives at another rate — the gold corpus is stored at 48 kHz — and
+always frames the request at 16 kHz, which is the rate FluidAudio's
+`AudioConverter.resample` returns untouched. `Worker.swift` is unchanged.
+
+**The filter.** sherpa-onnx's `LinearResampler` is Kaldi's `LinearResample`,
+verified in `sherpa-onnx/csrc/resample.cc`: `FilterFunc` is a sinc multiplied by
+a raised-cosine window, and the binding constructs it with the cutoff at 99% of
+the lower rate's Nyquist frequency and `num_zeros = 6`. The name describes the
+linear interpolation of the filter table, not of the signal. This is the same
+kernel sherpa's own feature front-end uses, so the decision is to reuse a
+bandlimited resampler already linked into the binary rather than add rubato.
+
+Three properties are tested directly rather than inferred. Filtering the signal
+in arbitrary chunk sizes returns exactly the samples one batch call returns,
+which is what makes per-callback conversion safe. A 12 kHz tone at 48 kHz,
+which would fold to 4 kHz under naive decimation, comes back below 5% of its
+input RMS. A 1 kHz tone keeps its amplitude within 2% and its sample count
+within one of the ratio. `audio.rs` repeats the first property through the
+callback path, covering the mono fold and the short-chunk case where the filter
+returns nothing.
+
+**Consequences.** The worker's resample stage is a rate comparison. The
+conversion cost that remains is spread across capture callbacks, and since a
+cpal callback that overruns its buffer period drops audio, that cost is measured
+rather than assumed: `AudioCapture` keeps a lock-free duration histogram and
+logs `capture_callback` when capture stops. On the 48 kHz loopback, 461
+callbacks over 4.917 s of audio measured a mean of 9.8 µs, a p99 of 30 µs, and a
+maximum of 103 µs against the 10.67 ms period of a 512-frame chunk — 0.09%,
+0.28%, and 0.97% of the budget. The maximum is a single-sample tail and varied
+between runs (35 µs and 103 µs across two), so it is the figure to watch if the
+callback grows again.
+
+That is 0.92 ms of callback wall time per audio-second, and it covers the whole
+callback — mono fold, level meter, filter, buffer append, and channel send — not
+the filter alone, which the histogram cannot separate. It replaces an earlier
+draft's asserted 0.1 ms, which was an order of magnitude low. The number that
+matters is unchanged either way: all of it runs during capture and none of it at
+the endpoint.
+
+`bench_asr` converts its fixture once at load, outside the measured loop,
+because that is now what production hands `Asr::recognize`; timing it inside the
+loop would measure a step the endpoint path no longer has.
+
+The sherpa fallback backend changed with it. In production it now receives
+16 kHz from capture instead of device-rate audio, so its own internal Kaldi
+resample became a no-op — the same filter, applied once instead of twice, with
+no expected quality change. `asr_diff` converts the 48 kHz gold corpus through
+`to_target_rate` before either backend sees it, so both arms are gated on the
+audio production actually produces rather than on a rate no user path emits.
+
+The quality risk is real and is gated where it can be seen: the gold corpus is
+48 kHz, so `scripts/bench-gold.sh` runs every fixture through this resampler and
+compares WER and CER against limits set when `AVAudioConverter` did the work.
+`scripts/bench-end-to-end.sh` covers the capture path with the same audio and
+requires an exact lexical match on every repetition.
+
+**Measured.** M5 Pro 24 GB, 2026-09-04, release build, 30 measured repetitions
+per bucket after 3 warmups, the same five 48 kHz fixtures for both arms, both
+arms run back to back in one session. "Before" is commit `9857547`, this branch's
+parent.
+
+| audio | resample before | resample after | ASR p50 before | ASR p50 after | change |
+|---|---:|---:|---:|---:|---:|
+| 0.816 s | 3.87 ms | 0.001 ms | 36.0 ms | 32.0 ms | −4.0 ms |
+| 2.828 s | 13.04 ms | 0.001 ms | 51.0 ms | 38.0 ms | −13.0 ms |
+| 4.854 s | 22.37 ms | 0.001 ms | 67.0 ms | 44.5 ms | −22.5 ms |
+| 8.062 s | 36.98 ms | 0.001 ms | 91.0 ms | 52.5 ms | −38.5 ms |
+| 16.513 s | 76.50 ms | 0.001 ms | 190.5 ms | 111.5 ms | −79.0 ms |
+
+The p50 change is the retired resample plus a smaller second term: the pipe now
+carries 16 kHz floats instead of 48 kHz, so measured IPC falls from 0.42 to
+0.21 ms at 5 s and from 1.14 to 0.47 ms at 20 s. At 5 s, 22.37 + 0.21 accounts
+for 22.6 of the 22.5 ms.
+
+Nothing else moved. Mel is 3.19 against 3.23 ms at 5 s, the encoder 25.97
+against 26.04, and the profiled transcribe interval 44.79 against 44.87. The
+Core ML dispatch counts are identical in both arms at every bucket — 7/17 at
+0.816 s through 119/349 at 16.513 s — so the Kaldi filter hands the encoder
+audio the model decodes into the same token stream AVAudioConverter's did.
+
+Gold at 10 repetitions passes with worst WER 5.43% and worst CER 3.57%, which
+are the manifest's baseline values under a zero-regression cap, with zero
+nondeterministic fixtures and zero changed transcripts.
+
+**Where the saving does and does not land.** Tap keeps its number. The
+end-to-end gate re-ran at 630.0 ms against 192.0 ms p50, a 3.28x ratio, and the
+`phase_timer` lines explain the flat result: the speculative decode ends about
+80 ms before the endpoint policy confirms, and post-endpoint work is 0 to 1 ms,
+so that path is bound by the confirmation window rather than by the decode.
+Removing 22 ms widens the margin instead of shortening the transcript. The
+saving is collected wherever the decode is not hidden — Hold, where the hotkey
+release is the endpoint and nothing overlaps it; the serial fallback; and any
+utterance long enough that its decode would otherwise outrun the window. It also
+stops the work from being done twice on every utterance in every mode.
+
+Hold shows it. Release-to-transcript p50 falls from 54.0 to 48.0 ms at the
+shortest bucket, 106.5 to 72.5 ms at 5 s, and 231.5 to 192.5 ms at the longest,
+though the two runs' captured durations differ by up to 0.8 s per bucket so this
+is a trend rather than a controlled comparison. Capture shutdown also rounds to
+0 ms now, against about 1 ms before: `finish_with_recording` no longer folds the
+recording to mono, since capture did that per callback, and only the resampler's
+tail flush remains after the stream is dropped.
+
+---
+
 ## Target status index
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -1811,6 +1945,15 @@ map are maintained in [`docs/macos-permissions.md`](macos-permissions.md).
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-09-04** — [ADR-0030](#0030--one-16-khz-resampler-in-rust-run-during-capture)
+  accepted and implemented. One Kaldi sinc resampler in `src/resample.rs`,
+  run per cpal callback, retires FluidAudio's per-call `AVAudioConverter`
+  from the endpoint path: resample falls from 22.4 to 0.001 ms at 5 s and
+  ASR p50 from 67.0 to 44.5 ms, with gold unchanged at its baseline WER
+  and CER. Capturing at 16 kHz was rejected — the built-in microphone does
+  not offer the rate, and requesting an unlisted one changes the device's
+  nominal rate system-wide.
 
 - **2026-08-11** — [ADR-0029](#0029--contextual-macos-permission-onboarding-and-recovery)
   added: ZoomItForMac-inspired permission-state separation, contextual
