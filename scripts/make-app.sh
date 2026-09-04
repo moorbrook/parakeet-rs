@@ -10,10 +10,44 @@
 #   4. Rewrite rpath                      — point at @executable_path/../
 #                                           Frameworks instead of the
 #                                           dev-machine @loader_path
-#   5. Ad-hoc code-sign                   — `codesign -s -` so Gatekeeper
-#                                           lets it run locally
+#   5. Code-sign                          — self-signed "Parakeet Local Dev"
+#                                           identity when present (stable TCC
+#                                           identity across rebuilds), else
+#                                           ad-hoc `-` with a loud warning
 #
 # Output: target/release/bundle/osx/Parakeet.app — drop into /Applications.
+#
+# One-time setup — stable code-signing identity for local development:
+#   macOS TCC keys its stored Microphone / Accessibility / Input Monitoring
+#   decisions off the app's code-signature designated requirement. An ad-hoc
+#   signature (`codesign -s -`) has no stable identity, so every rebuild is a
+#   brand-new app to TCC: stored grants stop matching, request calls such as
+#   CGRequestListenEventAccess silently return false without prompting, and
+#   the app often does not even appear in System Settings. Fix: create a
+#   self-signed "Code Signing" certificate named exactly `Parakeet Local Dev`
+#   in the login keychain. This script signs with it automatically whenever
+#   it is present, so grants survive rebuilds.
+#
+#   Keychain Access → Certificate Assistant → Create Certificate…:
+#     Name:             Parakeet Local Dev
+#     Identity Type:    Self Signed Root
+#     Certificate Type: Code Signing
+#
+#   Or via the command line:
+#     openssl req -new -newkey rsa:2048 -nodes \
+#         -keyout /tmp/parakeet-dev.key -x509 -days 3650 \
+#         -subj '/CN=Parakeet Local Dev' -out /tmp/parakeet-dev.crt \
+#         -addext keyUsage=digitalSignature \
+#         -addext extendedKeyUsage=codeSigning
+#     openssl pkcs12 -export -name 'Parakeet Local Dev' \
+#         -inkey /tmp/parakeet-dev.key -in /tmp/parakeet-dev.crt \
+#         -out /tmp/parakeet-dev.p12 -passout pass:
+#     security import /tmp/parakeet-dev.p12 \
+#         -k "$HOME/Library/Keychains/login.keychain-db" \
+#         -T /usr/bin/codesign
+#
+#   A self-signed cert cannot be notarised; distribution still needs
+#   Developer ID — see the notes at the bottom of this script.
 
 set -euo pipefail
 
@@ -140,21 +174,9 @@ fi
 # signatures that don't survive notarisation. Order matters: dylibs
 # first (leaves), executable last (root).
 #
-# `--options runtime` enables Hardened Runtime, which is mandatory for
-# notarisation. `--entitlements` attaches the mic + apple-events strings.
-# The `-` identity is the ad-hoc signature: enough to run locally on this
-# Mac, NOT enough for distribution. For real shipping you'd swap `-` for
-# a `Developer ID Application: <Name> (TEAMID)` identity, then run
-# `xcrun notarytool submit ... --wait` and `xcrun stapler staple` —
-# documented at the bottom of this script.
-
-echo "5. code-sign"
-SIGN_ID="${PARAKEET_SIGN_ID:--}"          # `-` = ad-hoc
-ENTITLEMENTS="$ROOT/entitlements.plist"
-
-# Hardened Runtime + the entitlements file are required for notarisation
-# but BREAK every non-Developer-ID signing path: under Hardened Runtime
-# the dyld team-ID check rejects dylibs whose synthesised team ID
+# `--options runtime` (Hardened Runtime) + entitlements are required for
+# notarisation but BREAK every non-Developer-ID signing path: under Hardened
+# Runtime the dyld team-ID check rejects dylibs whose synthesised team ID
 # doesn't match the main executable's. Ad-hoc (`-`) gives each artefact
 # a different pseudo team ID. Self-signed local-dev certs share a CN
 # but have `TeamIdentifier=not set`, and macOS still enforces a
@@ -162,6 +184,44 @@ ENTITLEMENTS="$ROOT/entitlements.plist"
 # aborts during `dyld4::prepare` at launch. Only enable Hardened
 # Runtime for genuine `Developer ID Application:` identities, where
 # the real team ID lets the check pass.
+#
+# Identity selection: `PARAKEET_SIGN_ID` overrides everything; otherwise the
+# stable `Parakeet Local Dev` keychain identity is used when present; only
+# when it is missing do we fall back to ad-hoc `-`, with a loud warning that
+# TCC grants will not survive rebuilds (see the cert-creation notes in the
+# header). For real shipping you'd use a
+# `Developer ID Application: <Name> (TEAMID)` identity, then run
+# `xcrun notarytool submit ... --wait` and `xcrun stapler staple` —
+# documented at the bottom of this script.
+
+echo "5. code-sign"
+ENTITLEMENTS="$ROOT/entitlements.plist"
+LOCAL_DEV_ID="Parakeet Local Dev"
+
+if [ -n "${PARAKEET_SIGN_ID:-}" ]; then
+  SIGN_ID="$PARAKEET_SIGN_ID"
+  echo "  using PARAKEET_SIGN_ID='$SIGN_ID'"
+elif security find-identity -v -p codesigning 2>/dev/null \
+     | grep -q "\"$LOCAL_DEV_ID\""; then
+  SIGN_ID="$LOCAL_DEV_ID"
+  echo "  using stable local identity '$SIGN_ID' (TCC grants survive rebuilds)"
+else
+  SIGN_ID="-"
+  echo "*****************************************************************" >&2
+  echo "WARNING: no '$LOCAL_DEV_ID' codesigning identity in the keychain." >&2
+  echo "Falling back to an AD-HOC signature." >&2
+  echo "" >&2
+  echo "macOS keys Input Monitoring / Microphone / Accessibility grants to" >&2
+  echo "the app's code signature. An ad-hoc signature changes on every" >&2
+  echo "rebuild, so each build looks like a new app: stored grants stop" >&2
+  echo "matching, Grant buttons silently do nothing, and the app may not" >&2
+  echo "even appear in System Settings > Privacy & Security." >&2
+  echo "" >&2
+  echo "Fix (one time): create a self-signed Code Signing certificate named" >&2
+  echo "'$LOCAL_DEV_ID' in the login keychain — see the header of this" >&2
+  echo "script. The next run picks it up automatically." >&2
+  echo "*****************************************************************" >&2
+fi
 if [[ "$SIGN_ID" == "Developer ID Application:"* ]]; then
   EXTRA_FLAGS=(--options runtime --timestamp --entitlements "$ENTITLEMENTS")
 else
@@ -242,8 +302,9 @@ fi
 #   5. xcrun stapler staple "$APP"
 #   6. ditto -c -k --keepParent "$APP" Parakeet-notarised.zip
 #
-# Steps 3–6 only matter for distribution. Local installs work with
-# `SIGN_ID=-` (the default), which is the ad-hoc identity.
+# Steps 3–6 only matter for distribution. Local installs default to the
+# `Parakeet Local Dev` keychain identity when present (stable TCC grants
+# across rebuilds), or ad-hoc `-` with a warning otherwise.
 
 echo
 echo "Built $APP"
