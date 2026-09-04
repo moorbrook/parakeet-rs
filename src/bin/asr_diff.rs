@@ -30,11 +30,15 @@ use parakeet_dictation::asr::{Asr, AsrBackendMetadata, AsrConfig, Decoded};
 use parakeet_dictation::asr_eval::{
     self, DecodeMetadata, GoldManifest, QualityReport, RunMetadata,
 };
-use parakeet_dictation::coreml_worker::{load_coreml_worker, CoreMlModelVariant, CoreMlWorkerConfig};
+use parakeet_dictation::coreml_worker::{
+    load_coreml_worker, CoreMlModelVariant, CoreMlRnntEngine, CoreMlWorkerConfig,
+};
 use parakeet_dictation::performance;
 use parakeet_dictation::resample::{to_target_rate, TARGET_SAMPLE_RATE};
 use parakeet_dictation::settings::SettingsStore;
+use parakeet_dictation::streamer::decode_hold_windowed;
 use parakeet_dictation::wav::read_wav_mono;
+use parakeet_dictation::windows::HoldWindowConfig;
 use parakeet_dictation::{vocabulary, warmup};
 use sha2::{Digest, Sha256};
 
@@ -53,8 +57,14 @@ struct Args {
     hotword_score: f32,
     backend: Backend,
     worker: Option<PathBuf>,
+    rnnt_engine: CoreMlRnntEngine,
     model_dir: Option<PathBuf>,
     repetitions: usize,
+    /// When set, each fixture is decoded the way a Hold session would decode
+    /// it — cut into windows at pauses and merged on word agreement — instead
+    /// of in one pass. This is how the seam merge is held to the same WER as
+    /// the plain decode on the gold corpus. See ADR-0032.
+    hold_windows: Option<HoldWindowConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,12 +101,14 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut audio_dir = PathBuf::from(DEFAULT_AUDIO_DIR);
     let mut baseline = PathBuf::from(DEFAULT_BASELINE);
     let mut record = false;
+    let mut hold_windows = None;
     let mut gold = None;
     let mut json_out = PathBuf::from(DEFAULT_QUALITY_REPORT);
     let mut vocabulary = None;
     let mut hotword_score = 2.0_f32;
     let mut backend = Backend::Sherpa;
     let mut worker = None;
+    let mut rnnt_engine = CoreMlRnntEngine::default();
     let mut model_dir = None;
     let mut repetitions = 1usize;
 
@@ -143,6 +155,12 @@ fn parse_args() -> anyhow::Result<Args> {
                 backend =
                     Backend::parse(&it.next().ok_or_else(|| anyhow!("--backend needs a name"))?)?;
             }
+            "--rnnt-engine" => {
+                rnnt_engine = CoreMlRnntEngine::parse(
+                    &it.next()
+                        .ok_or_else(|| anyhow!("--rnnt-engine needs a name"))?,
+                )?;
+            }
             "--worker" => {
                 worker = Some(PathBuf::from(
                     it.next().ok_or_else(|| anyhow!("--worker needs a path"))?,
@@ -160,6 +178,21 @@ fn parse_args() -> anyhow::Result<Args> {
                     .ok_or_else(|| anyhow!("--repetitions needs a positive integer"))?
                     .parse()
                     .context("--repetitions")?;
+            }
+            "--hold-windows" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--hold-windows needs MIN,MAX in seconds"))?;
+                let (min, max) = value
+                    .split_once(',')
+                    .ok_or_else(|| anyhow!("--hold-windows expects MIN,MAX in seconds"))?;
+                let config = HoldWindowConfig {
+                    enabled: true,
+                    min_seconds: min.trim().parse().context("--hold-windows minimum")?,
+                    max_seconds: max.trim().parse().context("--hold-windows maximum")?,
+                };
+                config.validate().map_err(|reason| anyhow!(reason))?;
+                hold_windows = Some(config);
             }
             "--record" => record = true,
             "-h" | "--help" => {
@@ -189,8 +222,10 @@ fn parse_args() -> anyhow::Result<Args> {
         hotword_score,
         backend,
         worker,
+        rnnt_engine,
         model_dir,
         repetitions,
+        hold_windows,
     })
 }
 
@@ -207,6 +242,7 @@ fn print_usage() {
         \x20               [--baseline JSON] [--json-out JSON]\n\
         \x20               [--backend sherpa|coreml-unified|coreml-tdt-v3]\n\
         \x20               [--worker PATH] [--model-dir DIR]\n\
+        \x20               [--rnnt-engine native|coreml]\n\
         \x20               [--repetitions N]\n\
         \x20               [--vocabulary FILE] [--hotword-score N]\n\
          \n\
@@ -319,6 +355,7 @@ fn run(args: &Args) -> anyhow::Result<bool> {
                 .model_variant()
                 .expect("a Core ML backend names a model variant");
             let mut config = CoreMlWorkerConfig::discover()?;
+            config.set_rnnt_engine(args.rnnt_engine);
             if let Some(worker) = &args.worker {
                 config.worker_path.clone_from(worker);
             }
@@ -384,7 +421,22 @@ fn run(args: &Args) -> anyhow::Result<bool> {
             eprintln!("repetition {}/{}", repetition + 1, args.repetitions);
         }
         for (name, samples, sample_rate) in &wav_inputs {
-            let result = asr.recognize_with_metrics(samples, *sample_rate)?;
+            let result = match &args.hold_windows {
+                // Timing here is the sum of every window plus the merge, which
+                // is the total work rather than what a user waits for; the
+                // release-to-text number lives in scripts/bench-hold.sh. This
+                // arm exists for the transcript.
+                Some(config) => {
+                    let started = Instant::now();
+                    let text = decode_hold_windowed(&asr, &store.vad_path(), samples, *config)?;
+                    Decoded {
+                        text,
+                        audio_seconds: samples.len() as f32 / *sample_rate as f32,
+                        decode_seconds: started.elapsed().as_secs_f32(),
+                    }
+                }
+                None => asr.recognize_with_metrics(samples, *sample_rate)?,
+            };
             peak_resident_bytes = peak_resident_bytes.max(process_tree_resident_bytes(&asr)?);
             first_result_seconds.get_or_insert_with(|| run_started.elapsed().as_secs_f64());
             if repetition == 0 {

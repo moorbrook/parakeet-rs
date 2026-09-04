@@ -184,7 +184,7 @@ the full tables are in [`bench/README.md`](../../bench/README.md).
 This needed a three-file change to FluidAudio, which hardcodes the 15 s window.
 The package is a local path override reconstituted by
 `scripts/reconstitute-fluidaudio.sh` from the pinned upstream revision plus
-`native/ParakeetCoreMLWorker/patches/fluidaudio-offline-window.patch`; nothing
+`native/ParakeetCoreMLWorker/patches/fluidaudio.patch`; nothing
 of FluidAudio is checked in but the patch, and the change is written to be
 offered upstream.
 
@@ -208,6 +208,172 @@ endpoint. Converting once in the capture callback took the worker's resample
 stage from 4.6 ms per second of 48 kHz input to 0.001 ms and halved measured IPC
 by shrinking the payload. There is nothing left to file: the stage no longer
 exists.
+
+## Tap confirmation window — 2026-09-04
+
+Tap Fast was endpoint-bound: the speculative decode finished about 80 ms before
+the 150 ms confirming Silero state released, and post-endpoint work was 0–1 ms.
+The window, not the decode, set the number. `scripts/bench-endpoint-sweep.sh`
+sweeps it against false early cuts on three fixtures.
+
+Two oracles are reported per row, because neither alone is sound. `false_cuts`
+counts commits that landed before Core Audio's predicted instant for the
+fixture's last sample above -80 dBFS; the LibriSpeech fixtures carry room tone
+above that floor, so a short window can miss that marker with every word
+intact. `mismatches` compares the transcript against the fixture reference and
+is the oracle for lost speech.
+
+Fast curve on the 4.854 s synthesized fixture, 15 repetitions, speculative
+Core ML:
+
+| window | false cuts | mismatches | mean | p50 | p95 |
+|---:|---:|---:|---:|---:|---:|
+| 150 ms | 0/15 | 0 | 186.4 ms | 181.0 ms | 209.9 ms |
+| 120 ms | 0/15 | 0 | 155.5 ms | 150.0 ms | 171.9 ms |
+| **90 ms** | 0/15 | 0 | **134.9 ms** | **125.0 ms** | 159.5 ms |
+| 60 ms | 0/15 | 0 | 137.1 ms | 147.0 ms | 156.1 ms |
+
+The curve stops improving at 90 ms and reverses at 60. Every 60 ms repetition
+reports `t_asr_done == t_vad_endpoint`: the synchronous speculative decode
+blocks the VAD watcher, so below about 90 ms the decode is the floor and a
+shorter window buys nothing. Decode time is bimodal at 54 ms and 94 ms, which
+puts the 5 s p50 on a cluster boundary and makes its mean the steadier reading.
+
+The same curve on the 3.505 s human fixture separates the candidates that the
+synthesized one cannot, 15 repetitions:
+
+| window | false cuts | mismatches | mean | p50 | p95 |
+|---:|---:|---:|---:|---:|---:|
+| 150 ms | 0/15 | 0 | 57.3 ms | 59.0 ms | 63.0 ms |
+| **90 ms** | 0/15 | 2 | **1.5 ms** | **0.0 ms** | 6.8 ms |
+
+The mismatches are `Concorde` for `Concord`: a decoder spelling variant, not
+truncation. Those transcripts read `Concorde returned to its place amidst the
+tents,` and carry every reference word. The variant is not window-dependent —
+it appears in 12 of the 153 transcripts across every run on this fixture,
+warmups included, at both 90 ms and 150 ms confirming windows.
+
+The absolute numbers on this fixture are offset by the marker. Silero calls
+silence inside the LibriSpeech room tone that keeps the -80 dBFS acoustic-end
+marker alive, so the 0 ms reading is an artifact of where that marker sits, not
+a commit before the speech ended. The 59 ms delta is the real saving.
+
+Long-form, 14.225 s fixture with its reviewed 544 ms intra-utterance pause:
+
+| window | false cuts | mean | p50 | p95 |
+|---:|---:|---:|---:|---:|
+| **750 ms** | 0/15 | — | — | — |
+| 500 ms | 0/15 | 382.0 ms | 379.0 ms | 401.0 ms |
+| 300 ms | 15/15 | — | — | — |
+
+500 ms survived this pause in all 15 repetitions, which is one fixture and does
+not justify moving a pause-safety policy. The 750 ms row reports no latency at
+all: another agent's fixture played through the shared BlackHole device during
+that run and its words appear in two of its transcripts, so every duration it
+produced is discarded. Its zero false cuts stand, because a commit's timing
+relative to playback does not depend on what else was audible. The shipping
+750 ms latency comes from the clean 30-repetition gate run below.
+
+### Decision
+
+**Tap Fast moves from 150 ms to 90 ms. Long-form stays at 750 ms.** Confirmed at
+30 repetitions:
+
+| fixture | 150 ms | 90 ms | delta p50 |
+|---|---:|---:|---:|
+| 4.854 s synthesized | 182.0 ms p50 / 183.5 mean | 148.5 ms p50 / 141.8 mean | **-33.5 ms** |
+| 3.505 s human | 59.0 ms p50 / 58.1 mean | 13.0 ms p50 / 10.1 mean | **-46.0 ms** |
+
+False cuts 0/30 everywhere; the single `Concorde` mismatch is the same lexical
+variant. The 40 ms target is met on human speech and missed by 6.5 ms on the
+synthesized fixture, where the bimodal decode pins p50 to a cluster boundary —
+that fixture's mean improves by 41.7 ms. The decode's two modes are the next
+lever and are not addressed here.
+
+Both gates were re-run at 30 repetitions and pass unchanged: the long-pause
+endpoint gate at 0/30 false stops (single 667.0 ms p50, multi 635.0 ms p50 /
+647.5 ms p95), and the frozen 3× end-to-end gate, now pinned to
+`--confirmation-ms 150` so it stays like-for-like, at 594.5 → 182.0 ms p50
+(3.27×) and 635.1 → 203.6 ms p95 (3.12×).
+
+### Punctuation-aware early commit: rejected
+
+A shorter window gated on the provisional transcript ending in sentence-final
+punctuation was implemented, measured, and removed. Three results killed it.
+
+It does not fire on real speech. The model ends the human single-sentence
+fixture `...amidst the tents,` with a comma in all 30 repetitions, so the gate
+never opened and the row is identical to the control: 59.0 ms p50 against
+59.0 ms.
+
+Where it does fire it is worth nothing over a plain shorter window. On the
+synthesized fixture, 150 ms gated at 90 ms and an ungated 90 ms produce the same
+distribution at 30 repetitions: 148.5 ms p50 both, means 139.4 and 141.8 ms.
+The 15-repetition rows for those two configurations read 145.0 and 125.0 ms p50,
+which is the bimodal decode landing a 15-sample median on either side of the
+cluster boundary; their means differ by 4.4 ms. Read the 30-repetition figures.
+
+Its premise is false. Long-form at 750 ms with a 90 ms punctuated window cut the
+multi-sentence fixture 15/15, and the provisional transcript at the 544 ms
+intra-utterance pause reads `...to greet the arrival of the young princess.` The
+model emits a sentence-final period mid-utterance, which is exactly where the
+policy must hold. Punctuation is not an end-of-utterance signal.
+
+Replay:
+
+```bash
+REPS=15 WARMUP_REPS=2 scripts/bench-endpoint-sweep.sh
+```
+
+## Native RNNT decode loop — 2026-09-04 (kata 2564)
+
+With bucketing and the resample gone, the greedy transducer loop was the largest
+stage left on a short utterance. It ran through Core ML one dispatch at a time:
+one prediction-network step per emitted token, one joint evaluation per frame and
+per token, each against a floor near 100 µs. Neither model has a Neural Engine
+path, so the round trip bought nothing. The worker now reads the weights out of
+`parakeet_unified_decoder.mlmodelc` and
+`parakeet_unified_joint_decision_single_step.mlmodelc` and runs both programs in
+process, and the whole decode issues one Core ML dispatch: the encoder.
+
+The loop is 2.4x faster and the utterance 1.4x: at 4.967 s the loop drops from
+20.8 to 8.6 ms and the worker total from 42.4 to 30.2 ms, with 183 Core ML calls
+becoming none. The full per-length table is in
+[`bench/README.md`](../../bench/README.md). The 5 ms target the issue set is
+missed, and the reason is not dispatch: one prediction step reads 13.1 MB of
+fp16 weights and a 5 s utterance takes 49 of them. The next lever, unimplemented,
+is precomputing `W_ih · embed[token]` for all 1025 tokens, which removes a
+quarter of that traffic and changes only the order the fp32 sum accumulates in.
+
+Three things the loop can now do that the compiled graph could not, and they are
+most of the 2.4x: the encoder projection is one matrix product over the whole
+window instead of a matrix-vector product per joint call, the decoder-side
+projection is computed once per emitted token instead of once per call, and the
+softmax runs only when a token is actually emitted.
+
+The arithmetic is not bit-identical to Core ML and cannot be made so. Core ML's
+CPU `lstm` accumulates its recurrent matrix product in fp16: with a zero `h_in`,
+which drops that term, the two agree to about one fp16 ulp, and with a nonzero
+one they differ by up to 0.02. The native loop accumulates in fp32 over the same
+fp16 weights, which is the more accurate of the two, and reproduces every fp16
+rounding the exported program performs at an operation boundary. Over a 32-step
+trajectory the decoder output the joint consumes agrees to 0.014, and the
+divergence does not compound. `scripts/capture-rnnt-parity.py` measures all of
+this and captures the fixture the Swift tests replay; it also settled the one
+thing the MIL text does not say, the LSTM gate order, at `i, f, o, g` by a 70x
+margin over the next candidate. The empirical answer is the gold corpus: all
+seven fixtures produce byte-identical hypotheses over 10 repetitions, at the
+baseline 5.43% WER / 3.57% CER.
+
+The inner matrix-vector product is in C. Swift compiles
+`SIMD8<Float>(SIMD8<Float16>)` to an outlined runtime call with a register spill
+around it, which measured 356 ms against 15 ms for the same loop written with
+NEON intrinsics.
+
+This needed a second change to FluidAudio, in the same checked-in patch as the
+encoder window: a protocol for the decode loop and a factory the manager takes
+it from. `--rnnt-engine coreml` keeps the original path, which is how the two
+arms above were measured on one build.
 
 ## Core ML runtime-plan tuner — 2026-08-11
 
@@ -275,6 +441,69 @@ therefore rejected as a production backend. Full artifact identities,
 per-category rows, native-build evidence, replay commands, and packaging
 analysis are in [`QWEN3_ASR_EVALUATION.md`](QWEN3_ASR_EVALUATION.md). The raw
 reports and machine-verifiable summary are under `bench/qwen3-asr/`.
+
+## Hold incremental windows — 2026-09-04 (kata ktfa, ADR-0032)
+
+Hold had nothing overlapping its decode: the first model call happened after
+the hotkey came up, so release-to-text grew with the recording. ADR-0032 cuts
+the held recording into windows while the key is still down, decodes each in
+the background, and joins them on the words neighbouring windows agree on, so
+what the user waits for is the tail window.
+
+Release-to-text p50, 30 repetitions per bucket, both arms back to back on the
+same quiet machine (`bench/hold.csv` against `bench/hold-serial.csv`):
+
+| captured audio | serial | windowed | p95 serial | p95 windowed |
+|---:|---:|---:|---:|---:|
+| 0.875 s | 48.5 ms | **36.0 ms** | 57.5 ms | 38.0 ms |
+| 2.891 s | 59.5 ms | **47.0 ms** | 69.8 ms | 65.5 ms |
+| 4.917 s | 64.5 ms | **58.5 ms** | 96.3 ms | 88.2 ms |
+| 8.128 s | 104.5 ms | **66.0 ms** | 146.6 ms | 76.0 ms |
+| 16.576 s | 180.5 ms | **65.0 ms** | 231.8 ms | 84.0 ms |
+| 16.139 s (multipause) | 177.5 ms | **62.0 ms** | 197.9 ms | 90.0 ms |
+
+Release-to-text stops growing with the recording past five seconds, which is the
+structural change: the encoder still costs what it costs, but all of it except
+the tail now runs while the user is still talking. The tail never waited behind
+an in-flight window at p95 in any bucket.
+
+Across the two multi-window buckets, 240 seams were merged over 30 repetitions
+each, 180 of them resolved by word agreement rather than by a silent overlap,
+and none duplicated or dropped a word.
+
+The three shortest buckets never cut a window — the per-session log shows
+`windows=1` on every repetition — so their 6 to 13 ms comes from replacing
+`run_manual`'s 15 ms sleep with a 3 ms blocking read on the audio tap, which
+recovers what the Hold baseline section attributes to that sleep.
+
+**Windows are cut at a fixed 6 s cap, not at pauses, and that is the measured
+decision.** Cutting at pauses moved gold WER from 5.43% to 6.52% and CER from
+3.57% to 4.62%, failing the manifest's zero-regression gate. The damage was in
+`commands` (12.20% to 14.63%) and `numbers` (6.67% to 10.00%) — fixtures two to
+four seconds long, where a pause inside a short utterance split it and each half
+decoded worse than the whole. Cutting only at the cap reproduced the plain
+transcript on every category: 5.43% WER, 3.57% CER, no change anywhere.
+
+FluidAudio had already measured the same effect and left the note in
+`UnifiedAsrManager.decodedTokens`: silence-aligned starts cost about 1 WER point
+against a fixed stride on the 15 s offline encoder, with no artifact benefit.
+Two independent measurements agreeing is enough to ship against pause alignment.
+The pause path is kept and tested but off by default, disabled by setting
+`hold_window_min_seconds` equal to the cap.
+
+The `6,6` PASS deserves one caveat: six of the seven gold fixtures are under
+4.3 s and decode as a single window in that arm, so they are identical to plain
+by construction. The one fixture long enough to cut, `librispeech-multi` at
+14.2 s, was cut and scored 0.00% WER. The multi-window evidence comes from there
+plus the 20 s and multipause loopback buckets.
+
+The join needs word boundaries, which the worker now reports as `token_spans`
+from FluidAudio's `transcribeWithTimings`. It runs the same decode as
+`transcribe` and reads emission frames the greedy RNNT decoder already recorded,
+so the spans cost only a frame-to-seconds conversion.
+
+Full tables, per-session window and seam counts, and the three gold arms are in
+[`bench/README.md`](../../bench/README.md).
 
 ## Neural Engine idle re-wake — 2026-09-04 (kata snx0)
 

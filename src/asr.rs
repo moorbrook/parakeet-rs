@@ -21,6 +21,8 @@ use sherpa_onnx::{
     OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
 };
 
+use crate::windows::{words_from_tokens, TokenSpan, Word};
+
 /// Below this real-time factor we assume CoreML is not engaged.
 const RTFX_COREML_FLOOR: f32 = 2.0;
 
@@ -32,6 +34,27 @@ const RTFX_COREML_FLOOR: f32 = 2.0;
 pub trait AsrBackend: Send + Sync {
     fn metadata(&self) -> &AsrBackendMetadata;
     fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded>;
+
+    /// Whether [`AsrBackend::transcribe_with_token_spans`] reports real spans.
+    ///
+    /// Hold-mode incremental windowing needs word boundaries to join two
+    /// windows on their overlap, so it asks this before it starts cutting and
+    /// otherwise leaves the session on the plain single-decode path.
+    fn reports_token_spans(&self) -> bool {
+        false
+    }
+
+    /// Decode, and additionally report the span of every RNNT emission on the
+    /// clip's own timeline. Backends that cannot report them return an empty
+    /// vector; callers must check [`AsrBackend::reports_token_spans`] rather
+    /// than reading an empty result as "no speech".
+    fn transcribe_with_token_spans(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<(Decoded, Vec<TokenSpan>)> {
+        Ok((self.transcribe(samples, sample_rate)?, Vec::new()))
+    }
 
     /// Resident bytes owned by helper processes outside this Rust process.
     fn auxiliary_resident_bytes(&self) -> Result<u64> {
@@ -69,6 +92,13 @@ pub struct StageReport {
     pub encoder_calls: u32,
     pub decoder_calls: u32,
     pub joint_calls: u32,
+    /// Prediction-network steps run natively, without a Core ML dispatch. The
+    /// native and Core ML counts are kept apart so a row cannot claim both
+    /// engines ran; exactly one of each pair is nonzero.
+    pub native_decoder_steps: u32,
+    /// Native joint evaluations: one decoder-side projection per step, plus one
+    /// decision per frame and per emitted token.
+    pub native_joint_steps: u32,
     /// Core ML predictions that matched none of the three known input shapes.
     /// A nonzero value means the pipeline changed and the split is suspect.
     pub other_calls: u32,
@@ -86,6 +116,9 @@ pub struct StageReport {
     pub decode_loop_dispatch_ms: f64,
     pub decoder_dispatch_ms: f64,
     pub joint_dispatch_ms: f64,
+    /// Wall time inside the native steps, the counterpart of
+    /// `decode_loop_dispatch_ms` when the loop runs without Core ML.
+    pub decode_loop_native_ms: f64,
     /// Tokenizer decode and overlap merge after the last dispatch.
     pub post_ms: f64,
     /// Dispatch time counted more than once because two Core ML predictions
@@ -97,7 +130,8 @@ pub struct StageReport {
     pub overlapped_dispatch_ms: f64,
     pub total_ms: f64,
     /// Compute units read off each live model, e.g.
-    /// `encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only`.
+    /// `encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only`. A
+    /// natively run stage reports `native`, which is not a Core ML placement.
     pub compute_units: String,
 }
 
@@ -313,6 +347,34 @@ impl Asr {
     pub fn recognize_silent_warmup(&self, samples: &[f32], sample_rate: u32) -> Result<String> {
         let decoded = self.recognize_with_timing(samples, sample_rate, /* warmup = */ true)?;
         Ok(decoded.text)
+    }
+
+    /// Whether this recognizer can report word boundaries, which is what
+    /// Hold-mode incremental windowing needs to join two windows.
+    pub fn reports_token_spans(&self) -> bool {
+        self.backend.reports_token_spans()
+    }
+
+    /// Decode one window of a longer recording and return its words placed on
+    /// the recording's timeline, `offset_s` being where the window starts.
+    ///
+    /// Deliberately not routed through `recognize_with_timing`: a window is a
+    /// fragment, so its RTFx is not the utterance's and the CoreML-fallback
+    /// warning would fire on short tails. The session logs window timings
+    /// itself.
+    pub fn recognize_window(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        offset_s: f32,
+    ) -> Result<Vec<Word>> {
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (_, spans) = self
+            .backend
+            .transcribe_with_token_spans(samples, sample_rate)?;
+        Ok(words_from_tokens(&spans, offset_s))
     }
 
     fn recognize_with_timing(

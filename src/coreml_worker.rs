@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::asr::{Asr, AsrBackend, AsrBackendMetadata, Decoded, StageReport};
 use crate::resample::{to_target_rate, TARGET_SAMPLE_RATE};
+use crate::windows::TokenSpan;
 
 const PROTOCOL_MAGIC: [u8; 4] = *b"PRKT";
 const PROTOCOL_VERSION: u32 = 1;
@@ -109,6 +110,39 @@ pub struct CoreMlWorkerConfig {
     /// bench turns this on; the dictation path leaves the worker's Core ML
     /// dispatch path untouched.
     pub emit_stage_timings: bool,
+    /// Which implementation of the greedy RNNT loop the worker runs.
+    pub rnnt_engine: CoreMlRnntEngine,
+}
+
+/// The two implementations of the transducer decode loop the worker can run.
+///
+/// They decode the same weights. The Core ML one pays a dispatch per
+/// prediction-network step and per joint evaluation; the native one reads the
+/// weights out of the same bundles and runs the arithmetic in process. Both
+/// stay reachable so a measurement can name which produced it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoreMlRnntEngine {
+    #[default]
+    Native,
+    CoreMl,
+}
+
+impl CoreMlRnntEngine {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::CoreMl => "coreml",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "native" => Ok(Self::Native),
+            "coreml" => Ok(Self::CoreMl),
+            other => bail!("unknown RNNT engine: {other} (expected native or coreml)"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -174,6 +208,7 @@ impl CoreMlWorkerConfig {
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
             emit_stage_timings: false,
+            rnnt_engine: CoreMlRnntEngine::default(),
         }
     }
 
@@ -188,6 +223,7 @@ impl CoreMlWorkerConfig {
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
             emit_stage_timings: false,
+            rnnt_engine: CoreMlRnntEngine::default(),
         }
     }
 
@@ -231,6 +267,10 @@ impl CoreMlWorkerConfig {
 
     pub fn set_emit_stage_timings(&mut self, emit: bool) {
         self.emit_stage_timings = emit;
+    }
+
+    pub fn set_rnnt_engine(&mut self, engine: CoreMlRnntEngine) {
+        self.rnnt_engine = engine;
     }
 
     pub fn set_compute_units(&mut self, compute_units: CoreMlComputeUnits) {
@@ -355,7 +395,9 @@ impl CoreMlWorkerBackend {
             .arg("--long-compute-units")
             .arg(config.long_compute_units.as_str())
             .arg("--long-regime-seconds")
-            .arg(config.long_regime_seconds.to_string());
+            .arg(config.long_regime_seconds.to_string())
+            .arg("--rnnt-engine")
+            .arg(config.rnnt_engine.as_str());
         // Only when it differs from the default, so the shipping worker's
         // command line is exactly what ADR-0022 measured.
         if config.model_variant != CoreMlModelVariant::default() {
@@ -410,10 +452,11 @@ impl CoreMlWorkerBackend {
                 model: config.model_variant.model_description().to_string(),
                 quantization: "int8 encoder".to_string(),
                 execution_provider: format!(
-                    "Core ML short={} long={} threshold={}s",
+                    "Core ML short={} long={} threshold={}s rnnt={}",
                     config.short_compute_units.as_str(),
                     config.long_compute_units.as_str(),
-                    config.long_regime_seconds
+                    config.long_regime_seconds,
+                    config.rnnt_engine.as_str()
                 ),
             },
             load_seconds,
@@ -422,12 +465,15 @@ impl CoreMlWorkerBackend {
     }
 }
 
-impl AsrBackend for CoreMlWorkerBackend {
-    fn metadata(&self) -> &AsrBackendMetadata {
-        &self.metadata
-    }
-
-    fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
+impl CoreMlWorkerBackend {
+    /// One request/response round trip. Both trait entry points share it so the
+    /// text a caller gets can never disagree with the spans beside it.
+    fn decode(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        require_spans: bool,
+    ) -> Result<(Decoded, Vec<TokenSpan>)> {
         validate_request(samples.len(), sample_rate)?;
         // Production capture already delivers 16 kHz, so this borrows. File-fed
         // callers (the gold corpus is 48 kHz) convert here rather than leaving
@@ -449,12 +495,51 @@ impl AsrBackend for CoreMlWorkerBackend {
             .decode_seconds
             .ok_or_else(|| anyhow!("Core ML result omitted decode_seconds"))?
             + response.resample_seconds.unwrap_or(0.0);
+        // Only the caller that asked for spans may fail for their absence. The
+        // plain path does not read them, and it is the fallback every Hold
+        // window failure lands on — making it depend on a field it ignores
+        // would defeat the fallback for exactly the worker that needs it.
+        let spans = match (&response.token_spans, require_spans) {
+            (Some(spans), _) => spans.iter().map(TokenSpan::from).collect(),
+            (None, false) => Vec::new(),
+            (None, true) => bail!(
+                "Core ML result omitted token_spans; this worker predates the \
+                 Hold window merge and must be rebuilt"
+            ),
+        };
 
-        Ok(Decoded {
-            text: response.text.unwrap_or_default(),
-            audio_seconds: samples.len() as f32 / sample_rate as f32,
-            decode_seconds: decode_seconds as f32,
-        })
+        Ok((
+            Decoded {
+                text: response.text.unwrap_or_default(),
+                audio_seconds: samples.len() as f32 / sample_rate as f32,
+                decode_seconds: decode_seconds as f32,
+            },
+            spans,
+        ))
+    }
+}
+
+impl AsrBackend for CoreMlWorkerBackend {
+    fn metadata(&self) -> &AsrBackendMetadata {
+        &self.metadata
+    }
+
+    fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
+        Ok(self
+            .decode(samples, sample_rate, /* require_spans = */ false)?
+            .0)
+    }
+
+    fn reports_token_spans(&self) -> bool {
+        true
+    }
+
+    fn transcribe_with_token_spans(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<(Decoded, Vec<TokenSpan>)> {
+        self.decode(samples, sample_rate, /* require_spans = */ true)
     }
 
     fn auxiliary_resident_bytes(&self) -> Result<u64> {
@@ -527,6 +612,30 @@ struct WorkerResponse {
     decode_seconds: Option<f64>,
     resample_seconds: Option<f64>,
     stages: Option<StageReport>,
+    /// One entry per RNNT emission, on the request's own timeline. Absent from
+    /// `ready` and failure frames, and from any worker built before the Hold
+    /// window merge needed them.
+    token_spans: Option<Vec<WireTokenSpan>>,
+}
+
+/// Wire form of one emission. Separate from [`TokenSpan`] so the worker's
+/// `convertToSnakeCase` field names are pinned here rather than in the module
+/// the merge logic lives in.
+#[derive(Clone, Debug, Deserialize)]
+struct WireTokenSpan {
+    text: String,
+    start_s: f64,
+    end_s: f64,
+}
+
+impl From<&WireTokenSpan> for TokenSpan {
+    fn from(wire: &WireTokenSpan) -> Self {
+        Self {
+            text: wire.text.clone(),
+            start_s: wire.start_s as f32,
+            end_s: wire.end_s as f32,
+        }
+    }
 }
 
 impl WorkerResponse {
@@ -617,6 +726,7 @@ mod tests {
             decode_seconds: None,
             resample_seconds: None,
             stages: None,
+            token_spans: None,
         };
         let error = response
             .require_success("result")
@@ -634,10 +744,12 @@ mod tests {
             "decode_seconds": 0.044, "resample_seconds": 0.023,
             "stages": {
                 "resample_ms": 22.976, "windows": 1, "encoder_calls": 1,
-                "decoder_calls": 35, "joint_calls": 96, "other_calls": 0,
+                "decoder_calls": 35, "joint_calls": 96,
+                "native_decoder_steps": 0, "native_joint_steps": 0, "other_calls": 0,
                 "mel_ms": 3.08, "encoder_ms": 25.959, "decode_loop_ms": 15.84,
                 "decode_loop_dispatch_ms": 15.135, "decoder_dispatch_ms": 5.359,
-                "joint_dispatch_ms": 9.776, "post_ms": 0.066, "total_ms": 44.944,
+                "joint_dispatch_ms": 9.776, "decode_loop_native_ms": 0.0,
+                "post_ms": 0.066, "total_ms": 44.944,
                 "compute_units": "encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only"
             }
         }"#;
@@ -666,10 +778,12 @@ mod tests {
             "stages": {
                 "resample_ms": 0.0, "windows": 1, "preprocessor_calls": 1,
                 "encoder_calls": 1, "decoder_calls": 12, "joint_calls": 40,
+                "native_decoder_steps": 0, "native_joint_steps": 0,
                 "other_calls": 0, "mel_ms": 0.42, "preprocessor_ms": 6.1,
                 "encoder_ms": 25.9, "decode_loop_ms": 9.2,
                 "decode_loop_dispatch_ms": 8.8, "decoder_dispatch_ms": 3.1,
-                "joint_dispatch_ms": 5.7, "post_ms": 0.05, "total_ms": 41.67,
+                "joint_dispatch_ms": 5.7, "decode_loop_native_ms": 0.0,
+                "post_ms": 0.05, "overlapped_dispatch_ms": 0.0, "total_ms": 41.67,
                 "compute_units": "preprocessor=cpu-only encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only"
             }
         }"#;
@@ -721,6 +835,40 @@ mod tests {
             .set_model_variant(CoreMlModelVariant::TdtV3)
             .expect("an existing directory is the supported source");
         assert_eq!(config.model_variant, CoreMlModelVariant::TdtV3);
+    }
+
+    #[test]
+    fn result_response_carries_the_worker_token_spans() {
+        // Field names are the worker's `convertToSnakeCase` encoding of its
+        // `TokenSpan`, and the piece keeps the leading space the tokenizer's
+        // word-start marker became — that space is what groups tokens into
+        // words on this side.
+        let payload = br#"{
+            "kind": "result", "ok": true, "text": "Hi there.", "decode_seconds": 0.04,
+            "token_spans": [
+                {"text": " Hi", "start_s": 0.08, "end_s": 0.16},
+                {"text": " there", "start_s": 0.24, "end_s": 0.32},
+                {"text": ".", "start_s": 0.32, "end_s": 0.40}
+            ]
+        }"#;
+        let response: WorkerResponse = serde_json::from_slice(payload).expect("valid result");
+        let wire = response.token_spans.expect("token spans present");
+        let spans: Vec<TokenSpan> = wire.iter().map(TokenSpan::from).collect();
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].text, " Hi");
+        assert!((spans[2].end_s - 0.40).abs() < 1e-6);
+        let words = crate::windows::words_from_tokens(&spans, 0.0);
+        assert_eq!(crate::windows::words_to_text(&words), "Hi there.");
+    }
+
+    #[test]
+    fn a_worker_without_token_spans_still_serves_the_plain_decode() {
+        // The plain decode is where every Hold window failure falls back to,
+        // so it must not depend on a field it never reads. Only the span-aware
+        // entry point may refuse a worker that predates them.
+        let payload = br#"{"kind": "result", "ok": true, "text": "hi", "decode_seconds": 0.04}"#;
+        let response: WorkerResponse = serde_json::from_slice(payload).expect("valid result");
+        assert!(response.token_spans.is_none());
     }
 
     #[test]

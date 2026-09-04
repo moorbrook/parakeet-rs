@@ -48,6 +48,24 @@ enum TranscriptionEngine {
         case .tdt(let session): try await session.transcribe(samples)
         }
     }
+
+    /// The same decode plus per-token emission spans, which Hold's incremental
+    /// windows merge on word agreement (ADR-0032).
+    ///
+    /// TDT's spans come from `ASRResult.tokenTimings` and are **unverified**:
+    /// the Hold path is a Unified feature and the TDT variant exists only for
+    /// the offline comparison in kata f0zg, so nothing has checked their
+    /// alignment. Do not enable Hold on TDT without measuring them.
+    func transcribeWithTimings(_ samples: [Float]) async throws
+        -> UnifiedAsrManager.TranscriptionWithTimings
+    {
+        switch self {
+        case .unified(let manager):
+            return try await manager.transcribeWithTimings(samples)
+        case .tdt(let session):
+            return try await session.transcribeWithTimings(samples)
+        }
+    }
 }
 
 /// A TDT manager plus the per-utterance decoder state it requires.
@@ -67,8 +85,21 @@ actor TdtSession {
     }
 
     func transcribe(_ samples: [Float]) async throws -> String {
+        try await result(for: samples).text
+    }
+
+    func transcribeWithTimings(_ samples: [Float]) async throws
+        -> UnifiedAsrManager.TranscriptionWithTimings
+    {
+        let result = try await result(for: samples)
+        return UnifiedAsrManager.TranscriptionWithTimings(
+            text: result.text,
+            tokenTimings: result.tokenTimings ?? []
+        )
+    }
+
+    private func result(for samples: [Float]) async throws -> ASRResult {
         var state = try TdtDecoderState(decoderLayers: decoderLayers)
-        let result = try await manager.transcribe(samples, decoderState: &state)
-        return result.text
+        return try await manager.transcribe(samples, decoderState: &state)
     }
 }
