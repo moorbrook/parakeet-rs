@@ -1919,8 +1919,10 @@ tail flush remains after the stream is dropped.
 
 ## 0031 — Hold decodes windows at pauses, joined on word agreement
 
-**Status:** **Accepted — implemented.** Numbers below are from
-`scripts/bench-hold.sh` on the M5 Pro; see `bench/README.md`.
+**Status:** **Accepted — implemented and measured.** Release-to-text p50 on the
+M5 Pro falls from 104.5 to 66.0 ms at an 8.1 s utterance and from 180.5 to
+65.0 ms at 16.6 s, with gold-corpus WER and CER unchanged. Tables and method in
+`bench/README.md`; the ledger entry is in `docs/asr/PERF.md`.
 
 **This is not ADR-0009's rejected streaming swap.** The recognizer is
 unchanged — the same offline full-attention Parakeet Unified encoder, the same
@@ -1944,18 +1946,38 @@ Voz's recipe for long audio — "cut into 15 s windows at pauses and join on the
 words neighbouring windows agree on" — applied incrementally rather than to a
 finished file.
 
-- **Where to cut.** Hold now runs one Silero state of its own, the low-latency
-  candidate detector, through `EndpointTracker` under the `Fast` policy. That
-  tracker fires `Confirmed` once per pause after 160 ms of silence and reports
-  the sample where the silence began; it re-arms when speech resumes. Tap's
-  endpoint authority is untouched — this tracker chooses window boundaries and
-  can never stop a recording.
-- **A pause is not enough.** Real dictation contains long unbroken clauses, and
-  the bench's own 8.1 s fixture is a single `say` sentence. Without a second
-  rule the whole utterance would still be one tail. So a window is also cut at a
-  hard length cap. That cap, not the pause interval, is what bounds the tail the
-  user waits for, which makes it the release-to-text ceiling: 6 s of tail is
-  roughly 26 ms of encoder plus 18 ms of RNNT loop.
+- **Where to cut: at a fixed 6 s cap, not at pauses.** This is the one place the
+  implementation departs from Voz's description, and it was decided by
+  measurement. Cutting at pauses moved the gold corpus from 5.43% to **6.52%
+  WER** and 3.57% to 4.62% CER, failing the manifest's zero-regression gate.
+  The damage was not at the seams: it was in `commands` (12.20% to 14.63%) and
+  `numbers` (6.67% to 10.00%), fixtures two to four seconds long, where a pause
+  inside a short utterance split it in half and each half decoded worse than the
+  whole. Cutting only at the cap scored **5.43% WER and 3.57% CER, identical to
+  the plain single-pass decode** on every category.
+
+  This reproduces a result FluidAudio had already recorded in
+  `UnifiedAsrManager.decodedTokens`: silence-aligned window starts measured
+  about 1 WER point worse than a fixed stride on the 15 s offline encoder
+  (Earnings-22 long-form), with no artifact benefit, which is why their own
+  offline path uses a fixed grid. Two independent measurements of the same
+  effect is enough to ship against it.
+
+  The pause path is kept and still tested, because it costs nothing to keep and
+  the evidence against it is one small corpus plus one upstream note. It is
+  turned off by setting `hold_window_min_seconds` equal to the cap, so the cap
+  wins every race. Lowering it needs fresh evidence, not preference.
+
+  The cap is what bounds the tail the user waits for, which makes it the
+  release-to-text ceiling: 6 s of tail is roughly 26 ms of encoder plus 18 ms of
+  RNNT loop, and the measured p50 at a 16.6 s utterance is 65.0 ms.
+
+- **Pause detection, when enabled.** Hold runs one Silero state of its own, the
+  low-latency candidate detector, through `EndpointTracker` under the `Fast`
+  policy. That tracker fires `Confirmed` once per pause after 160 ms of silence
+  and reports the sample where the silence began; it re-arms when speech
+  resumes. Tap's endpoint authority is untouched — this tracker chooses window
+  boundaries and can never stop a recording.
 - **Overlap.** A pause cut hands the confirmation silence to the next window —
   RNNT emission lags the acoustics, so a word spoken just before the pause can
   be timestamped inside it, and the next window needs to contain that audio for
@@ -2000,8 +2022,9 @@ decode error, and any merge that comes back empty on non-empty audio, abandons
 the windowed transcript and lets the app decode the recording in one pass. A
 seam bug can cost latency; it must never cost what the user said.
 
-**Configuration.** `hold_windows_enabled`, `hold_window_min_seconds` (3.0), and
-`hold_window_max_seconds` (6.0) in `settings.json`.
+**Configuration.** `hold_windows_enabled` (on), `hold_window_min_seconds` (6.0)
+and `hold_window_max_seconds` (6.0) in `settings.json` — equal, so pause cutting
+is off.
 `bench_e2e --hold-windows off|MIN,MAX` measures both paths through one binary,
 and `asr_diff --hold-windows MIN,MAX` decodes the gold corpus the windowed way
 so the seam merge is held to the same WER as the plain decode.

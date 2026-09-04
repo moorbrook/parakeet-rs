@@ -159,8 +159,15 @@ pub struct HoldWindowConfig {
     /// is released, and the whole recording is decoded at once. Kept as an
     /// explicit switch so the benchmark can measure both through one binary.
     pub enabled: bool,
-    /// Never cut at a pause until the current window holds at least this much
-    /// audio. Too small and a hesitant speaker generates a window per word.
+    /// Never cut at a pause until the speech in the current window reaches at
+    /// least this much audio.
+    ///
+    /// The shipping default sets this equal to [`Self::max_seconds`], which
+    /// leaves the length cap to win every race and so turns pause cutting off.
+    /// That is a measured decision, not a placeholder: at 3.0 the gold corpus
+    /// went from 5.43% to 6.52% WER because a pause inside a three-second
+    /// command split it in half, and FluidAudio measured the same effect on
+    /// long-form audio. See ADR-0031.
     pub min_seconds: f32,
     /// Cut regardless once the current window reaches this length. This is what
     /// bounds the tail decode the user actually waits for on release, so it is
@@ -172,7 +179,7 @@ impl Default for HoldWindowConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            min_seconds: 3.0,
+            min_seconds: 6.0,
             max_seconds: 6.0,
         }
     }
@@ -701,11 +708,37 @@ mod tests {
     }
 
     #[test]
+    fn the_shipping_default_never_cuts_at_a_pause() {
+        // min == max leaves the length cap to win every race. A short
+        // utterance with a pause in it must come out as one window: splitting
+        // one is what cost 1.09 points of gold WER. See ADR-0031.
+        let mut planner = WindowPlanner::new(HoldWindowConfig::default(), FRAME);
+        let mut reasons = Vec::new();
+        for frame in 0..2_000_u64 {
+            let detected = (frame / 60) % 3 != 2;
+            if let Some(cut) = planner.observe_frame(detected) {
+                reasons.push(cut.reason);
+            }
+        }
+        assert!(!reasons.is_empty(), "the cap must still close windows");
+        assert!(
+            reasons.iter().all(|reason| *reason == CutReason::Forced),
+            "default config cut at a pause: {reasons:?}"
+        );
+    }
+
+    #[test]
     fn windows_tile_the_recording_with_no_gap() {
         // Whatever the mix of pause and forced cuts, each window must start
         // where the previous one's overlap begins — a gap would silently drop
         // audio, which no merge could recover.
-        let mut planner = WindowPlanner::new(HoldWindowConfig::default(), FRAME);
+        let mut planner = WindowPlanner::new(
+            HoldWindowConfig {
+                min_seconds: 3.0,
+                ..HoldWindowConfig::default()
+            },
+            FRAME,
+        );
         let mut expected_start = 0_u64;
         let mut cuts = 0;
         for frame in 0..2_000_u64 {

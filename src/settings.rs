@@ -87,14 +87,16 @@ pub struct Settings {
     /// until the key is released.
     #[serde(default = "default_hold_windows_enabled")]
     pub hold_windows_enabled: bool,
-    /// Hold mode decodes the recording in windows closed at pauses while the
-    /// key is still held, so release-to-text is only the tail window. This is
-    /// the shortest window a pause may close.
+    /// Shortest window a pause may close. Defaults to the same value as
+    /// `hold_window_max_seconds`, which turns pause cutting off: cutting at
+    /// pauses measured 1.09 points of gold WER worse than cutting at the cap.
+    /// Lower it only with fresh evidence. See ADR-0031.
     #[serde(default = "default_hold_window_min_seconds")]
     pub hold_window_min_seconds: f32,
-    /// Longest window Hold mode will accumulate before cutting anyway. It
-    /// bounds the tail the user waits for on release, so it is the number that
-    /// sets the release-to-text ceiling for a long utterance.
+    /// Longest window Hold mode accumulates before cutting. Hold decodes each
+    /// closed window in the background while the key is still down, so this
+    /// bounds the tail the user actually waits for on release and is the number
+    /// that sets the release-to-text ceiling for a long utterance.
     #[serde(default = "default_hold_window_max_seconds")]
     pub hold_window_max_seconds: f32,
     /// Fire one throwaway dispatch at hotkey-down so the Neural Engine is

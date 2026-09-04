@@ -608,6 +608,109 @@ COREML_WORKER=target/release/parakeet-coreml-worker scripts/bench-gold.sh
 
 The worker must be the one built from this checkout: `token_spans` is what the
 merge aligns on, and a worker built before ADR-0031 does not report them.
+
+### Release-to-text: M5 Pro 24 GB (2026-09-04)
+
+30 measured repetitions per bucket, two warmups, `BlackHole 2ch` loopback,
+`--arm warm`. Both arms ran back to back on the same quiet machine (load average
+1.40 before the windowed arm, 1.30 before the serial one), so this is a
+controlled before/after rather than a comparison against the older baseline
+table above. `bench/hold.csv` and `bench/hold-serial.csv`.
+
+Three arms: windowing off, the shipping forced-cut config, and the pause-cut
+config that the WER section below rejects. `bench/hold-serial.csv`,
+`bench/hold-forced.csv`, `bench/hold.csv`.
+
+| bucket | captured audio | serial p50 | shipping `6,6` p50 | pause `3,6` p50 | serial p95 | shipping p95 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 s | 0.875 s | 48.5 ms | **36.0 ms** | 36.0 ms | 57.5 ms | 38.0 ms |
+| 3 s | 2.891 s | 59.5 ms | **47.0 ms** | 47.0 ms | 69.8 ms | 65.5 ms |
+| 5 s | 4.917 s | 64.5 ms | **58.5 ms** | 58.5 ms | 96.3 ms | 88.2 ms |
+| 10 s | 8.128 s | 104.5 ms | **66.0 ms** | 63.0 ms | 146.6 ms | 76.0 ms |
+| 20 s | 16.58 s | 180.5 ms | **65.0 ms** | 64.5 ms | 231.8 ms | 84.0 ms |
+| multipause | 16.14 s | 177.5 ms | **62.0 ms** | 78.5 ms | 197.9 ms | 90.0 ms |
+
+The 1, 3, and 5 s fixtures are all shorter than the 6 s cap, so no cut is
+possible and the two windowed configurations are the same code path on them;
+those three rows were measured once and are repeated in both columns.
+
+The shape is the point. Serial p50 grows with the recording because the whole
+recording is encoded after release. Windowed p50 stops growing after 5 s,
+because what is left at release is the tail window and nothing else. The
+shipping config costs 1 to 3 ms against the pause config on the two `say`
+fixtures and is 16 ms faster on the multipause one, where pause cutting left a
+3.69 s tail against a 2.83 s one.
+
+The 1, 3, and 5 s rows never cut a window at all — the per-session log confirms
+`windows=1` on every repetition — so their 6 to 13 ms improvement is entirely
+the `run_manual` poll change, a 15 ms sleep replaced by a 3 ms blocking read on
+the audio tap. That is the same 12 to 14 ms the Hold baseline section attributes
+to the sleep, recovered.
+
+### Windows and seams per session
+
+Read out of `bench/hold.log`, which carries one `hold windows=... seams=[...]`
+line per repetition beside its `phase_timer`:
+
+At the shipping config (`bench/hold-forced.log`):
+
+| bucket | windows | seams over 30 repetitions | tail p50 | queue wait p95 |
+|---|---:|---|---:|---:|
+| 1 s | 1 | none | 0.87 s | 0.0 ms |
+| 3 s | 1 | none | 2.89 s | 0.0 ms |
+| 5 s | 1 | none | 4.92 s | 0.0 ms |
+| 10 s | 2 | 30 agreed, 30 empty | 3.61 s | 0.0 ms |
+| 20 s + multipause | 4 | 180 agreed, 60 empty | 2.83 s | 0.0 ms |
+
+240 seams, 180 of them resolved by word agreement, none duplicating or dropping
+a word. The `EmptyOverlap` entries are the first seam of each session, where
+there is no previous window to reconcile against. The tail never waited behind
+an in-flight window at any percentile: a window closes at least a second before
+release and the worker is idle again by the time the tail arrives.
+
+At the pause config every seam is `EmptyOverlap` instead, because a pause cut's
+overlap is the confirmation silence and neither window puts a word in it. That
+join is a concatenation with nothing to reconcile, which is why the agreement
+path only appears once cuts land mid-speech.
+
+### WER: pause cuts lose, forced cuts are free
+
+`asr_diff --gold bench/gold/manifest.json --repetitions 3`, three arms on the
+same corpus and worker. The manifest gates on WER and CER with a zero-regression
+cap against a 5.43% / 3.57% baseline.
+
+| arm | WER | CER | exact | gate |
+|---|---:|---:|---:|---|
+| plain single-pass | 5.43% | 3.57% | 28.57% | PASS |
+| windowed, pause cuts (`3,6`) | **6.52%** | **4.62%** | 28.57% | **FAIL** |
+| windowed, forced cuts only (`6,6`) | 5.43% | 3.57% | 28.57% | PASS |
+
+Per category, the pause arm's damage is not at the seams:
+
+| category | fixtures | plain WER | `3,6` WER | `6,6` WER |
+|---|---:|---:|---:|---:|
+| commands | 5 | 12.20% | **14.63%** | 12.20% |
+| numbers | 3 | 6.67% | **10.00%** | 6.67% |
+| proper-nouns | 6 | 3.57% | 3.57% | 3.57% |
+| long | 1 | 0.00% | 0.00% | 0.00% |
+| custom-vocabulary | 2 | 27.27% | 27.27% | 27.27% |
+
+`commands` and `numbers` are two to four second fixtures. At
+`hold_window_min_seconds: 3.0` a pause inside one of them closes a window, and
+the two halves decode worse than the whole did. Cutting only at the cap cannot
+touch a fixture that short, and reproduces the plain transcript on every
+category.
+
+Read the `6,6` PASS honestly: six of the seven gold fixtures are under 4.3 s and
+so decode as a single window in that arm, identical to plain by construction.
+The one fixture long enough to be cut, `librispeech-multi` at 14.2 s, was cut and
+still scored 0.00% WER. That is one fixture of real multi-window evidence, which
+is why `bench/audio/multipause_48000.wav` and the 20 s bucket carry the rest.
+
+This reproduces FluidAudio's own finding, recorded in
+`UnifiedAsrManager.decodedTokens`: silence-aligned window starts measured about
+1 WER point worse than a fixed stride on the 15 s offline encoder, with no
+artifact benefit.
 ## ANE idle re-wake A/B: cold, prime, keep-alive (kata snx0)
 
 The Neural Engine hard power-gates when idle. Published measurements put the
@@ -1060,6 +1163,9 @@ Swap `--variant edits-only`, `--skip-min-words 4`, `--prompt-cache`, or
 | `coreml-unified-buckets*.csv` | Generated bucketed short-window encoder runs. |
 | `hold.{log,csv}`             | Generated Hold-mode release-to-transcript runs. |
 | `hold-multipause.{log,csv}`  | Generated Hold-mode runs on the four-clause pause fixture. |
+| `hold-serial*.{log,csv}`     | Generated Hold-mode runs with windowing off (the before arm). |
+| `hold-forced.{log,csv}`      | Generated Hold-mode runs at the shipping forced-cut config. |
+| `asr-quality-windowed-*.json` | Generated gold reports for the windowed decode arms. |
 | `idle-*.{log,csv}`           | Generated ANE idle re-wake A/B runs (sweep, tap, hold, energy). |
 | `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |
 | `endpoint-*.{log,csv}`       | Generated pause-friendly endpoint gate runs.   |
