@@ -13,7 +13,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use sherpa_onnx::LinearResampler;
 
 use crate::asr::Asr;
 use crate::audio::{AudioCapture, Recording};
@@ -49,8 +48,9 @@ pub enum EndpointStrategy {
 }
 
 pub enum Outcome {
-    /// End of speech reached. Carries the raw mono samples at the native
-    /// capture rate so the ASR can do its own resample / decode.
+    /// End of speech reached. Carries mono samples already at
+    /// [`SAMPLE_RATE`]; `AudioCapture` resampled them during the capture
+    /// callbacks, so no conversion work remains on this path.
     /// `timer` already has `mark_capture_end` (and `mark_vad_endpoint` in
     /// VadAutoStop mode) populated; the consumer is responsible for the
     /// remaining `mark_asr_*` / `mark_paste_done` calls and the final
@@ -85,7 +85,6 @@ struct VadRun {
     asr: Arc<Asr>,
     endpoint_strategy: EndpointStrategy,
     endpoint_policy: EndpointPolicy,
-    sample_rate: u32,
     tap_rx: Receiver<Vec<f32>>,
     signal_rx: Receiver<Signal>,
     timer: PhaseTimer,
@@ -193,7 +192,6 @@ pub fn start_with_strategy_on_device(
         None => AudioCapture::start_with_tap(tap_tx),
     }
     .context("starting capture")?;
-    let sample_rate = capture.sample_rate();
 
     // Anchor the audio timeline immediately after capture becomes live. VAD
     // construction happens while the microphone records leading silence, so
@@ -239,7 +237,6 @@ pub fn start_with_strategy_on_device(
                         asr,
                         endpoint_strategy,
                         endpoint_policy,
-                        sample_rate,
                         tap_rx,
                         signal_rx,
                         timer,
@@ -268,21 +265,17 @@ fn run_vad(run: VadRun) -> Outcome {
         asr,
         endpoint_strategy,
         endpoint_policy,
-        sample_rate,
         tap_rx,
         signal_rx,
         mut timer,
     } = run;
-    let Some(resampler) = LinearResampler::create(sample_rate as i32, SAMPLE_RATE as i32) else {
-        let _ = capture.stop();
-        return Outcome::Error(anyhow!(
-            "could not build {sample_rate}->{SAMPLE_RATE} resampler"
-        ));
-    };
 
+    // The tap already delivers SAMPLE_RATE mono: `AudioCapture` resamples in
+    // its capture callbacks, so both the VAD and the speculative ASR read the
+    // same samples with no conversion left to do here. ADR-0030.
     let mut window_buf: Vec<f32> = Vec::with_capacity(WINDOW_SAMPLES as usize * 4);
     let mut window: Vec<f32> = Vec::with_capacity(WINDOW_SAMPLES as usize);
-    let mut mono_audio: Vec<f32> = Vec::with_capacity(sample_rate as usize * 5);
+    let mut mono_audio: Vec<f32> = Vec::with_capacity(SAMPLE_RATE as usize * 5);
     let mut endpoint = EndpointTracker::new(endpoint_policy);
     let mut candidate_speech_end: Option<u64> = None;
     let mut processed_vad_samples: u64 = 0;
@@ -319,12 +312,8 @@ fn run_vad(run: VadRun) -> Outcome {
             }
         };
 
-        mono_audio.extend_from_slice(&chunk);
-        let chunk16 = resampler.resample(&chunk, false);
-        if chunk16.is_empty() {
-            continue;
-        }
-        window_buf.extend_from_slice(&chunk16);
+        window_buf.extend_from_slice(&chunk);
+        mono_audio.extend(chunk);
 
         while window_buf.len() >= WINDOW_SAMPLES as usize {
             window.clear();
@@ -364,7 +353,7 @@ fn run_vad(run: VadRun) -> Outcome {
                     );
                     if endpoint_strategy == EndpointStrategy::Speculative {
                         timer.mark_asr_start();
-                        early_transcript = match asr.recognize(&mono_audio, sample_rate) {
+                        early_transcript = match asr.recognize(&mono_audio, SAMPLE_RATE) {
                             Ok(text) if !text.trim().is_empty() => Some(text),
                             Ok(_) => None,
                             Err(error) => {
@@ -474,27 +463,14 @@ fn finish_with_recording(
             let Recording {
                 samples,
                 sample_rate,
-                channels,
             } = rec;
             if samples.is_empty() {
                 return Outcome::Cancelled;
             }
-            let mono = if channels <= 1 {
-                samples
-            } else {
-                let ch = channels as usize;
-                let n = samples.len() / ch;
-                let mut out = Vec::with_capacity(n);
-                for frame in samples.chunks_exact(ch) {
-                    let sum: f32 = frame.iter().sum();
-                    out.push(sum / ch as f32);
-                }
-                out
-            };
-            let audio_s = mono.len() as f32 / sample_rate as f32;
+            let audio_s = samples.len() as f32 / sample_rate as f32;
             timer.mark_capture_end(audio_s);
             Outcome::Speech {
-                samples: mono,
+                samples,
                 sample_rate,
                 early_transcript,
                 timer,

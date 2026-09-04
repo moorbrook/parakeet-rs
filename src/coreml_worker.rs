@@ -1,9 +1,16 @@
 //! Resident native Core ML ASR worker backend.
 //!
 //! The Swift worker owns FluidAudio's Parakeet Unified models for the process
-//! lifetime. Rust sends raw mono Float32 samples over a framed pipe protocol,
-//! avoiding per-utterance process startup, model loading, WAV encoding, and
-//! temporary files.
+//! lifetime. Rust sends mono Float32 samples at 16 kHz over a framed pipe
+//! protocol, avoiding per-utterance process startup, model loading, WAV
+//! encoding, and temporary files.
+//!
+//! The 16 kHz part matters: FluidAudio's `AudioConverter` builds a fresh
+//! `AVAudioConverter` for every call and cost 4.6 ms per audio-second of 48 kHz
+//! input, a third of the worker's time at 5 s. Its `resample` returns the input
+//! untouched when the rate already matches, so converting on this side with the
+//! project's own resampler retires that stage instead of duplicating it. See
+//! ADR-0030.
 
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +22,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::asr::{Asr, AsrBackend, AsrBackendMetadata, Decoded, StageReport};
+use crate::resample::{to_target_rate, TARGET_SAMPLE_RATE};
 
 const PROTOCOL_MAGIC: [u8; 4] = *b"PRKT";
 const PROTOCOL_VERSION: u32 = 1;
@@ -279,11 +287,17 @@ impl AsrBackend for CoreMlWorkerBackend {
     }
 
     fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
-        let sample_count = validate_request(samples.len(), sample_rate)?;
+        validate_request(samples.len(), sample_rate)?;
+        // Production capture already delivers 16 kHz, so this borrows. File-fed
+        // callers (the gold corpus is 48 kHz) convert here rather than leaving
+        // it to the worker's per-call AVAudioConverter.
+        let model_samples = to_target_rate(samples, sample_rate)
+            .context("converting audio to the Core ML worker's 16 kHz input rate")?;
+        let sample_count = validate_request(model_samples.len(), TARGET_SAMPLE_RATE)?;
 
         let mut process = self.process.lock();
         process
-            .write_request(samples, sample_rate, sample_count)
+            .write_request(&model_samples, TARGET_SAMPLE_RATE, sample_count)
             .context("sending audio to Core ML worker")?;
         let response = process
             .read_response()

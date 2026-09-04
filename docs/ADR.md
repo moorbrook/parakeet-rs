@@ -1783,6 +1783,74 @@ map are maintained in [`docs/macos-permissions.md`](macos-permissions.md).
 
 ---
 
+## 0030 — One 16 kHz resampler in Rust, run during capture
+
+**Status:** **Accepted — implemented.**
+
+**Context.** The [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend)
+worker received audio at the capture device's native rate and handed it to
+FluidAudio's `AudioConverter`, which builds a fresh `AVAudioConverter` per call.
+The g38m stage profiler priced that conversion at a linear 4.6 ms per second of
+48 kHz input: 22.7 ms of the 66.5 ms a 5 s utterance spent inside the worker,
+more than the entire RNNT decode loop at every measured length, and all of it
+after the endpoint. The Rust side was already converting the same audio to
+16 kHz for Silero VAD with a separate resampler, so the work happened twice and
+the copy that mattered was the one nobody could overlap.
+
+**Rejected: capture at 16 kHz from Core Audio.** Zero conversion would be
+cheapest, and the loopback device advertises 16 kHz. The built-in microphone
+does not. Its `supported_input_configs` list is 44100, 48000, 88200, and 96000
+at one channel; `Microsoft Teams Audio` offers only 48000. Requesting a rate a
+device does not list makes cpal's Core Audio host write
+`kAudioDevicePropertyNominalSampleRate`, which is a system-wide change other
+applications and Audio MIDI Setup observe. The option fails on the hardware
+before the side effect is even argued.
+
+**Decision.** Convert once, in `src/resample.rs`, and do it inside the cpal
+capture callback. `AudioCapture` folds each callback to mono, pushes it through
+a streaming resampler, and both accumulates and taps the 16 kHz result, so
+`Recording` and the VAD tap carry model-rate audio and `Recording.channels` is
+gone. `streamer.rs` no longer owns a resampler; the tap it already reads is what
+the recognizer receives. `CoreMlWorkerBackend::transcribe` converts anything
+that still arrives at another rate — the gold corpus is stored at 48 kHz — and
+always frames the request at 16 kHz, which is the rate FluidAudio's
+`AudioConverter.resample` returns untouched. `Worker.swift` is unchanged.
+
+**The filter.** sherpa-onnx's `LinearResampler` is Kaldi's `LinearResample`,
+verified in `sherpa-onnx/csrc/resample.cc`: `FilterFunc` is a sinc multiplied by
+a raised-cosine window, and the binding constructs it with the cutoff at 99% of
+the lower rate's Nyquist frequency and `num_zeros = 6`. The name describes the
+linear interpolation of the filter table, not of the signal. This is the same
+kernel sherpa's own feature front-end uses, so the decision is to reuse a
+bandlimited resampler already linked into the binary rather than add rubato.
+
+Three properties are tested directly rather than inferred. Filtering the signal
+in arbitrary chunk sizes returns exactly the samples one batch call returns,
+which is what makes per-callback conversion safe. A 12 kHz tone at 48 kHz,
+which would fold to 4 kHz under naive decimation, comes back below 5% of its
+input RMS. A 1 kHz tone keeps its amplitude within 2% and its sample count
+within one of the ratio. `audio.rs` repeats the first property through the
+callback path, covering the mono fold and the short-chunk case where the filter
+returns nothing.
+
+**Consequences.** The worker's resample stage is a rate comparison. The
+conversion cost that remains is spread across capture callbacks, where it is
+roughly 0.1 ms per audio-second against a callback budget of several
+milliseconds, so the endpoint path pays none of it. `bench_asr` converts its
+fixture once at load, outside the measured loop, because that is now what
+production hands `Asr::recognize`; timing it inside the loop would measure a
+step the endpoint path no longer has.
+
+The quality risk is real and is gated where it can be seen: the gold corpus is
+48 kHz, so `scripts/bench-gold.sh` runs every fixture through this resampler and
+compares WER and CER against limits set when `AVAudioConverter` did the work.
+`scripts/bench-end-to-end.sh` covers the capture path with the same audio and
+requires an exact lexical match on every repetition.
+
+MEASUREMENT_TABLE_PLACEHOLDER
+
+---
+
 ## Target status index
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
