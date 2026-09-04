@@ -2,9 +2,13 @@
 // compiled and evaluated on the Apple Neural Engine through the private
 // AppleNeuralEngine.framework Objective-C interface, with no Core ML in the path.
 //
-// The program is a single fp16 [64,64] matrix multiply expressed as a 1x1
-// convolution (the ANE's preferred matmul formulation), run over a [1,64,1,16]
+// The program is a single fp16 [CH,CH] matrix multiply expressed as a 1x1
+// convolution (the ANE's preferred matmul formulation), run over a [1,CH,1,16]
 // activation. The result is checked against an fp32 CPU reference.
+//
+// The output surface is scanned for any nonzero byte before scoring, so
+// "the engine wrote nothing" is distinguishable from "the engine wrote
+// somewhere the reader is not looking".
 //
 // Research spike. Private API, unsupported, version-fragile. Not production code.
 //
@@ -13,6 +17,8 @@
 //     -o ane_direct_matmul ane_direct_matmul.m
 // Run:
 //   ./ane_direct_matmul            # one compile + one evaluate, no timing loop
+//
+// Build with -DCH=768 to reproduce Orion's known-good 24 KB surface geometry.
 
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
@@ -21,9 +27,16 @@
 #import <dlfcn.h>
 #import <math.h>
 
-#define CH   64      // input and output channels
-#define SEQ  16      // sequence length; the minimum decode bucket
-#define SURF_BYTES 65536  // >= the ~49 KB minimum IOSurface the engine demands at eval
+#ifndef CH
+#define CH   64      // input and output channels; override with -DCH=768
+#endif
+#ifndef SEQ
+#define SEQ  16      // sequence length; override with -DSEQ=64
+#endif
+// Each surface is sized exactly to its tensor, as Orion's iosurface_tensor.m does.
+// An oversized surface is NOT the documented mitigation for the ~49 KB eval minimum;
+// padding the sequence dimension is.
+#define SURF_BYTES ((size_t)CH * SEQ * sizeof(_Float16))
 
 // A weight blob: 128-byte container header, fp16 payload. The MIL const() offset
 // of 64 points at the chunk header inside this layout, not at the payload.
@@ -146,46 +159,70 @@ int main(void) { @autoreleasepool {
     printf("evaluate: %s\n", ok ? "ok" : err.description.UTF8String);
     if (!ok) return 4;
 
-    // The engine's internal activation layout pads the last axis; rather than
-    // assume one, score the output under several candidate strides in the single
-    // evaluation we are allowed, and report which one reproduces the reference.
     IOSurfaceLock(out, kIOSurfaceLockReadOnly, NULL);
-    const _Float16 *op = (const _Float16 *)IOSurfaceGetBaseAddress(out);
+    const uint8_t *raw = (const uint8_t *)IOSurfaceGetBaseAddress(out);
+
+    // Before interpreting anything, establish that the engine wrote at all.
+    size_t nonzero = 0, first_nz = SURF_BYTES;
+    for (size_t b = 0; b < SURF_BYTES; b++)
+        if (raw[b]) { if (first_nz == SURF_BYTES) first_nz = b; nonzero++; }
+    printf("output surface: %zu bytes, %zu nonzero", (size_t)SURF_BYTES, nonzero);
+    if (nonzero) printf(", first nonzero at byte %zu", first_nz);
+    printf("\n");
+
+    const _Float16 *op = (const _Float16 *)raw;
     static double ref[CH * SEQ];
+    double ref_absmax = 0.0;
     for (int o = 0; o < CH; o++)
         for (int s = 0; s < SEQ; s++) {
             double a = 0.0;
             for (int i = 0; i < CH; i++) a += (double)W[o * CH + i] * (double)X[i * SEQ + s];
             ref[o * SEQ + s] = a;
+            if (fabs(a) > ref_absmax) ref_absmax = fabs(a);
         }
+    double got_absmax = 0.0;
+    for (int i = 0; i < CH * SEQ; i++)
+        if (fabs((double)op[i]) > got_absmax) got_absmax = fabs((double)op[i]);
+    printf("reference max|ref| = %.6f, read-back max|got| = %.6f\n", ref_absmax, got_absmax);
+
+    if (!nonzero) {
+        printf("NO WRITE OBSERVED: the engine reported success and left the surface untouched.\n");
+        IOSurfaceUnlock(out, kIOSurfaceLockReadOnly, NULL);
+        return 6;
+    }
+
+    // Only meaningful once the surface is nonzero. Absolute error is reported
+    // alongside, since a clamped relative denominator would let an all-zero
+    // read-back score as max|ref| and masquerade as a layout error.
     const int strides[] = { SEQ, 32, 64, 128 };
-    double best = 1e9; int best_stride = 0; int best_transposed = 0;
+    double best = 1e30; int best_stride = 0, best_transposed = 0;
     for (int k = 0; k < 4; k++) {
         for (int tr = 0; tr < 2; tr++) {
-            double worst_k = 0.0;
+            double worst_abs = 0.0;
             for (int o = 0; o < CH; o++)
                 for (int s = 0; s < SEQ; s++) {
-                    double got = tr ? (double)op[s * strides[k] + o]
-                                    : (double)op[o * strides[k] + s];
-                    double r = ref[o * SEQ + s];
-                    double denom = fabs(r) > 1.0 ? fabs(r) : 1.0;
-                    double rel = fabs(got - r) / denom;
-                    if (rel > worst_k) worst_k = rel;
+                    size_t idx = tr ? (size_t)s * strides[k] + o
+                                    : (size_t)o * strides[k] + s;
+                    if (idx * sizeof(_Float16) >= SURF_BYTES) continue;
+                    double d = fabs((double)op[idx] - ref[o * SEQ + s]);
+                    if (d > worst_abs) worst_abs = d;
                 }
-            printf("  stride=%3d %-12s max rel err %.5f\n",
-                   strides[k], tr ? "transposed" : "channel-major", worst_k);
-            if (worst_k < best) { best = worst_k; best_stride = strides[k]; best_transposed = tr; }
+            printf("  stride=%3d %-13s max abs err %.6f  (%.2f%% of max|ref|)\n",
+                   strides[k], tr ? "transposed" : "channel-major",
+                   worst_abs, 100.0 * worst_abs / ref_absmax);
+            if (worst_abs < best) { best = worst_abs; best_stride = strides[k]; best_transposed = tr; }
         }
     }
     IOSurfaceUnlock(out, kIOSurfaceLockReadOnly, NULL);
-    double worst = best;
-    printf("best: stride=%d %s, max relative error vs fp32 CPU reference %.5f\n",
-           best_stride, best_transposed ? "transposed" : "channel-major", best);
-    printf("%s\n", worst < 0.01 ? "PARITY OK" : "PARITY FAIL");
+    double worst = best / ref_absmax;
+    printf("best: stride=%d %s, max abs err %.6f = %.2f%% of max|ref|\n",
+           best_stride, best_transposed ? "transposed" : "channel-major",
+           best, 100.0 * worst);
+    printf("%s\n", worst < 0.02 ? "PARITY OK" : "PARITY FAIL");
 
     ((BOOL(*)(id, SEL, unsigned int, NSError **))objc_msgSend)(
         model, @selector(unloadWithQoS:error:), 21, &err);
     [fm removeItemAtPath:tmpDir error:nil];
     CFRelease(in); CFRelease(out);
-    return worst < 0.01 ? 0 : 5;
+    return worst < 0.02 ? 0 : 5;
 } }

@@ -7,17 +7,19 @@ Page citations use the printed folio of each paper, which for arXiv 2606.22283 s
 
 No-go for now, with one narrow exception worth keeping open.
 
-The path works. Every private class and C entry point the two papers describe is present on this
-machine, and a hand-authored MIL program compiled, loaded and evaluated on the engine from an
-ad-hoc signed binary with no entitlements and no Core ML in the process. That answers the
-feasibility question the issue asked.
+The path works and is numerically exact. Every private class and C entry point the two papers
+describe is present on this machine, and a hand-authored MIL matmul compiled, loaded and evaluated
+on the engine from an ad-hoc signed binary with no entitlements and no Core ML in the process,
+matching an fp64 CPU reference to the last fp16 bit. That answers the feasibility question the
+issue asked.
 
 The latency case is weaker. The decoder we would want to move is a two-layer LSTM, and `lstm`
 has no engine path on any Apple silicon family including M5 (2606.22283, Table A.12, p.255).
 Almost certainly Core ML runs that step off the engine already, which g38m is measuring. A direct
-port replaces a CPU LSTM with a hand-unrolled gate graph paying a 0.07 to 0.23 ms engine dispatch
-floor per step. Orion measured this shape of loss on GPT-2 124M, where CPU decode at 283 tok/s beat
-ANE decode at 170 tok/s (2603.06728, p.14 and p.16).
+port replaces a CPU LSTM with a hand-unrolled gate graph paying a per-dispatch floor of the order
+of 0.1 ms (section 4 gives the published figures and their generations; none is from an M5). Orion
+measured this shape of loss on GPT-2 124M, where CPU decode at 283 tok/s beat ANE decode at
+170 tok/s (2603.06728, p.14 and p.16).
 
 The one design that would change the arithmetic is described in section 4: a single fused program
 per frame, with the emit-versus-advance branch turned into arithmetic. Every operation it needs is
@@ -85,37 +87,59 @@ Objective-C route is reachable through the `objc2` 0.6 already in our `Cargo.tom
 
 ## 3. The prototype
 
-`reports/ane-direct/proto/ane_direct_matmul.m`. A single fp16 64x64 matmul expressed as a 1x1
-convolution over a `[1,64,1,16]` activation, weights in a BLOBFILE, IOSurface I/O, checked against
-an fp32 CPU reference.
+`reports/ane-direct/proto/ane_direct_matmul.m`. A single fp16 CH x CH matmul expressed as a 1x1
+convolution over a `[1,CH,1,SEQ]` activation, weights in a BLOBFILE, IOSurface I/O, checked against
+an fp64 CPU reference. It scans every byte of the output surface for a nonzero before scoring, so a
+surface the engine never touched is distinguishable from one written where the reader is not looking.
 
 ```
-xcrun clang -O2 -fobjc-arc -framework Foundation -framework IOSurface \
+xcrun clang -O2 -fobjc-arc -DCH=768 -DSEQ=64 -framework Foundation -framework IOSurface \
   -o ane_direct_matmul reports/ane-direct/proto/ane_direct_matmul.m
 ./ane_direct_matmul
 ```
 
-Ran twice, per the hardware constraint. Output:
+The engine computed the matmul exactly:
 
 ```
-staged program at BF598BB8...
 compile: ok
 load: ok
 evaluate: ok
-best: stride=16 channel-major, max relative error vs fp32 CPU reference 0.51953
-PARITY FAIL
+output surface: 98304 bytes, 92125 nonzero, first nonzero at byte 0
+reference max|ref| = 0.308594, read-back max|got| = 0.308594
+  stride= 64 channel-major max abs err 0.000000  (0.00% of max|ref|)
+  stride= 64 transposed    max abs err 0.605469  (196.20% of max|ref|)
+  stride= 32 channel-major max abs err 0.593750  (192.41% of max|ref|)
+  stride=128 channel-major max abs err 0.593750  (192.41% of max|ref|)
+best: stride=64 channel-major, max abs err 0.000000 = 0.00% of max|ref|
+PARITY OK
 ```
 
-The API path is proven and numeric parity remains open. The second run scored the output buffer
-under four row strides in both channel-major and transposed order, and none reproduced the
-reference; packed stride 16 was merely the least wrong. The suspect is the engine's internal activation
-tiling, described in the papers as packed `[1,C,1,S]` from byte 0 (#20) yet exposed by the netplist
-grammar as an `InputInterleave` / `OutputInterleave` factor (2606.22283, §6.2, p.38). Input and
-output layout are wrong together if they are wrong at all, so sweeping output strides alone cannot
-recover it. Orion reached full token agreement with the same 32-byte rows (C=768, S=16), so row
-padding alone is an unlikely culprit. The next experiment is an identity program, `out =
-identity(x)`, run over several values of C as well as S so channel tiling and row stride separate.
-Deferred while g38m owns the bench.
+The layout is packed channel-major at stride SEQ, as the papers describe (#20), and the wrong
+candidates miss by around 190%, so the discrimination is real. The test input is periodic and
+cancels heavily, which keeps max|ref| at 0.31 and makes this a check of layout and wiring rather
+than of fp16 accumulation over long contractions.
+
+Getting there took three runs and corrected an earlier wrong diagnosis. The first version of this
+prototype allocated a fixed 65536-byte surface with `Width` and `BytesPerRow` both 65536 for a
+2048-byte tensor. Evaluation returned success and the engine wrote nothing, and a scoring metric
+that clamped the relative-error denominator at 1.0 turned that silent zero into a plausible-looking
+0.51953, which is exactly max|ref| for that input. Every stride candidate then scored identically
+and the tie broke to the first. The reported "layout mismatch" was an artifact of the metric.
+
+What the three corrected runs actually establish about surface geometry:
+
+| Surface bytes | Tensor bytes | Result |
+|---|---|---|
+| 65536, `BytesPerRow` 65536 | 2048 | evaluate ok, surface untouched |
+| 2048, sized to the tensor | 2048 | `0x1d` at eval, `ANEProgramProcessRequestDirect` |
+| 24576, sized to the tensor | 24576 | `0x1d` at eval |
+| 98304, sized to the tensor | 98304 | evaluate ok, exact parity |
+
+Constraint #4's roughly 49 KB minimum is real and is enforced on the tensor, not on the allocation.
+Orion's stated mitigation, padding `[1,768,1,1]` to `[1,768,1,16]`, yields 24576 bytes and still
+trips `0x1d` here, so that example in 2603.06728 p.5 understates the threshold on this machine.
+Oversizing the surface past the minimum while leaving the tensor small buys nothing: the request is
+accepted and no write occurs.
 
 ## 4. Resident state against the Parakeet decoder
 
@@ -130,9 +154,12 @@ copies per step, which is the whole of what aliasing alone buys.
 
 Ported one-for-one, dispatch count is unchanged. The emit-versus-advance decision after the joint's
 argmax is host control flow, so the loop stays at roughly 62 frames x (1 decoder + 1 to n joint)
-per 5 s utterance, the count g38m is measuring today. What changes is the cost of each dispatch,
-from Core ML's per-prediction overhead down toward the 0.07 to 0.23 ms engine floor (2606.22283,
-p.85; ANEForge reports about 90 us for a small fused program).
+per 5 s utterance, the count g38m is measuring today. What changes is the cost of each dispatch, from Core ML's
+per-prediction overhead down toward the engine's own floor. Published figures, none measured on an
+M5: 0.23 ms by the slope method and 0.19 ms for a tiny model, both M1 (2606.22283, p.57); about
+0.095 ms of XPC and IOKit overhead on M4 Max (2603.06728, Table 1, p.2); "about 90us, near the
+engine's 70us per-program dispatch floor" in the ANEForge abstract, which does not state the
+generation. Measuring this on our M5 is item 1 of the deferred list.
 
 The issue's "one dispatch per frame" is reachable by a different construction. Unroll `max_symbols`
 decoder-plus-joint steps into a single program and turn the branch into arithmetic: `reduce_argmax`
@@ -159,21 +186,22 @@ operations, well inside the 16 to 64 op depth range where the engine reaches 94%
 | Private API breaks on a macOS update | High | Undocumented and version-fragile by the author's own statement (2606.22283, §6.3 p.40). Every selector and symbol would need re-probing per release. |
 | MIL dialect drift | Medium | Orion pins `program(1.3)` and `func main<ios18>`; our shipped models emit `program(1.0)` / `ios17`. The accepted grammar is whatever the daemon's compiler happens to take. |
 | Signing | Low | Ad-hoc signing worked here with no entitlements. Notarized-bundle behaviour untested. |
-| Undiscovered layout contract | High, current blocker | Parity failed and the papers do not fully specify the activation tiling. |
+| Silent no-write on undersized tensors | Medium | An under-minimum tensor in an oversized surface evaluates successfully and writes nothing. Any harness needs the nonzero scan as a standing assertion, not a debugging aid. |
 | Compile and program caps | Medium | About 119 compiles per process (#5) and near 128 loaded programs per process (2606.22283, p.85). A bucketed encoder would need a cache budget. |
 | Maintenance | High | A private-API runtime for a single-user app is standing maintenance, re-verified every macOS release. |
 
 ## Deferred timing, to run when g38m releases the bench
 
-Both probes below still need writing; neither exists yet.
+The layout question is closed. The `--repeat` flag below still needs writing.
 
 ```
-# 1. Fix layout first. Identity program over several C and S values, one dispatch each,
-#    so channel tiling and row stride separate.
-./ane_identity_probe --channels 64,128,768 --seq 16,32
-
-# 2. Bare dispatch floor. 1000 evaluations of the already-compiled matmul program, p50/p95.
+# 1. Bare dispatch floor on M5. 1000 evaluations of the already-compiled matmul
+#    program at CH=768 SEQ=64, p50/p95. This is the number none of the three
+#    papers measures on this generation.
 ./ane_direct_matmul --repeat 1000 --report-percentiles
+
+# 2. Bisect the eval minimum between 24576 and 98304 bytes, one dispatch per point,
+#    so a real decoder-sized program can be given the smallest legal tensor.
 
 # 3. The same shape through Core ML with MLComputeUnits.cpuAndNeuralEngine, for the delta.
 cargo run --release --bin bench_asr -- --stage-timers
