@@ -24,6 +24,7 @@ use parakeet_dictation::coreml_worker::{
     load_coreml_worker, CoreMlComputeUnits, CoreMlWorkerConfig,
 };
 use parakeet_dictation::performance::{self, next_session_id, PhaseTimer, PhaseTimerMode};
+use parakeet_dictation::resample::{to_target_rate, TARGET_SAMPLE_RATE};
 use parakeet_dictation::settings::SettingsStore;
 use parakeet_dictation::warmup;
 use parakeet_dictation::wav::read_wav_mono;
@@ -328,11 +329,19 @@ fn run(args: &Args) -> anyhow::Result<()> {
     }
     warmup::dummy_decode(&asr)?;
 
-    let (samples, sample_rate) = read_wav_mono(&args.wav)?;
-    let audio_s = samples.len() as f32 / sample_rate as f32;
+    let (fixture, fixture_rate) = read_wav_mono(&args.wav)?;
+    let audio_s = fixture.len() as f32 / fixture_rate as f32;
+    // Convert once, outside the measured loop, because that is what production
+    // does: `AudioCapture` resamples inside its capture callbacks, so
+    // `Asr::recognize` is always handed 16 kHz mono. Timing the conversion here
+    // would measure a step the endpoint path no longer has. ADR-0030.
+    let samples = to_target_rate(&fixture, fixture_rate)?.into_owned();
+    let sample_rate = TARGET_SAMPLE_RATE;
     log::info!(
-        "loaded {} ({audio_s:.3}s mono @ {sample_rate} Hz, {} samples)",
+        "loaded {} ({audio_s:.3}s mono @ {fixture_rate} Hz, {} samples); \
+         converted to {sample_rate} Hz ({} samples) before the measured loop",
         args.wav.display(),
+        fixture.len(),
         samples.len()
     );
 

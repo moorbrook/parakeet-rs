@@ -79,7 +79,12 @@ scripts/bench-hold.sh
 
 ## What is and isn't measured
 
-The bench loads pre-recorded WAVs and runs `Asr::recognize()` directly.
+The bench loads pre-recorded WAVs, converts them to 16 kHz once at load, and
+runs `Asr::recognize()` directly. The conversion sits outside the measured loop
+because that is where production does it: since ADR-0030 `AudioCapture`
+resamples inside its cpal callbacks, so `recognize()` is always handed 16 kHz
+mono. Fixtures stay at 48 kHz on disk so these runs stay comparable with the
+published baselines.
 Each repetition also emits `asr_boundary` with worker-internal
 resample-plus-inference time, outer Rust wall time, and their difference. For
 the Core ML worker that difference prices Float32 pipe transfer, scheduling,
@@ -120,7 +125,18 @@ measured transcript had an exact lexical match to the reviewed reference.
 
 The optimized path starts ASR from the early 32 ms detector, discards the
 provisional result whenever speech resumes, and lets an independent Silero
-state remain the sole stop authority. This frozen comparison explicitly uses
+state remain the sole stop authority. Re-run on 2026-09-04 after ADR-0030
+retired the resample stage, the gate reads 630.0 ms against 192.0 ms (3.28x
+p50) and 952.3 ms against 203.0 ms (4.69x p95), every transcript matching.
+
+Tap does not collect the resample saving, and the `phase_timer` lines say why:
+`t_asr_start=4966`, `t_asr_done=5013`, `t_vad_endpoint=5094`. The speculative
+decode finishes about 80 ms before the endpoint policy confirms, and
+`dur_post_endpoint_ms` is 0 to 1 ms, so this path is endpoint-bound rather than
+decode-bound. Taking 22 ms out of the decode widens that margin instead of
+shortening the result. The saving lands where the decode is not hidden: Hold,
+the serial fallback, and every utterance long enough that the decode would
+otherwise outrun the confirmation window. This frozen comparison explicitly uses
 Tap Fast's original 150 ms policy so the historical 3× result stays
 like-for-like. The gate fails unless both p50 and p95 are at least 3.0× and
 every transcript matches:
@@ -199,20 +215,30 @@ dispatch to the last dispatch of that window. Nothing in the pinned package is
 patched, and the shipping dictation path never installs the wrappers.
 
 Medians over 30 measured repetitions per bucket, three warmups, 48 kHz
-fixtures, release build (`bench/coreml-unified-stages.csv`):
+fixtures, release build (`bench/coreml-unified-stages.csv`). The resample column
+was retired by ADR-0030 and its measurement is reproduced under
+"Retiring the resample stage" below.
 
 | fixture | resample | mel | encoder | RNNT loop | post | worker total | IPC | ASR p50 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 0.740 s | 3.41 ms | 3.07 ms | **25.55 ms** | 2.98 ms | 0.04 ms | 35.2 ms | 0.16 ms | 36.0 ms |
-| 2.507 s | 11.46 ms | 3.08 ms | **25.48 ms** | 8.40 ms | 0.05 ms | 48.5 ms | 0.26 ms | 49.0 ms |
-| 4.967 s | 22.71 ms | 3.06 ms | **25.49 ms** | 15.21 ms | 0.06 ms | 66.5 ms | 0.42 ms | 67.0 ms |
-| 8.150 s | 37.77 ms | 3.32 ms | **26.03 ms** | 25.40 ms | 0.08 ms | 92.6 ms | 0.60 ms | 94.0 ms |
-| 15.691 s | 72.57 ms | 6.13 ms | **51.59 ms** | 54.40 ms | 0.13 ms | 184.9 ms | 1.11 ms | 187.0 ms |
+| 0.816 s | 0.001 ms | 3.20 ms | **25.99 ms** | 3.25 ms | 0.04 ms | 32.7 ms | 0.11 ms | 32.0 ms |
+| 2.828 s | 0.001 ms | 3.23 ms | **25.94 ms** | 9.04 ms | 0.05 ms | 38.2 ms | 0.17 ms | 38.0 ms |
+| 4.854 s | 0.001 ms | 3.19 ms | **25.97 ms** | 15.43 ms | 0.06 ms | 44.8 ms | 0.21 ms | 44.5 ms |
+| 8.062 s | 0.001 ms | 3.20 ms | **25.89 ms** | 23.57 ms | 0.07 ms | 52.7 ms | 0.27 ms | 52.5 ms |
+| 16.513 s | 0.001 ms | 6.22 ms | **51.95 ms** | 53.04 ms | 0.12 ms | 111.5 ms | 0.47 ms | 111.5 ms |
 
-Worker total is resample plus the profiled transcribe interval; it sits 0.7 to
-1.0 ms under the `asr_boundary` internal time, which is the response encode and
-the Swift work outside the profiled window. IPC is unchanged from the
-2026-08-11 boundary measurement and remains under 0.6% of the call.
+The 2026-09-04 g38m table this replaces was measured on a differently
+synthesized fixture set (0.740, 2.507, 4.967, 8.150, 15.691 s), so it is not a
+like-for-like row-by-row comparison; the before/after below re-measured the old
+code on these exact fixtures instead.
+
+Worker total is resample plus the profiled transcribe interval, and with
+resample retired the two are the same number. It now sits within about 0.01 ms
+of the `asr_boundary` internal time (44.789 against 44.795 ms at 5 s), where the
+g38m run had a 0.7 to 1.0 ms gap: that gap was the Swift work around the
+conversion, not around the profiled window. IPC halved with the payload, from
+0.42 to 0.21 ms at 5 s and 1.14 to 0.47 ms at 20 s, and stays under 0.5% of the
+call.
 
 Enabling the profiler costs nothing measurable. Matched 30-repetition runs with
 and without `--stage-timings` measured 35.51 against 35.51 ms at 1 s and 67.09
@@ -226,9 +252,10 @@ all three stages have dispatched, and the model placement is read once per stage
 rather than per call.
 
 These absolute numbers need a quiet machine, which matters more than the
-profiler does. Against the 2026-08-11 published baseline the 1, 3, 5, and 20 s
-buckets land within about 2 ms, and 10 s is roughly 5 ms higher; the interleaved
-A/B above rules the profiler out as the cause. A separate repeat under a
+profiler does. In the g38m run, which still paid the resample, the 1, 3, 5, and
+20 s buckets landed within about 2 ms of the 2026-08-11 published baseline and
+10 s was roughly 5 ms higher; the interleaved A/B above ruled the profiler out
+as the cause. A separate repeat under a
 competing job reproduced the dispatch counts exactly and kept the encoder flat
 at 26.4 to 28.5 ms, with resample and the decode loop 10 to 20% higher. The
 shape of the breakdown is stable; the millisecond values are not, so compare
@@ -236,8 +263,8 @@ against the ASR-only p50 column from the same run.
 
 The encoder cost does not depend on utterance length. `UnifiedAsrManager`
 zero-pads every window to a fixed 15 s buffer (240,000 samples, 1,501 mel
-frames) and runs the full offline encoder graph on it, so a 0.74 s utterance
-pays the same 25.5 ms as an 8.15 s one. The 15.691 s fixture exceeds the 15 s
+frames) and runs the full offline encoder graph on it, so a 0.816 s utterance
+pays the same 26.0 ms as an 8.062 s one. The 16.513 s fixture exceeds the 15 s
 window and needs a second one, which doubles both mel and encoder.
 `chunkStarts` adds that second window only past 240,000 samples, so a 14 s
 utterance still runs a single encoder pass.
@@ -246,17 +273,22 @@ utterance still runs a single encoder pass.
 
 | fixture | windows | encoder calls | decoder calls | joint calls | decoded frames | per joint | per decoder |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 0.740 s | 1 | 1 | 7 | 16 | 10 | 107 µs | 158 µs |
-| 2.507 s | 1 | 1 | 20 | 51 | 32 | 100 µs | 143 µs |
-| 4.967 s | 1 | 1 | 35 | 96 | 62 | 99 µs | 142 µs |
-| 8.150 s | 1 | 1 | 57 | 158 | 102 | 101 µs | 147 µs |
-| 15.691 s | 2 | 2 | 122 | 342 | 222 | 101 µs | 145 µs |
+| 0.816 s | 1 | 1 | 7 | 17 | 11 | 113 µs | 170 µs |
+| 2.828 s | 1 | 1 | 20 | 55 | 36 | 105 µs | 147 µs |
+| 4.854 s | 1 | 1 | 36 | 96 | 61 | 101 µs | 145 µs |
+| 8.062 s | 1 | 1 | 55 | 155 | 101 | 98 µs | 139 µs |
+| 16.513 s | 2 | 2 | 119 | 349 | 232 | 98 µs | 142 µs |
 
 Decoded frames are `joint_calls - (decoder_calls - windows)`, since the greedy
 loop issues one joint per frame plus one per emitted token, and one decoder call
-per window plus one per emitted token. Every bucket matches its 80 ms frame
-arithmetic: 4.967 s of audio decodes 62 frames. That agreement is what
-validates the counts.
+per window plus one per emitted token. Every single-window bucket matches its
+80 ms frame arithmetic: 4.854 s of audio decodes 61 frames. That agreement is
+what validates the counts.
+
+These counts are also identical to the pre-ADR-0030 arm at every bucket, which
+is the sharpest available check that moving the resample into Rust did not
+change what the encoder sees: a different filter would perturb the mel frames
+and, sooner or later, the token the greedy loop emits.
 
 The agreement is also checked at runtime, because a stage whose Core ML entry
 point stops being intercepted reports zero cost while every other number stays
@@ -303,22 +335,172 @@ BACKEND=coreml-unified OUT_CSV=bench/coreml-unified.csv scripts/bench-latency.sh
     --reps 8 --warmup-reps 3 --stage-timings --compute-units cpu-only
 ```
 
-### Where the 66 ms at 5 s goes
+### Where the 45 ms at 5 s goes
 
-No single stage owns it. On the 4.967 s fixture the 66.5 ms of worker-internal
-time is encoder 25.5 ms (38%), resample 22.7 ms (34%), RNNT decode loop 15.2 ms
-(23%), and mel 3.1 ms (5%), with IPC at 0.42 ms and post-processing under
-0.1 ms. The 35 ms floor at 1 s is owned by the encoder: the offline path pads
-every utterance to the fixed 15 s window, so 25.5 ms of encoder plus 3.1 ms of
-mel is length-independent work that a one-word utterance pays in full, and that
-28.6 ms is 80% of the 1 s result. The growth from 35 ms to 66 ms is split nearly
-evenly between resample, which costs a linear 4.6 ms per second of 48 kHz input
-and adds 19.3 ms, and the decode loop, which costs 0.25 ms per 80 ms frame and
-adds 12.2 ms. The prior hypothesis that the per-frame RNNT loop accounts for the
-gap over encoder arithmetic is half right: the loop is real, it is entirely on
-the CPU, and roughly 100 µs of each 0.25 ms frame is a single joint dispatch,
-but at every measured length the 48 kHz to 16 kHz resample costs more than the
-loop does.
+Two stages own it. On the 4.854 s fixture the 44.8 ms of worker-internal time is
+encoder 26.0 ms (58%), RNNT decode loop 15.4 ms (34%), and mel 3.2 ms (7%), with
+IPC at 0.21 ms and post-processing under 0.1 ms. The 32 ms floor at 1 s is owned
+by the encoder: the offline path pads every utterance to the fixed 15 s window,
+so 26.0 ms of encoder plus 3.2 ms of mel is length-independent work that a
+one-word utterance pays in full, and that 29.2 ms is 91% of the 1 s result. What
+grows with length is now only the decode loop, at 0.25 ms per 80 ms frame,
+entirely on the CPU, with roughly 100 µs of each frame being a single joint
+dispatch.
+
+### Retiring the resample stage
+
+Before ADR-0030 a third stage sat between them. The worker received device-rate
+audio and let FluidAudio's `AudioConverter` convert it, which builds a fresh
+`AVAudioConverter` per call and cost a linear 4.6 ms per second of 48 kHz input:
+22.4 ms of a 67 ms result at 5 s, more than the whole decode loop at every
+measured length, and all of it after the endpoint. Rust already converted the
+same audio for Silero VAD, so the work happened twice and the copy on the
+critical path was the redundant one.
+
+The fix converts once, in the cpal capture callback, so 16 kHz audio is ready
+when the user stops speaking. Both arms below ran back to back in one session on
+the same five fixtures; "before" is commit `9857547`.
+
+| fixture | resample before | resample after | ASR p50 before | ASR p50 after | change |
+|---|---:|---:|---:|---:|---:|
+| 0.816 s | 3.87 ms | 0.001 ms | 36.0 ms | 32.0 ms | −4.0 ms |
+| 2.828 s | 13.04 ms | 0.001 ms | 51.0 ms | 38.0 ms | −13.0 ms |
+| 4.854 s | 22.37 ms | 0.001 ms | 67.0 ms | 44.5 ms | −22.5 ms |
+| 8.062 s | 36.98 ms | 0.001 ms | 91.0 ms | 52.5 ms | −38.5 ms |
+| 16.513 s | 76.50 ms | 0.001 ms | 190.5 ms | 111.5 ms | −79.0 ms |
+
+The change is the retired resample plus a smaller second term: the pipe carries
+16 kHz floats instead of 48 kHz, so measured IPC falls from 0.42 to 0.21 ms at
+5 s and from 1.14 to 0.47 ms at 20 s. At 5 s, 22.37 + 0.21 accounts for 22.6 of
+the 22.5 ms measured. Every other stage held: mel 3.19 against 3.23 ms, encoder
+25.97 against 26.04, profiled transcribe interval 44.79 against 44.87.
+
+## Bucketed short-window encoders: M5 Pro 24 GB (2026-09-04)
+
+With the resample retired, the encoder is the whole of the short-utterance
+floor: 26.0 ms of a 32.7 ms one-second result, and flat, because the offline
+encoder is compiled at one fixed 15 s mel window and `UnifiedAsrManager`
+zero-pads every utterance to it. `scripts/build-bucket-encoder.py` exports the
+same NVIDIA checkpoint at shorter windows through FluidInference's `mobius`
+pipeline, and the worker sends each utterance to the narrowest compiled window
+that holds it. Buckets are discovered by filename in the model directory, so the
+two arms below differ only in which `--model-dir` the worker was given.
+
+Encoder cost against compiled window, `parakeet-encoder-probe` on zero inputs,
+ten predictions after three warmups:
+
+| window | mel frames | encoder frames | predict p50 |
+|---:|---:|---:|---:|
+| 2 s | 201 | 26 | 7.70 ms |
+| 5 s | 501 | 63 | 9.64 ms |
+| 8 s | 801 | 101 | 12.21 ms |
+| 12 s | 1201 | 151 | 24.48 ms |
+| 15 s (shipped) | 1501 | 188 | 26.11 ms |
+
+The curve bends: 7.5 µs per frame from 201 to 801, 30.7 µs from 801 to 1201,
+5.4 µs from 1201 to 1501. That bend is unexplained. It is why an 8 s window is
+worth having and a 12 s one is not, and why extrapolating from the short end
+would have been wrong: about 6 ms of the encoder is fixed cost no shorter window
+removes. Derivation and method are in
+[`docs/asr/COMPUTE_PLAN.md`](../docs/asr/COMPUTE_PLAN.md).
+
+Matched 30-repetition runs, three warmups, release build
+(`bench/coreml-unified-rerun-stages.csv` against
+`bench/coreml-unified-buckets-stages.csv`). Machine 80 to 92% idle throughout.
+
+| fixture | captured | bucket taken | encoder before | encoder after | mel before | mel after |
+|---|---:|---|---:|---:|---:|---:|
+| `1s_48000` | 0.816 s | 2 s | 25.98 ms | **7.71 ms** | 3.18 ms | 0.71 ms |
+| `3s_48000` | 2.828 s | 5 s | 25.31 ms | **9.74 ms** | 3.06 ms | 1.28 ms |
+| `5s_48000` | 4.854 s | 5 s | 25.45 ms | **9.98 ms** | 3.11 ms | 1.34 ms |
+| 7 s cut | 7.000 s | 8 s | 25.60 ms | **12.45 ms** | 3.10 ms | 1.89 ms |
+| `10s_48000` | 8.062 s | none | 25.55 ms | 25.60 ms | 3.14 ms | 3.16 ms |
+| `20s_48000` | 15.755 s | none | 51.88 ms | 51.16 ms | 6.22 ms | 6.05 ms |
+
+Mel falls with the encoder because `UnifiedMelExtractor` is built at the
+layout's window, so a 2 s bucket computes 201 mel frames instead of 1501.
+
+These runs predate the merge of ADR-0030, so both arms still paid the
+worker-side resample. That does not touch these two columns, and the check is in
+the table: the "before" arm's encoder and mel reproduce the post-ADR-0030
+per-stage table above within 0.7 ms at every fixture, which is what licenses
+reading the two tables together.
+
+Worker total, which excludes resample in both arms and is therefore directly
+comparable to the post-ADR-0030 numbers above:
+
+| fixture | captured | worker total before | after | saved |
+|---|---:|---:|---:|---:|
+| `1s_48000` | 0.816 s | 32.40 ms | **11.26 ms** | −21.1 ms |
+| `3s_48000` | 2.828 s | 37.08 ms | **19.78 ms** | −17.3 ms |
+| `5s_48000` | 4.854 s | 43.98 ms | **27.01 ms** | −17.0 ms |
+| 7 s cut | 7.000 s | 49.70 ms | **35.61 ms** | −14.1 ms |
+| `10s_48000` | 8.062 s | 52.91 ms | 52.89 ms | 0.0 ms |
+| `20s_48000` | 15.755 s | 112.61 ms | 110.77 ms | −1.8 ms |
+
+The "before" column agrees with the independently measured post-ADR-0030 worker
+totals in the per-stage table above to within 1.1 ms at every fixture, and the
+"after" column was checked directly on the merged code: a single 4.854 s
+decode with ADR-0030's 16 kHz capture path reports resample 0.001 ms, mel
+1.43 ms, encoder 10.01 ms and worker total 27.17 ms, against the 27.01 ms in
+the table. ASR p50 is worker total plus IPC, which is 0.11 to 0.27 ms across
+this range, so a one-second utterance goes from about 32 ms to about 11 ms of
+ASR. Repeated end-to-end p50 on the merged code has not been re-measured; when
+it is, it belongs in the per-stage table above rather than here.
+
+The 8.062 s fixture is unchanged twice over: it is 128,992 samples against the
+8 s bucket's 128,000, missing by 62 ms of audio, and it is also past the 8 s
+long-regime threshold. No stock fixture lands between 5 and 8 seconds, so the
+8 s bucket is measured on a 7.0 s cut of the gold corpus's 14.225 s
+`librispeech-multi` recording — real speech, trimmed with `soundfile` rather
+than newly synthesized. The 15.755 s fixture needs two 15 s windows either way.
+
+Every row has identical Core ML dispatch counts in both arms, which is what says
+the decode path did not change: 7/17, 20/55, 36/96, 48/135, 55/155 and 119/349
+decoder/joint calls respectively.
+
+At one second the remaining 11.3 ms is encoder 7.71, decode loop 2.83, mel 0.71
+and post 0.03. The length-independent encoder-and-mel share of the ASR call
+falls from 91% to 75%; what is left is a smaller fixed cost of the same kind,
+and the decode loop, which grows at 0.25 ms per 80 ms frame and now dominates
+past about 3 seconds of audio.
+
+Quality is unchanged. Matched ten-repetition gold runs, same corpus and worker,
+differing only in model directory:
+
+| arm | WER | CER | corpus decode p50 | p95 | RTFx p50 | peak RSS | load |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 15 s only | 5.434783% | 3.571429% | 0.4534 s | 0.4682 s | 75.1× | 0.10 GiB | 0.107 s |
+| buckets 2/5/8 | 5.434783% | 3.571429% | **0.3397 s** | **0.3879 s** | **100.2×** | 0.19 GiB | 0.495 s |
+
+Both are 5 word edits of 92 and 17 character edits of 476, with zero WER and CER
+spread and zero changed outputs across ten repetitions, so the bucket arm sits
+exactly on the frozen baseline and passes its 0.00-point regression cap. Every
+hypothesis is byte-identical between the two arms, checked field by field rather
+than inferred from equal scores. The gold corpus routes one fixture to the 2 s
+bucket, five to the 5 s, and the 14.225 s fixture to the unbucketed path; the
+7 s cut covers the 8 s bucket, and it is byte-identical too. Those corpus
+timings also predate ADR-0030 in both arms.
+
+Each bucket is a separate 590 MB compiled program, so 2/5/8 costs 1.77 GB of
+disk on top of the shipped 569 MB encoder. Resident memory is far cheaper
+because Core ML maps the weights: 0.10 to 0.19 GiB. The first load of a bucket
+compiles a Core ML plan and takes about 6 s; the plan cache is persistent, so
+warm load is 0.495 s against 0.107 s. That cold cost is behind a blocking read
+in the Rust worker handshake and is tracked as kata hrs0. The ANE's ~128
+loaded-program cap is not close at three buckets.
+
+```bash
+scripts/build-bucket-encoder.py --seconds 5    # ~90 s per bucket, 1 to 14
+BACKEND=coreml-unified OUT_CSV=bench/coreml-unified-buckets.csv \
+    PARAKEET_COREML_MODEL_DIR=<dir with bucket encoders> scripts/bench-latency.sh
+REPETITIONS=10 COREML_WORKER=target/release/parakeet-coreml-worker \
+    COREML_MODEL_DIR=<dir with bucket encoders> scripts/bench-gold.sh
+```
+
+Bucket artifacts are not on Hugging Face and the Rust download and verification
+path knows nothing about them, so a stock model directory has no buckets and
+behaves exactly as the tables above describe.
 
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 
@@ -331,15 +513,23 @@ there, and stops the clock at transcript-ready. Releasing at the acoustic end
 is the earliest a user could, so these are floor numbers for the mode.
 
 30 measured repetitions per bucket, two warmups, `BlackHole 2ch` loopback,
-resident Core ML worker (`bench/hold.csv`):
+resident Core ML worker (`bench/hold.csv`). Re-measured 2026-09-04 after
+ADR-0030; the 2026-09-04 pre-ADR-0030 column is kept beside it because Hold,
+unlike Tap, has nothing overlapping the decode and so collects the saving in
+full.
 
-| bucket | captured audio | n | mean | p50 | p95 | p99 |
-|---|---:|---:|---:|---:|---:|---:|
-| 1 s | 0.800 s | 30 | 58.0 ms | **54.0 ms** | 79.5 ms | 80.7 ms |
-| 3 s | 2.571 s | 30 | 71.5 ms | **67.0 ms** | 97.7 ms | 108.5 ms |
-| 5 s | 5.035 s | 30 | 117.9 ms | **106.5 ms** | 158.6 ms | 160.4 ms |
-| 10 s | 8.213 s | 30 | 144.1 ms | **137.5 ms** | 184.5 ms | 190.4 ms |
-| 20 s | 15.755 s | 30 | 238.5 ms | **231.5 ms** | 280.6 ms | 288.8 ms |
+| bucket | captured audio | n | mean | p50 | p95 | p99 | p50 before |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 1 s | 0.885 s | 30 | 49.0 ms | **48.0 ms** | 55.0 ms | 117.5 ms | 54.0 ms |
+| 3 s | 2.901 s | 30 | 56.6 ms | **55.0 ms** | 76.0 ms | 90.7 ms | 67.0 ms |
+| 5 s | 4.922 s | 30 | 84.5 ms | **72.5 ms** | 137.6 ms | 141.1 ms | 106.5 ms |
+| 10 s | 8.128 s | 30 | 117.7 ms | **125.0 ms** | 161.2 ms | 166.6 ms | 137.5 ms |
+| 20 s | 16.587 s | 30 | 204.4 ms | **192.5 ms** | 240.0 ms | 352.9 ms | 231.5 ms |
+
+The before column came from a run whose captured durations differ by up to
+0.8 s per bucket, so treat it as a trend rather than a controlled comparison;
+the controlled before/after is the ASR-only table under "Retiring the resample
+stage".
 
 Bucket labels are nominal. The captured-audio column is the median measured
 duration, and it is what these latencies belong to: the "20 s" row is a 15.755 s
@@ -350,17 +540,28 @@ Medians of the parts, from the same `phase_timer` lines:
 
 | bucket | captured audio | release to observed | capture stop and join | ASR | total p50 |
 |---|---:|---:|---:|---:|---:|
-| 1 s | 0.800 s | 8.0 ms | 0.0 ms | 44.5 ms | 54.0 ms |
-| 3 s | 2.571 s | 8.0 ms | 0.0 ms | 53.5 ms | 67.0 ms |
-| 5 s | 5.035 s | 9.5 ms | 1.0 ms | 95.0 ms | 106.5 ms |
-| 10 s | 8.213 s | 9.5 ms | 1.0 ms | 122.0 ms | 137.5 ms |
-| 20 s | 15.755 s | 12.0 ms | 1.0 ms | 219.5 ms | 231.5 ms |
+| 1 s | 0.885 s | 14.5 ms | 0.0 ms | 33.0 ms | 48.0 ms |
+| 3 s | 2.901 s | 12.0 ms | 0.0 ms | 40.0 ms | 55.0 ms |
+| 5 s | 4.922 s | 12.0 ms | 0.0 ms | 61.0 ms | 72.5 ms |
+| 10 s | 8.128 s | 12.5 ms | 0.0 ms | 115.5 ms | 125.0 ms |
+| 20 s | 16.587 s | 14.0 ms | 0.0 ms | 181.0 ms | 192.5 ms |
 
-`run_manual` polls its signal channel every 15 ms, which is the 8 to 12 ms
-median seen in the first column and up to 15 ms in the tail. Capture shutdown
-and the mono fold cost about 1 ms. Everything else is ASR, which runs 9 to 42%
-slower here than in the isolated bench, not monotonically in length, because the
-capture stream is still live in the same process. Hold also never sets `early_transcript`, so unlike Tap it
+The capture callback itself is measured, because one that overruns its buffer
+period drops audio. `AudioCapture` keeps a lock-free duration histogram and logs
+`capture_callback` at stop; on the 48 kHz loopback, 461 callbacks over 4.917 s
+measured mean 9.8 µs, p99 30 µs, max 103 µs against the 10.67 ms period of a
+512-frame chunk. That is 0.92 ms per audio-second for the whole callback — mono
+fold, level meter, filter, buffer append, channel send — all of it during
+capture and none at the endpoint.
+
+`run_manual` polls its signal channel every 15 ms, which is the 12 to 14 ms
+median seen in the first column. Capture shutdown now rounds to 0 ms at every
+bucket, where it used to cost about 1 ms: `finish_with_recording` no longer
+folds the whole recording to mono, because capture did that per callback, and
+all that remains after the stream is dropped is the resampler's tail flush.
+Everything else is ASR, which runs slower here than in the isolated bench, not
+monotonically in length, because the capture stream is still live in the same
+process. Hold also never sets `early_transcript`, so unlike Tap it
 cannot overlap any decode with the tail of the utterance.
 
 ```bash
@@ -604,6 +805,164 @@ Replay:
     --reps 30 --warmup-reps 3 2> bench/llm-4b-raw.log
 ```
 
+## §6 follow-up: polish latency and quality on an eval set (2026-09-04, M5 Pro 24 GB)
+
+Kata 0tpp. Everything above measures **one** transcript — the hardcoded
+`SAMPLE_INPUT`, 55 output tokens at the model's decode rate. That is the
+structural bound, not a p50 over anything a user dictates, and it is
+what the "1000 ms NOT MET" verdict was recorded against.
+
+`bench/polish/eval.json` is a 26-item eval set with the polished text
+each item should produce. `bench_llm --eval` runs it, scores word-level
+error rate against `expected` (casing and punctuation included — those
+are two of the three things polish exists to fix), and reports latency
+and quality over the same population.
+
+Machine load before each run: `Load Avg` 1.0–2.3, CPU ≥ 87 % idle.
+3 repetitions × 26 items = 78 measured decodes per row. Repetitions are
+low deliberately: within-item variance is negligible (§6's p99/p50 =
+1.04), so the percentiles are driven by *which item* it is, not by
+run-to-run noise. `p99` over 78 samples is a single item and is not
+quoted below.
+
+**Skipped items enter the percentiles as 0 ms.** The `skip < 4 words`
+row bypasses the model for three items and records them at zero, which
+is the latency the user experiences. It is not a decode time, and that
+row's distribution is therefore not the same shape as the others.
+
+> ### Quality-column correction (2026-09-04)
+>
+> The WER column below was first measured against `eval.json` schema 1
+> with a whitespace-splitting scorer. Both had defects, found in review:
+>
+> - **`technical` was measured wrong.** `technical-01` and `technical-03`
+>   expected spoken-to-written conversion (`one point zero point two one
+>   nine` → `1.0.219`, `colon colon` → `::`) that system-prompt rule 7
+>   explicitly forbids — "Preserve technical terms, names, and code-like
+>   fragments exactly as transcribed". They penalised the model for
+>   obeying the prompt. Schema 2 derives their expected text from the
+>   prompt rules alone. The category's WER falls **0.847 → 0.091**.
+> - **`command` was scored blind.** The scorer split on whitespace, so a
+>   model that emitted a space where `new paragraph` required a line
+>   break scored zero errors. It now tokenises breaks. The category's
+>   WER rises **0.000 → 0.059**, exposing a real defect: on
+>   `command-01` and `command-04` the 4B produced
+>   `Ship the parts Monday. Invoice follows separately.` — correct
+>   punctuation, no line break.
+>
+> Inputs did not change, so **every latency number below is unaffected**.
+> Only the 4B row's quality has been re-measured under schema 2
+> (blended **WER 0.061, 18/26 exact**, recomputed from the unchanged
+> categories plus a deterministic re-run of the two corrected ones).
+> The 2B, 0.8B, and edits-only rows still carry schema-1 quality and are
+> **not comparable to it**; re-measuring them needs another bench turn.
+
+| Variant | p50 | p95 | `legacy-bench-sample` | mean WER | exact | mean out tokens |
+|---|---|---|---|---|---|---|
+| **4B Q6_K full-text (shipping)** | **444 ms** | 1219 ms | 1209 ms | **0.139** | 17/26 | 18.7 |
+| 4B full-text + skip < 4 words | 446 ms | 1222 ms | 1221 ms | 0.139 | 17/26 | 18.3 |
+| 4B full-text + context reuse | 424 ms | 1220 ms | 1198 ms | 0.139 | 17/26 | 18.7 |
+| 4B edits-only | 600 ms | 2438 ms | 2421 ms | 0.321 | 9/26 | 26.3 |
+| 2B Q6_K full-text | 230 ms | 572 ms | 571 ms | 0.185 | 13/26 | 20.5 |
+| 0.8B Q6_K full-text | 141 ms | 338 ms | 330 ms | 0.249 | 11/26 | 21.6 |
+
+**The shipping configuration meets the <1000 ms p50 target on the eval
+set.** The `legacy-bench-sample` column shows why the two verdicts
+differ: that one item costs 1209 ms in the same run whose p50 is 444 ms.
+
+### Composition caveat — read this before quoting the p50
+
+The eval set's composition was a judgement call, and composition
+determines the blended p50. Nine of 26 items are zero-change by
+construction. Per-category numbers are published so the blended figure
+can be re-weighted against a different view of what real dictation looks
+like:
+
+| Category | n | 4B p50 | 4B max | 4B WER | 2B p50 | 2B WER |
+|---|---|---|---|---|---|---|
+| clean | 6 | 429 ms | 514 ms | 0.000 | 197 ms | 0.000 |
+| short | 3 | 299 ms | 326 ms | 0.000 | 147 ms | 0.000 |
+| filler-light | 6 | 446 ms | 492 ms | 0.042 | 212 ms | 0.173 |
+| command | 4 | 439 ms | 503 ms | 0.000 | 251 ms | 0.211 |
+| technical | 3 | 609 ms | 652 ms | 0.847 | 298 ms | 0.681 |
+| filler-heavy | 3 | 857 ms | 1219 ms | 0.257 | 391 ms | 0.258 |
+| long | 1 | 2812 ms | 2812 ms | 0.060 | 1400 ms | 0.103 |
+
+(WER columns here are schema 1; see the correction box above. Latency is
+unaffected.)
+
+Latency tracks output length almost exactly; quality does not.
+
+**Retracted:** an earlier revision of this section claimed the
+`technical` category showed "spoken version numbers and identifiers are
+where polish does real damage". That was wrong, and backwards. Re-run
+with `--show-output`, the 4B **preserves** identifiers exactly as rule 7
+instructs:
+
+```
+input    : Um, bump serde to one point zero point two one nine in Cargo dot toml.
+produced : Bump serde to one point zero point two one nine in Cargo dot toml.
+```
+
+Filler removed, casing fixed, identifier untouched — correct on every
+count. The 0.847 was my eval set demanding a conversion the prompt
+forbids. Whether polish damages identifiers is **unmeasured**: no item
+in this set tests it, because the prompt tells the model not to touch
+them.
+
+The genuine defects the corrected metrics surface are smaller and
+different: the 4B leaves `and, you know,` in `technical-03`, and ignores
+the `new line` / `new paragraph` commands in two of four `command`
+items.
+
+### Findings per avenue
+
+- **Edits-only is worse on both axes.** The model answers with the
+  corrected transcript instead of an edit list in 17 of 26 items, on the
+  4B, with an explicit prohibition and a worked example in the prompt.
+  The arithmetic does not favour it even when it works: full-text
+  averages 18.7 output tokens, an `OLD ==> NEW` line costs 5–8 tokens
+  per fix because `OLD` must carry enough context to be unique, and the
+  variant measured 26.3. A GBNF grammar (`LlamaSampler::grammar`, and
+  the `sampler` feature is already on) would force the `==>` structure
+  but cannot stop `<whole input> ==> <corrected>`, which parses cleanly
+  and doubles the tokens.
+- **Prompt caching is unavailable on this model family.** Qwen 3.5 is a
+  hybrid Gated-DeltaNet architecture (ADR-0018); its recurrent state
+  carries no per-token position, so `llama_memory_seq_rm` refuses
+  partial sequence removal. `mean_reused_prompt_tokens=0.0` on every
+  run. The same refused operation is what draft-model speculative
+  decoding would need for rollback, so that avenue is blocked too. What
+  the `--prompt-cache` row actually measures is **context reuse** — not
+  re-allocating a `LlamaContext` per call — worth 20 ms (444 → 424),
+  consistent with the 29 ms TTFT bounding it.
+- **Skipping short utterances helps the mean, not the p50.** It fires on
+  3/26 items with identical quality, and moves the mean 591 → 556 ms.
+  The p50 is unchanged (444 → 446) because the items it removes were
+  already the fastest ones; taking three items off the bottom does not
+  move the middle.
+- **Neither smaller model is a free swap.** The 2B cuts p95 from 1219 to
+  572 ms and the structural-bound item from 1209 to 571 ms, at WER 0.185
+  vs 0.139 and 13/26 vs 17/26 exact. It is a tail fix bought with
+  quality. The 0.8B is faster still and clearly worse.
+
+Fixed-sample replays for cross-checking against §6 above (15 reps):
+4B Q6_K **p50 1202 ms** (§6 recorded 1225), 2B Q6_K p50 565 ms.
+
+Replay:
+
+```bash
+LLM="$HOME/Library/Application Support/com.parakeet.rs/llm"
+./target/release/bench_llm \
+    --model "$LLM/qwen3.5-4b-q6_k/Qwen3.5-4B-Q6_K.gguf" \
+    --eval bench/polish/eval.json --variant full-text \
+    --reps 3 --tag qwen3.5-4b-q6_k --csv bench/polish/variants.csv \
+    2> bench/llm-4b-fulltext-raw.log
+```
+
+Swap `--variant edits-only`, `--skip-min-words 4`, `--prompt-cache`, or
+`--model` for the other rows.
+
 ## Files
 
 | Path                         | Purpose                                          |
@@ -619,8 +978,12 @@ Replay:
 | `coreml-unified.csv`         | Generated shipping-backend ASR percentiles.     |
 | `*-boundary.csv`             | Generated Rust/worker boundary measurements.    |
 | `*-stages.csv`               | Generated per-stage breakdown and Core ML dispatch counts. |
+| `coreml-unified-buckets*.csv` | Generated bucketed short-window encoder runs. |
 | `hold.{log,csv}`             | Generated Hold-mode release-to-transcript runs. |
 | `idle-*.{log,csv}`           | Generated ANE idle re-wake A/B runs (sweep, tap, hold, energy). |
 | `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |
 | `endpoint-*.{log,csv}`       | Generated pause-friendly endpoint gate runs.   |
 | `polish-backends.csv`        | Historical §6 Phase-0 2B polish measurements.  |
+| `polish/eval.json`           | Polish quality eval set: 26 transcripts with expected output. |
+| `polish/variants.csv`        | Generated per-variant polish latency/quality summary. |
+| `llm-*-raw.log`              | Generated `llm_timer` / `llm_eval_*` lines per polish variant run. |
