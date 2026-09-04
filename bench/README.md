@@ -711,6 +711,14 @@ This reproduces FluidAudio's own finding, recorded in
 `UnifiedAsrManager.decodedTokens`: silence-aligned window starts measured about
 1 WER point worse than a fixed stride on the 15 s offline encoder, with no
 artifact benefit.
+
+The `6,6` arm was re-run after the seam-merge fixes (seam-nearest tie-break, the
+no-drop disagreement path, the two-word agreement floor) to confirm the result
+still belongs to the shipped code. Every transcript and every per-fixture and
+per-category score came back identical; only timing fields moved. The plain and
+`3,6` rows above are from the original sitting and were not re-run — the
+comparison they support is unaffected, since none of those fixtures reaches a
+seam the fixes touch.
 ## ANE idle re-wake A/B: cold, prime, keep-alive (kata snx0)
 
 The Neural Engine hard power-gates when idle. Published measurements put the

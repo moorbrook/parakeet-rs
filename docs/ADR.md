@@ -1923,8 +1923,11 @@ tail flush remains after the stream is dropped.
 M5 Pro falls from 104.5 to 66.0 ms at an 8.1 s utterance and from 180.5 to
 65.0 ms at 16.6 s, with gold-corpus WER and CER unchanged at 5.43% / 3.57%.
 
-That WER result is weaker than it reads and should not be cited without the
-caveat: six of the seven gold fixtures are under 4.3 s, so at a 6 s cap they
+That result was re-measured after the seam-merge fixes and came back identical,
+transcript for transcript, so it belongs to the shipped code rather than to the
+version that was current when the arms were first run.
+
+It is weaker than it reads, though, and should not be cited without the caveat: six of the seven gold fixtures are under 4.3 s, so at a 6 s cap they
 decode as a single window and are identical to the plain path by construction.
 Only `librispeech-multi` (14.2 s) is actually cut, and it scored 0.00% WER. The
 rest of the multi-window evidence is loopback runs over `say`-generated audio,
