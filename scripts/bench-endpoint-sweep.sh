@@ -49,9 +49,9 @@ fi
 scripts/build-coreml-worker.sh
 cargo build --release --locked --bin bench_e2e
 
-# label fixture policy confirmation_ms punctuated_ms
+# label fixture policy confirmation_ms
 run_row() {
-    local label="$1" fixture="$2" policy="$3" confirmation="$4" punctuated="$5"
+    local label="$1" fixture="$2" policy="$3" confirmation="$4"
     # Every row carries a reference transcript. The acoustic-end marker fires
     # at the fixture's last sample above -80 dBFS, and the LibriSpeech room
     # tone sits above that floor, so a short window can miss the marker with
@@ -60,9 +60,6 @@ run_row() {
     # The LibriSpeech references are the corpus text, not this model's output,
     # so a row's mismatch count is read against its own control row rather
     # than against zero.
-    #
-    # bash 3.2 treats an empty array under `set -u` as unbound, so this array
-    # is never allowed to be empty.
     local wav reference
     case "$fixture" in
         5s) wav="$FIVE_S"; reference="$FIVE_S_EXPECTED" ;;
@@ -78,7 +75,6 @@ run_row() {
         --strategy speculative \
         --endpoint-policy "$policy" \
         --confirmation-ms "$confirmation" \
-        --punctuated-ms "$punctuated" \
         --tolerate-false-cuts \
         --device "$DEVICE" \
         --wav "$wav" \
@@ -89,34 +85,25 @@ run_row() {
 
     uv run --quiet scripts/bench-endpoint-sweep.py \
         --log "$log" --out "$CSV" --label "$label" --fixture "$fixture" \
-        --policy "$policy" --confirmation-ms "$confirmation" \
-        --punctuated-ms "$punctuated"
+        --policy "$policy" --confirmation-ms "$confirmation"
 }
 
 echo "== Tap Fast confirmation curve (5 s fixture) =="
-run_row fast-150-off   5s fast 150 off
-run_row fast-120-off   5s fast 120 off
-run_row fast-90-off    5s fast 90  off
-run_row fast-60-off    5s fast 60  off
+run_row fast-150 5s fast 150
+run_row fast-120 5s fast 120
+run_row fast-90  5s fast 90
+run_row fast-60  5s fast 60
 
 echo
-echo "== Punctuation-aware commit behind the unchanged 150 ms window (5 s) =="
-run_row fast-150-p120  5s fast 150 120
-run_row fast-150-p90   5s fast 150 90
-run_row fast-150-p60   5s fast 150 60
+echo "== The same curve on the single-sentence human fixture =="
+run_row single-fast-150 single fast 150
+run_row single-fast-90  single fast 90
 
 echo
-echo "== Tap Fast false cuts on the single-sentence human fixture =="
-run_row single-fast-150-off single fast 150 off
-run_row single-fast-90-off  single fast 90  off
-run_row single-fast-150-p90 single fast 150 90
-
-echo
-echo "== Long-form window and the adversarial 544 ms intra-utterance pause =="
-run_row multi-long-750-off multi long-form 750 off
-run_row multi-long-750-p90 multi long-form 750 90
-run_row multi-long-500-off multi long-form 500 off
-run_row multi-long-300-off multi long-form 300 off
+echo "== Long-form window against the reviewed 544 ms intra-utterance pause =="
+run_row multi-long-750 multi long-form 750
+run_row multi-long-500 multi long-form 500
+run_row multi-long-300 multi long-form 300
 
 echo
 echo "Sweep written to $CSV"

@@ -141,6 +141,110 @@ leaving every other number plausible.
 Full tables, dispatch counts, and method are in
 [`bench/README.md`](../../bench/README.md).
 
+## Tap confirmation window — 2026-09-04
+
+Tap Fast was endpoint-bound: the speculative decode finished about 80 ms before
+the 150 ms confirming Silero state released, and post-endpoint work was 0–1 ms.
+The window, not the decode, set the number. `scripts/bench-endpoint-sweep.sh`
+sweeps it against false early cuts on three fixtures.
+
+Two oracles are reported per row, because neither alone is sound. `false_cuts`
+counts commits that landed before Core Audio's predicted instant for the
+fixture's last sample above -80 dBFS; the LibriSpeech fixtures carry room tone
+above that floor, so a short window can miss that marker with every word
+intact. `mismatches` compares the transcript against the fixture reference and
+is the oracle for lost speech.
+
+Fast curve on the 4.854 s synthesized fixture, 15 repetitions, speculative
+Core ML:
+
+| window | false cuts | mismatches | mean | p50 | p95 |
+|---:|---:|---:|---:|---:|---:|
+| 150 ms | 0/15 | 0 | 186.4 ms | 181.0 ms | 209.9 ms |
+| 120 ms | 0/15 | 0 | 155.5 ms | 150.0 ms | 171.9 ms |
+| **90 ms** | 0/15 | 0 | **134.9 ms** | **125.0 ms** | 159.5 ms |
+| 60 ms | 0/15 | 0 | 137.1 ms | 147.0 ms | 156.1 ms |
+
+The curve stops improving at 90 ms and reverses at 60. Every 60 ms repetition
+reports `t_asr_done == t_vad_endpoint`: the synchronous speculative decode
+blocks the VAD watcher, so below about 90 ms the decode is the floor and a
+shorter window buys nothing. Decode time is bimodal at 54 ms and 94 ms, which
+puts the 5 s p50 on a cluster boundary and makes its mean the steadier reading.
+
+The same curve on the 3.505 s human fixture separates the candidates that the
+synthesized one cannot, 15 repetitions:
+
+| window | false cuts | mismatches | mean | p50 | p95 |
+|---:|---:|---:|---:|---:|---:|
+| 150 ms | 0/15 | 0 | 57.3 ms | 59.0 ms | 63.0 ms |
+| **90 ms** | 0/15 | 2 | **1.5 ms** | **0.0 ms** | 6.8 ms |
+
+The two mismatches are `Concorde` for `Concord`, a lexical variant present in
+the 150 ms rows too, not truncation. Silero calls silence inside the LibriSpeech
+room tone that keeps the -80 dBFS marker alive, so the absolute 0 ms is an
+artifact of the marker; the 59 ms delta is the real saving.
+
+Long-form, 14.225 s fixture with its reviewed 544 ms intra-utterance pause:
+
+| window | false cuts | mean | p50 | p95 |
+|---:|---:|---:|---:|---:|
+| **750 ms** | 0/15 | — | 635.0 ms | — |
+| 500 ms | 0/15 | 382.0 ms | 379.0 ms | 401.0 ms |
+| 300 ms | 15/15 | — | — | — |
+
+500 ms survived this pause in all 15 repetitions, which is one fixture and does
+not justify moving a pause-safety policy. The 750 ms row's latency spread is
+discarded: another agent's fixture played through the shared BlackHole device
+during that run and its words appear in two transcripts.
+
+### Decision
+
+**Tap Fast moves from 150 ms to 90 ms. Long-form stays at 750 ms.** Confirmed at
+30 repetitions:
+
+| fixture | 150 ms | 90 ms | delta p50 |
+|---|---:|---:|---:|
+| 4.854 s synthesized | 182.0 ms p50 / 183.5 mean | 148.5 ms p50 / 141.8 mean | **-33.5 ms** |
+| 3.505 s human | 59.0 ms p50 / 58.1 mean | 13.0 ms p50 / 10.1 mean | **-46.0 ms** |
+
+False cuts 0/30 everywhere; the single `Concorde` mismatch is the same lexical
+variant. The 40 ms target is met on human speech and missed by 6.5 ms on the
+synthesized fixture, where the bimodal decode pins p50 to a cluster boundary —
+that fixture's mean improves by 41.7 ms. The decode's two modes are the next
+lever and are not addressed here.
+
+Both gates were re-run at 30 repetitions and pass unchanged: the long-pause
+endpoint gate at 0/30 false stops (single 667.0 ms p50, multi 635.0 ms p50 /
+647.5 ms p95), and the frozen 3× end-to-end gate, now pinned to
+`--confirmation-ms 150` so it stays like-for-like, at 594.5 → 182.0 ms p50
+(3.27×) and 635.1 → 203.6 ms p95 (3.12×).
+
+### Punctuation-aware early commit: rejected
+
+A shorter window gated on the provisional transcript ending in sentence-final
+punctuation was implemented, measured, and removed. Three results killed it.
+
+It does not fire on real speech. The model ends the human single-sentence
+fixture `...amidst the tents,` with a comma in all 30 repetitions, so the gate
+never opened and the row is identical to the control: 59.0 ms p50 against
+59.0 ms.
+
+Where it does fire it is worth nothing over a plain shorter window. On the
+synthesized fixture, 150 ms gated at 90 ms and an ungated 90 ms produce the same
+distribution at 30 repetitions: 148.5 ms p50 both, means 139.4 and 141.8 ms.
+
+Its premise is false. Long-form at 750 ms with a 90 ms punctuated window cut the
+multi-sentence fixture 15/15, and the provisional transcript at the 544 ms
+intra-utterance pause reads `...to greet the arrival of the young princess.` The
+model emits a sentence-final period mid-utterance, which is exactly where the
+policy must hold. Punctuation is not an end-of-utterance signal.
+
+Replay:
+
+```bash
+REPS=15 WARMUP_REPS=2 scripts/bench-endpoint-sweep.sh
+```
+
 ## Core ML runtime-plan tuner — 2026-08-11
 
 Release worker, ten corpus repetitions and three model-load repetitions on the

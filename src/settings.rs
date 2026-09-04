@@ -25,7 +25,7 @@ pub enum TriggerMode {
     /// clause/sentence pauses before auto-pasting. A second tap cancels.
     #[default]
     Tap,
-    /// Original 150 ms auto-stop for short commands where minimum final-pause
+    /// 90 ms auto-stop for short commands where minimum final-pause
     /// latency matters more than tolerating a long pause.
     #[serde(rename = "tap_fast")]
     TapFast,

@@ -93,7 +93,7 @@ short-utterance floor to IPC.
 It **does not** exercise:
 
 - `cpal` mic-capture callback latency
-- the Silero VAD endpoint policy (750 ms for Tap; 150 ms for Tap Fast)
+- the Silero VAD endpoint policy (750 ms for Tap; 90 ms for Tap Fast)
 - the `CGEventKeyboardSetUnicodeString` keystroke insertion step
   (sub-ms per chord — see ADR-0019)
 
@@ -129,17 +129,21 @@ state remain the sole stop authority. Re-run on 2026-09-04 after ADR-0030
 retired the resample stage, the gate reads 630.0 ms against 192.0 ms (3.28x
 p50) and 952.3 ms against 203.0 ms (4.69x p95), every transcript matching.
 
-Tap does not collect the resample saving, and the `phase_timer` lines say why:
+Tap did not collect the resample saving, and the `phase_timer` lines said why:
 `t_asr_start=4966`, `t_asr_done=5013`, `t_vad_endpoint=5094`. The speculative
 decode finishes about 80 ms before the endpoint policy confirms, and
 `dur_post_endpoint_ms` is 0 to 1 ms, so this path is endpoint-bound rather than
 decode-bound. Taking 22 ms out of the decode widens that margin instead of
 shortening the result. The saving lands where the decode is not hidden: Hold,
 the serial fallback, and every utterance long enough that the decode would
-otherwise outrun the confirmation window. This frozen comparison explicitly uses
-Tap Fast's original 150 ms policy so the historical 3× result stays
-like-for-like. The gate fails unless both p50 and p95 are at least 3.0× and
-every transcript matches:
+otherwise outrun the confirmation window. ADR-0031 acted on the endpoint side
+instead and moved Tap Fast to 90 ms; the window sweep is below.
+
+This frozen comparison pins `--confirmation-ms 150`, Tap Fast's original policy,
+so the historical 3× result stays like-for-like whatever the shipping window
+becomes. Re-run on 2026-09-04 it reads 594.5 → 182.0 ms p50 (3.27×) and
+635.1 → 203.6 ms p95 (3.12×). The gate fails unless both p50 and p95 are at
+least 3.0× and every transcript matches:
 
 ```bash
 REPS=30 WARMUP_REPS=2 scripts/bench-end-to-end.sh
@@ -147,8 +151,8 @@ REPS=30 WARMUP_REPS=2 scripts/bench-end-to-end.sh
 
 ## Long-pause endpoint gate
 
-Normal Tap now uses a 750 ms confirmation policy; Tap Fast retains 150 ms for
-short commands. The separate endpoint gate replays versioned human LibriSpeech
+Normal Tap uses a 750 ms confirmation policy; Tap Fast uses 90 ms for short
+commands (ADR-0031). The separate endpoint gate replays versioned human LibriSpeech
 audio through production capture, VAD, speculative Core ML inference, and
 session shutdown. Its 14.225 s fixture includes a reviewed 544 ms natural
 pause that the former policy cut. A pass requires zero early stops and p95
@@ -159,12 +163,12 @@ fixtures:
 REPS=30 WARMUP_REPS=2 scripts/bench-endpoint-policy.sh
 ```
 
-M5 Pro 24 GB release results (2026-08-11):
+M5 Pro 24 GB release results (re-run 2026-09-04):
 
 | fixture | repetitions | false stops | p50 | p95 |
 |---|---:|---:|---:|---:|
-| 3.505 s single sentence | 30 | **0** | 668.0 ms | 668.0 ms |
-| 14.225 s multi sentence | 30 | **0** | 637.0 ms | 658.1 ms |
+| 3.505 s single sentence | 30 | **0** | 667.0 ms | 672.9 ms |
+| 14.225 s multi sentence | 30 | **0** | 635.0 ms | 647.5 ms |
 
 The unchanged Tap Fast comparison was also re-run for 30 repetitions after
 this policy split. It retained **3.24× p50 / 3.18× p95** speedups (589.5 →
@@ -174,6 +178,28 @@ remains above its accepted 3× target.
 The fixture manifest, source revision, hashes, references, and license are in
 [`bench/endpointing/`](endpointing/). This gate isolates endpoint behavior;
 transcript WER/CER remains the responsibility of `asr_diff`.
+
+## Confirmation-window sweep
+
+Tap's end-to-end number is the confirmation window plus Silero's detection lag;
+`scripts/bench-endpoint-sweep.sh` sweeps that window over all three fixtures.
+Each row reports two oracles, because neither alone is sound. `false_cuts`
+counts commits landing before Core Audio's predicted instant for the fixture's
+last sample above -80 dBFS — the LibriSpeech fixtures carry room tone above that
+floor, so a short window can miss the marker with every word intact.
+`mismatches` compares the transcript against the fixture reference and is the
+oracle for lost speech.
+
+The curve stops improving at 90 ms and reverses at 60, where every repetition
+reports `t_asr_done == t_vad_endpoint`: the synchronous speculative decode
+blocks the VAD watcher, so below about 90 ms the decode is the floor. ADR-0031
+takes Tap Fast to 90 ms and rejects a punctuation-aware early commit that was
+built and measured alongside it. Full tables are in
+[`docs/asr/PERF.md`](../docs/asr/PERF.md).
+
+```bash
+REPS=15 WARMUP_REPS=2 scripts/bench-endpoint-sweep.sh
+```
 
 ## Native Core ML result: M5 Pro 24 GB (2026-08-10)
 
@@ -535,4 +561,5 @@ Replay:
 | `hold.{log,csv}`             | Generated Hold-mode release-to-transcript runs. |
 | `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |
 | `endpoint-*.{log,csv}`       | Generated pause-friendly endpoint gate runs.   |
+| `endpoint-sweep*.{csv,/}`    | Generated confirmation-window sweep rows and logs. |
 | `polish-backends.csv`        | Historical §6 Phase-0 2B polish measurements.  |

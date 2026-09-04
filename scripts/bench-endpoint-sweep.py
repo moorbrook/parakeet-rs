@@ -27,7 +27,6 @@ COLUMNS = [
     "fixture",
     "policy",
     "confirmation_ms",
-    "punctuated_ms",
     "reps",
     "false_cuts",
     "mismatches",
@@ -79,7 +78,6 @@ def main() -> int:
     ap.add_argument("--fixture", required=True)
     ap.add_argument("--policy", required=True)
     ap.add_argument("--confirmation-ms", required=True)
-    ap.add_argument("--punctuated-ms", required=True)
     args = ap.parse_args()
 
     durations, summary = parse(args.log)
@@ -92,7 +90,6 @@ def main() -> int:
         "fixture": args.fixture,
         "policy": args.policy,
         "confirmation_ms": args.confirmation_ms,
-        "punctuated_ms": args.punctuated_ms,
         "reps": summary.get("reps", ""),
         "false_cuts": summary.get("false_cuts", ""),
         "mismatches": summary.get("mismatches", ""),

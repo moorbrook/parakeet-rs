@@ -17,7 +17,7 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use parakeet_dictation::asr::{Asr, AsrConfig};
 use parakeet_dictation::asr_eval::normalize_lexical;
 use parakeet_dictation::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
-use parakeet_dictation::endpointing::{EndpointConfig, EndpointPolicy};
+use parakeet_dictation::endpointing::EndpointPolicy;
 use parakeet_dictation::performance;
 use parakeet_dictation::settings::SettingsStore;
 use parakeet_dictation::streamer::{self, EndpointStrategy, Mode, Outcome};
@@ -36,11 +36,8 @@ struct Args {
     backend: Backend,
     strategy: EndpointStrategy,
     endpoint_policy: EndpointPolicy,
-    /// Sweep override for the ordinary confirmation window.
+    /// Sweep override for the confirmation window.
     confirmation_ms: Option<u32>,
-    /// Sweep override for the punctuated window. The outer `Option` is
-    /// "was it given"; the inner one is the value, with `off` disabling it.
-    punctuated_ms: Option<Option<u32>>,
     /// Count false cuts and transcript mismatches instead of aborting on the
     /// first one. A rate needs every repetition, and restarting the process
     /// per repetition would reload and re-warm the Core ML worker.
@@ -94,13 +91,6 @@ fn parse_strategy(value: &str) -> anyhow::Result<EndpointStrategy> {
     }
 }
 
-fn parse_punctuated_ms(value: &str) -> anyhow::Result<Option<u32>> {
-    if value == "off" {
-        return Ok(None);
-    }
-    Ok(Some(value.parse().context("--punctuated-ms")?))
-}
-
 fn parse_endpoint_policy(value: &str) -> anyhow::Result<EndpointPolicy> {
     match value {
         "fast" => Ok(EndpointPolicy::Fast),
@@ -117,7 +107,6 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut strategy = EndpointStrategy::Serial;
     let mut endpoint_policy = EndpointPolicy::LongForm;
     let mut confirmation_ms = None;
-    let mut punctuated_ms = None;
     let mut tolerate_false_cuts = false;
     let mut device = DEFAULT_DEVICE.to_string();
     let mut expected = None;
@@ -171,12 +160,6 @@ fn parse_args() -> anyhow::Result<Args> {
                         .context("--confirmation-ms")?,
                 );
             }
-            "--punctuated-ms" => {
-                punctuated_ms = Some(parse_punctuated_ms(
-                    &it.next()
-                        .ok_or_else(|| anyhow!("--punctuated-ms needs a number or 'off'"))?,
-                )?);
-            }
             "--tolerate-false-cuts" => {
                 tolerate_false_cuts = true;
             }
@@ -219,7 +202,6 @@ fn parse_args() -> anyhow::Result<Args> {
         strategy,
         endpoint_policy,
         confirmation_ms,
-        punctuated_ms,
         tolerate_false_cuts,
         device,
         expected,
@@ -235,7 +217,7 @@ fn print_usage() {
          \x20                [--backend sherpa|coreml-unified]\n\
          \x20                [--strategy serial|speculative]\n\
          \x20                [--endpoint-policy fast|long-form]\n\
-         \x20                [--confirmation-ms N] [--punctuated-ms N|off]\n\
+         \x20                [--confirmation-ms N]\n\
          \x20                [--tolerate-false-cuts]\n\
          \x20                [--device 'BlackHole 2ch']\n\
          \x20                [--expected 'reference transcript']\n\
@@ -269,17 +251,11 @@ fn main() -> ExitCode {
 }
 
 impl Args {
-    /// Resolve the session's silence thresholds: the named policy first, then
-    /// any explicit sweep override.
-    fn endpoint_config(&self) -> EndpointConfig {
-        let mut config = self.endpoint_policy.config();
-        if let Some(ms) = self.confirmation_ms {
-            config.confirmation_ms = ms;
-        }
-        if let Some(punctuated) = self.punctuated_ms {
-            config.punctuated_confirmation_ms = punctuated;
-        }
-        config
+    /// The session's silence window: the named policy, unless the sweep
+    /// overrode it with a value no policy names.
+    fn confirmation_ms(&self) -> u32 {
+        self.confirmation_ms
+            .unwrap_or_else(|| self.endpoint_policy.confirmation_ms())
     }
 }
 
@@ -315,12 +291,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
         args.device
     );
 
-    let config = args.endpoint_config();
-    log::info!(
-        "endpoint config: confirmation_ms={} punctuated_ms={:?}",
-        config.confirmation_ms,
-        config.punctuated_confirmation_ms
-    );
+    log::info!("endpoint config: confirmation_ms={}", args.confirmation_ms());
 
     for rep in 0..args.warmup_reps {
         run_one(
@@ -350,10 +321,9 @@ fn run(args: &Args) -> anyhow::Result<()> {
     }
     log::info!(
         "bench_e2e_summary reps={} false_cuts={false_cuts} mismatches={mismatches} \
-         confirmation_ms={} punctuated_ms={:?}",
+         confirmation_ms={}",
         args.reps,
-        config.confirmation_ms,
-        config.punctuated_confirmation_ms
+        args.confirmation_ms()
     );
     Ok(())
 }
@@ -410,7 +380,7 @@ fn run_one(
         streamer_mode,
         asr.clone(),
         args.strategy,
-        args.endpoint_config(),
+        args.confirmation_ms(),
         Some(&args.device),
     )?;
     let playback = start_playback(&args.device, samples.clone(), sample_rate)?;
@@ -459,8 +429,8 @@ fn run_one(
         Ok(end) => end,
         Err(_) if args.tolerate_false_cuts => {
             // The provisional transcript is the evidence for *why* it cut:
-            // for a punctuated-commit row it says whether the model ended a
-            // sentence at an intra-utterance pause.
+            // it shows how much of the utterance the decoder had when the
+            // window elapsed, and whether the cut point was a sentence end.
             log::info!(
                 "bench_e2e false_cut rep={rep} provisional={:?}",
                 early_transcript.unwrap_or_default()
