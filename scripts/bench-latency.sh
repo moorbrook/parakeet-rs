@@ -49,6 +49,10 @@ BACKEND="${BACKEND:-sherpa}"
 # encoder, RNNT loop) plus its Core ML dispatch counts. sherpa has no
 # equivalent seam, so the flag is only passed to the native backends.
 STAGE_TIMINGS="${STAGE_TIMINGS:-1}"
+# Extra flags appended verbatim to every bench_asr invocation, for arms that
+# differ only by a backend knob (e.g. --tdt-decode-compute-units cpu-only).
+# Word-split on purpose; keep the values shell-safe.
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 case "$BACKEND" in
     sherpa|coreml-unified|coreml-tdt-v3) ;;
@@ -114,6 +118,7 @@ for len in "${LENGTHS[@]}"; do
     fi
     "$BENCH_BIN" --backend "$BACKEND" --wav "$wav" \
         --reps "$REPS" --warmup-reps "$WARMUP_REPS" "${stage_args[@]+"${stage_args[@]}"}" \
+        ${EXTRA_ARGS} \
         2>>"$RAW_LOG" \
         || echo "  ↑ bench failed for $wav (see $RAW_LOG)"
 done

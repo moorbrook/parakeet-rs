@@ -97,6 +97,11 @@ pub struct CoreMlWorkerConfig {
     /// to 1; raising it measures FluidAudio's parallel arm, whose overlapping
     /// dispatch the stage profiler reports as un-partitionable.
     pub tdt_chunk_concurrency: u32,
+    /// Where TDT's decoder and joint run. `None` keeps FluidAudio's own
+    /// placement; `Some` pins them, which is how the K=64 top-K cost is
+    /// separated from the placement difference against Unified. The encoder
+    /// stays on the regime's units either way.
+    pub tdt_decode_compute_units: Option<CoreMlComputeUnits>,
     pub short_compute_units: CoreMlComputeUnits,
     pub long_compute_units: CoreMlComputeUnits,
     pub long_regime_seconds: u32,
@@ -164,6 +169,7 @@ impl CoreMlWorkerConfig {
             model_source: CoreMlModelSource::ExistingDirectory(model_directory.into()),
             model_variant: CoreMlModelVariant::Unified,
             tdt_chunk_concurrency: 1,
+            tdt_decode_compute_units: None,
             short_compute_units: CoreMlComputeUnits::default(),
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
@@ -177,6 +183,7 @@ impl CoreMlWorkerConfig {
             model_source: CoreMlModelSource::DownloadRoot(model_root.into()),
             model_variant: CoreMlModelVariant::Unified,
             tdt_chunk_concurrency: 1,
+            tdt_decode_compute_units: None,
             short_compute_units: CoreMlComputeUnits::default(),
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
@@ -216,6 +223,10 @@ impl CoreMlWorkerConfig {
         }
         self.tdt_chunk_concurrency = chunks;
         Ok(())
+    }
+
+    pub fn set_tdt_decode_compute_units(&mut self, units: Option<CoreMlComputeUnits>) {
+        self.tdt_decode_compute_units = units;
     }
 
     pub fn set_emit_stage_timings(&mut self, emit: bool) {
@@ -346,6 +357,11 @@ impl CoreMlWorkerBackend {
             command
                 .arg("--tdt-chunk-concurrency")
                 .arg(config.tdt_chunk_concurrency.to_string());
+        }
+        if let Some(units) = config.tdt_decode_compute_units {
+            command
+                .arg("--tdt-decode-compute-units")
+                .arg(units.as_str());
         }
         if config.emit_stage_timings {
             command.arg("--emit-stage-timings");

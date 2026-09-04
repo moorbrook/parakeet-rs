@@ -41,6 +41,7 @@ struct Args {
     model_dir: Option<PathBuf>,
     compute_units: CoreMlComputeUnits,
     tdt_chunk_concurrency: u32,
+    tdt_decode_compute_units: Option<CoreMlComputeUnits>,
     stage_timings: bool,
     arm: Arm,
     idle_gap_ms: u64,
@@ -131,6 +132,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut model_dir = None;
     let mut compute_units = CoreMlComputeUnits::default();
     let mut tdt_chunk_concurrency = 1;
+    let mut tdt_decode_compute_units = None;
     let mut stage_timings = false;
     let mut arm = Arm::Warm;
     let mut idle_gap_ms: u64 = 0;
@@ -187,6 +189,12 @@ fn parse_args() -> anyhow::Result<Args> {
                     .parse()
                     .context("parsing --tdt-chunk-concurrency")?;
             }
+            "--tdt-decode-compute-units" => {
+                tdt_decode_compute_units = Some(CoreMlComputeUnits::parse(
+                    &it.next()
+                        .ok_or_else(|| anyhow!("--tdt-decode-compute-units needs a name"))?,
+                )?);
+            }
             "--stage-timings" => {
                 stage_timings = true;
             }
@@ -232,6 +240,7 @@ fn parse_args() -> anyhow::Result<Args> {
         model_dir,
         compute_units,
         tdt_chunk_concurrency,
+        tdt_decode_compute_units,
         stage_timings,
         arm,
         idle_gap_ms,
@@ -458,6 +467,7 @@ fn load_backend(args: &Args, store: &SettingsStore) -> anyhow::Result<Asr> {
             }
             config.set_model_variant(variant)?;
             config.set_tdt_chunk_concurrency(args.tdt_chunk_concurrency)?;
+            config.set_tdt_decode_compute_units(args.tdt_decode_compute_units);
             config.set_compute_units(args.compute_units);
             config.set_emit_stage_timings(args.stage_timings);
             log::info!(

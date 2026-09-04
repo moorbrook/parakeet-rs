@@ -331,23 +331,42 @@ at that sample size. `bench/README.md` records the rows and the reasoning.
 
 ## Parakeet TDT 0.6B v3 challenger — 2026-09-04
 
-**No-go.** TDT 0.6B v3 measures 7.61% WER / 3.99% CER on the gold corpus
-against the frozen Unified baseline of 5.434783% / 3.571429%. The manifest sets
-`max_wer_regression_percent` to 0.00, so the bar is WER ≤ 5.434783% exactly and
-TDT misses it by 2.18 points. On a 92-word corpus one extra word edit is 1.09
-points; this is nine word edits against five, not a rounding difference. The
-absolute 8.00% ceiling is not what fails. Keep Unified as the default and do
-not open a switch issue.
+**No-go.** Measured at ten repetitions with zero WER and CER spread, TDT 0.6B
+v3 records 7.608696% WER / 3.991597% CER against the frozen Unified baseline of
+5.434783% / 3.571429%. That is seven word edits of 92 against five. The
+manifest sets `max_wer_regression_percent` to 0.00, so the bar is WER ≤
+5.434783% exactly and TDT is 2.17 points over — two whole errors on a corpus
+where one edit is 1.09 points. Its absolute 7.61% is still under the 8.00%
+ceiling; the gate that fails is the regression one. TDT ties or loses every
+category and wins none, worst at custom-vocabulary (45.45% against 27.27%) and
+commands (17.07% against 12.20%). Keep Unified as the default and do not open a
+switch issue.
+
+| arm | WER | CER | corpus p50 | RTFx p50 | peak RSS | load | gate |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Unified | **5.434783%** | **3.571429%** | **0.3048 s** | **111.7×** | **0.10 GiB** | 0.135 s | pass |
+| TDT v3 | 7.608696% | 3.991597% | 0.4161 s | 81.8× | 0.12 GiB | **0.100 s** | **fail** |
 
 The latency case that motivated the trial does not survive measurement either.
-TDT's duration head does cut joint predictions 2.84× on a 14.225 s fixture —
-92 against Unified's 261 — but per-call cost rises by about the factor the
-count falls, so total joint dispatch lands within 1% of Unified. Two
-differences could produce that and these runs do not separate them:
-`JointDecisionv3` also computes K=64 top-K outputs, and FluidAudio's TDT loader
-places the decoder and joint on CPU+ANE where the Unified loader pins them
-CPU-only. Worker total on that fixture is 81.42 ms against 67.79 ms, and
-post-dispatch work is 14.83 ms against 0.11 ms.
+At 30 repetitions TDT is slower at every length: 45.0 against 31.0 ms at one
+second, 51.0/36.0 at three, 58.5/44.5 at five, 68.0/53.0 at ten, and
+182.0/110.5 at twenty. The published 155.6× versus 123.3× RTFx does not appear
+here at any length.
+
+TDT's duration head does what it claims — 92 joint predictions against
+Unified's 261 on a 14.225 s fixture, 2.84× fewer — and returns nothing, because
+each TDT joint call costs about 2.8× what a Unified one does. Pinning the
+decoder and joint CPU-only, where the Unified loader pins them, moved joint
+dispatch from 27.58 ms to 28.90 ms: slightly worse, so placement is not the
+cause. What is left is the graph. `JointDecisionv3` computes `top_k_ids` and
+`top_k_logits` at K=64 on every call for script-aware language filtering, over
+an 8,192-entry vocabulary against Unified's 1,024.
+
+Separately, TDT carries a post-dispatch tail flat at about 15 ms at every
+length — tokenizer decode and token-timing assembly after the last Core ML
+dispatch — against Unified's 0.03 to 0.12 ms. That tail alone is the whole of
+the 14 ms deficit from 1 to 10 seconds, and it erases a genuine 1.6 to 2.2 ms
+encoder win and a 1.8 ms mel win.
 
 TDT's published Core ML encoder takes a fixed `[1, 128, 1501]` mel, the same
 15 s window the Unified offline encoder takes, so the bucketed short-window
@@ -360,9 +379,7 @@ a future conversion: `--model-variant tdt-v3` on the worker,
 `scripts/fetch-tdt-v3-model.py` for the pinned artifact. It is deliberately not
 reachable from the shipping download path: TDT has no Rust integrity gate, so
 the worker refuses `--model-root` for it and forbids FluidAudio's downloader.
-Reopen if a conversion appears that is EN-competitive on this corpus. The
-latency case is worth one more measurement first: a TDT arm with the decoder
-and joint pinned CPU-only, which is what would separate top-K cost from
-placement cost. Full tables, the artifact
-manifest and the replay commands are in
-[`../../bench/README.md`](../../bench/README.md).
+Reopen only for a conversion that is EN-competitive on this corpus and drops
+the top-K joint outputs. Full tables, the artifact manifest and the replay
+commands are in [`../../bench/README.md`](../../bench/README.md); raw reports
+are under `bench/f0zg/`.

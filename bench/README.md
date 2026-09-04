@@ -524,29 +524,109 @@ encoder takes. So the bucketed short-window work above does not carry over:
 TDT would need its own re-conversion at each window before it could pay the
 same short-utterance saving.
 
-### The duration head cuts joint calls, and it does not help
+### Latency against the shipping backend
 
-One 14.225 s fixture, one 15 s window, one repetition each, release build,
-`--stage-timings`:
+Matched 30-repetition runs, three warmups, release build, stage timings on,
+same fixtures. Machine 85 to 93% idle throughout. Both arms exclude nothing:
+the outer timer wraps `Asr::recognize()`, and the Rust-to-worker boundary was
+0.10 to 0.44 ms in both, so the gap below is entirely model-side.
 
-| | preprocessor calls | encoder calls | decoder calls | joint calls | joint dispatch |
+| fixture | Unified p50 | TDT v3 p50 | Unified p95 | TDT v3 p95 |
+|---|---:|---:|---:|---:|
+| 1 s | **31.0 ms** | 45.0 ms | **33.5 ms** | 49.0 ms |
+| 3 s | **36.0 ms** | 51.0 ms | **38.0 ms** | 56.5 ms |
+| 5 s | **44.5 ms** | 58.5 ms | **57.2 ms** | 64.3 ms |
+| 10 s | **53.0 ms** | 68.0 ms | **57.7 ms** | 76.0 ms |
+| 20 s | **110.5 ms** | 182.0 ms | **116.9 ms** | 193.9 ms |
+
+TDT loses at every length: 14 to 15 ms flat from 1 to 10 seconds, and 71.5 ms
+at 20 s where two windows double every per-window cost. The 155.6× versus
+123.3× RTFx that motivated the trial does not appear here at any length.
+
+Where the flat 14 ms goes, from the same runs:
+
+| stage | Unified 1 s | TDT v3 1 s | Unified 5 s | TDT v3 5 s |
+|---|---:|---:|---:|---:|
+| mel (host) | 3.04 | 0.24 | 3.12 | 0.24 |
+| mel graph | 0.00 | 1.04 | 0.00 | 1.02 |
+| encoder | 25.49 | **23.93** | 26.00 | **23.82** |
+| decode loop | **2.88** | 5.11 | **15.43** | 18.78 |
+| post | **0.03** | 14.72 | **0.06** | 15.06 |
+| total | **31.53** | 45.01 | **44.78** | 58.90 |
+
+TDT's encoder is 1.6 to 2.2 ms *faster* and its mel front end is 1.8 ms
+cheaper. Both are erased by a post-dispatch tail that is flat at about 15 ms
+regardless of length, against Unified's 0.03 to 0.12 ms. That tail is
+tokenizer decode and token-timing assembly inside FluidAudio's TDT path, after
+the last Core ML dispatch; it is not the duration head and not the model.
+
+### The duration head skips frames, and the joint graph eats the saving
+
+Paired 14.225 s fixture, one 15 s window, 10 repetitions after 3 warmups:
+
+| arm | decoder calls | joint calls | joint dispatch | post | total |
 |---|---:|---:|---:|---:|---:|
-| Unified | 0 | 1 | 84 | **261** | 26.02 ms |
-| TDT v3 | 1 | 1 | 82 | **92** | 26.27 ms |
+| Unified | 84 | **261** | 25.55 ms | 0.10 ms | **67.05 ms** |
+| TDT v3 | 82 | **92** | 27.58 ms | 14.48 ms | 82.42 ms |
+| TDT v3, decode pinned CPU-only | 82 | **92** | 28.90 ms | 13.99 ms | 84.19 ms |
 
-The frame skipping is real: 92 joint predictions against Unified's 261, a 2.84×
-reduction on identical audio. It buys nothing — per-call joint cost rises by
-about the same factor the count falls, and total joint dispatch lands within 1%
-of Unified. Two differences could produce that and these runs do not separate
-them: `JointDecisionv3` also emits `top_k_ids` and `top_k_logits` at K=64 for
-script-aware filtering, and FluidAudio's TDT loader places the decoder and joint
-on CPU+ANE where the Unified loader pins them CPU-only.
+The frame skipping is real and large: 92 joint predictions against 261, 2.84×
+fewer on identical audio. It returns nothing, because each TDT joint call costs
+about 2.8× what a Unified one does.
 
-The rest of the stage split moves against TDT as well. Its mel front end is a
-Core ML graph (`Preprocessor.mlmodelc`, CPU-only) rather than Swift, which is
-1.04 ms of dispatch plus 0.24 ms of marshalling against Unified's 3.18 ms — a
-small win. The tail is not: post-dispatch work is 14.83 ms for TDT against
-0.11 ms for Unified, and worker total is 81.42 ms against 67.79 ms.
+The third row settles why. FluidAudio's TDT loader places the decoder and joint
+on CPU+ANE where the Unified loader pins them CPU-only, which was the other
+candidate explanation. Pinning them (`--tdt-decode-compute-units cpu-only`,
+encoder left on the Neural Engine) moves joint dispatch from 27.58 ms to
+28.90 ms — slightly worse, not better. Placement is not the cause. What is left
+is the graph: `JointDecisionv3` computes `top_k_ids` and `top_k_logits` at
+K=64 on every call for script-aware language filtering, and the v3 vocabulary
+is 8,192 entries against Unified's 1,024. A TDT conversion without the top-K
+outputs is the only version of this model worth re-measuring.
+
+### Quality: a hard fail on the English gate
+
+Matched ten-repetition gold runs, same corpus and worker, differing only in
+model directory. Zero WER and CER spread and zero changed outputs in both arms,
+so these are exact, not sampled.
+
+| arm | WER | CER | corpus p50 | p95 | RTFx p50 | peak RSS | load | gate |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Unified | **5.434783%** | **3.571429%** | **0.3048 s** | **0.4239 s** | **111.7×** | **0.10 GiB** | 0.135 s | pass |
+| TDT v3 | 7.608696% | 3.991597% | 0.4161 s | 0.4990 s | 81.8× | 0.12 GiB | **0.100 s** | **fail** |
+
+Seven word edits of 92 against five, and 19 character edits of 476 against 17.
+The manifest's regression cap is 0.00 points, so the bar is WER ≤ 5.434783%
+exactly and TDT is 2.17 points over. One word edit on this corpus is 1.09
+points, so the margin is two whole errors, not rounding. TDT's absolute 7.61%
+is still under the 8.00% ceiling; the gate that fails is the regression one.
+
+Per category, TDT ties or loses everywhere and wins nothing:
+
+| category | Unified WER | TDT v3 WER |
+|---|---:|---:|
+| commands | **12.20%** | 17.07% |
+| custom-vocabulary | **27.27%** | 45.45% |
+| numbers | 6.67% | 6.67% |
+| proper-nouns | **3.57%** | 5.95% |
+| punctuation | **5.43%** | 7.61% |
+| general, long, noisy | 0.00% | 0.00% |
+
+The two extra errors are both in command phrasing:
+
+| fixture | reference | TDT v3 |
+|---|---|---|
+| `slurp-stock-ibm-close` | "Is IBM up today?" | "It's I PM up today." |
+| `slurp-alarm-seven-thirty-close` | "Please wake me up at seven thirty AM." | "Please wake me up at seven hundred and thirty AM." |
+| `slurp-music-olly-tactics-close` | "Hey Olly, play playlist Tactics from music." | "Hey Ollie, play playlist tactics for music." |
+
+Unified gets the first two inside the frozen baseline and misses the third the
+same way. Spoken numbers and proper nouns under command phrasing carry
+dictation, and that is exactly where the multilingual checkpoint gives ground
+to the EN-tuned one.
+
+TDT's one win is warm model load, 0.100 s against 0.135 s, which is off the
+dictation path either way.
 
 ### Long-form chunk concurrency
 
@@ -568,46 +648,27 @@ Serial is also the honest default for this workload. A dictation utterance is
 decoded on its own, chunking only engages past 15 s, and the long-regime
 threshold is 8 s. Raise the flag to measure the parallel arm deliberately.
 
-### Quality: a hard fail on the English gate
-
-Same seven-fixture gold corpus, same worker, one repetition:
-
-| arm | WER | CER |
-|---|---:|---:|
-| Unified (frozen baseline, 10 reps) | **5.434783%** | **3.571429%** |
-| TDT v3 (1 rep) | 7.61% | 3.99% |
-
-TDT's own worst category is custom-vocabulary at 45.45% WER, and commands at
-17.07%; a matched per-category Unified row is not yet measured.
-
-The manifest's regression cap is 0.00 points, so the bar is WER ≤ 5.434783%
-exactly. TDT is 2.18 points over it. On a 92-word corpus one extra word error
-is 1.09 points, so this is a five-word-edit baseline against a nine-word-edit
-challenger, not a rounding difference. Its absolute WER still sits under the
-8.00% ceiling; the gate that fails is the regression one.
-
-The errors are the shape the multilingual-versus-EN-tuned split predicts:
-
-| fixture | reference | TDT v3 |
-|---|---|---|
-| `slurp-stock-ibm-close` | "Is IBM up today?" | "It's I PM up today." |
-| `slurp-alarm-seven-thirty-close` | "Please wake me up at seven thirty AM." | "Please wake me up at seven hundred and thirty AM." |
-| `slurp-music-olly-tactics-close` | "Hey Olly, play playlist Tactics from music." | "Hey Ollie, play playlist tactics for music." |
-
-Unified transcribes all three within the frozen baseline. The two categories
-that carry dictation — spoken numbers and proper nouns under command phrasing —
-are exactly where TDT loses.
-
 ### Reproducing
 
+Raw artifacts for every arm above are under `bench/f0zg/`.
+
 ```bash
-scripts/fetch-tdt-v3-model.py           # 469 MB, pinned revision, SHA-256 verified
-BACKEND=coreml-tdt-v3 OUT_CSV=bench/coreml-tdt-v3.csv \
-    PARAKEET_COREML_MODEL_DIR="$HOME/Library/Application Support/com.parakeet.rs/models/coreml/parakeet-tdt-0.6b-v3" \
-    scripts/bench-latency.sh
+scripts/fetch-tdt-v3-model.py    # 469 MB, pinned revision, SHA-256 verified
+TDT="$HOME/Library/Application Support/com.parakeet.rs/models/coreml/parakeet-tdt-0.6b-v3"
+
+BACKEND=coreml-unified OUT_CSV=bench/f0zg/unified.csv scripts/bench-latency.sh
+BACKEND=coreml-tdt-v3 OUT_CSV=bench/f0zg/tdt-v3.csv \
+    PARAKEET_COREML_MODEL_DIR="$TDT" scripts/bench-latency.sh
+BACKEND=coreml-tdt-v3 OUT_CSV=bench/f0zg/tdt-v3-cpudecode.csv \
+    PARAKEET_COREML_MODEL_DIR="$TDT" \
+    EXTRA_ARGS="--tdt-decode-compute-units cpu-only" scripts/bench-latency.sh
+
 REPETITIONS=10 COREML_WORKER=target/release/parakeet-coreml-worker \
-    scripts/bench-gold.sh                # runs the TDT arm when the model is present
+    scripts/bench-gold.sh            # runs the TDT arm when the model is present
 ```
+
+`--tdt-chunk-concurrency N` raises TDT's long-form chunk parallelism for a
+wall-clock arm; the per-stage rows are correctly refused at anything above 1.
 
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 

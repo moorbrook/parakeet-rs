@@ -41,6 +41,12 @@ private struct WorkerOptions {
     /// because concurrent dispatch makes the stage profiler's timeline stop
     /// being a partition. Raise it to measure the parallel arm deliberately.
     let tdtChunkConcurrency: Int
+    /// Where TDT's decoder and joint run. FluidAudio's TDT loader puts them on
+    /// the configuration's units (CPU+ANE here) while the Unified loader pins
+    /// them CPU-only, so an arm that pins them separates that placement
+    /// difference from the K=64 top-K outputs `JointDecisionv3` also computes.
+    /// `nil` keeps FluidAudio's own behaviour. The encoder is unaffected.
+    let tdtDecodeComputeUnits: MLComputeUnits?
     let shortComputeUnits: MLComputeUnits
     let longComputeUnits: MLComputeUnits
     let longRegimeSeconds: UInt32
@@ -55,6 +61,7 @@ private struct WorkerOptions {
         var modelRoot: URL?
         var modelVariant: ModelVariant = .unified
         var tdtChunkConcurrency = 1
+        var tdtDecodeComputeUnits: MLComputeUnits?
         var shortComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
         var longComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
         var longRegimeSeconds: UInt32 = 8
@@ -91,6 +98,14 @@ private struct WorkerOptions {
                     )
                 }
                 tdtChunkConcurrency = count
+            case "--tdt-decode-compute-units":
+                index += 1
+                guard index < arguments.count else {
+                    throw WorkerError.invalidArgument(
+                        "--tdt-decode-compute-units needs a name"
+                    )
+                }
+                tdtDecodeComputeUnits = try parseComputeUnits(arguments[index])
             case "--compute-units":
                 index += 1
                 guard index < arguments.count else {
@@ -136,6 +151,7 @@ private struct WorkerOptions {
                 let usage =
                     "usage: parakeet-coreml-worker [--model-dir DIR | --model-root DIR] "
                     + "[--model-variant unified|tdt-v3] [--tdt-chunk-concurrency N] "
+                    + "[--tdt-decode-compute-units NAME] "
                     + "[--compute-units NAME | --short-compute-units NAME "
                     + "--long-compute-units NAME --long-regime-seconds N] "
                     + "[--encoder-buckets auto|none|N,N,...] [--emit-stage-timings]\n"
@@ -166,6 +182,7 @@ private struct WorkerOptions {
             modelRoot: modelRoot,
             modelVariant: modelVariant,
             tdtChunkConcurrency: tdtChunkConcurrency,
+            tdtDecodeComputeUnits: tdtDecodeComputeUnits,
             shortComputeUnits: shortComputeUnits,
             longComputeUnits: longComputeUnits,
             longRegimeSeconds: longRegimeSeconds,
@@ -420,11 +437,18 @@ private struct ParakeetCoreMLWorker {
             // directory this worker was pointed at is the only thing it can
             // ever run.
             ModelHub.offlineMode = true
+            // `configuration.computeUnits` is what the decoder and joint get;
+            // the encoder is passed separately so pinning the decode side does
+            // not take the encoder off the Neural Engine with it.
+            if let decodeUnits = options.tdtDecodeComputeUnits {
+                configuration.computeUnits = decodeUnits
+            }
             let models = try await AsrModels.load(
                 from: modelDirectory,
                 configuration: configuration,
                 version: .v3,
-                encoderPrecision: .int8
+                encoderPrecision: .int8,
+                encoderComputeUnits: computeUnits
             )
             let manager = AsrManager(
                 config: ASRConfig(parallelChunkConcurrency: options.tdtChunkConcurrency)
