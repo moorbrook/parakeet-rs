@@ -133,12 +133,25 @@ impl App {
     ///
     /// This runs on the **main thread** when invoked from the NSEvent
     /// global-monitor block (`hotkey::install_media_key_monitor`), so
-    /// any lock held here also blocks the AppKit run loop. The FSM's
-    /// internal mutex is the only one taken on the press path; it's
-    /// held only for the read-modify-write of the (state, session,
-    /// pending_terminate) triple and never across I/O. The mic open
-    /// and Silero VAD load happen on a worker thread spawned by
-    /// `start_session`, not under any lock.
+    /// any lock held here also blocks the AppKit run loop. Two locks are
+    /// taken on this path, both briefly and never across I/O:
+    ///
+    /// - The FSM's internal mutex, for the read-modify-write of the
+    ///   (state, session, pending_terminate) triple.
+    /// - `self.asr`, for the duration of one `Arc` clone in
+    ///   [`Self::prime_engine`].
+    ///
+    /// The `asr` lock is the sharper edge of the two, because what a writer
+    /// does under it matters as much as how long it holds it: dropping the
+    /// last `Arc<Asr>` runs `WorkerProcess::drop`, which kills and reaps the
+    /// Core ML child. Both writers therefore swap under the guard and drop the
+    /// old recognizer after releasing it. Keep it that way — an in-place
+    /// assignment there puts a child reap in front of every hotkey press that
+    /// lands during a reload.
+    ///
+    /// The mic open and Silero VAD load happen on a worker thread spawned by
+    /// `start_session`, not under any lock, and the prime dispatch happens on
+    /// `EnginePrimer`'s thread rather than here.
     ///
     /// Do not introduce blocking I/O, file reads, or network calls
     /// inside any lock acquired by this path — doing so freezes the
@@ -552,7 +565,14 @@ impl App {
             // cost ~400 ms for nothing here.
             match load_asr_blocking(&app.settings, /* warm = */ false) {
                 Ok((asr, biasing)) => {
-                    *app.asr.lock() = Some(asr);
+                    // Take the old recognizer out under the guard and drop it
+                    // after the guard is released. Dropping in place would run
+                    // `WorkerProcess::drop` — kill() plus wait() on the Core ML
+                    // child — while still holding `asr`, and a hotkey press
+                    // taking that same lock on the main thread would block the
+                    // AppKit run loop on a child reap.
+                    let previous = app.asr.lock().replace(asr);
+                    drop(previous);
                     // Record what this build actually read, sampled
                     // before it started. An edit that landed mid-build
                     // therefore still compares unequal and gets picked
@@ -604,7 +624,10 @@ impl App {
 
         match result {
             Ok(Ok((asr, biasing))) => {
-                *self.asr.lock() = Some(asr);
+                // Same reason as the reload path: never drop the old
+                // recognizer while the lock the press path takes is held.
+                let previous = self.asr.lock().replace(asr);
+                drop(previous);
                 *self.loaded_biasing.lock() = Some(biasing);
                 self.set_state(DictationState::Idle);
             }

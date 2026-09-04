@@ -595,6 +595,13 @@ loopback in the time it takes.
 
 Arms are tagged with an `idle_arm` log marker rather than a new `phase_timer`
 field, so nothing in the production timing path changes.
+
+The shipping prime drops a second request while one is in flight rather than
+queueing it. It cannot cancel the first, so a press-release short enough to end
+while a prime is still running puts that endpoint decode behind one dispatch on
+the worker's single pipe, about 30 to 50 ms. It is bounded at one dispatch and
+only reachable on a press that found the engine cold - the case that was going
+to pay a re-wake regardless.
 `scripts/bench-idle.py` attributes each timed line to the marker above it,
 warns about any line it cannot label, and carries `encoder_ms` from the stage
 profiler alongside the latency percentiles - the encoder is the only stage on
@@ -711,6 +718,17 @@ profiler, so there is no encoder column here:
 The 1 s row is the clean one and it is the largest effect measured anywhere in
 this experiment: the prime removes 73.0 ms at p50 and 70.6 ms at p95, matching
 the warm arm exactly.
+
+That 73 ms is larger than the mechanism accounts for. The sweep prices the
+encoder re-wake at 25.4 ms, and Tap Fast's cold penalty at 1 s is 27.0 ms at
+p50, which matches it. Hold's is nearly three times that, and `bench_e2e` does
+not run the stage profiler, so there is no encoder column here to attribute the
+remainder to. Something else in the Hold path is also paying for the idle gap -
+the capture stream, the loopback device, or CPU frequency, none of which the
+isolated ASR bench exercises. The direction and the ordering are not in doubt,
+and the prime removes whatever it is along with the encoder cost, but the 25.4
+ms re-wake explains only about a third of the Hold number. Running
+`bench_e2e` with stage timings would settle it.
 
 Read the `warm` column here differently than in the Tap Fast table. `warm`
 skips the idle gap but still plays the fixture, so each of its decodes follows

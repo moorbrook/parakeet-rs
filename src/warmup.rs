@@ -62,10 +62,17 @@ const PRIME_SAMPLE_RATE: u32 = 16_000;
 
 /// Length of one priming buffer.
 ///
-/// The encoder runs over a fixed window regardless of how short the input is,
-/// so a shorter buffer buys nothing on the engine and only trims the pipe
-/// write. 0.5 s matches the throwaway pass of [`dummy_decode`], which is the
-/// shape already known to compile and run cleanly on this model.
+/// 0.5 s matches the throwaway pass of [`dummy_decode`], the shape already
+/// known to compile and run cleanly on this model.
+///
+/// The size used to be irrelevant: one 15 s encoder ran the same window
+/// whatever the input length. Bucketed encoders changed that —
+/// `EncoderBuckets.select` routes a request to the narrowest compiled window
+/// that holds it, so this buffer picks the smallest bucket rather than the one
+/// the utterance to come will use. The engine's power gate is a hardware unit
+/// that any dispatch lifts, so the re-wake this exists to avoid is still
+/// covered; a per-program load cost across buckets would not be. Kata xt0y
+/// follows up once bucket artifacts ship.
 pub const PRIME_SECONDS: f32 = 0.5;
 
 /// Run one minimal dispatch through the recognizer.
@@ -101,6 +108,13 @@ impl EnginePrimer {
     ///
     /// Returns `true` when a thread was spawned. A `false` return is the
     /// normal outcome of a rapid second press, not an error.
+    ///
+    /// The guard drops the second request rather than queueing it, but it
+    /// cannot cancel the first: a press-release short enough to end while a
+    /// prime is still running puts that endpoint decode behind one dispatch on
+    /// the worker's single pipe, about 30 to 50 ms. It is bounded at one, and
+    /// it only happens on a press that found the engine cold, which is
+    /// precisely the case that was going to pay a re-wake anyway.
     pub fn prime_in_background(&self, asr: Arc<Asr>) -> bool {
         if self
             .in_flight
@@ -110,12 +124,18 @@ impl EnginePrimer {
             log::debug!("engine prime skipped: one is already in flight");
             return false;
         }
-        let in_flight = Arc::clone(&self.in_flight);
+        let clear_on_exit = InFlightGuard {
+            flag: Arc::clone(&self.in_flight),
+        };
         std::thread::spawn(move || {
+            // Held across the dispatch so the flag is cleared by unwinding
+            // too. A panic crossing the worker's IPC boundary would otherwise
+            // latch it true and silently disable priming for the rest of the
+            // process lifetime.
+            let _clear_on_exit = clear_on_exit;
             if let Err(error) = prime_engine(&asr) {
                 log::warn!("engine prime failed; the next decode pays the re-wake: {error:#}");
             }
-            in_flight.store(false, Ordering::Release);
         });
         true
     }
@@ -123,6 +143,18 @@ impl EnginePrimer {
     /// True while a spawned prime has not yet returned.
     pub fn is_in_flight(&self) -> bool {
         self.in_flight.load(Ordering::Acquire)
+    }
+}
+
+/// Clears [`EnginePrimer`]'s in-flight flag on both the normal and the
+/// unwinding path out of a prime.
+struct InFlightGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
     }
 }
 
@@ -274,6 +306,71 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         // Once the first one has drained, priming is available again.
         assert!(primer.prime_in_background(asr));
+    }
+
+    /// Panics on the first dispatch, succeeds afterwards.
+    struct PanicOnceBackend {
+        metadata: AsrBackendMetadata,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl AsrBackend for PanicOnceBackend {
+        fn metadata(&self) -> &AsrBackendMetadata {
+            &self.metadata
+        }
+
+        fn transcribe(&self, _samples: &[f32], _sample_rate: u32) -> Result<Decoded> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                panic!("worker IPC exploded");
+            }
+            Ok(Decoded {
+                text: String::new(),
+                audio_seconds: 0.5,
+                decode_seconds: 0.0,
+            })
+        }
+    }
+
+    #[test]
+    fn a_panicking_dispatch_does_not_latch_the_in_flight_flag() {
+        // Without the drop guard the flag stays true for the process lifetime
+        // and every later prime is dropped in silence — the app would keep
+        // paying the re-wake it was built to avoid, with nothing in the log to
+        // say why.
+        let calls = Arc::new(AtomicU64::new(0));
+        let asr = Arc::new(Asr::from_backend(Arc::new(PanicOnceBackend {
+            metadata: AsrBackendMetadata {
+                backend: "panic-once".into(),
+                model: "none".into(),
+                quantization: "none".into(),
+                execution_provider: "test".into(),
+            },
+            calls: Arc::clone(&calls),
+        })));
+        let primer = EnginePrimer::new();
+
+        // The spawned thread panics; the default hook prints to stderr, which
+        // is noise in the test output and not a failure.
+        assert!(primer.prime_in_background(Arc::clone(&asr)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while primer.is_in_flight() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !primer.is_in_flight(),
+            "the guard must clear the flag while unwinding"
+        );
+
+        assert!(primer.prime_in_background(asr));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while primer.is_in_flight() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "priming must still work after a panicking dispatch"
+        );
     }
 
     #[test]
