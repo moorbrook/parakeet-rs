@@ -1952,6 +1952,9 @@ killed it:
 2. Where it fires it is worth nothing over a plain shorter window. On the
    synthesized fixture, 150 ms gated at 90 ms and an ungated 90 ms give the same
    distribution over 30 repetitions: 148.5 ms p50 both, means 139.4 and 141.8 ms.
+   Their 15-repetition p50s differ, 145.0 against 125.0 ms, because a 15-sample
+   median lands on either side of the bimodal decode's cluster boundary; the
+   means there differ by 4.4 ms.
 3. Its premise is false. Long-form at 750 ms with a 90 ms punctuated window cut
    the multi-sentence fixture 15/15, and the provisional transcript at its
    reviewed 544 ms intra-utterance pause reads `...to greet the arrival of the

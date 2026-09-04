@@ -179,8 +179,9 @@ synthesized one cannot, 15 repetitions:
 | 150 ms | 0/15 | 0 | 57.3 ms | 59.0 ms | 63.0 ms |
 | **90 ms** | 0/15 | 2 | **1.5 ms** | **0.0 ms** | 6.8 ms |
 
-The two mismatches are `Concorde` for `Concord`, a lexical variant present in
-the 150 ms rows too, not truncation. Silero calls silence inside the LibriSpeech
+The mismatches are `Concorde` for `Concord`, a lexical variant that also appears
+in 150 ms rows, not truncation. The 30-repetition 90 ms run produced it once in
+30 measured repetitions against 31 full-reference transcripts including warmups. Silero calls silence inside the LibriSpeech
 room tone that keeps the -80 dBFS marker alive, so the absolute 0 ms is an
 artifact of the marker; the 59 ms delta is the real saving.
 
@@ -232,6 +233,9 @@ never opened and the row is identical to the control: 59.0 ms p50 against
 Where it does fire it is worth nothing over a plain shorter window. On the
 synthesized fixture, 150 ms gated at 90 ms and an ungated 90 ms produce the same
 distribution at 30 repetitions: 148.5 ms p50 both, means 139.4 and 141.8 ms.
+The 15-repetition rows for those two configurations read 145.0 and 125.0 ms p50,
+which is the bimodal decode landing a 15-sample median on either side of the
+cluster boundary; their means differ by 4.4 ms. Read the 30-repetition figures.
 
 Its premise is false. Long-form at 750 ms with a 90 ms punctuated window cut the
 multi-sentence fixture 15/15, and the provisional transcript at the 544 ms
