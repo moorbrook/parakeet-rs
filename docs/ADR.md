@@ -1917,6 +1917,95 @@ tail flush remains after the stream is dropped.
 
 ---
 
+## 0031 — Hold decodes windows at pauses, joined on word agreement
+
+**Status:** **Accepted — implemented.** Numbers below are from
+`scripts/bench-hold.sh` on the M5 Pro; see `bench/README.md`.
+
+**This is not ADR-0009's rejected streaming swap.** The recognizer is
+unchanged — the same offline full-attention Parakeet Unified encoder, the same
+int8 weights, the same 15 s windows inside the worker; only *when* windows are
+submitted and *how* their transcripts are joined changes, so none of the WER
+cost that sank the chunked-attention candidates applies here.
+
+**Context.** Hold (press-and-hold) had nothing overlapping its decode.
+`run_manual` drained the audio tap and threw the chunks away, and the first
+model call happened after the hotkey came up. The g38m instrumentation priced
+that: 72.5 ms p50 at a 4.9 s utterance, 125.0 ms at 8.1 s, 192.5 ms at 15.8 s,
+of which the ASR call alone was 61, 115.5, and 181 ms. The growth is structural,
+not a bug — the encoder costs about 26 ms per 15 s window plus roughly 3 ms per
+audio-second in the RNNT loop, and in Hold all of it lands after the endpoint.
+Tap does not have this problem: ADR-0023's speculative decode already runs
+during the endpoint confirmation window.
+
+**Decision.** Cut the held recording into windows while the key is still down
+and decode each one in the background, so that on release only the tail is left.
+Voz's recipe for long audio — "cut into 15 s windows at pauses and join on the
+words neighbouring windows agree on" — applied incrementally rather than to a
+finished file.
+
+- **Where to cut.** Hold now runs one Silero state of its own, the low-latency
+  candidate detector, through `EndpointTracker` under the `Fast` policy. That
+  tracker fires `Confirmed` once per pause after 160 ms of silence and reports
+  the sample where the silence began; it re-arms when speech resumes. Tap's
+  endpoint authority is untouched — this tracker chooses window boundaries and
+  can never stop a recording.
+- **A pause is not enough.** Real dictation contains long unbroken clauses, and
+  the bench's own 8.1 s fixture is a single `say` sentence. Without a second
+  rule the whole utterance would still be one tail. So a window is also cut at a
+  hard length cap. That cap, not the pause interval, is what bounds the tail the
+  user waits for, which makes it the release-to-text ceiling: 6 s of tail is
+  roughly 26 ms of encoder plus 18 ms of RNNT loop.
+- **Overlap.** A pause cut hands the confirmation silence to the next window —
+  RNNT emission lags the acoustics, so a word spoken just before the pause can
+  be timestamped inside it, and the next window needs to contain that audio for
+  the merge to see the duplicate. A forced cut lands mid-speech and hands over
+  1.5 s, enough that the straddling word is decoded whole by the next window and
+  the merge has several words to agree on.
+- **How to join.** The worker now answers with `token_spans`: one entry per RNNT
+  emission, carrying the detokenized piece and its span in seconds. FluidAudio's
+  `transcribeWithTimings` runs the same decode as `transcribe` and reads
+  emission frames the greedy decoder already recorded, so this costs only the
+  frame-to-seconds conversion. Rust groups the pieces into words on the
+  tokenizer's word-start marker and merges two windows by finding the longest
+  run of words they agree on inside their shared audio, splicing there. Matching
+  is on letters only, case- and punctuation-insensitive, and never on time:
+  emission frames are 80 ms apart and the same word is routinely stamped a frame
+  apart by two windows. A single shared function word is not accepted as
+  agreement.
+- **When they agree on nothing** the seam falls to the midpoint of the overlap.
+  Each window is truncated at one edge — the earlier one on the right, the later
+  one on the left — so the midpoint is where each is least damaged, and a word
+  straddling it is taken from the window that decoded it whole. This never
+  duplicates and never reorders.
+
+**Rejected: aligning on time instead of text.** Splitting the overlap at a fixed
+instant needs no agreement search and is one line. It also cuts words in half
+whenever the two windows' emission frames disagree, which they do by
+construction. Text agreement is the only rule that can tell a duplicate from two
+different words at the same moment.
+
+**Rejected: submitting windows out of order.** The worker protocol serves one
+request at a time behind a mutex, so a second concurrent submission would only
+queue. One decoder thread with a job queue is what the protocol wants, and
+joining it before the session ends keeps a stray decode from holding the worker
+while the next session starts. The tail's wait behind an in-flight window is
+inherent and shows at p95 rather than p50.
+
+**Failure is always backwards.** Windowing turns itself off, with the reason
+logged, when the recognizer reports no word boundaries (sherpa), when the
+configuration is out of range, when Silero will not load, when the audio tap
+closes early, or when capture returns something other than 16 kHz. Any window
+decode error, and any merge that comes back empty on non-empty audio, abandons
+the windowed transcript and lets the app decode the recording in one pass. A
+seam bug can cost latency; it must never cost what the user said.
+
+**Configuration.** `hold_windows_enabled`, `hold_window_min_seconds` (3.0), and
+`hold_window_max_seconds` (6.0) in `settings.json`.
+`bench_e2e --hold-windows off|MIN,MAX` measures both paths through one binary,
+and `asr_diff --hold-windows MIN,MAX` decodes the gold corpus the windowed way
+so the seam merge is held to the same WER as the plain decode.
+
 ## Target status index
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -1945,6 +2034,14 @@ tail flush remains after the stream is dropped.
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-09-04** — [ADR-0031](#0031--hold-decodes-windows-at-pauses-joined-on-word-agreement)
+  accepted and implemented. Hold cuts windows at Silero-confirmed pauses (and at
+  a length cap when the speaker does not pause), decodes them in the background
+  while the key is held, and joins them on the words neighbouring windows agree
+  on, so release-to-text is the tail window rather than the whole recording. The
+  recognizer is unchanged; this is not the streaming-model swap ADR-0009
+  rejected.
 
 - **2026-09-04** — [ADR-0030](#0030--one-16-khz-resampler-in-rust-run-during-capture)
   accepted and implemented. One Kaldi sinc resampler in `src/resample.rs`,

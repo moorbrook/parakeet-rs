@@ -82,23 +82,33 @@ pub struct TokenSpan {
 /// including punctuation, which the tokenizer emits without a leading space —
 /// joins the word in progress. `offset_s` is where this window starts in the
 /// recording.
+///
+/// The bare word-start marker is its own token in this vocabulary: the model
+/// spells "30" as `▁`, `3`, `0`, which arrives here as `" "`, `"3"`, `"0"`. Such
+/// a token carries no letters but does carry the boundary, so it has to open the
+/// next word rather than be skipped — otherwise the digits attach to the
+/// preceding word and "for 30" comes back as "for30".
 pub fn words_from_tokens(tokens: &[TokenSpan], offset_s: f32) -> Vec<Word> {
     let mut words: Vec<Word> = Vec::new();
+    let mut at_boundary = true;
     for token in tokens {
-        let starts_word = token.text.starts_with(' ') || words.is_empty();
+        let starts_word = at_boundary || token.text.starts_with(' ');
         let piece = token.text.trim();
         if piece.is_empty() {
+            at_boundary |= token.text.starts_with(' ');
             continue;
         }
-        if starts_word {
-            words.push(Word {
+        at_boundary = false;
+        match words.last_mut() {
+            Some(last) if !starts_word => {
+                last.text.push_str(piece);
+                last.end_s = token.end_s + offset_s;
+            }
+            _ => words.push(Word {
                 text: piece.to_string(),
                 start_s: token.start_s + offset_s,
                 end_s: token.end_s + offset_s,
-            });
-        } else if let Some(last) = words.last_mut() {
-            last.text.push_str(piece);
-            last.end_s = token.end_s + offset_s;
+            }),
         }
     }
     words
@@ -458,6 +468,63 @@ mod tests {
         // Offsets land on the recording's timeline, not the window's.
         assert!((words[0].start_s - 2.08).abs() < 1e-5);
         assert!((words[2].end_s - 2.64).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_bare_word_start_marker_opens_the_next_word() {
+        // The model spells numbers as a lone word-start marker followed by
+        // digit pieces. Dropping the marker for having no letters glued the
+        // digits onto the previous word ("for30").
+        let tokens = [
+            TokenSpan {
+                text: " for".to_string(),
+                start_s: 0.0,
+                end_s: 0.08,
+            },
+            TokenSpan {
+                text: " ".to_string(),
+                start_s: 0.08,
+                end_s: 0.16,
+            },
+            TokenSpan {
+                text: "3".to_string(),
+                start_s: 0.16,
+                end_s: 0.24,
+            },
+            TokenSpan {
+                text: "0".to_string(),
+                start_s: 0.24,
+                end_s: 0.32,
+            },
+            TokenSpan {
+                text: " iterations".to_string(),
+                start_s: 0.4,
+                end_s: 0.48,
+            },
+        ];
+        let words = words_from_tokens(&tokens, 0.0);
+        assert_eq!(texts(&words), ["for", "30", "iterations"]);
+        assert_eq!(words_to_text(&words), "for 30 iterations");
+        // The digits' span is the digits', not the marker's.
+        assert!((words[1].start_s - 0.16).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_window_whose_first_token_carries_no_marker_still_opens_a_word() {
+        let tokens = [
+            TokenSpan {
+                text: "lengths".to_string(),
+                start_s: 0.0,
+                end_s: 0.08,
+            },
+            TokenSpan {
+                text: ",".to_string(),
+                start_s: 0.08,
+                end_s: 0.16,
+            },
+        ];
+        let words = words_from_tokens(&tokens, 0.0);
+        assert_eq!(texts(&words), ["lengths,"]);
     }
 
     #[test]
