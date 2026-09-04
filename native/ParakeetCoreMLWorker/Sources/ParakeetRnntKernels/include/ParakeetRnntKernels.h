@@ -34,6 +34,15 @@ void parakeet_rnnt_matvec(
 /// fp16 tensor does.
 void parakeet_rnnt_round_fp16(float *values, size_t count);
 
+/// Whether the stage profiler is recording, as one relaxed atomic.
+///
+/// The native decode loop asks this before every step, including on the
+/// shipping path where the profiler is never installed. A lock there would be
+/// uncontended but still a lock, on a question whose answer changes twice per
+/// utterance.
+void parakeet_rnnt_set_recording(int recording);
+int parakeet_rnnt_recording(void);
+
 #ifdef __cplusplus
 }
 #endif

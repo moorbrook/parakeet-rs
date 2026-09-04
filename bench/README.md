@@ -558,10 +558,11 @@ Whole-decode effect, same runs:
 ### The 5 ms target was missed
 
 Kata 2564 asked for the loop under 5 ms at 5 s. It is 8.63 ms: 2.4x faster, not
-4x. The remaining cost is weight traffic, not dispatch. One prediction-network
-step reads 13.1 MB of fp16 weights and the 4.967 s fixture takes 49 of them,
-plus 134 joint decisions at 1.3 MB each — about 780 MB for one utterance, which
-no amount of dispatch removal touches.
+4x. The remaining cost is weight traffic, not dispatch. One prediction-network step
+reads 13.1 MB of fp16 weights and the 4.967 s fixture takes 49 of them; with 49
+decoder-side projections at 0.8 MB and 134 joint decisions at 1.3 MB that is
+642 + 40 + 176, about 860 MB for one utterance, which no amount of dispatch
+removal touches.
 
 The next lever is the embedding-input product. The first LSTM layer computes
 `W_ih · embed[token]`, which depends only on the token, so all 1025 of them can

@@ -132,6 +132,11 @@ extension NativeRnntDecoder: UnifiedRnntDecoding {
         var currentCell = cellState
         var emissions: [UnifiedRnntEmission] = []
 
+        // Every window re-derives this first step rather than caching the one
+        // a reset decoder always produces. Caching it would save one step per
+        // window and cost the property the bench leans on hardest: that the
+        // native and CoreML arms report identical step counts, and that
+        // `joint - (decoder - windows)` is the decoded-frame count in both.
         var step = predictionStep(token: currentToken, hidden: currentHidden, cell: currentCell)
 
         for frame in frameRange {
@@ -457,11 +462,14 @@ final class RnntJointNetwork {
 
     enum ProjectionError: LocalizedError {
         case unexpectedEncoderShape([Int])
+        case frameRangeOutOfBounds(Range<Int>, Int)
 
         var errorDescription: String? {
             switch self {
             case .unexpectedEncoderShape(let shape):
                 "encoder output has shape \(shape), which this joint cannot project"
+            case .frameRangeOutOfBounds(let range, let frames):
+                "frames \(range) were asked of an encoder output holding \(frames)"
             }
         }
     }
@@ -477,6 +485,12 @@ final class RnntJointNetwork {
         let shape = encoded.shape.map(\.intValue)
         guard shape.count == 3, shape[1] == encoderDimension, encoded.dataType == .float32 else {
             throw ProjectionError.unexpectedEncoderShape(shape)
+        }
+        // The caller derives the range from the encoder's own reported length,
+        // so a range past the end means those two disagree — worth an error
+        // rather than reading whatever follows the buffer.
+        guard frameRange.lowerBound >= 0, frameRange.upperBound <= shape[2] else {
+            throw ProjectionError.frameRangeOutOfBounds(frameRange, shape[2])
         }
         let frames = frameRange.count
         let projected = ProjectedFrames(frames: frames, stride: decoderDimension)
@@ -585,12 +599,18 @@ final class RnntJointNetwork {
             }
         }
 
-        var best: Float = 0
-        var index: vDSP_Length = 0
+        // First index wins, which is what `ios17.reduce_argmax` does. The
+        // logits are rounded to fp16, so exact ties between two tokens are not
+        // a theoretical case, and vDSP's own tie-breaking is unspecified.
+        var best = -Float.greatestFiniteMagnitude
+        var token = 0
         logits.withUnsafeBufferPointer { values in
-            vDSP_maxvi(values.baseAddress!, 1, &best, &index, vDSP_Length(vocabulary))
+            let base = values.baseAddress!
+            for index in 0..<vocabulary where base[index] > best {
+                best = base[index]
+                token = index
+            }
         }
-        let token = Int(index)
         guard token != blankIndex else { return Decision(token: token, probability: 0) }
 
         var shifted = logits

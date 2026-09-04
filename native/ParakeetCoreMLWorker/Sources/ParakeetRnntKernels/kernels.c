@@ -1,6 +1,19 @@
 #include "include/ParakeetRnntKernels.h"
 
 #include <arm_neon.h>
+#include <stdatomic.h>
+
+static atomic_int parakeet_rnnt_recording_flag = 0;
+
+void parakeet_rnnt_set_recording(int recording)
+{
+    atomic_store_explicit(&parakeet_rnnt_recording_flag, recording, memory_order_relaxed);
+}
+
+int parakeet_rnnt_recording(void)
+{
+    return atomic_load_explicit(&parakeet_rnnt_recording_flag, memory_order_relaxed);
+}
 
 /// Largest vector the fp16 fast path converts on the stack. Every matrix in the
 /// decode loop is narrower than this (1280 for the interleaved LSTM gates, 640

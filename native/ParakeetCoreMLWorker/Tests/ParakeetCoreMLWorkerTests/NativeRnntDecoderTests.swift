@@ -1,4 +1,5 @@
 import CoreML
+import CryptoKit
 import FluidAudio
 import Foundation
 import Testing
@@ -45,6 +46,8 @@ struct NativeRnntDecoderTests {
         let vocabulary: Int
         let stepTolerance: Float
         let probabilityTolerance: Float
+        let decoderWeightsSha256: String
+        let jointWeightsSha256: String
         let decoderSteps: [Step]
         let jointCases: [JointCase]
         /// Encoder frames built to emit from a freshly reset decoder, for the
@@ -63,10 +66,29 @@ struct NativeRnntDecoderTests {
         }
     }
 
-    private static var modelDirectory: URL? {
+    /// Whether these tests should run at all.
+    ///
+    /// The models are 600 M parameters and are not checked in, so a machine
+    /// without them skips — visibly, as a skipped test rather than a green one
+    /// that asserted nothing. `PARAKEET_MODEL_DIR` is different: naming a
+    /// directory is a claim that it holds the models, so a wrong one runs and
+    /// fails instead of quietly skipping.
+    static var modelsAvailable: Bool {
+        ProcessInfo.processInfo.environment["PARAKEET_MODEL_DIR"] != nil
+            || installedModelDirectory != nil
+    }
+
+    /// The directory to load from, or nil when the environment named one that
+    /// does not hold the models.
+    static var modelDirectory: URL? {
         if let override = ProcessInfo.processInfo.environment["PARAKEET_MODEL_DIR"] {
-            return URL(fileURLWithPath: override, isDirectory: true)
+            let directory = URL(fileURLWithPath: override, isDirectory: true)
+            return holdsModels(directory) ? directory : nil
         }
+        return installedModelDirectory
+    }
+
+    private static var installedModelDirectory: URL? {
         guard
             let support = FileManager.default.urls(
                 for: .applicationSupportDirectory, in: .userDomainMask
@@ -75,9 +97,12 @@ struct NativeRnntDecoderTests {
         let directory = support
             .appendingPathComponent("com.parakeet.rs/models/coreml", isDirectory: true)
             .appendingPathComponent("parakeet-unified-en-0.6b", isDirectory: true)
-        return FileManager.default.fileExists(
+        return holdsModels(directory) ? directory : nil
+    }
+
+    private static func holdsModels(_ directory: URL) -> Bool {
+        FileManager.default.fileExists(
             atPath: directory.appendingPathComponent("parakeet_unified_decoder.mlmodelc").path)
-            ? directory : nil
     }
 
     private static func fixture() throws -> Fixture {
@@ -88,10 +113,36 @@ struct NativeRnntDecoderTests {
         return try decoder.decode(Fixture.self, from: Data(contentsOf: url))
     }
 
-    @Test("the prediction network reproduces every captured decoder step")
+    /// The weights the capture was taken from, so a model swap fails as a
+    /// stale capture rather than as an unexplained tolerance number.
+    private static func expectFixtureMatchesWeights(
+        _ fixture: Fixture, in directory: URL
+    ) throws {
+        for (bundle, expected) in [
+            ("parakeet_unified_decoder.mlmodelc", fixture.decoderWeightsSha256),
+            ("parakeet_unified_joint_decision_single_step.mlmodelc", fixture.jointWeightsSha256),
+        ] {
+            let blob = try Data(
+                contentsOf: directory.appendingPathComponent(bundle)
+                    .appendingPathComponent("weights/weight.bin"),
+                options: .mappedIfSafe
+            )
+            let digest = SHA256.hash(data: blob).map { String(format: "%02x", $0) }.joined()
+            #expect(
+                digest == expected,
+                "capture is stale: \(bundle) hashes \(digest), the fixture was taken from \(expected); regenerate with scripts/capture-rnnt-parity.py")
+        }
+    }
+
+    @Test(
+        "the prediction network reproduces every captured decoder step",
+        .enabled(if: NativeRnntDecoderTests.modelsAvailable))
     func predictionNetworkMatchesCapture() throws {
-        guard let directory = Self.modelDirectory else { return }
+        let directory = try #require(
+            Self.modelDirectory,
+            "PARAKEET_MODEL_DIR does not hold parakeet_unified_decoder.mlmodelc")
         let fixture = try Self.fixture()
+        try Self.expectFixtureMatchesWeights(fixture, in: directory)
         #expect(fixture.gateOrder == "ifog")
         let network = try RnntPredictionNetwork(
             bundle: directory.appendingPathComponent("parakeet_unified_decoder.mlmodelc"),
@@ -134,9 +185,13 @@ struct NativeRnntDecoderTests {
         #expect(try Self.unpack(first.cIn).allSatisfy { $0 == 0 })
     }
 
-    @Test("reset returns the decoder to the state it was constructed in")
+    @Test(
+        "reset returns the decoder to the state it was constructed in",
+        .enabled(if: NativeRnntDecoderTests.modelsAvailable))
     func resetRestoresTheStartingState() throws {
-        guard let directory = Self.modelDirectory else { return }
+        let directory = try #require(
+            Self.modelDirectory,
+            "PARAKEET_MODEL_DIR does not hold parakeet_unified_decoder.mlmodelc")
         let config = UnifiedConfig()
         let decoder = try NativeRnntDecoder(modelDirectory: directory, config: config)
         // The frames are built to make the joint emit; what the test pins is
@@ -165,6 +220,62 @@ struct NativeRnntDecoderTests {
             "a second pass without reset must not retrace the first, or this proves nothing")
     }
 
+    @Test(
+        "a frame range past the encoder output is refused",
+        .enabled(if: NativeRnntDecoderTests.modelsAvailable))
+    func frameRangePastTheEncoderOutputThrows() throws {
+        let directory = try #require(
+            Self.modelDirectory,
+            "PARAKEET_MODEL_DIR does not hold parakeet_unified_decoder.mlmodelc")
+        let joint = try RnntJointNetwork(
+            bundle: directory.appendingPathComponent(
+                "parakeet_unified_joint_decision_single_step.mlmodelc"))
+        let fixture = try Self.fixture()
+        let frames = try fixture.loopFrames.prefix(2).map { try Self.unpack($0) }
+        let encoded = try Self.encoderOutput(frames, dimension: joint.encoderDimension)
+        // The caller derives the range from the encoder's reported length, so
+        // this is the shape of a disagreement between those two, not of a
+        // caller bug the decoder can absorb.
+        #expect(throws: RnntJointNetwork.ProjectionError.self) {
+            _ = try joint.projectEncoder(encoded, frameRange: 0..<(frames.count + 1))
+        }
+        #expect(throws: Never.self) {
+            _ = try joint.projectEncoder(encoded, frameRange: 0..<frames.count)
+        }
+    }
+
+    @Test(
+        "no frame emits more symbols than the per-frame cap allows",
+        .enabled(if: NativeRnntDecoderTests.modelsAvailable))
+    func symbolCapForcesTheFrameToAdvance() throws {
+        let directory = try #require(
+            Self.modelDirectory,
+            "PARAKEET_MODEL_DIR does not hold parakeet_unified_decoder.mlmodelc")
+        let fixture = try Self.fixture()
+        // One frame, repeated, built to separate a token from blank strongly
+        // enough that the joint keeps choosing it as the prediction state moves
+        // under it. Without the cap the loop would not leave the frame.
+        let frame = try Self.unpack(try #require(fixture.loopFrames.first))
+        let frames = Array(repeating: frame, count: 3)
+        let config = UnifiedConfig()
+        let decoder = try NativeRnntDecoder(modelDirectory: directory, config: config)
+        let encoded = try Self.encoderOutput(frames, dimension: decoder.encoderDimension)
+        let emissions = try decoder.decode(
+            encoded: encoded, frameRange: 0..<frames.count, globalFrameOffset: 0)
+
+        var perFrame: [Int: Int] = [:]
+        for emission in emissions { perFrame[emission.frame, default: 0] += 1 }
+        #expect(!perFrame.isEmpty, "the frames must emit for the cap to mean anything")
+        for (frame, count) in perFrame {
+            #expect(
+                count <= config.maxSymbolsPerFrame,
+                "frame \(frame) emitted \(count) symbols, cap is \(config.maxSymbolsPerFrame)")
+        }
+        #expect(
+            perFrame.values.contains(config.maxSymbolsPerFrame),
+            "no frame reached the cap, so this exercises the break on blank instead")
+    }
+
     /// Frames laid out as the `[1, D, T]` encoder output the decoder reads.
     private static func encoderOutput(
         _ frames: [[Float]], dimension: Int
@@ -181,10 +292,15 @@ struct NativeRnntDecoderTests {
         return array
     }
 
-    @Test("the joint picks the same token as the compiled model")
+    @Test(
+        "the joint picks the same token as the compiled model",
+        .enabled(if: NativeRnntDecoderTests.modelsAvailable))
     func jointMatchesCapture() throws {
-        guard let directory = Self.modelDirectory else { return }
+        let directory = try #require(
+            Self.modelDirectory,
+            "PARAKEET_MODEL_DIR does not hold parakeet_unified_decoder.mlmodelc")
         let fixture = try Self.fixture()
+        try Self.expectFixtureMatchesWeights(fixture, in: directory)
         let joint = try RnntJointNetwork(
             bundle: directory.appendingPathComponent(
                 "parakeet_unified_joint_decision_single_step.mlmodelc"))
