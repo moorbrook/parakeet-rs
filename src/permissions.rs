@@ -289,6 +289,16 @@ struct PermissionUiState {
     dialog_visible: bool,
     input_missing_at_install: bool,
     return_scope: DashboardScope,
+    /// Monotonic id of the most recent Input Monitoring re-check request;
+    /// a delayed re-check whose captured id no longer matches was
+    /// superseded by a later Grant click and must do nothing.
+    input_request_generation: u64,
+    /// An activation transition was observed since the most recent Input
+    /// Monitoring request was scheduled. The consent alert dismiss path
+    /// re-activates the app, so this proves a prompt appeared (or the user
+    /// left and returned) even when the app is active again by re-check
+    /// time — the fallback must not fire then.
+    input_request_activation_observed: bool,
 }
 
 thread_local! {
@@ -353,6 +363,10 @@ pub fn application_did_become_active(mtm: MainThreadMarker) {
         };
         ui.refresh_when_active = false;
         ui.last_state = Some(current);
+        // A pending Input Monitoring re-check treats any activation as the
+        // consent alert having appeared and been handled; see
+        // `perform_input_monitoring_recheck`.
+        ui.input_request_activation_observed = true;
         (should_present, scope)
     });
     if should_present.0 {
@@ -578,8 +592,9 @@ enum InputMonitoringRecheckOutcome {
     /// The grant landed during the window; refresh the dashboard so the
     /// granted state (and any relaunch notice) shows.
     Granted,
-    /// The app lost focus: the consent alert is up (or the user switched
-    /// away). Do nothing; the armed activation refresh handles the return.
+    /// The app lost focus — or re-activated — during the window: the consent
+    /// alert appeared (and may already have been answered), or the user
+    /// switched away. Do nothing; the armed activation refresh handles it.
     PromptLive,
     /// Still not granted and the app never lost focus: no prompt appeared —
     /// denied, or the stored decision went stale because the app was
@@ -591,11 +606,14 @@ enum InputMonitoringRecheckOutcome {
 fn input_monitoring_recheck_outcome(
     granted_at_recheck: bool,
     app_active: bool,
+    activation_observed: bool,
 ) -> InputMonitoringRecheckOutcome {
-    match (granted_at_recheck, app_active) {
-        (true, _) => InputMonitoringRecheckOutcome::Granted,
-        (false, false) => InputMonitoringRecheckOutcome::PromptLive,
-        (false, true) => InputMonitoringRecheckOutcome::NeedsSettingsFallback,
+    if granted_at_recheck {
+        InputMonitoringRecheckOutcome::Granted
+    } else if !app_active || activation_observed {
+        InputMonitoringRecheckOutcome::PromptLive
+    } else {
+        InputMonitoringRecheckOutcome::NeedsSettingsFallback
     }
 }
 
@@ -619,23 +637,44 @@ fn handle_input_monitoring_request(
         "Input Monitoring request returned not-granted; re-checking in \
          {INPUT_MONITORING_RECHECK_DELAY:?} whether the consent prompt took focus"
     );
+    let generation = UI_STATE.with(|slot| {
+        let mut ui = slot.borrow_mut();
+        ui.input_request_generation += 1;
+        ui.input_request_activation_observed = false;
+        ui.input_request_generation
+    });
     crate::objc_util::dispatch_to_main_after(INPUT_MONITORING_RECHECK_DELAY, move || {
         let Some(mtm) = MainThreadMarker::new() else {
             log::error!("Input Monitoring re-check dispatched off the main thread");
             return;
         };
-        perform_input_monitoring_recheck(permission, scope, mtm);
+        perform_input_monitoring_recheck(permission, scope, generation, mtm);
     });
 }
 
 fn perform_input_monitoring_recheck(
     permission: Permission,
     scope: DashboardScope,
+    generation: u64,
     mtm: MainThreadMarker,
 ) {
+    let (superseded, activation_observed) = UI_STATE.with(|slot| {
+        let ui = slot.borrow();
+        (
+            ui.input_request_generation != generation,
+            ui.input_request_activation_observed,
+        )
+    });
+    if superseded {
+        log::info!(
+            "Input Monitoring re-check superseded by a later request; doing \
+             nothing"
+        );
+        return;
+    }
     let granted = input_monitoring_granted();
     let app_active = NSApplication::sharedApplication(mtm).isActive();
-    match input_monitoring_recheck_outcome(granted, app_active) {
+    match input_monitoring_recheck_outcome(granted, app_active, activation_observed) {
         InputMonitoringRecheckOutcome::Granted => {
             log::info!(
                 "Input Monitoring granted during the re-check window; \
@@ -645,8 +684,9 @@ fn perform_input_monitoring_recheck(
         }
         InputMonitoringRecheckOutcome::PromptLive => {
             log::info!(
-                "Input Monitoring consent prompt is live (app inactive); the \
-                 armed activation refresh will pick up the decision"
+                "Input Monitoring consent prompt was live (app inactive or an \
+                 activation was observed during the window); the armed \
+                 activation refresh handles the decision"
             );
         }
         InputMonitoringRecheckOutcome::NeedsSettingsFallback => {
@@ -881,21 +921,29 @@ mod tests {
         // CGRequestListenEventAccess returns the current access state, not
         // whether it prompted: a first request shows the consent alert and
         // still returns false. The re-check resolves it — the alert takes
-        // focus, a suppressed request does not.
+        // focus, a suppressed request does not, and an activation observed
+        // during the window means the alert appeared even if the app is
+        // active again by the time the re-check samples it.
         assert_eq!(
-            input_monitoring_recheck_outcome(true, true),
+            input_monitoring_recheck_outcome(true, true, false),
             InputMonitoringRecheckOutcome::Granted
         );
         assert_eq!(
-            input_monitoring_recheck_outcome(true, false),
+            input_monitoring_recheck_outcome(true, false, true),
             InputMonitoringRecheckOutcome::Granted
         );
         assert_eq!(
-            input_monitoring_recheck_outcome(false, false),
+            input_monitoring_recheck_outcome(false, false, false),
+            InputMonitoringRecheckOutcome::PromptLive
+        );
+        // Prompt dismissed inside the window: active again, but the
+        // activation transition proves the prompt appeared.
+        assert_eq!(
+            input_monitoring_recheck_outcome(false, true, true),
             InputMonitoringRecheckOutcome::PromptLive
         );
         assert_eq!(
-            input_monitoring_recheck_outcome(false, true),
+            input_monitoring_recheck_outcome(false, true, false),
             InputMonitoringRecheckOutcome::NeedsSettingsFallback
         );
     }

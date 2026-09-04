@@ -2506,11 +2506,13 @@ adding the app by hand — and they expired on the next rebuild.
 2. `src/permissions.rs` distinguishes what a `CGRequestListenEventAccess()`
    false return means. The call reports the *current* access state, not
    whether it prompted: a first request shows the consent alert and still
-   returns false. The Grant path therefore re-checks on the main thread
+   returns    false. The Grant path therefore re-checks on the main thread
    ~1.5 s later: the consent alert takes focus away from the app, so
-   granted-at-re-check → refresh; app inactive → the alert is live and the
-   armed activation refresh handles the return; still not granted and the
-   app never lost focus → no prompt appeared (denied, or the stored
+   granted-at-re-check → refresh; app inactive, or an activation was
+   observed during the window (the alert appeared and was answered) →
+   the alert was live and the armed activation refresh handles the
+   return; still not granted, app still active, and no activation
+   observed → no prompt appeared (denied, or the stored
    decision went stale after a rebuild) — log at warn level and open
    System Settings → Privacy & Security → Input Monitoring through the
    existing per-permission deep-link with generic fallback, refreshing
