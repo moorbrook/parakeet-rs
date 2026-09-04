@@ -12,6 +12,14 @@ let package = Package(
             name: "parakeet-coreml-worker",
             targets: ["ParakeetCoreMLWorker"]
         ),
+        .executable(
+            name: "parakeet-compute-plan",
+            targets: ["ParakeetComputePlan"]
+        ),
+        .executable(
+            name: "parakeet-encoder-probe",
+            targets: ["ParakeetEncoderProbe"]
+        ),
     ],
     dependencies: [
         .package(
@@ -26,6 +34,18 @@ let package = Package(
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],
             path: "Sources/ParakeetCoreMLWorker"
+        ),
+        // Diagnostic only: reports the Core ML compute plan per operation.
+        // Deliberately does not depend on FluidAudio.
+        .executableTarget(
+            name: "ParakeetComputePlan",
+            path: "Sources/ParakeetComputePlan"
+        ),
+        // Diagnostic only: reports an encoder's compiled shapes and its cost on
+        // zero inputs. Deliberately does not depend on FluidAudio.
+        .executableTarget(
+            name: "ParakeetEncoderProbe",
+            path: "Sources/ParakeetEncoderProbe"
         ),
     ]
 )
