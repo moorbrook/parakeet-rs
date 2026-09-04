@@ -77,8 +77,9 @@ quality, and resource use beat that full production pipeline.
 
 The native worker requires Apple Silicon and macOS 14 or later. Worker spawn,
 model verification, Core ML load, or runtime failure returns to the existing
-sherpa-onnx backend. A non-empty custom vocabulary also selects sherpa because
-it owns contextual biasing. For diagnosis or emergency rollback, launch with
+sherpa-onnx backend. A custom vocabulary no longer forces that choice: the
+worker tokenizes the terms with this bundle's own `vocab.json` and biases the
+joint output toward them (ADR-0033). For diagnosis or emergency rollback, launch with
 `PARAKEET_ASR_BACKEND=sherpa`; unset it or use `auto` to restore normal policy.
 Unknown values are rejected instead of silently selecting a backend.
 Missing, stale, or invalid runtime-plan profiles use CPU+ANE;

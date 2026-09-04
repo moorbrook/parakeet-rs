@@ -535,8 +535,7 @@ pub fn open(mtm: MainThreadMarker) {
         &content,
         "Names, jargon, and product names Parakeet mishears. One per\n\
          line, spelled how you want them transcribed. Opens in your\n\
-         text editor; click Save here afterwards to apply. A non-empty\n\
-         list makes recognition about 13% slower.",
+         text editor; click Save here afterwards to apply.",
         PAD,
         row7_y - 50.0,
         WINDOW_W - PAD * 2.0,

@@ -179,7 +179,8 @@ Persistent settings, vocabulary, tuning evidence, and model paths are under
   ([ADR-0002](docs/ADR.md#0002--macos-only)).
 - **Optimized ASR requires macOS 14+.** On macOS 11–13, or whenever the native
   worker/model cannot load, Parakeet automatically uses sherpa-onnx. A custom
-  vocabulary also selects sherpa intentionally.
+  vocabulary stays on the fast path: the native worker biases toward it
+  directly ([ADR-0033](docs/ADR.md#0033--contextual-biasing-on-the-native-core-ml-path)).
 - **Text injection** works in terminals (Ghostty, iTerm2, Terminal.app),
   browsers, native Cocoa, Electron (Slack/VS Code/etc.), JetBrains,
   Xcode. Doesn't reach password fields or apps with aggressive input

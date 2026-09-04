@@ -42,6 +42,10 @@ struct Args {
     compute_units: CoreMlComputeUnits,
     stage_timings: bool,
     rnnt_engine: CoreMlRnntEngine,
+    /// Custom vocabulary sent to the native worker, so the biased decode loop
+    /// can be timed against the unbiased one on the same fixture.
+    vocabulary: Option<PathBuf>,
+    hotword_score: f32,
     arm: Arm,
     idle_gap_ms: u64,
     /// Interval between the idle gap and the measured decode, standing in for
@@ -123,6 +127,8 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut idle_gap_ms: u64 = 0;
     let mut record_gap_ms: Option<u64> = None;
     let mut keepalive_ms: u64 = 250;
+    let mut vocabulary: Option<PathBuf> = None;
+    let mut hotword_score = 2.0_f32;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -176,6 +182,19 @@ fn parse_args() -> anyhow::Result<Args> {
                         .ok_or_else(|| anyhow!("--rnnt-engine needs a name"))?,
                 )?;
             }
+            "--vocabulary" => {
+                vocabulary = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--vocabulary needs a path"))?,
+                ));
+            }
+            "--hotword-score" => {
+                hotword_score = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--hotword-score needs a number"))?
+                    .parse()
+                    .context("--hotword-score")?;
+            }
             "--arm" => {
                 arm = Arm::parse(&it.next().ok_or_else(|| anyhow!("--arm needs a name"))?)?;
             }
@@ -219,6 +238,8 @@ fn parse_args() -> anyhow::Result<Args> {
         compute_units,
         stage_timings,
         rnnt_engine,
+        vocabulary,
+        hotword_score,
         arm,
         idle_gap_ms,
         record_gap_ms,
@@ -233,6 +254,7 @@ fn print_usage() {
          \x20                [--worker PATH] [--model-dir DIR]\n\
          \x20                [--compute-units all|cpu-and-gpu|cpu-and-neural-engine|cpu-only]\n\
          \x20                [--stage-timings] [--rnnt-engine native|coreml]\n\
+         \x20                [--vocabulary FILE] [--hotword-score N]\n\
          \x20                [--arm warm|cold|prime|cadence]\n\
          \x20                [--idle-gap-ms N] [--record-gap-ms N] [--keepalive-ms N]\n\
          \n\
@@ -438,6 +460,16 @@ fn load_backend(args: &Args, store: &SettingsStore) -> anyhow::Result<Asr> {
             config.set_compute_units(args.compute_units);
             config.set_emit_stage_timings(args.stage_timings);
             config.set_rnnt_engine(args.rnnt_engine);
+            if let Some(path) = &args.vocabulary {
+                let terms = parakeet_dictation::vocabulary::terms(path)?;
+                log::info!(
+                    "biasing toward {} terms from {} at score {}",
+                    terms.len(),
+                    path.display(),
+                    args.hotword_score
+                );
+                config.set_vocabulary(terms, args.hotword_score);
+            }
             log::info!(
                 "loading Core ML worker {} with {:?}",
                 config.worker_path.display(),
