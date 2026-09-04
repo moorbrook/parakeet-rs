@@ -9,8 +9,9 @@
 **Current outcome (2026-08-11):** the shipping pipeline is resident Parakeet
 Unified Core ML recognition with speculative decode, optional Qwen 3.5 4B
 Q6_K polish through llama.cpp/Metal, and synthetic Unicode keystroke delivery.
-Tap Fast measured 182.0 ms p50 from acoustic endpoint to transcript-ready;
-pause-friendly Tap stayed below one second p95 on the endpoint corpus. The
+Tap Fast measured 148.5 ms p50 from acoustic endpoint to transcript-ready after
+ADR-0031 moved its confirmation window from 150 to 90 ms; pause-friendly Tap
+stayed below one second p95 on the endpoint corpus. The
 original Qwen 2B candidate was replaced by the higher-quality 4B model, whose
 standalone polish benchmark measured 1225 ms p50 completion and 29 ms p50
 TTFT. Streaming output keeps first text visible well before completion.

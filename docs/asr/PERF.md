@@ -179,24 +179,32 @@ synthesized one cannot, 15 repetitions:
 | 150 ms | 0/15 | 0 | 57.3 ms | 59.0 ms | 63.0 ms |
 | **90 ms** | 0/15 | 2 | **1.5 ms** | **0.0 ms** | 6.8 ms |
 
-The mismatches are `Concorde` for `Concord`, a lexical variant that also appears
-in 150 ms rows, not truncation. The 30-repetition 90 ms run produced it once in
-30 measured repetitions against 31 full-reference transcripts including warmups. Silero calls silence inside the LibriSpeech
-room tone that keeps the -80 dBFS marker alive, so the absolute 0 ms is an
-artifact of the marker; the 59 ms delta is the real saving.
+The mismatches are `Concorde` for `Concord`: a decoder spelling variant, not
+truncation. Those transcripts read `Concorde returned to its place amidst the
+tents,` and carry every reference word. The variant is not window-dependent —
+it appears in 12 of the 153 transcripts across every run on this fixture,
+warmups included, at both 90 ms and 150 ms confirming windows.
+
+The absolute numbers on this fixture are offset by the marker. Silero calls
+silence inside the LibriSpeech room tone that keeps the -80 dBFS acoustic-end
+marker alive, so the 0 ms reading is an artifact of where that marker sits, not
+a commit before the speech ended. The 59 ms delta is the real saving.
 
 Long-form, 14.225 s fixture with its reviewed 544 ms intra-utterance pause:
 
 | window | false cuts | mean | p50 | p95 |
 |---:|---:|---:|---:|---:|
-| **750 ms** | 0/15 | — | 635.0 ms | — |
+| **750 ms** | 0/15 | — | — | — |
 | 500 ms | 0/15 | 382.0 ms | 379.0 ms | 401.0 ms |
 | 300 ms | 15/15 | — | — | — |
 
 500 ms survived this pause in all 15 repetitions, which is one fixture and does
-not justify moving a pause-safety policy. The 750 ms row's latency spread is
-discarded: another agent's fixture played through the shared BlackHole device
-during that run and its words appear in two transcripts.
+not justify moving a pause-safety policy. The 750 ms row reports no latency at
+all: another agent's fixture played through the shared BlackHole device during
+that run and its words appear in two of its transcripts, so every duration it
+produced is discarded. Its zero false cuts stand, because a commit's timing
+relative to playback does not depend on what else was audible. The shipping
+750 ms latency comes from the clean 30-repetition gate run below.
 
 ### Decision
 

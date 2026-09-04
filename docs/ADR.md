@@ -1929,11 +1929,15 @@ The `phase_timer` line said why: `t_asr_start=4966`, `t_asr_done=5013`,
 1 ms. Taking time out of the decode widened that margin instead of shortening
 the result. Only the confirmation window moved Tap's number.
 
-**Decision.** Tap Fast confirms after 90 ms of Silero silence instead of 150 ms
-(three 32 ms windows after quantization, from five). Long-form keeps 750 ms. The
-resolved window is passed as a value rather than derived from the policy inside
-each consumer, so the confirming Silero state, the local candidate tracker, and
-the sweep benchmark cannot disagree.
+**Decision.** Tap Fast confirms after 90 ms of Silero silence instead of 150 ms.
+`FAST_CONFIRMATION_MS` is 90; both the confirming Silero state and the candidate
+tracker consume audio in 512-sample frames, so the earliest commit is the third
+silent frame, 96 ms, exactly as ADR-0025's 150 ms became 160 ms. The shipped
+constant is 90 ms and every table here reports measured latency, so 96 ms never
+appears as a figure — it is only what the quantizer does with 90. Long-form keeps
+750 ms. The resolved window is passed as a value rather than derived from the
+policy inside each consumer, so the confirming Silero state, the local candidate
+tracker, and the sweep benchmark cannot disagree.
 
 90 ms is where the curve stops. Every 60 ms repetition reports
 `t_asr_done == t_vad_endpoint`: `asr.recognize()` runs synchronously on the VAD
@@ -1989,6 +1993,11 @@ requires, and keeps the Core ML worker warm across repetitions.
 | 4.854 s synthesized | 182.0 ms p50 / 183.5 mean | 148.5 ms p50 / 141.8 mean | **-33.5 ms** |
 | 3.505 s human | 59.0 ms p50 / 58.1 mean | 13.0 ms p50 / 10.1 mean | **-46.0 ms** |
 
+The human fixture's absolute figures are offset low: Silero calls silence inside
+the LibriSpeech room tone that keeps the -80 dBFS acoustic-end marker alive, so
+the marker sits later than the speech does. Compare the deltas, not the
+absolutes.
+
 False cuts were 0/30 in every row. The issue asked for at least 40 ms off p50:
 human speech gives 46.0 ms, the synthesized fixture 33.5 ms, and that fixture's
 mean improves by 41.7 ms. The shortfall is the bimodal decode pinning p50 to a
@@ -2020,7 +2029,7 @@ reachable at the commit named in the change log.
 | ADR-0007 target | Owner ADR | Status | Blocked by |
 |---|---|---|---|
 | Accelerated Core ML path present | [0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage) + [0015](#0015--coreml-ep-verification-protocol) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped + measured** — native worker quality/latency gates pass; the sherpa fallback retains its CoreML symbol/runtime checks | exact per-op placement remains Apple-managed |
-| <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) + [0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) + [0031](#0031--tap-fast-confirms-at-90-ms-punctuation-rejected-as-an-endpoint-signal) | **Shipped + measured** — Tap Fast is 148.5 ms p50 on the representative 5 s bucket and 13.0 ms on the 3.505 s human fixture; pause-friendly Tap remains below 1 s on the endpoint corpus | nothing |
+| <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) + [0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) + [0031](#0031--tap-fast-confirms-at-90-ms-punctuation-rejected-as-an-endpoint-signal) | **Shipped + measured** — Tap Fast is 148.5 ms p50 on the representative 5 s bucket, down 33.5 ms, and 46.0 ms faster on the 3.505 s human fixture (13.0 ms measured, offset low by that fixture's marker); pause-friendly Tap remains below 1 s on the endpoint corpus | nothing |
 | Live partial transcripts | [0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) | **Out of scope** — no quality-preserving streaming model won; speculative final decode provides the measured latency win | a new candidate must beat the existing quality/latency/resource gates |
 | CPU+ANE requested and performance-gated | [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans) | **Shipped** — explicit tuner retained CPU+ANE on the M5 Pro after all challengers failed the ≥5%/quality/memory gates | Core ML owns final per-op placement |
 | ≤5 GB resident set with polish On | [0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation) + [0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped** — native tray shell, resident Core ML worker, and Qwen mmap/lifecycle | nothing |
@@ -2047,8 +2056,9 @@ Anything not on this table is either accepted-and-done or out of scope.
 - **2026-09-04** — [ADR-0031](#0031--tap-fast-confirms-at-90-ms-punctuation-rejected-as-an-endpoint-signal)
   accepted and implemented. Tap Fast confirms after 90 ms of Silero silence
   instead of 150 ms: 182.0 to 148.5 ms p50 on the synthesized 5 s fixture and
-  59.0 to 13.0 ms on the 3.505 s human fixture, 0/30 false cuts, both existing
-  gates unchanged. A punctuation-aware early commit was built and measured
+  59.0 to 13.0 ms on the 3.505 s human fixture, whose absolutes sit low because
+  its acoustic-end marker survives into the room tone; 0/30 false cuts and both
+  existing gates unchanged. A punctuation-aware early commit was built and measured
   alongside it and is rejected: the model emits a sentence-final period at the
   endpoint corpus's 544 ms intra-utterance pause, so it cut that fixture 15/15,
   and where it was safe it matched a plain 90 ms window. Its implementation and

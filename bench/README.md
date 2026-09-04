@@ -141,8 +141,8 @@ instead and moved Tap Fast to 90 ms; the window sweep is below.
 
 This frozen comparison pins `--confirmation-ms 150`, Tap Fast's original policy,
 so the historical 3× result stays like-for-like whatever the shipping window
-becomes. Re-run on 2026-09-04 it reads 594.5 → 182.0 ms p50 (3.27×) and
-635.1 → 203.6 ms p95 (3.12×). The gate fails unless both p50 and p95 are at
+becomes. Re-run on 2026-09-04 it reads, baseline before optimized, 594.5 → 182.0 ms p50
+(3.27×) and 635.1 → 203.6 ms p95 (3.12×). The gate fails unless both p50 and p95 are at
 least 3.0× and every transcript matches:
 
 ```bash
