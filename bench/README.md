@@ -79,7 +79,12 @@ scripts/bench-hold.sh
 
 ## What is and isn't measured
 
-The bench loads pre-recorded WAVs and runs `Asr::recognize()` directly.
+The bench loads pre-recorded WAVs, converts them to 16 kHz once at load, and
+runs `Asr::recognize()` directly. The conversion sits outside the measured loop
+because that is where production does it: since ADR-0030 `AudioCapture`
+resamples inside its cpal callbacks, so `recognize()` is always handed 16 kHz
+mono. Fixtures stay at 48 kHz on disk so these runs stay comparable with the
+published baselines.
 Each repetition also emits `asr_boundary` with worker-internal
 resample-plus-inference time, outer Rust wall time, and their difference. For
 the Core ML worker that difference prices Float32 pipe transfer, scheduling,
@@ -120,7 +125,18 @@ measured transcript had an exact lexical match to the reviewed reference.
 
 The optimized path starts ASR from the early 32 ms detector, discards the
 provisional result whenever speech resumes, and lets an independent Silero
-state remain the sole stop authority. This frozen comparison explicitly uses
+state remain the sole stop authority. Re-run on 2026-09-04 after ADR-0030
+retired the resample stage, the gate reads 630.0 ms against 192.0 ms (3.28x
+p50) and 952.3 ms against 203.0 ms (4.69x p95), every transcript matching.
+
+Tap does not collect the resample saving, and the `phase_timer` lines say why:
+`t_asr_start=4966`, `t_asr_done=5013`, `t_vad_endpoint=5094`. The speculative
+decode finishes about 80 ms before the endpoint policy confirms, and
+`dur_post_endpoint_ms` is 0 to 1 ms, so this path is endpoint-bound rather than
+decode-bound. Taking 22 ms out of the decode widens that margin instead of
+shortening the result. The saving lands where the decode is not hidden: Hold,
+the serial fallback, and every utterance long enough that the decode would
+otherwise outrun the confirmation window. This frozen comparison explicitly uses
 Tap Fast's original 150 ms policy so the historical 3× result stays
 like-for-like. The gate fails unless both p50 and p95 are at least 3.0× and
 every transcript matches:
@@ -199,15 +215,22 @@ dispatch to the last dispatch of that window. Nothing in the pinned package is
 patched, and the shipping dictation path never installs the wrappers.
 
 Medians over 30 measured repetitions per bucket, three warmups, 48 kHz
-fixtures, release build (`bench/coreml-unified-stages.csv`):
+fixtures, release build (`bench/coreml-unified-stages.csv`). The resample column
+was retired by ADR-0030 and its measurement is reproduced under
+"Retiring the resample stage" below.
 
 | fixture | resample | mel | encoder | RNNT loop | post | worker total | IPC | ASR p50 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 0.740 s | 3.41 ms | 3.07 ms | **25.55 ms** | 2.98 ms | 0.04 ms | 35.2 ms | 0.16 ms | 36.0 ms |
-| 2.507 s | 11.46 ms | 3.08 ms | **25.48 ms** | 8.40 ms | 0.05 ms | 48.5 ms | 0.26 ms | 49.0 ms |
-| 4.967 s | 22.71 ms | 3.06 ms | **25.49 ms** | 15.21 ms | 0.06 ms | 66.5 ms | 0.42 ms | 67.0 ms |
-| 8.150 s | 37.77 ms | 3.32 ms | **26.03 ms** | 25.40 ms | 0.08 ms | 92.6 ms | 0.60 ms | 94.0 ms |
-| 15.691 s | 72.57 ms | 6.13 ms | **51.59 ms** | 54.40 ms | 0.13 ms | 184.9 ms | 1.11 ms | 187.0 ms |
+| 0.816 s | 0.001 ms | 3.20 ms | **25.99 ms** | 3.25 ms | 0.04 ms | 32.7 ms | 0.11 ms | 32.0 ms |
+| 2.828 s | 0.001 ms | 3.23 ms | **25.94 ms** | 9.04 ms | 0.05 ms | 38.2 ms | 0.17 ms | 38.0 ms |
+| 4.854 s | 0.001 ms | 3.19 ms | **25.97 ms** | 15.43 ms | 0.06 ms | 44.8 ms | 0.21 ms | 44.5 ms |
+| 8.062 s | 0.001 ms | 3.20 ms | **25.89 ms** | 23.57 ms | 0.07 ms | 52.7 ms | 0.27 ms | 52.5 ms |
+| 16.513 s | 0.001 ms | 6.22 ms | **51.95 ms** | 53.04 ms | 0.12 ms | 111.5 ms | 0.47 ms | 111.5 ms |
+
+The 2026-09-04 g38m table this replaces was measured on a differently
+synthesized fixture set (0.740, 2.507, 4.967, 8.150, 15.691 s), so it is not a
+like-for-like row-by-row comparison; the before/after below re-measured the old
+code on these exact fixtures instead.
 
 Worker total is resample plus the profiled transcribe interval; it sits 0.7 to
 1.0 ms under the `asr_boundary` internal time, which is the response encode and
@@ -246,17 +269,22 @@ utterance still runs a single encoder pass.
 
 | fixture | windows | encoder calls | decoder calls | joint calls | decoded frames | per joint | per decoder |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| 0.740 s | 1 | 1 | 7 | 16 | 10 | 107 µs | 158 µs |
-| 2.507 s | 1 | 1 | 20 | 51 | 32 | 100 µs | 143 µs |
-| 4.967 s | 1 | 1 | 35 | 96 | 62 | 99 µs | 142 µs |
-| 8.150 s | 1 | 1 | 57 | 158 | 102 | 101 µs | 147 µs |
-| 15.691 s | 2 | 2 | 122 | 342 | 222 | 101 µs | 145 µs |
+| 0.816 s | 1 | 1 | 7 | 17 | 11 | 113 µs | 170 µs |
+| 2.828 s | 1 | 1 | 20 | 55 | 36 | 105 µs | 147 µs |
+| 4.854 s | 1 | 1 | 36 | 96 | 61 | 101 µs | 145 µs |
+| 8.062 s | 1 | 1 | 55 | 155 | 101 | 98 µs | 139 µs |
+| 16.513 s | 2 | 2 | 119 | 349 | 232 | 98 µs | 142 µs |
 
 Decoded frames are `joint_calls - (decoder_calls - windows)`, since the greedy
 loop issues one joint per frame plus one per emitted token, and one decoder call
-per window plus one per emitted token. Every bucket matches its 80 ms frame
-arithmetic: 4.967 s of audio decodes 62 frames. That agreement is what
-validates the counts.
+per window plus one per emitted token. Every single-window bucket matches its
+80 ms frame arithmetic: 4.854 s of audio decodes 61 frames. That agreement is
+what validates the counts.
+
+These counts are also identical to the pre-ADR-0030 arm at every bucket, which
+is the sharpest available check that moving the resample into Rust did not
+change what the encoder sees: a different filter would perturb the mel frames
+and, sooner or later, the token the greedy loop emits.
 
 The agreement is also checked at runtime, because a stage whose Core ML entry
 point stops being intercepted reports zero cost while every other number stays
@@ -303,22 +331,45 @@ BACKEND=coreml-unified OUT_CSV=bench/coreml-unified.csv scripts/bench-latency.sh
     --reps 8 --warmup-reps 3 --stage-timings --compute-units cpu-only
 ```
 
-### Where the 66 ms at 5 s goes
+### Where the 45 ms at 5 s goes
 
-No single stage owns it. On the 4.967 s fixture the 66.5 ms of worker-internal
-time is encoder 25.5 ms (38%), resample 22.7 ms (34%), RNNT decode loop 15.2 ms
-(23%), and mel 3.1 ms (5%), with IPC at 0.42 ms and post-processing under
-0.1 ms. The 35 ms floor at 1 s is owned by the encoder: the offline path pads
-every utterance to the fixed 15 s window, so 25.5 ms of encoder plus 3.1 ms of
-mel is length-independent work that a one-word utterance pays in full, and that
-28.6 ms is 80% of the 1 s result. The growth from 35 ms to 66 ms is split nearly
-evenly between resample, which costs a linear 4.6 ms per second of 48 kHz input
-and adds 19.3 ms, and the decode loop, which costs 0.25 ms per 80 ms frame and
-adds 12.2 ms. The prior hypothesis that the per-frame RNNT loop accounts for the
-gap over encoder arithmetic is half right: the loop is real, it is entirely on
-the CPU, and roughly 100 µs of each 0.25 ms frame is a single joint dispatch,
-but at every measured length the 48 kHz to 16 kHz resample costs more than the
-loop does.
+Two stages own it. On the 4.854 s fixture the 44.8 ms of worker-internal time is
+encoder 26.0 ms (58%), RNNT decode loop 15.4 ms (34%), and mel 3.2 ms (7%), with
+IPC at 0.21 ms and post-processing under 0.1 ms. The 32 ms floor at 1 s is owned
+by the encoder: the offline path pads every utterance to the fixed 15 s window,
+so 26.0 ms of encoder plus 3.2 ms of mel is length-independent work that a
+one-word utterance pays in full, and that 29.2 ms is 91% of the 1 s result. What
+grows with length is now only the decode loop, at 0.25 ms per 80 ms frame,
+entirely on the CPU, with roughly 100 µs of each frame being a single joint
+dispatch.
+
+### Retiring the resample stage
+
+Before ADR-0030 a third stage sat between them. The worker received device-rate
+audio and let FluidAudio's `AudioConverter` convert it, which builds a fresh
+`AVAudioConverter` per call and cost a linear 4.6 ms per second of 48 kHz input:
+22.4 ms of a 67 ms result at 5 s, more than the whole decode loop at every
+measured length, and all of it after the endpoint. Rust already converted the
+same audio for Silero VAD, so the work happened twice and the copy on the
+critical path was the redundant one.
+
+The fix converts once, in the cpal capture callback, so 16 kHz audio is ready
+when the user stops speaking. Both arms below ran back to back in one session on
+the same five fixtures; "before" is commit `9857547`.
+
+| fixture | resample before | resample after | ASR p50 before | ASR p50 after | change |
+|---|---:|---:|---:|---:|---:|
+| 0.816 s | 3.87 ms | 0.001 ms | 36.0 ms | 32.0 ms | −4.0 ms |
+| 2.828 s | 13.04 ms | 0.001 ms | 51.0 ms | 38.0 ms | −13.0 ms |
+| 4.854 s | 22.37 ms | 0.001 ms | 67.0 ms | 44.5 ms | −22.5 ms |
+| 8.062 s | 36.98 ms | 0.001 ms | 91.0 ms | 52.5 ms | −38.5 ms |
+| 16.513 s | 76.50 ms | 0.001 ms | 190.5 ms | 111.5 ms | −79.0 ms |
+
+The change is the retired resample plus a smaller second term: the pipe carries
+16 kHz floats instead of 48 kHz, so measured IPC falls from 0.42 to 0.21 ms at
+5 s and from 1.14 to 0.47 ms at 20 s. At 5 s, 22.37 + 0.21 accounts for 22.6 of
+the 22.5 ms measured. Every other stage held: mel 3.19 against 3.23 ms, encoder
+25.97 against 26.04, profiled transcribe interval 44.79 against 44.87.
 
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 

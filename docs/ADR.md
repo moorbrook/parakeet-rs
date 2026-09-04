@@ -1847,7 +1847,44 @@ compares WER and CER against limits set when `AVAudioConverter` did the work.
 `scripts/bench-end-to-end.sh` covers the capture path with the same audio and
 requires an exact lexical match on every repetition.
 
-MEASUREMENT_TABLE_PLACEHOLDER
+**Measured.** M5 Pro 24 GB, 2026-09-04, release build, 30 measured repetitions
+per bucket after 3 warmups, the same five 48 kHz fixtures for both arms, both
+arms run back to back in one session. "Before" is commit `9857547`, this branch's
+parent.
+
+| audio | resample before | resample after | ASR p50 before | ASR p50 after | change |
+|---|---:|---:|---:|---:|---:|
+| 0.816 s | 3.87 ms | 0.001 ms | 36.0 ms | 32.0 ms | −4.0 ms |
+| 2.828 s | 13.04 ms | 0.001 ms | 51.0 ms | 38.0 ms | −13.0 ms |
+| 4.854 s | 22.37 ms | 0.001 ms | 67.0 ms | 44.5 ms | −22.5 ms |
+| 8.062 s | 36.98 ms | 0.001 ms | 91.0 ms | 52.5 ms | −38.5 ms |
+| 16.513 s | 76.50 ms | 0.001 ms | 190.5 ms | 111.5 ms | −79.0 ms |
+
+The p50 change is the retired resample plus a smaller second term: the pipe now
+carries 16 kHz floats instead of 48 kHz, so measured IPC falls from 0.42 to
+0.21 ms at 5 s and from 1.14 to 0.47 ms at 20 s. At 5 s, 22.37 + 0.21 accounts
+for 22.6 of the 22.5 ms.
+
+Nothing else moved. Mel is 3.19 against 3.23 ms at 5 s, the encoder 25.97
+against 26.04, and the profiled transcribe interval 44.79 against 44.87. The
+Core ML dispatch counts are identical in both arms at every bucket — 7/17 at
+0.816 s through 119/349 at 16.513 s — so the Kaldi filter hands the encoder
+audio the model decodes into the same token stream AVAudioConverter's did.
+
+Gold at 10 repetitions passes with worst WER 5.43% and worst CER 3.57%, which
+are the manifest's baseline values under a zero-regression cap, with zero
+nondeterministic fixtures and zero changed transcripts.
+
+**Where the saving does and does not land.** Tap keeps its number. The
+end-to-end gate re-ran at 630.0 ms against 192.0 ms p50, a 3.28x ratio, and the
+`phase_timer` lines explain the flat result: the speculative decode ends about
+80 ms before the endpoint policy confirms, and post-endpoint work is 0 to 1 ms,
+so that path is bound by the confirmation window rather than by the decode.
+Removing 22 ms widens the margin instead of shortening the transcript. The
+saving is collected wherever the decode is not hidden — Hold, where the hotkey
+release is the endpoint and nothing overlaps it; the serial fallback; and any
+utterance long enough that its decode would otherwise outrun the window. It also
+stops the work from being done twice on every utterance in every mode.
 
 ---
 
