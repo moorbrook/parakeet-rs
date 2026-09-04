@@ -33,18 +33,29 @@
 #     Identity Type:    Self Signed Root
 #     Certificate Type: Code Signing
 #
-#   Or via the command line:
+#   Or via the command line (artifacts land in a private temp dir that is
+#   removed on exit — do not leave the key or the p12 in a world-readable
+#   /tmp path):
+#     CERT_DIR="$(mktemp -d)"
+#     trap 'rm -rf "$CERT_DIR"' EXIT
 #     openssl req -new -newkey rsa:2048 -nodes \
-#         -keyout /tmp/parakeet-dev.key -x509 -days 3650 \
-#         -subj '/CN=Parakeet Local Dev' -out /tmp/parakeet-dev.crt \
+#         -keyout "$CERT_DIR/parakeet-dev.key" -x509 -days 3650 \
+#         -subj '/CN=Parakeet Local Dev' -out "$CERT_DIR/parakeet-dev.crt" \
 #         -addext keyUsage=digitalSignature \
 #         -addext extendedKeyUsage=codeSigning
 #     openssl pkcs12 -export -name 'Parakeet Local Dev' \
-#         -inkey /tmp/parakeet-dev.key -in /tmp/parakeet-dev.crt \
-#         -out /tmp/parakeet-dev.p12 -passout pass:
-#     security import /tmp/parakeet-dev.p12 \
+#         -inkey "$CERT_DIR/parakeet-dev.key" -in "$CERT_DIR/parakeet-dev.crt" \
+#         -out "$CERT_DIR/parakeet-dev.p12" -passout pass:
+#     security import "$CERT_DIR/parakeet-dev.p12" \
 #         -k "$HOME/Library/Keychains/login.keychain-db" \
 #         -T /usr/bin/codesign
+#     security add-trusted-cert -r trustRoot -p codeSign \
+#         -k "$HOME/Library/Keychains/login.keychain-db" \
+#         "$CERT_DIR/parakeet-dev.crt"
+#
+#   The add-trusted-cert step (Keychain Access equivalent: double-click the
+#   certificate -> Always Trust) marks the self-signed root as trusted for
+#   code signing so verification and TCC never hit an untrusted-issuer path.
 #
 #   A self-signed cert cannot be notarised; distribution still needs
 #   Developer ID — see the notes at the bottom of this script.

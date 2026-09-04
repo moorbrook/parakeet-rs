@@ -2503,14 +2503,20 @@ adding the app by hand — and they expired on the next rebuild.
    self-signed and ad-hoc bundles — under Hardened Runtime the dyld
    team-ID check rejects the bundled dylibs (observed as
    `dyld4::prepare` "different Team IDs" aborts on macOS 26.4.1).
-2. `src/permissions.rs` treats a `false` return from
-   `CGRequestListenEventAccess()` as "macOS will not prompt for this
-   build": it logs at warn level, opens System Settings → Privacy &
+2. `src/permissions.rs` distinguishes what a `CGRequestListenEventAccess()`
+   false return means. The call reports the *current* access state, not
+   whether it prompted: a first request shows the consent alert and still
+   returns false. The Grant path therefore consults a persisted
+   requested-once marker
+   (`~/Library/Application Support/com.parakeet.rs/tcc/input-monitoring-requested`):
+   granted → refresh; first request → leave the prompt in front with the
+   return-from-prompt refresh already armed; requested before and still
+   not granted → log at warn level and open System Settings → Privacy &
    Security → Input Monitoring through the existing per-permission
-   deep-link with generic fallback, and refreshes the dashboard —
-   mirroring the `OpenSettings` branch's error handling instead of the
-   historic silent no-op. The decision and warning text are pure
-   functions, unit-tested without TCC calls.
+   deep-link with generic fallback, refreshing the dashboard only when
+   that deep link fails — exactly mirroring the `OpenSettings` branch,
+   so the modal never covers the pane. The decision and warning text are
+   pure functions, unit-tested without TCC calls.
 
 **Consequences.** A rebuilt-and-reinstalled Parakeet.app keeps its TCC
 identity, so an existing Input Monitoring grant keeps working and
@@ -2574,10 +2580,11 @@ Anything not on this table is either accepted-and-done or out of scope.
   Input Monitoring / Microphone / Accessibility grants keep matching — the
   root cause of the Input Monitoring Grant button silently doing nothing
   on rebuilt installs. Ad-hoc remains as a loud-warned fallback when the
-  identity is absent. The Grant path additionally handles a false
-  `CGRequestListenEventAccess()` return by warning, opening the Input
-  Monitoring settings pane, and refreshing the dashboard rather than
-  no-oping silently.
+  identity is absent. The Grant path additionally distinguishes a first
+  request (the system consent prompt appears and the call still returns
+  false) from an already-requested-but-not-granted state, where it warns
+  and opens the Input Monitoring settings pane, refreshing the dashboard
+  only when the pane fails to open — never a silent no-op.
 
 - **2026-09-04** — [ADR-0033](#0033--contextual-biasing-on-the-native-core-ml-path)
   accepted and implemented. Contextual biasing moved onto the native Core ML
