@@ -342,8 +342,10 @@ mod tests {
 
     #[test]
     fn the_engine_prime_flag_round_trips_when_turned_off() {
-        let mut settings = Settings::default();
-        settings.prime_engine_on_keydown = false;
+        let settings = Settings {
+            prime_engine_on_keydown: false,
+            ..Settings::default()
+        };
         let json = serde_json::to_string(&settings).expect("serialise");
         let back: Settings = serde_json::from_str(&json).expect("deserialise");
         assert!(!back.prime_engine_on_keydown);
