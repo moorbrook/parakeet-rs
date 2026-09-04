@@ -282,10 +282,8 @@ fn main() -> ExitCode {
 /// the worker's pipe.
 fn apply_arm(args: &Args, asr: &Arc<Asr>, audio_s: f32) -> anyhow::Result<u64> {
     let idle_gap = Duration::from_millis(args.idle_gap_ms);
-    let record_gap = Duration::from_millis(
-        args.record_gap_ms
-            .unwrap_or_else(|| (audio_s * 1_000.0) as u64),
-    );
+    let record_gap =
+        Duration::from_millis(args.record_gap_ms.unwrap_or((audio_s * 1_000.0) as u64));
     match args.arm {
         Arm::Warm => Ok(0),
         Arm::Cold => {

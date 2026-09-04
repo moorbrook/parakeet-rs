@@ -252,8 +252,9 @@ mod tests {
         let (backend, calls) = CountingBackend::new(Duration::ZERO);
         let asr = Asr::from_backend(backend);
         prime_engine(&asr).expect("prime must succeed");
+        // Reaching the backend at all is the assertion: a zero-length buffer
+        // would return Ok without ever dispatching.
         assert_eq!(calls.load(Ordering::Relaxed), 1);
-        assert!(PRIME_SECONDS > 0.0);
     }
 
     #[test]
