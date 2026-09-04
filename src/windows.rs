@@ -25,9 +25,13 @@ use crate::endpointing::{EndpointEvent, EndpointPolicy, EndpointTracker, SAMPLE_
 /// instead, which is usually wordless.
 pub const FORCED_CUT_OVERLAP_S: f32 = 1.5;
 
-/// Longest common run of words required before the merge splices on agreement,
-/// when both sides of the overlap have at least this many words. A single
-/// shared function word ("the") is far too easy to match by chance.
+/// Longest common run of words required before the merge splices on agreement.
+///
+/// A hard floor, not a preference scaled to the overlap size. One shared word
+/// is far too easy to match by chance, and a one-word overlap that falls to the
+/// disagreement path loses nothing: that path deduplicates by text, so the
+/// single word is reconciled there without risking a splice at the wrong
+/// occurrence.
 const MIN_AGREEMENT_WORDS: usize = 2;
 
 /// One decoded word with its span on the recording's timeline, in seconds.
@@ -317,6 +321,21 @@ fn normalize(word: &str) -> String {
 
 /// Longest contiguous run of equal normalized words between `tail` and `head`.
 /// Returns `(tail_index, head_index, length)`.
+///
+/// **Tie-break: seam-nearest on both sides — largest `i`, then smallest `j`.**
+/// The two windows are truncated at opposite edges, `prev` on its right and
+/// `next` on its left, so the seam is the end of `tail` and the start of
+/// `head`. When a phrase repeats, the copy each window is most likely to be
+/// describing is the one closest to its own truncation.
+///
+/// This is not cosmetic. With `tail = [x, very, good, very, good]` and
+/// `head = [very, good]`, the earliest match splices after the *first*
+/// repetition and the second one is lost; the latest match keeps both. The
+/// mirrored case is why `j` is minimized: `head`'s first occurrence is the one
+/// adjacent to the seam, and matching a later one would emit the phrase twice.
+///
+/// Empty normalized words — a token that is pure punctuation — match each other
+/// and would silently pad a run, so they end it instead.
 fn longest_common_run(tail: &[String], head: &[String]) -> (usize, usize, usize) {
     let mut best = (0_usize, 0_usize, 0_usize);
     for (i, tail_word) in tail.iter().enumerate() {
@@ -328,12 +347,18 @@ fn longest_common_run(tail: &[String], head: &[String]) -> (usize, usize, usize)
             while i + length < tail.len()
                 && j + length < head.len()
                 && tail[i + length] == head[j + length]
+                && !tail[i + length].is_empty()
             {
                 length += 1;
             }
-            // Prefer the longest run; among equals prefer the one earliest in
-            // the following window, which is the one nearest the seam.
-            if length > best.2 || (length == best.2 && length > 0 && j < best.1) {
+            let better = match length.cmp(&best.2) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => {
+                    length > 0 && (i, std::cmp::Reverse(j)) > (best.0, std::cmp::Reverse(best.1))
+                }
+            };
+            if better {
                 best = (i, j, length);
             }
         }
@@ -350,8 +375,9 @@ pub enum SeamOutcome {
     EmptyOverlap,
     /// The windows agreed on a run of words; the splice is that run.
     Agreed { words: usize },
-    /// The windows overlap in time but share no word run. The seam falls back
-    /// to the overlap midpoint.
+    /// The windows overlap in time but share no run long enough to splice on.
+    /// Both sides are kept whole and `next` is joined on after any leading
+    /// words that exactly repeat what `prev` ended with.
     Disagreed,
 }
 
@@ -360,10 +386,14 @@ pub enum SeamOutcome {
 ///
 /// The rule is Voz's: find the longest run of words the two windows agree on
 /// inside the shared audio and splice there, so a word emitted by both appears
-/// once. When they agree on nothing, the seam falls to the midpoint of the
-/// overlap — `prev` is truncated at its right edge and `next` at its left, so
-/// the midpoint is where each is least damaged, and taking a straddling word
-/// from `next` keeps the copy that was decoded whole.
+/// once. When they agree on nothing, both sides are kept whole and `next` is
+/// joined on after any leading words that exactly repeat what `prev` ended
+/// with.
+///
+/// Neither path may drop a word that only one window heard. The agreement path
+/// splices at a matched run, and the fallback removes only exact text
+/// duplicates, so a word present in one window and absent from the other always
+/// survives.
 pub fn merge_words(prev: &[Word], next: &[Word], overlap_start_s: f32) -> (Vec<Word>, SeamOutcome) {
     if prev.is_empty() {
         return (next.to_vec(), SeamOutcome::EmptyOverlap);
@@ -403,22 +433,56 @@ pub fn merge_words(prev: &[Word], next: &[Word], overlap_start_s: f32) -> (Vec<W
         .map(|word| normalize(&word.text))
         .collect();
     let (i, j, length) = longest_common_run(&tail, &head);
-    let required = MIN_AGREEMENT_WORDS.min(tail.len()).min(head.len());
-    if length >= required && length > 0 {
+    if length >= MIN_AGREEMENT_WORDS {
         let mut merged = prev[..tail_start + i + length].to_vec();
         merged.extend_from_slice(&next[j + length..]);
         return (merged, SeamOutcome::Agreed { words: length });
     }
 
-    let midpoint = (overlap_start_s + prev_end_s) / 2.0;
-    let mut merged: Vec<Word> = prev
-        .iter()
-        .filter(|word| word.end_s <= midpoint)
-        .cloned()
-        .collect();
-    let boundary = merged.last().map_or(f32::NEG_INFINITY, |word| word.end_s);
-    merged.extend(next.iter().filter(|word| word.start_s >= boundary).cloned());
+    // No agreement, so nothing identifies the same speech in both windows and
+    // no word may be removed on suspicion. Keep all of `prev`, then all of
+    // `next` except any leading words that exactly repeat what `prev` ended
+    // with.
+    //
+    // Timestamps cannot close this seam. RNNT emission lags the acoustics by a
+    // variable amount, so a word only the later window heard can be stamped
+    // before the last word of the earlier one; any rule that cuts either side
+    // by time deletes real speech. That was the previous rule — it cut `prev`
+    // at the midpoint of the overlap on the assumption that `next` had
+    // re-decoded that audio, which is exactly the assumption a disagreement
+    // says is false.
+    //
+    // The cost is that a word `prev` truncated mid-utterance survives beside
+    // the later window's complete copy, since a fragment does not match its
+    // whole form. A visible stutter at a seam is the better failure: a reader
+    // can see it, where a deleted clause looks like something the speaker
+    // never said.
+    let repeated = leading_repeat(prev, next);
+    let mut merged = prev.to_vec();
+    merged.extend_from_slice(&next[repeated..]);
     (merged, SeamOutcome::Disagreed)
+}
+
+/// How many leading words of `next` repeat the trailing words of `kept`.
+///
+/// The longest suffix/prefix match, so a duplicated phrase is dropped whole
+/// rather than one word at a time. Zero when nothing matches, which is the
+/// answer that keeps every word.
+fn leading_repeat(kept: &[Word], next: &[Word]) -> usize {
+    let limit = kept.len().min(next.len());
+    for count in (1..=limit).rev() {
+        let matches = kept[kept.len() - count..]
+            .iter()
+            .zip(next[..count].iter())
+            .all(|(left, right)| {
+                let left = normalize(&left.text);
+                !left.is_empty() && left == normalize(&right.text)
+            });
+        if matches {
+            return count;
+        }
+    }
+    0
 }
 
 #[cfg(test)]
@@ -574,10 +638,15 @@ mod tests {
     }
 
     #[test]
-    fn agreement_survives_case_punctuation_and_a_frame_of_timestamp_drift() {
-        // The same word in two windows is emitted at different encoder frames
-        // (80 ms resolution) and can pick up different sentence casing and
-        // trailing punctuation. Matching is on letters only, never on time.
+    fn one_matching_word_is_reconciled_by_the_fallback_not_by_a_splice() {
+        // A single shared word used to be accepted as agreement when the
+        // overlap held only one word. It is not: one word matches by chance
+        // far too easily, and splicing on the wrong occurrence loses speech.
+        // The fallback handles it instead, and handles it correctly — the
+        // duplicate "report" appears once, and nothing else moves.
+        //
+        // Matching is still on letters only: the two windows stamp the word a
+        // frame apart and disagree on casing and trailing punctuation.
         let prev = words(&[("Ready", 3.0, 3.3), ("the", 3.4, 3.6), ("Report", 3.7, 4.1)]);
         let next = words(&[
             ("report,", 3.78, 4.18),
@@ -585,15 +654,112 @@ mod tests {
             ("send", 4.8, 5.1),
         ]);
         let (merged, outcome) = merge_words(&prev, &next, 3.5);
-        assert_eq!(outcome, SeamOutcome::Agreed { words: 1 });
+        assert_eq!(outcome, SeamOutcome::Disagreed);
+        // The earlier window's copy is kept and the later window's repeat of it
+        // is skipped, so the word appears exactly once and the rest of `next`
+        // follows untouched.
         assert_eq!(texts(&merged), ["Ready", "the", "Report", "please", "send"]);
     }
 
     #[test]
-    fn disagreement_falls_back_to_the_overlap_midpoint_without_duplicating() {
-        // Two windows overlap in time but share no word. Everything before the
-        // midpoint comes from the earlier window, everything after from the
-        // later one, and no word appears twice.
+    fn a_repeated_phrase_splices_at_the_occurrence_nearest_the_seam() {
+        // `prev` is truncated on its right, so its last "very good" is the one
+        // the following window is describing. Splicing at the first repetition
+        // instead silently deletes the second.
+        let prev = words(&[
+            ("x", 3.0, 3.2),
+            ("very", 3.3, 3.5),
+            ("good", 3.6, 3.8),
+            ("very", 3.9, 4.1),
+            ("good", 4.2, 4.4),
+        ]);
+        let next = words(&[
+            ("very", 3.95, 4.15),
+            ("good", 4.25, 4.45),
+            ("news", 4.6, 4.9),
+        ]);
+        let (merged, outcome) = merge_words(&prev, &next, 3.1);
+        assert_eq!(outcome, SeamOutcome::Agreed { words: 2 });
+        assert_eq!(
+            texts(&merged),
+            ["x", "very", "good", "very", "good", "news"]
+        );
+    }
+
+    #[test]
+    fn a_repeated_phrase_in_the_later_window_is_not_emitted_twice() {
+        // The mirror: `next` is truncated on its left, so its *first* "very
+        // good" is the one adjacent to the seam. Matching the second one would
+        // emit the phrase twice.
+        let prev = words(&[("x", 3.0, 3.2), ("very", 3.3, 3.5), ("good", 3.6, 3.8)]);
+        let next = words(&[
+            ("very", 3.35, 3.55),
+            ("good", 3.65, 3.85),
+            ("very", 3.95, 4.15),
+            ("good", 4.25, 4.45),
+        ]);
+        let (merged, outcome) = merge_words(&prev, &next, 3.1);
+        assert_eq!(outcome, SeamOutcome::Agreed { words: 2 });
+        assert_eq!(texts(&merged), ["x", "very", "good", "very", "good"]);
+    }
+
+    #[test]
+    fn a_doubled_function_word_neither_duplicates_nor_disappears() {
+        // "the the" is a real thing a speaker says and a real thing the model
+        // emits. Both copies must survive exactly once.
+        let prev = words(&[("said", 3.0, 3.3), ("the", 3.4, 3.6), ("the", 3.7, 3.9)]);
+        let next = words(&[("the", 3.45, 3.65), ("the", 3.75, 3.95), ("end", 4.1, 4.4)]);
+        let (merged, outcome) = merge_words(&prev, &next, 3.2);
+        assert_eq!(outcome, SeamOutcome::Agreed { words: 2 });
+        assert_eq!(texts(&merged), ["said", "the", "the", "end"]);
+    }
+
+    #[test]
+    fn the_fallback_keeps_a_word_the_later_window_stamped_early() {
+        // RNNT emission lags the acoustics by a variable amount, so a word only
+        // the later window heard can carry a timestamp before the last word
+        // kept from the earlier one. Filtering `next` by timestamp deleted it.
+        // Nothing here matches by text, so nothing may be dropped.
+        let prev = words(&[("alpha", 0.5, 1.0), ("bravo", 1.2, 1.7)]);
+        let next = words(&[("charlie", 1.5, 1.9), ("delta", 2.0, 2.4)]);
+        let (merged, outcome) = merge_words(&prev, &next, 1.1);
+        assert_eq!(outcome, SeamOutcome::Disagreed);
+        assert_eq!(texts(&merged), ["alpha", "bravo", "charlie", "delta"]);
+    }
+
+    #[test]
+    fn the_fallback_drops_a_repeated_phrase_whole() {
+        // What the fallback may remove is an exact repeat of what `prev` just
+        // ended with, and it removes the whole run rather than one word.
+        let prev = words(&[("open", 0.5, 0.9), ("the", 1.0, 1.2), ("door", 1.3, 1.7)]);
+        let next = words(&[
+            ("the", 1.15, 1.35),
+            ("door", 1.45, 1.85),
+            ("quickly", 2.0, 2.5),
+        ]);
+        let (merged, outcome) = merge_words(&prev, &next, 1.6);
+        assert_eq!(outcome, SeamOutcome::Disagreed);
+        assert_eq!(texts(&merged), ["open", "the", "door", "quickly"]);
+    }
+
+    #[test]
+    fn punctuation_only_words_never_pad_an_agreement_run() {
+        // A token that normalizes to nothing matches any other such token.
+        // Letting one extend a run would splice on evidence that is not there.
+        let prev = words(&[("alpha", 3.0, 3.3), ("--", 3.4, 3.5), ("bravo", 3.6, 3.9)]);
+        let next = words(&[
+            ("--", 3.45, 3.55),
+            ("charlie", 3.7, 4.0),
+            ("delta", 4.1, 4.4),
+        ]);
+        let (_, outcome) = merge_words(&prev, &next, 3.2);
+        assert_eq!(outcome, SeamOutcome::Disagreed);
+    }
+
+    #[test]
+    fn disagreement_keeps_both_sides_whole() {
+        // Two windows overlap in time but share no word. A disagreement is not
+        // evidence that either side is wrong, so neither loses anything.
         let prev = words(&[
             ("alpha", 0.5, 1.0),
             ("bravo", 1.2, 1.7),
@@ -602,12 +768,10 @@ mod tests {
         let next = words(&[("delta", 2.3, 2.8), ("echo", 3.0, 3.5)]);
         let (merged, outcome) = merge_words(&prev, &next, 2.0);
         assert_eq!(outcome, SeamOutcome::Disagreed);
-        // Midpoint of [2.0, 2.7] is 2.35: "charlie" ends after it and is
-        // dropped in favour of the copy the later window decoded whole.
-        assert_eq!(texts(&merged), ["alpha", "bravo", "delta", "echo"]);
-        for pair in merged.windows(2) {
-            assert!(pair[0].start_s <= pair[1].start_s, "seam reordered words");
-        }
+        assert_eq!(
+            texts(&merged),
+            ["alpha", "bravo", "charlie", "delta", "echo"]
+        );
     }
 
     #[test]

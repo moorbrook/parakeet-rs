@@ -1917,11 +1917,20 @@ tail flush remains after the stream is dropped.
 
 ---
 
-## 0031 — Hold decodes windows at pauses, joined on word agreement
+## 0031 — Hold decodes 6 s windows during the hold, joined on word agreement
 
 **Status:** **Accepted — implemented and measured.** Release-to-text p50 on the
 M5 Pro falls from 104.5 to 66.0 ms at an 8.1 s utterance and from 180.5 to
-65.0 ms at 16.6 s, with gold-corpus WER and CER unchanged. Tables and method in
+65.0 ms at 16.6 s, with gold-corpus WER and CER unchanged at 5.43% / 3.57%.
+
+That WER result is weaker than it reads and should not be cited without the
+caveat: six of the seven gold fixtures are under 4.3 s, so at a 6 s cap they
+decode as a single window and are identical to the plain path by construction.
+Only `librispeech-multi` (14.2 s) is actually cut, and it scored 0.00% WER. The
+rest of the multi-window evidence is loopback runs over `say`-generated audio,
+not human speech. A corpus with several 15 to 30 s human utterances would settle
+it; until one exists, treat the quality claim as "no regression detected on the
+evidence available" rather than as a measured equality. Tables and method in
 `bench/README.md`; the ledger entry is in `docs/asr/PERF.md`.
 
 **This is not ADR-0009's rejected streaming swap.** The recognizer is
@@ -2058,13 +2067,15 @@ Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
 
-- **2026-09-04** — [ADR-0031](#0031--hold-decodes-windows-at-pauses-joined-on-word-agreement)
-  accepted and implemented. Hold cuts windows at Silero-confirmed pauses (and at
-  a length cap when the speaker does not pause), decodes them in the background
-  while the key is held, and joins them on the words neighbouring windows agree
-  on, so release-to-text is the tail window rather than the whole recording. The
-  recognizer is unchanged; this is not the streaming-model swap ADR-0009
-  rejected.
+- **2026-09-04** — [ADR-0031](#0031--hold-decodes-6-s-windows-during-the-hold-joined-on-word-agreement)
+  accepted and implemented. Hold cuts the held recording into 6 s windows,
+  decodes them in the background while the key is still down, and joins them on
+  the words neighbouring windows agree on, so release-to-text is the tail window
+  rather than the whole recording: 180.5 ms to 65.0 ms p50 at a 16.6 s
+  utterance. Cutting at Silero-confirmed pauses instead was implemented,
+  measured, and rejected — it cost 1.09 points of gold WER by splitting short
+  utterances — so the pause path ships disabled. The recognizer is unchanged;
+  this is not the streaming-model swap ADR-0009 rejected.
 
 - **2026-09-04** — [ADR-0030](#0030--one-16-khz-resampler-in-rust-run-during-capture)
   accepted and implemented. One Kaldi sinc resampler in `src/resample.rs`,

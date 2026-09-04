@@ -302,10 +302,8 @@ fn apply_arm(args: &Args, asr: &Arc<Asr>, audio_s: f32) -> anyhow::Result<u64> {
         }
         Arm::Cadence => {
             std::thread::sleep(idle_gap);
-            let keep_alive = warmup::KeepAlive::start(
-                Arc::clone(asr),
-                Duration::from_millis(args.keepalive_ms),
-            );
+            let keep_alive =
+                warmup::KeepAlive::start(Arc::clone(asr), Duration::from_millis(args.keepalive_ms));
             std::thread::sleep(record_gap);
             // `stop` joins. The worker serializes on one pipe, so an unjoined
             // cadence could put a whole encoder pass inside the measurement.

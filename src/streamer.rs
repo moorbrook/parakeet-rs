@@ -233,16 +233,15 @@ pub fn start_with_strategy_on_device(
         None
     };
 
-    // Hold mode cuts windows at pauses so most of the recording is already
-    // decoded by the time the key is released. It needs its own Silero state
-    // (Tap's two belong to the endpoint authority) and a recognizer that
-    // reports word boundaries, without which two windows cannot be joined.
-    // Anything missing leaves Hold on the original single-decode path.
-    let windowing = if matches!(mode, Mode::Manual) {
-        build_hold_windowing(vad_model, &asr, hold_windows)
-    } else {
-        None
-    };
+    // Hold's own Silero state is NOT loaded here. Tap pays that load before the
+    // spawn because its VAD owns the endpoint and the session is meaningless
+    // without it; Hold's only chooses window boundaries, and the first one
+    // cannot arrive for seconds. Loading it on this side would put 100-300 ms
+    // on the hotkey-down edge, the same edge that fires the engine prime, for
+    // no benefit — so `run_manual` builds it as its first act instead, while
+    // capture is already running and the tap is already buffering.
+    let hold_vad_model = vad_model.to_path_buf();
+    let hold_asr = Arc::clone(&asr);
 
     let join = std::thread::Builder::new()
         .name(match mode {
@@ -268,7 +267,14 @@ pub fn start_with_strategy_on_device(
                     }),
                     None => Outcome::Error(anyhow!("VadAutoStop spawned without a VAD model")),
                 },
-                Mode::Manual => run_manual(capture, tap_rx, signal_rx, timer, windowing),
+                Mode::Manual => run_manual(
+                    capture,
+                    tap_rx,
+                    signal_rx,
+                    timer,
+                    // Built here, on the watcher thread, not on the caller's.
+                    build_hold_windowing(&hold_vad_model, &hold_asr, hold_windows),
+                ),
             };
             let _ = outcome_tx.send(outcome);
         })
@@ -333,6 +339,12 @@ pub fn decode_hold_windowed(
 
 /// Build the Hold-mode window state, or `None` with a reason logged. Never an
 /// error: dictation must still work when windowing cannot.
+///
+/// Called from the Hold watcher thread rather than from `start`, so the Silero
+/// load stays off the hotkey-down edge. Audio captured while it runs is not
+/// lost: `AudioCapture` is already accumulating the recording and the tap is an
+/// unbounded channel, so the first loop iteration drains whatever queued up and
+/// the planner sees every frame in order.
 fn build_hold_windowing(
     vad_model: &Path,
     asr: &Arc<Asr>,
@@ -651,7 +663,13 @@ fn run_manual(
         match signal_rx.try_recv() {
             Ok(Signal::Cancel) => {
                 if let Some(windowing) = windowing {
-                    // Join before returning so no decode outlives the session.
+                    // Drains rather than aborts. `finish` closes the queue and
+                    // waits for the windows already submitted; there is no way
+                    // to cancel a request the worker has started, and abandoning
+                    // the thread would leave one holding the worker's single
+                    // pipe into the next session. Worst case is one window's
+                    // decode, tens of milliseconds, on a path the user has
+                    // already walked away from.
                     let _ = windowing.decoder.finish();
                 }
                 return finish(capture, Outcome::Cancelled);
@@ -680,8 +698,12 @@ fn run_manual(
                 // Capture ended under us. The recording is still whatever
                 // `AudioCapture` accumulated, so give up on windowing rather
                 // than on the session, and stop spinning on a dead channel.
-                if windowing.take().is_some() {
+                // Join the decoder rather than dropping it: an in-flight window
+                // would otherwise hold the worker's single pipe into whatever
+                // runs next.
+                if let Some(windowing) = windowing.take() {
                     log::warn!("audio tap closed during hold; decoding the recording in one pass");
+                    let _ = windowing.decoder.finish();
                 }
                 std::thread::sleep(MANUAL_POLL);
                 None
