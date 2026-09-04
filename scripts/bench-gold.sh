@@ -9,6 +9,10 @@ REPETITIONS=${REPETITIONS:-10}
 # tree — required whenever the worker protocol or decode loop has changed.
 WORKER=${COREML_WORKER:-/Applications/Parakeet.app/Contents/MacOS/parakeet-coreml-worker}
 MODEL_DIR=${COREML_MODEL_DIR:-$HOME/Library/Application Support/com.parakeet.rs/models/coreml/parakeet-unified-en-0.6b}
+# The TDT 0.6B v3 challenger (kata f0zg). Fetch it with
+# scripts/fetch-tdt-v3-model.py; absent, the challenger row is skipped and the
+# shipping gate still runs.
+TDT_MODEL_DIR=${COREML_TDT_V3_MODEL_DIR:-$HOME/Library/Application Support/com.parakeet.rs/models/coreml/parakeet-tdt-0.6b-v3}
 MANIFEST="$ROOT/bench/gold/manifest.json"
 AUDIO_DIR="$ROOT/bench/gold/audio"
 VOCABULARY="$ROOT/bench/gold/vocabulary.txt"
@@ -37,6 +41,16 @@ shipping_status=0
     --worker "$WORKER" \
     --model-dir "$MODEL_DIR" \
     --json-out "$ROOT/bench/coreml-gold-quality.json" || shipping_status=$?
+
+if [[ -d "$TDT_MODEL_DIR" ]]; then
+    "$BINARY" "${common[@]}" \
+        --backend coreml-tdt-v3 \
+        --worker "$WORKER" \
+        --model-dir "$TDT_MODEL_DIR" \
+        --json-out "$ROOT/bench/coreml-tdt-v3-gold-quality.json" || true
+else
+    echo "skipping the TDT v3 challenger: $TDT_MODEL_DIR is missing" >&2
+fi
 
 "$BINARY" "${common[@]}" \
     --backend coreml-unified \

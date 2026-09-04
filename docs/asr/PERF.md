@@ -557,3 +557,70 @@ at n=12. Hold's `warm` arm still plays the fixture, so it sits about one
 utterance from its own previous dispatch rather than back to back, which at 5 s
 leaves an expected cold-to-warm separation of roughly 10 ms - inside the noise
 at that sample size. `bench/README.md` records the rows and the reasoning.
+
+## Parakeet TDT 0.6B v3 challenger — 2026-09-04
+
+**No-go.** Measured at ten repetitions with zero WER and CER spread, TDT 0.6B
+v3 records 7.608696% WER / 3.991597% CER against the frozen Unified baseline of
+5.434783% / 3.571429%. That is seven word edits of 92 against five. The
+manifest sets `max_wer_regression_percent` to 0.00, so the bar is WER ≤
+5.434783% exactly and TDT is 2.17 points over. Its absolute 7.61% is still
+under the 8.00% ceiling; the gate that fails is the regression one. Keep
+Unified as the default and do not open a switch issue.
+
+The quality margin is thinner than the aggregate reads. Four of seven fixtures
+are clean in both arms and two more fail identically in both; the whole 5 → 7
+difference is one four-word utterance, "Is IBM up today?", which Unified renders
+"Is IPM up today?" (1 edit) and TDT renders "It's I PM up today." (3 edits).
+Every per-category difference traces to that fixture. So the corpus supports
+"TDT is not better and fails a gate Unified passes", not "TDT is worse at
+English"; a wider corpus would be needed for the stronger claim. The latency
+result below is what makes building one pointless.
+
+| arm | WER | CER | corpus p50 | RTFx p50 | peak RSS | load | gate |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Unified | **5.434783%** | **3.571429%** | **0.3048 s** | **111.7×** | **0.10 GiB** | 0.135 s | pass |
+| TDT v3 | 7.608696% | 3.991597% | 0.4161 s | 81.8× | 0.12 GiB | **0.100 s** | **fail** |
+
+The latency case that motivated the trial does not survive measurement either.
+At 30 repetitions TDT is slower at every length: 45.0 against 31.0 ms at one
+second, 51.0/36.0 at three, 58.5/44.5 at five, 68.0/53.0 at ten, and
+182.0/110.5 at twenty. The published 155.6× versus 123.3× RTFx does not appear
+here at any length.
+
+TDT's duration head does what it claims — 92 joint predictions against
+Unified's 261 on a 14.225 s fixture, 2.84× fewer — and returns nothing, because
+each TDT joint call costs 3.06× what a Unified one does, 0.300 ms against
+0.098 ms. Pinning the decoder and joint CPU-only, where the Unified loader pins
+them, moved joint dispatch from 27.58 ms to 28.90 ms: slightly worse, so
+placement is not the cause. What is left is the graph. `JointDecisionv3`
+computes `top_k_ids` and `top_k_logits` at K=64 on every call for script-aware
+language filtering, over an 8,192-entry vocabulary against Unified's 1,024.
+
+Separately, and larger, TDT carries an **unexplained** post-dispatch tail of
+about 15 ms against Unified's 0.03 to 0.12 ms. It is close to constant where a
+per-token cost could not be — 14.72 to 15.16 ms while decoder calls go from 5
+to 52 — so tokenizer decode and token-timing assembly are ruled out as the bulk
+of it; it rises to 19.58 ms on the two-window fixture, so some is per-window.
+Overlap-merge in `ChunkProcessor`, the per-utterance progress-emitter session,
+and decoder-state teardown are candidates, none measured: the profiler's
+timeline ends at the last dispatch. That tail alone is the whole of the 14 ms
+deficit from 1 to 10 seconds, and it erases a real 1.6 to 2.2 ms encoder
+advantage and 1.8 ms mel advantage. It is the first thing to measure if TDT is
+ever revisited.
+
+TDT's published Core ML encoder takes a fixed `[1, 128, 1501]` mel, the same
+15 s window the Unified offline encoder takes, so the bucketed short-window
+encoders would need a separate TDT re-conversion at each window before TDT
+could pay the same short-utterance saving.
+
+The evaluation path stays in the tree so the numbers can be re-checked against
+a future conversion: `--model-variant tdt-v3` on the worker,
+`PARAKEET_COREML_MODEL_VARIANT` / `--backend coreml-tdt-v3` in the bench, and
+`scripts/fetch-tdt-v3-model.py` for the pinned artifact. It is deliberately not
+reachable from the shipping download path: TDT has no Rust integrity gate, so
+the worker refuses `--model-root` for it and forbids FluidAudio's downloader.
+Reopen only for a conversion that is EN-competitive on this corpus and drops
+the top-K joint outputs. Full tables, the artifact manifest and the replay
+commands are in [`../../bench/README.md`](../../bench/README.md); raw reports
+are under `bench/f0zg/`.

@@ -28,6 +28,10 @@ final class StageProfiler: @unchecked Sendable {
     static let shared = StageProfiler()
 
     enum Stage: UInt8 {
+        /// TDT's mel front end is a Core ML graph (`Preprocessor.mlmodelc`,
+        /// pinned to CPU by FluidAudio). Unified computes mel in Swift and
+        /// never produces this stage.
+        case preprocessor
         case encoder
         case decoder
         case joint
@@ -53,6 +57,7 @@ final class StageProfiler: @unchecked Sendable {
         /// Set by the caller since it happens outside the profiled interval.
         var resampleMs: Double = 0
         let windows: Int
+        let preprocessorCalls: Int
         let encoderCalls: Int
         let decoderCalls: Int
         let jointCalls: Int
@@ -63,7 +68,11 @@ final class StageProfiler: @unchecked Sendable {
         /// one decision per frame and per emitted token.
         let nativeJointSteps: Int
         let otherCalls: Int
+        /// Host-side work before a mel or encoder dispatch. For Unified this
+        /// is the whole mel front end; for TDT it is only the marshalling
+        /// around `preprocessorMs`.
         let melMs: Double
+        let preprocessorMs: Double
         let encoderMs: Double
         let decodeLoopMs: Double
         let decodeLoopDispatchMs: Double
@@ -73,6 +82,13 @@ final class StageProfiler: @unchecked Sendable {
         /// `decodeLoopDispatchMs`.
         let decodeLoopNativeMs: Double
         let postMs: Double
+        /// How much dispatch time overlapped other dispatch time. The stage
+        /// durations below are sums over a timeline, so they only partition
+        /// the decode interval while dispatch is serial. FluidAudio's TDT
+        /// long-form path can decode chunks concurrently, and then the
+        /// per-stage columns double-count. Nonzero means read the wall totals
+        /// and ignore the split.
+        let overlappedDispatchMs: Double
         let totalMs: Double
         /// `MLModelConfiguration.computeUnits` read off the live model object
         /// each stage dispatched to, e.g. "encoder=cpu-and-neural-engine
@@ -208,7 +224,7 @@ final class StageProfiler: @unchecked Sendable {
     }
 
     private static func describe(_ placements: [Stage: String]) -> String {
-        [Stage.encoder, .decoder, .nativeDecoder, .joint, .nativeJoint]
+        [Stage.preprocessor, .encoder, .decoder, .nativeDecoder, .joint, .nativeJoint]
             .compactMap { stage -> String? in
                 guard let placement = placements[stage] else { return nil }
                 return "\(reportedName(of: stage))=\(placement)"
@@ -228,6 +244,7 @@ final class StageProfiler: @unchecked Sendable {
 
     private static func name(of stage: Stage) -> String {
         switch stage {
+        case .preprocessor: "preprocessor"
         case .encoder: "encoder"
         case .decoder: "decoder"
         case .joint: "joint"
@@ -255,12 +272,14 @@ final class StageProfiler: @unchecked Sendable {
         endNanoseconds: UInt64,
         computeUnits: String
     ) -> Report {
+        var preprocessorCalls = 0
         var encoderCalls = 0
         var decoderCalls = 0
         var jointCalls = 0
         var nativeDecoderSteps = 0
         var nativeJointSteps = 0
         var otherCalls = 0
+        var preprocessorNanoseconds: UInt64 = 0
         var encoderNanoseconds: UInt64 = 0
         var decoderNanoseconds: UInt64 = 0
         var jointNanoseconds: UInt64 = 0
@@ -268,6 +287,9 @@ final class StageProfiler: @unchecked Sendable {
         for event in timeline {
             let elapsed = event.endNanoseconds &- event.startNanoseconds
             switch event.stage {
+            case .preprocessor:
+                preprocessorCalls += 1
+                preprocessorNanoseconds &+= elapsed
             case .encoder:
                 encoderCalls += 1
                 encoderNanoseconds &+= elapsed
@@ -298,12 +320,23 @@ final class StageProfiler: @unchecked Sendable {
         var openEncoderEnd: UInt64?
         var lastEnd = startNanoseconds
         for event in timeline {
-            if event.stage == .encoder {
+            switch event.stage {
+            case .preprocessor:
+                // A mel dispatch opens the next window, so it closes the
+                // previous window's decode loop rather than extending it.
+                if let encoderEnd = openEncoderEnd {
+                    decodeLoopNanoseconds &+= lastEnd &- encoderEnd
+                    openEncoderEnd = nil
+                }
+                melNanoseconds &+= event.startNanoseconds &- min(previousEnd, event.startNanoseconds)
+            case .encoder:
                 if let encoderEnd = openEncoderEnd {
                     decodeLoopNanoseconds &+= lastEnd &- encoderEnd
                 }
                 melNanoseconds &+= event.startNanoseconds &- min(previousEnd, event.startNanoseconds)
                 openEncoderEnd = event.endNanoseconds
+            case .decoder, .joint, .nativeDecoder, .nativeJoint, .other:
+                break
             }
             previousEnd = max(previousEnd, event.endNanoseconds)
             lastEnd = max(lastEnd, event.endNanoseconds)
@@ -314,6 +347,7 @@ final class StageProfiler: @unchecked Sendable {
 
         return Report(
             windows: encoderCalls,
+            preprocessorCalls: preprocessorCalls,
             encoderCalls: encoderCalls,
             decoderCalls: decoderCalls,
             jointCalls: jointCalls,
@@ -321,6 +355,7 @@ final class StageProfiler: @unchecked Sendable {
             nativeJointSteps: nativeJointSteps,
             otherCalls: otherCalls,
             melMs: milliseconds(melNanoseconds),
+            preprocessorMs: milliseconds(preprocessorNanoseconds),
             encoderMs: milliseconds(encoderNanoseconds),
             decodeLoopMs: milliseconds(decodeLoopNanoseconds),
             decodeLoopDispatchMs: milliseconds(decoderNanoseconds &+ jointNanoseconds),
@@ -328,9 +363,39 @@ final class StageProfiler: @unchecked Sendable {
             jointDispatchMs: milliseconds(jointNanoseconds),
             decodeLoopNativeMs: milliseconds(nativeNanoseconds),
             postMs: milliseconds(endNanoseconds &- max(lastEnd, startNanoseconds)),
+            overlappedDispatchMs: milliseconds(overlap(in: timeline)),
             totalMs: milliseconds(endNanoseconds &- startNanoseconds),
             computeUnits: computeUnits
         )
+    }
+
+    /// Total dispatch time counted more than once: the sum of every event's
+    /// duration less the length of their union. Zero for a serial pipeline.
+    /// `timeline` is already sorted by start.
+    static func overlap(in timeline: [Event]) -> UInt64 {
+        var summed: UInt64 = 0
+        var union: UInt64 = 0
+        var mergedStart: UInt64?
+        var mergedEnd: UInt64 = 0
+        for event in timeline {
+            summed &+= event.endNanoseconds &- event.startNanoseconds
+            guard let start = mergedStart else {
+                mergedStart = event.startNanoseconds
+                mergedEnd = event.endNanoseconds
+                continue
+            }
+            if event.startNanoseconds > mergedEnd {
+                union &+= mergedEnd &- start
+                mergedStart = event.startNanoseconds
+                mergedEnd = event.endNanoseconds
+            } else {
+                mergedEnd = max(mergedEnd, event.endNanoseconds)
+            }
+        }
+        if let start = mergedStart {
+            union &+= mergedEnd &- start
+        }
+        return summed > union ? summed &- union : 0
     }
 
     // MARK: - Classification
@@ -341,7 +406,10 @@ final class StageProfiler: @unchecked Sendable {
     /// (`UnifiedFeatureProviders.swift`), so the input alone identifies the model.
     static func classify(_ input: MLFeatureProvider) -> Stage {
         let names = input.featureNames
+        // `mel` is the encoder input for both graph sets; TDT's mel front end
+        // is a separate graph taking the raw waveform.
         if names.contains("mel") { return .encoder }
+        if names.contains("audio_signal") { return .preprocessor }
         if names.contains("encoder_step") { return .joint }
         if names.contains("targets") { return .decoder }
         return .other

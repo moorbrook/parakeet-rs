@@ -23,14 +23,15 @@ ADRs target. Update whenever the code lands or a measurement is taken.
 | Menubar UX | SF Symbols (`mic` / `mic.fill` / `arrow.down.circle`) via `objc2_app_kit::NSImage`; state-reflective menu labels | HIG-conformant template image with state | none — shipped |
 | Paste path | `CGEventKeyboardSetUnicodeString` synthetic keystroke at `AnnotatedSession` tap layer (`src/ax_paste.rs`) | no clipboard mutation; works in terminals, browsers, native, Electron, IDEs | none — [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) shipped, supersedes ADR-0011 |
 | Smart formatting | In-process LLM polish pass: Qwen 3.5 4B Q6_K via llama-cpp-2 + Metal (`src/polish.rs`); opt-in via Settings → Polish → On | optional local polish, streaming output to cursor on word boundaries | none — [ADR-0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) shipped + amended (4B bump) |
-| Custom vocabulary | A plain-text vocabulary selects sherpa beam search with validated hotword encoding; the default empty vocabulary keeps the faster native worker | explicit specialization without silently changing the generic model | none — ADR-0020 + ADR-0028 shipped and bounded by measured evidence |
+| Custom vocabulary | A plain-text vocabulary is tokenized with the model's own pieces and biased over the native joint output; the sherpa hotword path survives only as the fallback's implementation | explicit specialization without silently changing the generic model | none — ADR-0033 removed the fallback cliff; ADR-0028's bound on a global score change stands |
 | macOS permissions | Contextual Input Monitoring onboarding, just-in-time Microphone/Accessibility requests, a permanent dashboard, settings recovery links, and activation-time revocation detection | explain before requesting and remain usable when a grant is absent | implementation shipped in ADR-0029; destructive revocation confirmation remains issue #23 |
 
 **Primary acceleration path complete.** ADR-0012 and ADR-0015 first proved the
-sherpa fallback's CoreML execution. ADR-0022 then moved the default empty-
-vocabulary path to a resident native Parakeet Unified worker, ADR-0023
-overlapped recognition with endpoint confirmation, and ADR-0026 added safe
-per-chip runtime selection without changing model weights.
+sherpa fallback's CoreML execution. ADR-0022 then moved the default path to a
+resident native Parakeet Unified worker, ADR-0023 overlapped recognition with
+endpoint confirmation, ADR-0026 added safe per-chip runtime selection without
+changing model weights, and ADR-0033 brought the custom vocabulary onto that
+path so no user setting drops back to the fallback.
 
 ---
 
@@ -2164,6 +2165,115 @@ is off.
 and `asr_diff --hold-windows MIN,MAX` decodes the gold corpus the windowed way
 so the seam merge is held to the same WER as the plain decode.
 
+## 0033 — Contextual biasing on the native Core ML path
+
+**Status:** **Accepted — implemented; single-run functional evidence, ten-repetition
+evidence pending a bench turn.**
+
+**Context.** [ADR-0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list)
+put contextual biasing in sherpa-onnx because sherpa owned the only
+implementation of it, and [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend)
+therefore routed any non-empty custom vocabulary to that fallback. The cost of
+that route is the whole of ADR-0022: 132x real time drops to roughly 11x, and
+0.10 GiB of resident set becomes 4.25 GiB, for exactly the users who cared
+enough about accuracy to write a vocabulary file. The measured sweep in
+[`docs/asr/DOMAIN_ADAPTATION.md`](asr/DOMAIN_ADAPTATION.md) also found that
+sherpa's biasing bought nothing at the shipped score: 54.55% custom-vocabulary
+WER at score 2.0, identical to greedy, and no score improved one category
+without worsening another.
+
+**Decision.** Bias inside the native worker, over the joint logits the RNNT
+loop already computes, and remove the vocabulary condition from backend
+selection. sherpa remains reachable through Core ML load failure and
+`PARAKEET_ASR_BACKEND=sherpa`, and keeps its hotwords-file path for those.
+
+- The worker tokenizes each term with the model bundle's own `vocab.json`
+  (1024 SentencePiece pieces), longest-match from the left, with `▁` prefixed
+  to each word. The bundle ships the inventory but not the merge ranks a
+  faithful BPE encoder needs, so this approximates the model's own
+  segmentation; a disagreement costs biasing on that term, not correctness.
+- The token sequences build an Aho-Corasick trie with failure arcs. Each node
+  carries `nodeScore` (the boost accumulated along its path), `endScore` (the
+  part a completed entry has banked, including through the output link when the
+  node's *suffix* is a complete entry) and `atRisk = nodeScore - endScore`.
+- A step's true shallow-fusion deltas are `0` for blank, which does not extend
+  the label sequence; `atRisk(n) + banked(s, n) - atRisk(s)` for a token
+  continuing or starting an entry; and `-atRisk(s)` for any other token, the
+  retraction. A greedy argmax compares outcomes only inside one step, so the
+  vector is shifted by `+atRisk(s)`, which puts the non-matching tokens at zero
+  and makes the boost sparse: blank plus the tokens reachable from the state or
+  its failure chain, a few dozen logits out of 1025.
+- Two departures from sherpa's `ContextGraph`, both because greedy takes one
+  step at a time where a beam scores whole paths. Blank is boosted by
+  `atRisk(s)` rather than left among the non-matching tokens, or continuing an
+  entry would be worth the whole accumulated boost over blank rather than one
+  token's score, and the loop would emit the rest of a hotword inside a single
+  frame until it hit the symbol cap. And a completed entry is banked into
+  `endScore` rather than compensated by a separate `output_score` that
+  `Finalize` settles, or an uncompensated retraction sitting on blank after a
+  match would suppress the word that follows it.
+- The terms reach the worker in one `PRKV` control frame at spawn, so the trie
+  is built once. The frame carries a distinct magic rather than a protocol
+  version bump, leaving the audio frame untouched. The worker replies with the
+  accepted count and the terms its inventory could not represent, which Rust
+  logs — the Core ML counterpart of ADR-0020's `tokens.txt` validation.
+- Biasing is refused, not ignored, under `--rnnt-engine coreml` and
+  `--model-variant tdt-v3`. Neither decode loop has the hook, and accepting the
+  terms there would claim biasing that nothing was doing.
+- The boost is removed from the logits again before the softmax, so the
+  confidence a biased emission reports is still the model's own.
+
+**Evidence (single run, rep=1, M5 Pro, release worker).** The seven-fixture
+human gold corpus, `bench/gold/vocabulary.txt` (IBM, Olly, Tactics), all three
+terms accepted by the tokenizer.
+
+| configuration | overall WER | overall CER | custom-vocabulary WER / CER |
+|---|---:|---:|---:|
+| Core ML, no vocabulary | 5.43% | 3.57% | 27.27% / 8.93% |
+| Core ML, biased, score 2.0 | **3.26%** | **2.94%** | **9.09% / 3.57%** |
+| Core ML, biased, score 3.0 | 3.26% | 2.94% | 9.09% / 3.57% |
+| Core ML, biased, score 4.0 | 3.26% | 2.94% | 9.09% / 3.57% |
+| sherpa, `modified_beam_search`, score 2.0 (ADR-0028) | 10.87% | 5.46% | 54.55% / 12.50% |
+| sherpa, `modified_beam_search`, score 2.75 (ADR-0028) | 8.70% | 6.09% | 27.27% / 12.50% |
+
+Per-category against the unbiased Core ML baseline, negative better:
+
+| category | Δ WER points | Δ CER points |
+|---|---:|---:|
+| commands | -4.88 | -1.50 |
+| custom vocabulary | -18.18 | -5.36 |
+| general | 0.00 | 0.00 |
+| long | 0.00 | 0.00 |
+| noisy | 0.00 | 0.00 |
+| numbers | 0.00 | 0.00 |
+| proper nouns | -2.38 | -0.69 |
+| punctuation-tagged corpus | -2.17 | -0.63 |
+
+No category regresses at any measured score, which is what the sherpa sweep
+could not achieve — `IBM` and `Olly` are both repaired while the noisy `Amy`
+fixture, which sherpa's first effective score turned into `80`, stays exact.
+The residual custom-vocabulary error is `from` → `for`, an acoustic
+substitution the vocabulary has no bearing on. Scores 3.0 and 4.0 change only
+capitalization inside already-correct words, so the shipped
+`hotword_score` default of 2.0 is unchanged.
+
+With an empty vocabulary the decode is unchanged by construction — the sparse
+boost loops are empty and the argmax is byte-for-byte the one ADR-0032 shipped
+— and the run reproduces the frozen baseline's aggregate and every per-category
+WER/CER to the full float:
+5.434782608695652% / 3.5714285714285716%. The frozen baseline records no
+per-fixture transcripts, so that is agreement on every published number rather
+than a transcript diff.
+
+**Consequences.** ADR-0020's format and its silent-drop trap survive only on
+the sherpa fallback, which now needs an explicit environment variable or a load
+failure to reach. `crate::vocabulary::has_terms` is gone; backend selection no
+longer reads the vocabulary at all. The 15% latency budget for a 50-entry
+vocabulary, and the ten-repetition gold numbers with the vocabulary set, are
+the remaining measurements.
+
+---
+
 ## Target status index
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -2175,7 +2285,7 @@ so the seam merge is held to the same WER as the plain decode.
 | ≤5 GB resident set with polish On | [0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation) + [0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped** — native tray shell, resident Core ML worker, and Qwen mmap/lifecycle | nothing |
 | Smart formatting parity with Wispr Flow | [0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) | **Shipped** — optional local Qwen polish streams on word boundaries | strict last-token latency remains above the original target |
 | Clipboard not clobbered | [0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) | **Shipped** on the normal path; clipboard is rescue-only for observable delivery failure | `CGEventPost` has no delivery receipt |
-| Custom vocabulary | [0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0028](#0028--generic-asr-base-with-evidence-gated-domain-and-user-adaptation) | **Shipped + bounded** — non-empty vocabulary selects sherpa; no measured global score clears the quality gate | constrained native Unified biasing requires new separated evidence |
+| Custom vocabulary | [0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list) + [0028](#0028--generic-asr-base-with-evidence-gated-domain-and-user-adaptation) + [0033](#0033--contextual-biasing-on-the-native-core-ml-path) | **Shipped + measured** — the native worker biases over its own joint output, repairing both custom-vocabulary fixtures with no category regression and no fallback | ten-repetition and 50-entry latency evidence |
 
 **Completed path to the ADR-0007 latency claim:**
 1. [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend) — move
@@ -2192,6 +2302,14 @@ so the seam merge is held to the same WER as the plain decode.
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-09-04** — [ADR-0033](#0033--contextual-biasing-on-the-native-core-ml-path)
+  accepted and implemented. Contextual biasing moved onto the native Core ML
+  path as an Aho-Corasick shallow-fusion boost over the joint logits, and the
+  sherpa fallback stopped being what a custom vocabulary selects. On the human
+  gold corpus at the shipped score the biased path measured 3.26% WER / 2.94%
+  CER against 5.43% / 3.57% unbiased, with custom-vocabulary WER 27.27% to
+  9.09% and no category regression.
 
 - **2026-09-04** — [ADR-0031](#0031--tap-fast-confirms-at-90-ms-punctuation-rejected-as-an-endpoint-signal)
   accepted and implemented. Tap Fast confirms after 90 ms of Silero silence
