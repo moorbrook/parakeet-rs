@@ -30,7 +30,9 @@ use parakeet_dictation::asr::{Asr, AsrBackendMetadata, AsrConfig, Decoded};
 use parakeet_dictation::asr_eval::{
     self, DecodeMetadata, GoldManifest, QualityReport, RunMetadata,
 };
-use parakeet_dictation::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
+use parakeet_dictation::coreml_worker::{
+    load_coreml_worker, CoreMlRnntEngine, CoreMlWorkerConfig,
+};
 use parakeet_dictation::performance;
 use parakeet_dictation::resample::{to_target_rate, TARGET_SAMPLE_RATE};
 use parakeet_dictation::settings::SettingsStore;
@@ -53,6 +55,7 @@ struct Args {
     hotword_score: f32,
     backend: Backend,
     worker: Option<PathBuf>,
+    rnnt_engine: CoreMlRnntEngine,
     model_dir: Option<PathBuf>,
     repetitions: usize,
 }
@@ -84,6 +87,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut hotword_score = 2.0_f32;
     let mut backend = Backend::Sherpa;
     let mut worker = None;
+    let mut rnnt_engine = CoreMlRnntEngine::default();
     let mut model_dir = None;
     let mut repetitions = 1usize;
 
@@ -129,6 +133,12 @@ fn parse_args() -> anyhow::Result<Args> {
             "--backend" => {
                 backend =
                     Backend::parse(&it.next().ok_or_else(|| anyhow!("--backend needs a name"))?)?;
+            }
+            "--rnnt-engine" => {
+                rnnt_engine = CoreMlRnntEngine::parse(
+                    &it.next()
+                        .ok_or_else(|| anyhow!("--rnnt-engine needs a name"))?,
+                )?;
             }
             "--worker" => {
                 worker = Some(PathBuf::from(
@@ -176,6 +186,7 @@ fn parse_args() -> anyhow::Result<Args> {
         hotword_score,
         backend,
         worker,
+        rnnt_engine,
         model_dir,
         repetitions,
     })
@@ -194,6 +205,7 @@ fn print_usage() {
         \x20               [--baseline JSON] [--json-out JSON]\n\
         \x20               [--backend sherpa|coreml-unified]\n\
         \x20               [--worker PATH] [--model-dir DIR]\n\
+        \x20               [--rnnt-engine native|coreml]\n\
         \x20               [--repetitions N]\n\
         \x20               [--vocabulary FILE] [--hotword-score N]\n\
          \n\
@@ -302,6 +314,7 @@ fn run(args: &Args) -> anyhow::Result<bool> {
         })?,
         Backend::CoreMlUnified => {
             let mut config = CoreMlWorkerConfig::discover()?;
+            config.set_rnnt_engine(args.rnnt_engine);
             if let Some(worker) = &args.worker {
                 config.worker_path.clone_from(worker);
             }

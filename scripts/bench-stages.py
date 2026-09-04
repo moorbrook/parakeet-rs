@@ -8,9 +8,11 @@
 
     [...] INFO  bench_asr asr_stages session_id=bench-5s_48000-r000-... \\
                 audio_s=4.967 resample_ms=22.976 windows=1 encoder_calls=1 \\
-                decoder_calls=35 joint_calls=96 other_calls=0 mel_ms=3.080 \\
+                decoder_calls=35 joint_calls=96 native_decoder_steps=0 \\
+                native_joint_steps=0 other_calls=0 mel_ms=3.080 \\
                 encoder_ms=25.959 decode_loop_ms=15.840 \\
                 decode_loop_dispatch_ms=15.135 decoder_dispatch_ms=5.359 \\
+                decode_loop_native_ms=0.000 \\
                 joint_dispatch_ms=9.776 post_ms=0.066 total_ms=44.944 \\
                 boundary_ms=0.404 compute_units=encoder=...,decoder=...
 
@@ -38,6 +40,8 @@ COUNT_FIELDS = [
     "encoder_calls",
     "decoder_calls",
     "joint_calls",
+    "native_decoder_steps",
+    "native_joint_steps",
     "other_calls",
 ]
 TIME_FIELDS = [
@@ -48,6 +52,7 @@ TIME_FIELDS = [
     "decode_loop_dispatch_ms",
     "decoder_dispatch_ms",
     "joint_dispatch_ms",
+    "decode_loop_native_ms",
     "post_ms",
     "total_ms",
     "boundary_ms",
@@ -109,7 +114,17 @@ def validate(by_bucket: dict[int, list[dict]]) -> list[str]:
                     f"{bucket}s bucket: {row['other_calls']} unattributed Core ML predictions"
                 )
                 break
-            frames = row["joint_calls"] - (row["decoder_calls"] - row["windows"])
+            if row["decoder_calls"] and row["native_decoder_steps"]:
+                problems.append(
+                    f"{bucket}s bucket: {row['decoder_calls']} Core ML decoder calls and "
+                    f"{row['native_decoder_steps']} native steps in one utterance"
+                )
+                break
+            # The loop runs on one engine or the other, so the frame identity
+            # holds over whichever pair of counters is populated.
+            decoder_steps = row["decoder_calls"] + row["native_decoder_steps"]
+            joint_steps = row["joint_calls"] + row["native_joint_steps"]
+            frames = joint_steps - (decoder_steps - row["windows"])
             if frames < 1:
                 problems.append(f"{bucket}s bucket: implied decoded-frame count {frames}")
                 break

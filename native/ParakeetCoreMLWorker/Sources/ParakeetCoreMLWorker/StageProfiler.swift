@@ -30,6 +30,13 @@ final class StageProfiler: @unchecked Sendable {
         case encoder
         case decoder
         case joint
+        /// Prediction-network and joint steps run natively by
+        /// `NativeRnntDecoder`. They are not Core ML dispatches, so they are
+        /// counted apart from `decoder` and `joint` rather than folded into
+        /// them: a row where both are nonzero would mean the loop changed
+        /// engines mid-utterance.
+        case nativeDecoder
+        case nativeJoint
         case other
     }
 
@@ -48,6 +55,12 @@ final class StageProfiler: @unchecked Sendable {
         let encoderCalls: Int
         let decoderCalls: Int
         let jointCalls: Int
+        /// Native prediction-network steps, the counterpart of `decoderCalls`
+        /// when the loop runs without Core ML.
+        let nativeDecoderSteps: Int
+        /// Native joint evaluations: one decoder-side projection per step plus
+        /// one decision per frame and per emitted token.
+        let nativeJointSteps: Int
         let otherCalls: Int
         let melMs: Double
         let encoderMs: Double
@@ -55,11 +68,15 @@ final class StageProfiler: @unchecked Sendable {
         let decodeLoopDispatchMs: Double
         let decoderDispatchMs: Double
         let jointDispatchMs: Double
+        /// Wall time inside the native steps, the counterpart of
+        /// `decodeLoopDispatchMs`.
+        let decodeLoopNativeMs: Double
         let postMs: Double
         let totalMs: Double
         /// `MLModelConfiguration.computeUnits` read off the live model object
         /// each stage dispatched to, e.g. "encoder=cpu-and-neural-engine
-        /// decoder=cpu-only joint=cpu-only".
+        /// decoder=cpu-only joint=cpu-only". A natively run stage reports
+        /// "native", which is not a Core ML placement at all.
         let computeUnits: String
     }
 
@@ -70,8 +87,9 @@ final class StageProfiler: @unchecked Sendable {
     private var events: [Event] = []
     private var wrappedMethods: Set<String> = []
     private var recording = false
-    /// Compute units observed on the live `MLModel` each stage dispatched to.
-    private var observedComputeUnits: [Stage: MLComputeUnits] = [:]
+    /// Where each stage ran: the compute units read off the live `MLModel`, or
+    /// "native" for a stage that never reaches Core ML.
+    private var observedPlacements: [Stage: String] = [:]
 
     /// Cap the timeline so a pathological input cannot grow it without bound.
     /// A 20 s utterance produces roughly 1,500 dispatches.
@@ -113,7 +131,7 @@ final class StageProfiler: @unchecked Sendable {
         recording = false
         let timeline = events.sorted { $0.startNanoseconds < $1.startNanoseconds }
         events.removeAll(keepingCapacity: true)
-        let placements = observedComputeUnits
+        let placements = observedPlacements
         lock.unlock()
         return Self.reduce(
             timeline: timeline,
@@ -144,7 +162,7 @@ final class StageProfiler: @unchecked Sendable {
         // outside `decode_loop_dispatch_ms` and inflate the residual between
         // them. The placement cannot change for a loaded model, so it is read
         // once per stage.
-        let needsPlacement = observedComputeUnits[event.stage] == nil
+        let needsPlacement = observedPlacements[event.stage] == nil
         if Self.trace {
             FileHandle.standardError.write(
                 Data(
@@ -158,18 +176,53 @@ final class StageProfiler: @unchecked Sendable {
             events.append(event)
         }
         if let placement {
-            observedComputeUnits[event.stage] = placement
+            observedPlacements[event.stage] = Self.name(of: placement)
         }
         lock.unlock()
     }
 
-    private static func describe(_ placements: [Stage: MLComputeUnits]) -> String {
-        [Stage.encoder, .decoder, .joint]
+    // MARK: - Native steps
+
+    /// Timestamp a native step, or 0 when nothing is recording.
+    ///
+    /// The natively run decode loop has no Core ML dispatch to intercept, so it
+    /// reports its own steps. Called on the shipping path too, where the
+    /// profiler is never installed and this is one uncontended lock.
+    func nativeStart() -> UInt64 {
+        lock.lock()
+        let active = recording
+        lock.unlock()
+        return active ? Self.now() : 0
+    }
+
+    func recordNative(_ stage: Stage, since start: UInt64) {
+        guard start != 0 else { return }
+        let end = Self.now()
+        lock.lock()
+        if recording, events.count < Self.maximumEvents {
+            events.append(Event(stage: stage, startNanoseconds: start, endNanoseconds: end))
+        }
+        observedPlacements[stage] = "native"
+        lock.unlock()
+    }
+
+    private static func describe(_ placements: [Stage: String]) -> String {
+        [Stage.encoder, .decoder, .nativeDecoder, .joint, .nativeJoint]
             .compactMap { stage -> String? in
                 guard let placement = placements[stage] else { return nil }
-                return "\(name(of: stage))=\(name(of: placement))"
+                return "\(reportedName(of: stage))=\(placement)"
             }
             .joined(separator: " ")
+    }
+
+    /// A native stage reports under the name of the stage it replaces, since
+    /// the placement string already says it did not go through Core ML.
+    private static func reportedName(of stage: Stage) -> String {
+        switch stage {
+        case .nativeDecoder: "decoder"
+        case .nativeJoint: "joint"
+        default: name(of: stage)
+        }
     }
 
     private static func name(of stage: Stage) -> String {
@@ -177,6 +230,8 @@ final class StageProfiler: @unchecked Sendable {
         case .encoder: "encoder"
         case .decoder: "decoder"
         case .joint: "joint"
+        case .nativeDecoder: "native-decoder"
+        case .nativeJoint: "native-joint"
         case .other: "other"
         }
     }
@@ -202,10 +257,13 @@ final class StageProfiler: @unchecked Sendable {
         var encoderCalls = 0
         var decoderCalls = 0
         var jointCalls = 0
+        var nativeDecoderSteps = 0
+        var nativeJointSteps = 0
         var otherCalls = 0
         var encoderNanoseconds: UInt64 = 0
         var decoderNanoseconds: UInt64 = 0
         var jointNanoseconds: UInt64 = 0
+        var nativeNanoseconds: UInt64 = 0
         for event in timeline {
             let elapsed = event.endNanoseconds &- event.startNanoseconds
             switch event.stage {
@@ -218,6 +276,12 @@ final class StageProfiler: @unchecked Sendable {
             case .joint:
                 jointCalls += 1
                 jointNanoseconds &+= elapsed
+            case .nativeDecoder:
+                nativeDecoderSteps += 1
+                nativeNanoseconds &+= elapsed
+            case .nativeJoint:
+                nativeJointSteps += 1
+                nativeNanoseconds &+= elapsed
             case .other:
                 otherCalls += 1
             }
@@ -252,6 +316,8 @@ final class StageProfiler: @unchecked Sendable {
             encoderCalls: encoderCalls,
             decoderCalls: decoderCalls,
             jointCalls: jointCalls,
+            nativeDecoderSteps: nativeDecoderSteps,
+            nativeJointSteps: nativeJointSteps,
             otherCalls: otherCalls,
             melMs: milliseconds(melNanoseconds),
             encoderMs: milliseconds(encoderNanoseconds),
@@ -259,6 +325,7 @@ final class StageProfiler: @unchecked Sendable {
             decodeLoopDispatchMs: milliseconds(decoderNanoseconds &+ jointNanoseconds),
             decoderDispatchMs: milliseconds(decoderNanoseconds),
             jointDispatchMs: milliseconds(jointNanoseconds),
+            decodeLoopNativeMs: milliseconds(nativeNanoseconds),
             postMs: milliseconds(endNanoseconds &- max(lastEnd, startNanoseconds)),
             totalMs: milliseconds(endNanoseconds &- startNanoseconds),
             computeUnits: computeUnits
@@ -336,10 +403,17 @@ final class StageProfiler: @unchecked Sendable {
     /// Core ML registers some engine classes only once a prediction has run, so
     /// the sweep repeats before each utterance and must not double-wrap.
     /// Whether any pipeline stage has yet to be observed dispatching.
+    /// A natively decoded utterance never dispatches the decoder or the joint,
+    /// so the sweep is satisfied by either the Core ML stage or its native
+    /// counterpart. Without that it would rerun before every utterance and
+    /// charge its 0.8 ms to the profiled window.
     private func needsSweep() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return ![Stage.encoder, .decoder, .joint].allSatisfy(observedComputeUnits.keys.contains)
+        let seen = observedPlacements.keys
+        return !(seen.contains(.encoder)
+            && (seen.contains(.decoder) || seen.contains(.nativeDecoder))
+            && (seen.contains(.joint) || seen.contains(.nativeJoint)))
     }
 
     private func claim(_ key: String) -> Bool {

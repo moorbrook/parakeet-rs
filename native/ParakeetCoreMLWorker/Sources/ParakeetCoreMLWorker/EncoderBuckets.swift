@@ -65,12 +65,15 @@ struct EncoderBuckets {
 
     /// Load one manager per requested window. Every model but the encoder is
     /// loaded again per bucket; they are 17 MB together against 569 MB for an
-    /// encoder, and sharing them would mean reaching inside the manager.
+    /// encoder, and sharing them would mean reaching inside the manager. The
+    /// native decode loop does share its weights, since it is built here rather
+    /// than by CoreML — see `NativeRnntDecoder`.
     static func load(
         windows: [Int],
         directory: URL,
         computeUnits: MLComputeUnits,
-        precision: UnifiedEncoderPrecision
+        precision: UnifiedEncoderPrecision,
+        rnntDecoderFactory: UnifiedAsrManager.UnifiedRnntDecoderFactory?
     ) async throws -> Self {
         var loaded: [Bucket] = []
         for seconds in windows.sorted() {
@@ -79,7 +82,8 @@ struct EncoderBuckets {
             let manager = UnifiedAsrManager(
                 configuration: configuration,
                 config: UnifiedConfig(offlineWindowSeconds: seconds),
-                encoderPrecision: precision
+                encoderPrecision: precision,
+                rnntDecoderFactory: rnntDecoderFactory
             )
             try await manager.loadModels(from: directory)
             loaded.append(

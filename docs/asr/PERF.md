@@ -184,7 +184,7 @@ the full tables are in [`bench/README.md`](../../bench/README.md).
 This needed a three-file change to FluidAudio, which hardcodes the 15 s window.
 The package is a local path override reconstituted by
 `scripts/reconstitute-fluidaudio.sh` from the pinned upstream revision plus
-`native/ParakeetCoreMLWorker/patches/fluidaudio-offline-window.patch`; nothing
+`native/ParakeetCoreMLWorker/patches/fluidaudio.patch`; nothing
 of FluidAudio is checked in but the patch, and the change is written to be
 offered upstream.
 
