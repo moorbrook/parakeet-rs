@@ -1,0 +1,171 @@
+{
+  "schema": 2,
+  "description": "Polish quality + latency eval set. Each item is a raw ASR transcript as Parakeet TDT 0.6B v3 would emit it (already capitalised and punctuated per the NVIDIA model card) paired with the polished text the pass is supposed to produce. `bench_llm --eval` runs every item through a polish variant, scores word-level edit distance against `expected`, and reports completion percentiles over the same items, so the quality column and the latency column describe one population.\n\nCategory mix is an ASSUMPTION about real dictation, not a measurement of it: it assumes most utterances need nothing or need one filler removed. Nothing has been sampled to check that, so the blended percentiles it produces must be read alongside the per-category table. The historical `bench_llm` SAMPLE_INPUT is retained as `legacy-bench-sample` so the 1225 ms p50 in bench/README.md §6 stays comparable.",
+  "categories": {
+    "clean": "Nothing to fix. Polish must return the input unchanged.",
+    "short": "Under 4 words. Prompt rule 6 says return unchanged.",
+    "filler-light": "One or two filler words. The common case.",
+    "filler-heavy": "Filler on nearly every clause. Worst case.",
+    "command": "Inline editing commands the speaker dictated.",
+    "technical": "Identifiers, versions, and code fragments that must survive verbatim. Schema 2 corrected technical-01 and technical-03: their v1 `expected` demanded spoken-to-written conversion ('one point zero point two one nine' -> '1.0.219', 'colon colon' -> '::') which system-prompt rule 7 explicitly forbids, so they penalised the model for obeying the prompt. Expected text is now derived from the prompt rules alone.",
+    "long": "Multi-sentence transcript that exercises the output cap."
+  },
+  "items": [
+    {
+      "id": "clean-01",
+      "category": "clean",
+      "input": "The build finished in about four minutes.",
+      "expected": "The build finished in about four minutes."
+    },
+    {
+      "id": "clean-02",
+      "category": "clean",
+      "input": "Can you send me the invoice for last month?",
+      "expected": "Can you send me the invoice for last month?"
+    },
+    {
+      "id": "clean-03",
+      "category": "clean",
+      "input": "I'll be out of the office Thursday and Friday.",
+      "expected": "I'll be out of the office Thursday and Friday."
+    },
+    {
+      "id": "clean-04",
+      "category": "clean",
+      "input": "Let's move the standup to nine thirty.",
+      "expected": "Let's move the standup to nine thirty."
+    },
+    {
+      "id": "clean-05",
+      "category": "clean",
+      "input": "The spindle motor drew twelve amps under load, which is within spec.",
+      "expected": "The spindle motor drew twelve amps under load, which is within spec."
+    },
+    {
+      "id": "clean-06",
+      "category": "clean",
+      "input": "Please confirm the shipment left the dock yesterday afternoon.",
+      "expected": "Please confirm the shipment left the dock yesterday afternoon."
+    },
+    {
+      "id": "short-01",
+      "category": "short",
+      "input": "Yes.",
+      "expected": "Yes."
+    },
+    {
+      "id": "short-02",
+      "category": "short",
+      "input": "Sounds good.",
+      "expected": "Sounds good."
+    },
+    {
+      "id": "short-03",
+      "category": "short",
+      "input": "On my way.",
+      "expected": "On my way."
+    },
+    {
+      "id": "filler-light-01",
+      "category": "filler-light",
+      "input": "Um, I think we should ship it on Tuesday.",
+      "expected": "I think we should ship it on Tuesday."
+    },
+    {
+      "id": "filler-light-02",
+      "category": "filler-light",
+      "input": "So the encoder cable was, uh, pinched behind the panel.",
+      "expected": "So the encoder cable was pinched behind the panel."
+    },
+    {
+      "id": "filler-light-03",
+      "category": "filler-light",
+      "input": "We could, you know, just retry the request twice before giving up.",
+      "expected": "We could just retry the request twice before giving up."
+    },
+    {
+      "id": "filler-light-04",
+      "category": "filler-light",
+      "input": "It's sort of a caching problem, not a network one.",
+      "expected": "It's a caching problem, not a network one."
+    },
+    {
+      "id": "filler-light-05",
+      "category": "filler-light",
+      "input": "Er, can you check whether the tool changer homed correctly?",
+      "expected": "Can you check whether the tool changer homed correctly?"
+    },
+    {
+      "id": "filler-light-06",
+      "category": "filler-light",
+      "input": "I mean, the quote already includes freight to Long Beach.",
+      "expected": "The quote already includes freight to Long Beach."
+    },
+    {
+      "id": "filler-heavy-01",
+      "category": "filler-heavy",
+      "input": "Um so I was thinking we could you know probably uh move the deadline back to next Friday I mean it's getting kind of tight and like the team's been a bit stretched.",
+      "expected": "So I was thinking we could probably move the deadline back to next Friday. It's getting tight and the team's been a bit stretched."
+    },
+    {
+      "id": "filler-heavy-02",
+      "category": "filler-heavy",
+      "input": "Yeah so uh basically the the fixture is like not repeating and um I sort of want to check the clamp pressure first you know.",
+      "expected": "Yeah, so basically the fixture is not repeating, and I want to check the clamp pressure first."
+    },
+    {
+      "id": "legacy-bench-sample",
+      "category": "filler-heavy",
+      "input": "um so I was thinking we could you know probably uh move the deadline back to next Friday I mean it's getting kind of tight and like the team's been a bit stretched with the migration work and all the on-call stuff so yeah let's just push it",
+      "expected": "So I was thinking we could probably move the deadline back to next Friday. It's getting tight and the team's been a bit stretched with the migration work and all the on-call stuff, so let's just push it."
+    },
+    {
+      "id": "command-01",
+      "category": "command",
+      "input": "Ship the parts Monday new paragraph invoice follows separately.",
+      "expected": "Ship the parts Monday.\nInvoice follows separately."
+    },
+    {
+      "id": "command-02",
+      "category": "command",
+      "input": "The order total is nine hundred dollars scratch that the order total is nine hundred and forty dollars.",
+      "expected": "The order total is nine hundred and forty dollars."
+    },
+    {
+      "id": "command-03",
+      "category": "command",
+      "input": "Please call the vendor tomorrow period we need the lead time before Friday period",
+      "expected": "Please call the vendor tomorrow. We need the lead time before Friday."
+    },
+    {
+      "id": "command-04",
+      "category": "command",
+      "input": "Add two spare belts new line add one drive coupling",
+      "expected": "Add two spare belts.\nAdd one drive coupling."
+    },
+    {
+      "id": "technical-01",
+      "category": "technical",
+      "input": "Um, bump serde to one point zero point two one nine in Cargo dot toml.",
+      "expected": "Bump serde to one point zero point two one nine in Cargo dot toml."
+    },
+    {
+      "id": "technical-02",
+      "category": "technical",
+      "input": "The FANUC alarm was SV0417 on axis two, uh, servo parameter out of range.",
+      "expected": "The FANUC alarm was SV0417 on axis two, servo parameter out of range."
+    },
+    {
+      "id": "technical-03",
+      "category": "technical",
+      "input": "Call polish_streaming with PolishMode colon colon On and, you know, check the return.",
+      "expected": "Call polish_streaming with PolishMode colon colon On and check the return."
+    },
+    {
+      "id": "long-01",
+      "category": "long",
+      "input": "Okay so here's where we landed on the Jabil cell. Um, the three stations are all using the same gripper design but station two needs a longer stroke because the part sits deeper in the nest. Uh, Jeff sent over the updated spreadsheet yesterday and the quantities are net of what we already have on the shelf, so don't add the stock back in. Like, the rails are the long pole here, they're eight weeks out from Acer unless we buy the twenty foot lengths and cut them ourselves which is what I'd rather do. I mean we've done that before and it worked fine. So yeah, let's plan on cutting in house and I'll get the purchase order out this week.",
+      "expected": "Okay, so here's where we landed on the Jabil cell. The three stations are all using the same gripper design, but station two needs a longer stroke because the part sits deeper in the nest. Jeff sent over the updated spreadsheet yesterday and the quantities are net of what we already have on the shelf, so don't add the stock back in. The rails are the long pole here, they're eight weeks out from Acer unless we buy the twenty foot lengths and cut them ourselves, which is what I'd rather do. We've done that before and it worked fine. So let's plan on cutting in house and I'll get the purchase order out this week."
+    }
+  ]
+}

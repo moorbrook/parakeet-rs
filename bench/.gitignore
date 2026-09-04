@@ -11,3 +11,6 @@ asr-quality.json
 *-quality.json
 *.csv
 !cleanup-backends.csv
+!polish/
+!polish/*.csv
+!polish/eval.json
