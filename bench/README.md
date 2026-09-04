@@ -232,10 +232,13 @@ synthesized fixture set (0.740, 2.507, 4.967, 8.150, 15.691 s), so it is not a
 like-for-like row-by-row comparison; the before/after below re-measured the old
 code on these exact fixtures instead.
 
-Worker total is resample plus the profiled transcribe interval; it sits 0.7 to
-1.0 ms under the `asr_boundary` internal time, which is the response encode and
-the Swift work outside the profiled window. IPC is unchanged from the
-2026-08-11 boundary measurement and remains under 0.6% of the call.
+Worker total is resample plus the profiled transcribe interval, and with
+resample retired the two are the same number. It now sits within about 0.01 ms
+of the `asr_boundary` internal time (44.789 against 44.795 ms at 5 s), where the
+g38m run had a 0.7 to 1.0 ms gap: that gap was the Swift work around the
+conversion, not around the profiled window. IPC halved with the payload, from
+0.42 to 0.21 ms at 5 s and 1.14 to 0.47 ms at 20 s, and stays under 0.5% of the
+call.
 
 Enabling the profiler costs nothing measurable. Matched 30-repetition runs with
 and without `--stage-timings` measured 35.51 against 35.51 ms at 1 s and 67.09
@@ -249,9 +252,10 @@ all three stages have dispatched, and the model placement is read once per stage
 rather than per call.
 
 These absolute numbers need a quiet machine, which matters more than the
-profiler does. Against the 2026-08-11 published baseline the 1, 3, 5, and 20 s
-buckets land within about 2 ms, and 10 s is roughly 5 ms higher; the interleaved
-A/B above rules the profiler out as the cause. A separate repeat under a
+profiler does. In the g38m run, which still paid the resample, the 1, 3, 5, and
+20 s buckets landed within about 2 ms of the 2026-08-11 published baseline and
+10 s was roughly 5 ms higher; the interleaved A/B above ruled the profiler out
+as the cause. A separate repeat under a
 competing job reproduced the dispatch counts exactly and kept the encoder flat
 at 26.4 to 28.5 ms, with resample and the decode loop 10 to 20% higher. The
 shape of the breakdown is stable; the millisecond values are not, so compare

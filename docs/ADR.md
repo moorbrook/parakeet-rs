@@ -1925,6 +1925,15 @@ Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
 
+- **2026-09-04** — [ADR-0030](#0030--one-16-khz-resampler-in-rust-run-during-capture)
+  accepted and implemented. One Kaldi sinc resampler in `src/resample.rs`,
+  run per cpal callback, retires FluidAudio's per-call `AVAudioConverter`
+  from the endpoint path: resample falls from 22.4 to 0.001 ms at 5 s and
+  ASR p50 from 67.0 to 44.5 ms, with gold unchanged at its baseline WER
+  and CER. Capturing at 16 kHz was rejected — the built-in microphone does
+  not offer the rate, and requesting an unlisted one changes the device's
+  nominal rate system-wide.
+
 - **2026-08-11** — [ADR-0029](#0029--contextual-macos-permission-onboarding-and-recovery)
   added: ZoomItForMac-inspired permission-state separation, contextual
   request scopes, explicit denied/restricted/revoked recovery, targeted
