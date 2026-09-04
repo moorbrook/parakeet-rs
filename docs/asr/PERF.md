@@ -141,6 +141,40 @@ leaving every other number plausible.
 Full tables, dispatch counts, and method are in
 [`bench/README.md`](../../bench/README.md).
 
+## Short-utterance encoder cost — 2026-09-04
+
+The offline encoder is compiled at a fixed 15 s mel window and every utterance
+is zero-padded to it, so short dictation paid a flat 25.5 ms of encoder plus
+3.1 ms of mel however little was said. Compiling the same NVIDIA checkpoint at
+shorter windows and dispatching each utterance to the narrowest one that holds
+it removes most of that. **A one-second utterance now costs 7.7 ms of encoder
+and 0.7 ms of mel instead of 26.0 and 3.2, and the whole ASR call falls from
+36.0 to 15.0 ms p50.** At 2.8 s the encoder is 9.7 ms against 25.3, at 4.9 s
+9.98 against 25.4, and at 7.0 s 12.5 against 25.6; utterances past the longest
+bucket are unchanged. Buckets of 2, 5 and 8 seconds cost 1.77 GB of disk and
+take peak RSS from 0.10 to 0.19 GiB.
+
+Quality is unchanged and checked at the transcript, not the score: matched
+ten-repetition gold runs differing only in model directory both give 5.434783%
+WER and 3.571429% CER with zero spread, and every hypothesis is byte-identical
+between the two arms. Corpus decode p50 falls from 0.4534 s to 0.3397 s
+(75.1× to 100.2× RTFx).
+
+Encoder cost is close to linear in the compiled window but not exactly: it rises
+7.5 µs per mel frame from 201 to 801 frames, 30.7 µs per frame from 801 to 1201,
+and 5.4 µs again to 1501. About 6 ms is fixed cost that no shorter window
+removes. That shape is why 8 s is worth compiling and 12 s is not, and it is
+unexplained. The compute plan behind it, and the per-operation device
+assignments for all three models, are in [`COMPUTE_PLAN.md`](COMPUTE_PLAN.md);
+the full tables are in [`bench/README.md`](../../bench/README.md).
+
+This needed a three-file change to FluidAudio, which hardcodes the 15 s window.
+The package is a local path override reconstituted by
+`scripts/build-coreml-worker.sh` from the pinned upstream revision plus
+`native/ParakeetCoreMLWorker/patches/fluidaudio-offline-window.patch`; nothing
+of FluidAudio is checked in but the patch, and the change is written to be
+offered upstream.
+
 ## Core ML runtime-plan tuner — 2026-08-11
 
 Release worker, ten corpus repetitions and three model-load repetitions on the
