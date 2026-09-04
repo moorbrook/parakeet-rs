@@ -50,7 +50,7 @@ use serde::Deserialize;
 
 use parakeet_dictation::performance::next_session_id;
 use parakeet_dictation::polish::{
-    self, GenerateOutcome, PolishStrategy, PrefixCache, PromptTemplate, SkipPolicy,
+    self, GenerateConfig, GenerateOutcome, PolishStrategy, PrefixCache, PromptTemplate, SkipPolicy,
     PROD_GENERATE_CONFIG,
 };
 
@@ -89,6 +89,11 @@ struct ItemResult {
     /// skip policy bypassed the model entirely.
     total: Duration,
     out_tokens: u32,
+    /// Prompt tokens served from the prefix cache rather than
+    /// prefilled. Stays zero when llama.cpp refuses partial KV removal,
+    /// which is how a `--prompt-cache` run reports that the cache did
+    /// nothing rather than quietly claiming a win.
+    reused_prompt_tokens: usize,
     /// Polish bypassed by [`SkipPolicy`]; no decode happened.
     skipped: bool,
     /// `edits-only` produced a reply that [`polish::apply_edits`]
@@ -404,6 +409,7 @@ fn run_eval_item(
             category: item.category.clone(),
             total: Duration::ZERO,
             out_tokens: 0,
+            reused_prompt_tokens: 0,
             skipped: true,
             edit_fallback: false,
             wer: word_error_rate(&item.expected, &item.input),
@@ -437,6 +443,7 @@ fn run_eval_item(
         category: item.category.clone(),
         total: outcome.ttft + outcome.gen_time,
         out_tokens: outcome.out_tokens,
+        reused_prompt_tokens: outcome.reused_prompt_tokens,
         skipped: false,
         edit_fallback,
         wer: word_error_rate(&item.expected, &produced),
@@ -483,11 +490,18 @@ fn polish_full_text_output(reply: &str) -> String {
 struct Runner<'m> {
     backend: &'m LlamaBackend,
     model: &'m LlamaModel,
+    /// Decode budget for the strategy under test. `edits-only` runs
+    /// under a tighter output cap than `full-text` — see
+    /// `polish::EDITS_GENERATE_CONFIG`.
+    cfg: GenerateConfig,
     cached: Option<(llama_cpp_2::context::LlamaContext<'m>, PrefixCache)>,
 }
 
 impl<'m> Runner<'m> {
     fn new(backend: &'m LlamaBackend, model: &'m LlamaModel, args: &Args) -> Result<Self> {
+        // Context size is the same across strategies; only the output
+        // cap differs, so one context serves either.
+        let cfg = GenerateConfig::for_strategy(args.strategy);
         let cached = if args.prompt_cache {
             let ctx = polish::new_context(backend, model, &PROD_GENERATE_CONFIG)?;
             Some((ctx, PrefixCache::new()))
@@ -497,6 +511,7 @@ impl<'m> Runner<'m> {
         Ok(Self {
             backend,
             model,
+            cfg,
             cached,
         })
     }
@@ -504,27 +519,16 @@ impl<'m> Runner<'m> {
     fn generate(&mut self, prompt: &str) -> Result<(String, GenerateOutcome)> {
         let mut buf = String::new();
         let outcome = match &mut self.cached {
-            Some((ctx, cache)) => polish::generate_in(
-                ctx,
-                self.model,
-                prompt,
-                &PROD_GENERATE_CONFIG,
-                cache,
-                |piece| {
+            Some((ctx, cache)) => {
+                polish::generate_in(ctx, self.model, prompt, &self.cfg, cache, |piece| {
                     buf.push_str(piece);
                     Ok(())
-                },
-            )?,
-            None => polish::generate(
-                self.backend,
-                self.model,
-                prompt,
-                &PROD_GENERATE_CONFIG,
-                |piece| {
-                    buf.push_str(piece);
-                    Ok(())
-                },
-            )?,
+                })?
+            }
+            None => polish::generate(self.backend, self.model, prompt, &self.cfg, |piece| {
+                buf.push_str(piece);
+                Ok(())
+            })?,
         };
         Ok((buf, outcome))
     }
@@ -546,9 +550,10 @@ fn log_timer_item(sid: &str, model_tag: &str, item_id: &str, outcome: &GenerateO
     let (ttft_ms, gen_ms, total_ms, tokens_per_s) = timer_fields(outcome);
     log::info!(
         "llm_timer session_id={sid} model={model_tag} item={item_id} prompt_tokens={} \
-         out_tokens={} ttft_ms={ttft_ms} gen_ms={gen_ms} \
+         reused_prompt_tokens={} out_tokens={} ttft_ms={ttft_ms} gen_ms={gen_ms} \
          total_ms={total_ms} tokens_per_s={tokens_per_s:.1} truncated={} skipped=false",
         outcome.prompt_tokens,
+        outcome.reused_prompt_tokens,
         outcome.out_tokens,
         outcome.truncated
     );
@@ -631,12 +636,20 @@ fn report(args: &Args, model_tag: &str, set: &EvalSet, results: &[ItemResult]) -
     let fallbacks = first_rep.iter().filter(|r| r.edit_fallback).count();
     let mean_out_tokens =
         f64::from(first_rep.iter().map(|r| r.out_tokens).sum::<u32>()) / first_rep.len() as f64;
+    // Measured over every rep: the first pass through the set can never
+    // reuse anything (the cache starts empty), so a first-rep-only mean
+    // would understate a working cache and hide a broken one.
+    let mean_reused = results
+        .iter()
+        .map(|r| r.reused_prompt_tokens)
+        .sum::<usize>() as f64
+        / results.len() as f64;
 
     log::info!(
         "llm_eval_summary model={model_tag} variant={} prompt_cache={} skip_min_words={} \
          n={} items={} mean_ms={mean_ms:.1} p50_ms={p50} p95_ms={p95} p99_ms={p99} \
          mean_wer={mean_wer:.4} exact={exact}/{} skipped={skipped}/{} edit_fallbacks={fallbacks}/{} \
-         mean_out_tokens={mean_out_tokens:.1}",
+         mean_out_tokens={mean_out_tokens:.1} mean_reused_prompt_tokens={mean_reused:.1}",
         strategy_name(args.strategy),
         args.prompt_cache,
         args.skip.min_words,

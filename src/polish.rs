@@ -89,7 +89,17 @@ What to change:\n\
 4. Do NOT paraphrase, summarise, expand, reorder, or improve the wording, and do not add information the speaker did not say.\n\
 5. Leave technical terms, names, and code-like fragments exactly as transcribed.\n\
 6. If the input is empty, a single word, or unintelligible, output NONE.\n\
-7. Do not call any tools.";
+7. Do not call any tools.\n\
+\n\
+Never output the corrected transcription itself. Never repeat these instructions.\n\
+\n\
+Example. Transcription:\n\
+um so the fixture is like not repeating and I want to check the clamp pressure new line also order two belts\n\
+Your entire output:\n\
+um so the ==> So the\n\
+is like not ==> is not\n\
+pressure new line also ==> pressure.\\nAlso\n\
+two belts ==> two belts.";
 
 /// Knob set for [`generate`]. Keep two production-facing instances:
 /// [`PROD_GENERATE_CONFIG`] for the real polish path, and (implicitly)
@@ -120,6 +130,41 @@ pub const PROD_GENERATE_CONFIG: GenerateConfig = GenerateConfig {
     // pasted as if complete.
     max_output_tokens: 768,
 };
+
+/// Output cap for [`PolishStrategy::EditsOnly`].
+///
+/// An edit list is proportional to the number of *fixes*, not to the
+/// length of the dictation, so it does not need the full-text budget.
+/// The 768-token cap is actively harmful here: a model that ignores the
+/// format and starts reciting the instructions back runs to the cap and
+/// costs 4 s before the reply is rejected. 256 bounds that worst case at
+/// roughly 6 s of decode on the 4B while still fitting about 40 edits —
+/// far more than a dictation ever needs.
+///
+/// Truncation is safe in this strategy: [`apply_edits`] never applies a
+/// partial list, so a cut-off reply becomes a raw-transcript fallback
+/// rather than a half-polished paste.
+pub const EDITS_GENERATE_CONFIG: GenerateConfig = GenerateConfig {
+    ctx_size: 2048,
+    max_output_tokens: 256,
+};
+
+// The edits cap only earns its keep while it is materially tighter than
+// the full-text budget. A future edit that raises it back toward 768
+// re-opens the runaway-reply cost this constant exists to bound, so
+// fail the build rather than a bench run weeks later.
+const _: () =
+    assert!(EDITS_GENERATE_CONFIG.max_output_tokens * 2 <= PROD_GENERATE_CONFIG.max_output_tokens);
+
+impl GenerateConfig {
+    /// The decode budget a strategy runs under.
+    pub fn for_strategy(strategy: PolishStrategy) -> Self {
+        match strategy {
+            PolishStrategy::FullText => PROD_GENERATE_CONFIG,
+            PolishStrategy::EditsOnly => EDITS_GENERATE_CONFIG,
+        }
+    }
+}
 
 /// Which shape of output the polish pass asks the model for.
 ///
@@ -188,6 +233,13 @@ pub struct PolishTuning {
 #[derive(Clone, Copy, Debug)]
 pub struct GenerateOutcome {
     pub prompt_tokens: usize,
+    /// Prompt tokens served from a [`PrefixCache`] rather than
+    /// prefilled. Zero for every call through [`generate`], which
+    /// starts from an empty context. Reported so a run cannot claim a
+    /// prompt-cache benefit it did not receive — llama.cpp refuses
+    /// partial KV removal on some architectures and this silently
+    /// drops to zero when it does.
+    pub reused_prompt_tokens: usize,
     pub out_tokens: u32,
     /// Wall-clock from start-of-call to end-of-prefill. Includes
     /// `LlamaContext::new` + tokenize + prefill decode.
@@ -331,7 +383,7 @@ impl LlamaPolish {
             &self.backend,
             &self.model,
             &prompt,
-            &PROD_GENERATE_CONFIG,
+            &EDITS_GENERATE_CONFIG,
             |piece| {
                 reply.push_str(piece);
                 Ok(())
@@ -766,8 +818,24 @@ where
     // at positions `prompt_tokens..`. Anything left behind would be
     // attended to at the wrong position.
     let reuse_u32 = u32::try_from(reuse).context("prefix cache length exceeds u32")?;
-    ctx.clear_kv_cache_seq(Some(0), Some(reuse_u32), None)
+    // `llama_memory_seq_rm` returns false when the memory module cannot
+    // remove a *partial* sequence. Qwen 3.5 is a hybrid Gated-DeltaNet
+    // architecture (ADR-0018): its recurrent state carries no per-token
+    // position to roll back to, so llama.cpp refuses to truncate it and
+    // leaves the cache untouched. Reusing the prefix anyway makes the
+    // next decode fail with "inconsistent sequence positions" — the
+    // cache's last position is still the previous call's last generated
+    // token. Fall back to a full clear and a complete prefill.
+    let partial_removed = ctx
+        .clear_kv_cache_seq(Some(0), Some(reuse_u32), None)
         .context("trim kv cache to reusable prefix")?;
+    let reuse = if partial_removed || reuse == 0 {
+        reuse
+    } else {
+        ctx.clear_kv_cache_seq(Some(0), None, None)
+            .context("clear kv cache after refused partial removal")?;
+        0
+    };
     // Committed to a reuse point; if the prefill below fails, the cache
     // no longer describes the context. Record the new prompt only after
     // the decode succeeds, and clear now so an early return can't leave
@@ -836,6 +904,7 @@ where
 
     Ok(GenerateOutcome {
         prompt_tokens,
+        reused_prompt_tokens: reuse,
         out_tokens: n_decode,
         ttft,
         gen_time,
@@ -1349,6 +1418,48 @@ mod tests {
         // tokens).
         assert_eq!(PROD_GENERATE_CONFIG.ctx_size, 2048);
         assert_eq!(PROD_GENERATE_CONFIG.max_output_tokens, 768);
+    }
+
+    #[test]
+    fn edits_config_caps_output_well_below_the_full_text_budget() {
+        // The point of the edits-only strategy is a short reply. If its
+        // cap ever creeps back up to the full-text budget, a model that
+        // ignores the format silently costs the full worst-case decode
+        // before the reply is rejected.
+        assert_eq!(
+            EDITS_GENERATE_CONFIG.ctx_size,
+            PROD_GENERATE_CONFIG.ctx_size
+        );
+        assert_eq!(EDITS_GENERATE_CONFIG.max_output_tokens, 256);
+    }
+
+    #[test]
+    fn generate_config_for_strategy_matches_the_constants() {
+        assert_eq!(
+            GenerateConfig::for_strategy(PolishStrategy::FullText).max_output_tokens,
+            PROD_GENERATE_CONFIG.max_output_tokens
+        );
+        assert_eq!(
+            GenerateConfig::for_strategy(PolishStrategy::EditsOnly).max_output_tokens,
+            EDITS_GENERATE_CONFIG.max_output_tokens
+        );
+    }
+
+    #[test]
+    fn edits_prompt_carries_a_worked_example_in_the_output_format() {
+        // Without a worked example a small model answers with the
+        // corrected transcript, or recites the instructions back. The
+        // example is what makes the format stick, so a future prompt
+        // edit that drops it must fail here rather than in a bench run
+        // weeks later.
+        let p = PromptTemplate::edits_only().render("x");
+        assert!(p.contains("Example. Transcription:"));
+        assert!(p.contains("um so the ==> So the"));
+        assert!(
+            p.contains(r"pressure.\nAlso"),
+            "escape example must survive"
+        );
+        assert!(p.contains("Never output the corrected transcription itself."));
     }
 
     // ── Edits-only strategy ─────────────────────────────────────────
