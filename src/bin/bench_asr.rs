@@ -254,6 +254,7 @@ fn print_usage() {
         "usage: bench_asr --wav PATH [--reps N] [--warmup-reps N]\n\
          \x20                [--backend sherpa|coreml-unified|coreml-tdt-v3]\n\
         \x20                [--tdt-chunk-concurrency N]\n\
+        \x20                [--tdt-decode-compute-units NAME]\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\
          \x20                [--compute-units all|cpu-and-gpu|cpu-and-neural-engine|cpu-only]\n\
          \x20                [--stage-timings]\n\
@@ -667,6 +668,50 @@ mod tests {
         stages.mel_ms = 0.0;
         let error = validate_stage_report(&stages).expect_err("a missing encoder must fail");
         assert!(error.to_string().contains("no encoder dispatches"));
+    }
+
+    #[test]
+    fn overlapping_dispatch_fails_because_the_split_double_counts() {
+        // FluidAudio's TDT long-form path decodes chunks concurrently, which
+        // makes the stage durations timeline sums over overlapping intervals.
+        // Publishing that split would report more dispatch than wall time.
+        let mut stages = healthy();
+        stages.overlapped_dispatch_ms = 85.55;
+        let error =
+            validate_stage_report(&stages).expect_err("overlapping dispatch must fail the run");
+        let message = error.to_string();
+        assert!(message.contains("overlapping other dispatch"));
+        assert!(message.contains("--tdt-chunk-concurrency 1"));
+    }
+
+    #[test]
+    fn a_mel_graph_that_did_not_run_once_per_window_fails() {
+        // TDT runs Preprocessor.mlmodelc exactly once per window. Any other
+        // count means the front end changed and the mel/encoder split is no
+        // longer describing what ran.
+        let mut stages = healthy();
+        stages.windows = 2;
+        stages.encoder_calls = 2;
+        stages.preprocessor_calls = 3;
+        let error = validate_stage_report(&stages)
+            .expect_err("a mismatched mel front-end count must fail");
+        assert!(error.to_string().contains("mel front-end dispatches"));
+    }
+
+    #[test]
+    fn a_unified_report_without_a_mel_graph_still_validates() {
+        // Zero is the Unified shape, not a mismatch: its mel is Swift.
+        let mut stages = healthy();
+        stages.preprocessor_calls = 0;
+        validate_stage_report(&stages).expect("Unified reports no mel dispatches");
+    }
+
+    #[test]
+    fn a_tdt_report_with_one_mel_graph_call_per_window_validates() {
+        let mut stages = healthy();
+        stages.preprocessor_calls = stages.windows;
+        stages.preprocessor_ms = 1.04;
+        validate_stage_report(&stages).expect("one mel dispatch per window is the TDT shape");
     }
 
     #[test]

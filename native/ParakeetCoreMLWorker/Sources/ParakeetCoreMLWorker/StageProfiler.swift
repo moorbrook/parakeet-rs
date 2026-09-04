@@ -304,7 +304,7 @@ final class StageProfiler: @unchecked Sendable {
     /// Total dispatch time counted more than once: the sum of every event's
     /// duration less the length of their union. Zero for a serial pipeline.
     /// `timeline` is already sorted by start.
-    private static func overlap(in timeline: [Event]) -> UInt64 {
+    static func overlap(in timeline: [Event]) -> UInt64 {
         var summed: UInt64 = 0
         var union: UInt64 = 0
         var mergedStart: UInt64?

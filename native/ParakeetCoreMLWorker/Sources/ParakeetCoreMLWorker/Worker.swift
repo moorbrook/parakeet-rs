@@ -329,8 +329,14 @@ private struct ParakeetCoreMLWorker {
             }
         }
         let loadSeconds = seconds(since: loadStart)
-        FileHandle.standardError.write(
-            Data("parakeet-coreml-worker: model variant \(options.modelVariant.rawValue)\n".utf8))
+        // Only when it is not the shipping default: every dictation launch
+        // writes this to the app's stderr, and "unified" says nothing.
+        if options.modelVariant != .unified {
+            FileHandle.standardError.write(
+                Data(
+                    "parakeet-coreml-worker: model variant \(options.modelVariant.rawValue)\n"
+                        .utf8))
+        }
         if !buckets.isEmpty {
             let windows = buckets.descriptions.joined(separator: ", ")
             FileHandle.standardError.write(

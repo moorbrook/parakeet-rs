@@ -554,11 +554,26 @@ Where the flat 14 ms goes, from the same runs:
 | post | **0.03** | 14.72 | **0.06** | 15.06 |
 | total | **31.53** | 45.01 | **44.78** | 58.90 |
 
-TDT's encoder is 1.6 to 2.2 ms *faster* and its mel front end is 1.8 ms
-cheaper. Both are erased by a post-dispatch tail that is flat at about 15 ms
-regardless of length, against Unified's 0.03 to 0.12 ms. That tail is
-tokenizer decode and token-timing assembly inside FluidAudio's TDT path, after
-the last Core ML dispatch; it is not the duration head and not the model.
+TDT's encoder is 1.6 to 2.2 ms *faster* on these fixtures and its mel front end
+is 1.8 ms cheaper. Both are erased by a post-dispatch tail — the interval
+between the last Core ML dispatch and the end of `transcribe` — which Unified
+pays 0.03 to 0.12 ms for and TDT pays about 15 ms for.
+
+That tail is **unexplained**. It is close to constant where a per-token cost
+could not be: across the one-window fixtures it moves from 14.72 to 15.16 ms
+while decoder calls go from 5 to 52 and joint calls from 13 to 59, so tokenizer
+decode and token-timing assembly are ruled out as the bulk of it. It rises to
+19.58 ms on the two-window 20 s fixture, so some of it is per-window. Candidates
+not separated here: overlap-merge and hypothesis assembly in FluidAudio's
+`ChunkProcessor`, the progress-emitter session it opens and closes per
+utterance, or teardown of the per-utterance decoder state. None is measured;
+the profiler's timeline ends at the last dispatch and nothing instruments what
+follows. Whatever it is, it is worth more than the joint graph to anyone
+revisiting TDT, and it is not the duration head.
+
+The encoder result should be read narrowly too: 23.8 to 23.9 ms against 25.4 to
+26.0 ms is a real and repeatable difference on this hardware at this precision,
+but both are the same 15 s graph shape and the gap is under 10%.
 
 ### The duration head skips frames, and the joint graph eats the saving
 
@@ -572,7 +587,7 @@ Paired 14.225 s fixture, one 15 s window, 10 repetitions after 3 warmups:
 
 The frame skipping is real and large: 92 joint predictions against 261, 2.84×
 fewer on identical audio. It returns nothing, because each TDT joint call costs
-about 2.8× what a Unified one does.
+3.06× what a Unified one does — 0.300 ms against 0.098 ms.
 
 The third row settles why. FluidAudio's TDT loader places the decoder and joint
 on CPU+ANE where the Unified loader pins them CPU-only, which was the other
@@ -601,7 +616,19 @@ exactly and TDT is 2.17 points over. One word edit on this corpus is 1.09
 points, so the margin is two whole errors, not rounding. TDT's absolute 7.61%
 is still under the 8.00% ceiling; the gate that fails is the regression one.
 
-Per category, TDT ties or loses everywhere and wins nothing:
+Read per fixture, the difference is narrower than the aggregate suggests. Four
+of seven are clean in both arms. Of the three that fail, two fail *identically*:
+
+| fixture | reference | Unified | TDT v3 |
+|---|---|---|---|
+| `slurp-alarm-seven-thirty-close` | "Please wake me up at seven thirty AM." | "…at seven hundred and thirty AM" — 2 edits | "…at seven hundred and thirty AM." — 2 edits |
+| `slurp-music-olly-tactics-close` | "Hey Olly, play playlist Tactics from music." | "Hey Ollie, play playlist tactics for music" — 2 edits | "Hey Ollie, play playlist tactics for music." — 2 edits |
+| `slurp-stock-ibm-close` | "Is IBM up today?" | "Is IPM up today?" — **1 edit** | "It's I PM up today." — **3 edits** |
+
+**The entire 5 → 7 regression is the IBM fixture.** Both models mishear the
+acronym; Unified corrupts one word and TDT splits it into three. Every
+per-category difference below traces to that one fixture, because it is the
+only one the two arms disagree on:
 
 | category | Unified WER | TDT v3 WER |
 |---|---:|---:|
@@ -612,18 +639,13 @@ Per category, TDT ties or loses everywhere and wins nothing:
 | punctuation | **5.43%** | 7.61% |
 | general, long, noisy | 0.00% | 0.00% |
 
-The two extra errors are both in command phrasing:
-
-| fixture | reference | TDT v3 |
-|---|---|---|
-| `slurp-stock-ibm-close` | "Is IBM up today?" | "It's I PM up today." |
-| `slurp-alarm-seven-thirty-close` | "Please wake me up at seven thirty AM." | "Please wake me up at seven hundred and thirty AM." |
-| `slurp-music-olly-tactics-close` | "Hey Olly, play playlist Tactics from music." | "Hey Ollie, play playlist tactics for music." |
-
-Unified gets the first two inside the frozen baseline and misses the third the
-same way. Spoken numbers and proper nouns under command phrasing carry
-dictation, and that is exactly where the multilingual checkpoint gives ground
-to the EN-tuned one.
+That is worth stating plainly: on this corpus the gate is decided by a single
+four-word utterance. The no-go stands — the cap is 0.00 points and a regression
+is a regression — but "TDT is worse at English" is more than these seven
+fixtures can support. What they do support is that TDT is not *better*, and
+that it fails a gate Unified passes. A wider corpus would be needed before
+claiming a general English quality gap, and it is not worth building one while
+the latency case below also fails.
 
 TDT's one win is warm model load, 0.100 s against 0.135 s, which is off the
 dictation path either way.
@@ -669,6 +691,9 @@ REPETITIONS=10 COREML_WORKER=target/release/parakeet-coreml-worker \
 
 `--tdt-chunk-concurrency N` raises TDT's long-form chunk parallelism for a
 wall-clock arm; the per-stage rows are correctly refused at anything above 1.
+`PARAKEET_COREML_TDT_V3_MODEL_DIR` overrides the TDT directory alone, so a
+shell that already exports `PARAKEET_COREML_MODEL_DIR` for the shipping pack
+does not have to be unset to run the challenger.
 
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 

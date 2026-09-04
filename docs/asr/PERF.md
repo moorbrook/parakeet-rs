@@ -335,12 +335,18 @@ at that sample size. `bench/README.md` records the rows and the reasoning.
 v3 records 7.608696% WER / 3.991597% CER against the frozen Unified baseline of
 5.434783% / 3.571429%. That is seven word edits of 92 against five. The
 manifest sets `max_wer_regression_percent` to 0.00, so the bar is WER ≤
-5.434783% exactly and TDT is 2.17 points over — two whole errors on a corpus
-where one edit is 1.09 points. Its absolute 7.61% is still under the 8.00%
-ceiling; the gate that fails is the regression one. TDT ties or loses every
-category and wins none, worst at custom-vocabulary (45.45% against 27.27%) and
-commands (17.07% against 12.20%). Keep Unified as the default and do not open a
-switch issue.
+5.434783% exactly and TDT is 2.17 points over. Its absolute 7.61% is still
+under the 8.00% ceiling; the gate that fails is the regression one. Keep
+Unified as the default and do not open a switch issue.
+
+The quality margin is thinner than the aggregate reads. Four of seven fixtures
+are clean in both arms and two more fail identically in both; the whole 5 → 7
+difference is one four-word utterance, "Is IBM up today?", which Unified renders
+"Is IPM up today?" (1 edit) and TDT renders "It's I PM up today." (3 edits).
+Every per-category difference traces to that fixture. So the corpus supports
+"TDT is not better and fails a gate Unified passes", not "TDT is worse at
+English"; a wider corpus would be needed for the stronger claim. The latency
+result below is what makes building one pointless.
 
 | arm | WER | CER | corpus p50 | RTFx p50 | peak RSS | load | gate |
 |---|---:|---:|---:|---:|---:|---:|---|
@@ -355,18 +361,24 @@ here at any length.
 
 TDT's duration head does what it claims — 92 joint predictions against
 Unified's 261 on a 14.225 s fixture, 2.84× fewer — and returns nothing, because
-each TDT joint call costs about 2.8× what a Unified one does. Pinning the
-decoder and joint CPU-only, where the Unified loader pins them, moved joint
-dispatch from 27.58 ms to 28.90 ms: slightly worse, so placement is not the
-cause. What is left is the graph. `JointDecisionv3` computes `top_k_ids` and
-`top_k_logits` at K=64 on every call for script-aware language filtering, over
-an 8,192-entry vocabulary against Unified's 1,024.
+each TDT joint call costs 3.06× what a Unified one does, 0.300 ms against
+0.098 ms. Pinning the decoder and joint CPU-only, where the Unified loader pins
+them, moved joint dispatch from 27.58 ms to 28.90 ms: slightly worse, so
+placement is not the cause. What is left is the graph. `JointDecisionv3`
+computes `top_k_ids` and `top_k_logits` at K=64 on every call for script-aware
+language filtering, over an 8,192-entry vocabulary against Unified's 1,024.
 
-Separately, TDT carries a post-dispatch tail flat at about 15 ms at every
-length — tokenizer decode and token-timing assembly after the last Core ML
-dispatch — against Unified's 0.03 to 0.12 ms. That tail alone is the whole of
-the 14 ms deficit from 1 to 10 seconds, and it erases a genuine 1.6 to 2.2 ms
-encoder win and a 1.8 ms mel win.
+Separately, and larger, TDT carries an **unexplained** post-dispatch tail of
+about 15 ms against Unified's 0.03 to 0.12 ms. It is close to constant where a
+per-token cost could not be — 14.72 to 15.16 ms while decoder calls go from 5
+to 52 — so tokenizer decode and token-timing assembly are ruled out as the bulk
+of it; it rises to 19.58 ms on the two-window fixture, so some is per-window.
+Overlap-merge in `ChunkProcessor`, the per-utterance progress-emitter session,
+and decoder-state teardown are candidates, none measured: the profiler's
+timeline ends at the last dispatch. That tail alone is the whole of the 14 ms
+deficit from 1 to 10 seconds, and it erases a real 1.6 to 2.2 ms encoder
+advantage and 1.8 ms mel advantage. It is the first thing to measure if TDT is
+ever revisited.
 
 TDT's published Core ML encoder takes a fixed `[1, 128, 1501]` mel, the same
 15 s window the Unified offline encoder takes, so the bucketed short-window

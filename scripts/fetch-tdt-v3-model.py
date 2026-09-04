@@ -124,7 +124,12 @@ def main() -> int:
                 return 1
             if want != entry:
                 print(
-                    f"{relative} does not match the manifest: {entry} != {want}",
+                    f"{relative} does not match the manifest.\n"
+                    f"  on disk:   {entry}\n"
+                    f"  manifest:  {want}\n"
+                    f"Delete {destination} and rerun to refetch it. If a fresh "
+                    f"download still mismatches, the pinned revision moved and "
+                    f"the manifest is what needs reviewing, not the file.",
                     file=sys.stderr,
                 )
                 return 1

@@ -270,7 +270,17 @@ impl CoreMlWorkerConfig {
             Err(std::env::VarError::NotPresent) => CoreMlModelVariant::default(),
             Err(error) => return Err(error).context("reading PARAKEET_COREML_MODEL_VARIANT"),
         };
-        let model_directory = match std::env::var_os("PARAKEET_COREML_MODEL_DIR") {
+        // The variant-specific override wins so both packs can be configured
+        // at once: a shell that exports `PARAKEET_COREML_MODEL_DIR` for the
+        // shipping pack would otherwise silently hand that directory to TDT,
+        // which fails at load having named the wrong folder.
+        let variant_directory = match model_variant {
+            CoreMlModelVariant::Unified => None,
+            CoreMlModelVariant::TdtV3 => std::env::var_os("PARAKEET_COREML_TDT_V3_MODEL_DIR"),
+        };
+        let model_directory = match variant_directory
+            .or_else(|| std::env::var_os("PARAKEET_COREML_MODEL_DIR"))
+        {
             Some(path) => PathBuf::from(path),
             None => dirs::data_dir()
                 .ok_or_else(|| anyhow!("macOS application-support directory is unavailable"))?
