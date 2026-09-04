@@ -45,7 +45,7 @@ DEVICE="${DEVICE:-BlackHole 2ch}"
 IDLE_GAP_MS="${IDLE_GAP_MS:-60000}"
 KEEPALIVE_MS="${KEEPALIVE_MS:-250}"
 LENGTHS=(1 5)
-SWEEP_GAPS_MS=(100 500 2000 5000 10000 60000)
+SWEEP_GAPS_MS=(0 100 500 2000 5000 10000 60000)
 SWEEP_REPS="${SWEEP_REPS:-8}"
 WAV_DIR="bench/audio"
 ENERGY_WINDOW_S="${ENERGY_WINDOW_S:-60}"
@@ -177,9 +177,13 @@ energy)
         # Wait for the worker to exist, then sample its cumulative CPU time
         # across the window. This needs no root and captures the host-side
         # cost of the cadence; powermetrics below adds the engine's own draw.
+        #
+        # Match on the child of THIS bench process, not on the newest worker
+        # named parakeet-coreml-worker: other worktrees on this machine run
+        # the same binary, and a name match would silently sample a stranger.
         local worker_pid="" waited=0
         while [[ -z "$worker_pid" && $waited -lt 60 ]]; do
-            worker_pid="$(pgrep -n -f parakeet-coreml-worker || true)"
+            worker_pid="$(pgrep -P "$bench_pid" -f parakeet-coreml-worker || true)"
             [[ -n "$worker_pid" ]] || { sleep 1; waited=$((waited + 1)); }
         done
         if [[ -z "$worker_pid" ]]; then
@@ -191,10 +195,21 @@ energy)
         sleep 5
         local before after
         before="$(ps -o cputime= -p "$worker_pid" | tr -d ' ')"
+        # `grep` on an unexpected sampler name would yield nothing AND return
+        # before the window elapsed, which would quietly turn a 60 s
+        # measurement into a 0 s one. Sample into a file for the full window
+        # and filter afterwards, so the window length never depends on what
+        # powermetrics chose to print.
+        local pm_out="bench/idle-energy-${label}.powermetrics"
         if command -v powermetrics >/dev/null && sudo -n true 2>/dev/null; then
             sudo -n powermetrics --samplers ane_power -i 5000 -n \
-                "$((ENERGY_WINDOW_S / 5))" 2>/dev/null \
-                | grep -i "ANE Power" | tee -a "$LOG" || true
+                "$((ENERGY_WINDOW_S / 5))" >"$pm_out" 2>/dev/null || true
+            if grep -i -q "ANE" "$pm_out"; then
+                grep -i "ANE" "$pm_out" | tee -a "$LOG"
+            else
+                echo "  powermetrics produced no ANE rows; check the sampler name" \
+                    | tee -a "$LOG"
+            fi
         else
             echo "  powermetrics needs an interactive sudo; reporting worker CPU only" \
                 | tee -a "$LOG"
