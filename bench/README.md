@@ -463,6 +463,38 @@ low deliberately: within-item variance is negligible (§6's p99/p50 =
 run-to-run noise. `p99` over 78 samples is a single item and is not
 quoted below.
 
+**Skipped items enter the percentiles as 0 ms.** The `skip < 4 words`
+row bypasses the model for three items and records them at zero, which
+is the latency the user experiences. It is not a decode time, and that
+row's distribution is therefore not the same shape as the others.
+
+> ### Quality-column correction (2026-09-04)
+>
+> The WER column below was first measured against `eval.json` schema 1
+> with a whitespace-splitting scorer. Both had defects, found in review:
+>
+> - **`technical` was measured wrong.** `technical-01` and `technical-03`
+>   expected spoken-to-written conversion (`one point zero point two one
+>   nine` → `1.0.219`, `colon colon` → `::`) that system-prompt rule 7
+>   explicitly forbids — "Preserve technical terms, names, and code-like
+>   fragments exactly as transcribed". They penalised the model for
+>   obeying the prompt. Schema 2 derives their expected text from the
+>   prompt rules alone. The category's WER falls **0.847 → 0.091**.
+> - **`command` was scored blind.** The scorer split on whitespace, so a
+>   model that emitted a space where `new paragraph` required a line
+>   break scored zero errors. It now tokenises breaks. The category's
+>   WER rises **0.000 → 0.059**, exposing a real defect: on
+>   `command-01` and `command-04` the 4B produced
+>   `Ship the parts Monday. Invoice follows separately.` — correct
+>   punctuation, no line break.
+>
+> Inputs did not change, so **every latency number below is unaffected**.
+> Only the 4B row's quality has been re-measured under schema 2
+> (blended **WER 0.061, 18/26 exact**, recomputed from the unchanged
+> categories plus a deterministic re-run of the two corrected ones).
+> The 2B, 0.8B, and edits-only rows still carry schema-1 quality and are
+> **not comparable to it**; re-measuring them needs another bench turn.
+
 | Variant | p50 | p95 | `legacy-bench-sample` | mean WER | exact | mean out tokens |
 |---|---|---|---|---|---|---|
 | **4B Q6_K full-text (shipping)** | **444 ms** | 1219 ms | 1209 ms | **0.139** | 17/26 | 18.7 |
@@ -494,11 +526,32 @@ like:
 | filler-heavy | 3 | 857 ms | 1219 ms | 0.257 | 391 ms | 0.258 |
 | long | 1 | 2812 ms | 2812 ms | 0.060 | 1400 ms | 0.103 |
 
-Latency tracks output length almost exactly; quality does not. The
-`technical` category is the worst on both models — spoken version
-numbers and identifiers ("one point zero point two one nine",
-`PolishMode colon colon On`) are where polish does real damage, and that
-is a quality bug worth its own issue, not a latency one.
+(WER columns here are schema 1; see the correction box above. Latency is
+unaffected.)
+
+Latency tracks output length almost exactly; quality does not.
+
+**Retracted:** an earlier revision of this section claimed the
+`technical` category showed "spoken version numbers and identifiers are
+where polish does real damage". That was wrong, and backwards. Re-run
+with `--show-output`, the 4B **preserves** identifiers exactly as rule 7
+instructs:
+
+```
+input    : Um, bump serde to one point zero point two one nine in Cargo dot toml.
+produced : Bump serde to one point zero point two one nine in Cargo dot toml.
+```
+
+Filler removed, casing fixed, identifier untouched — correct on every
+count. The 0.847 was my eval set demanding a conversion the prompt
+forbids. Whether polish damages identifiers is **unmeasured**: no item
+in this set tests it, because the prompt tells the model not to touch
+them.
+
+The genuine defects the corrected metrics surface are smaller and
+different: the 4B leaves `and, you know,` in `technical-03`, and ignores
+the `new line` / `new paragraph` commands in two of four `command`
+items.
 
 ### Findings per avenue
 

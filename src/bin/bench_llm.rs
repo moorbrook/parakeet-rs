@@ -103,6 +103,11 @@ struct ItemResult {
     /// Word-error rate of the produced text against `expected`.
     wer: f64,
     exact: bool,
+    /// What the pass actually delivered. Only populated under
+    /// `--show-output`: a WER number tells you an item scored badly, but
+    /// only the text tells you whether the model misbehaved or the
+    /// item's `expected` asks for something the system prompt forbids.
+    produced: Option<String>,
 }
 
 // ── Args ────────────────────────────────────────────────────────────
@@ -379,9 +384,19 @@ fn run_eval(
     for rep in 0..args.reps {
         for item in &set.items {
             let sid = format!("bench-{model_tag}-{}-r{rep:03}", item.id);
-            let result = run_eval_item(&mut runner, args, item, &sid, model_tag)?;
-            if rep == 0 && args.show_output {
-                log::info!("[{}] -> quality wer={:.3}", item.id, result.wer);
+            let show = args.show_output && rep == 0;
+            let result = run_eval_item(&mut runner, args, item, &sid, model_tag, show)?;
+            if show {
+                log::info!(
+                    "---- {} ({}) wer={:.3} exact={}",
+                    item.id,
+                    item.category,
+                    result.wer,
+                    result.exact
+                );
+                log::info!("  input    : {}", item.input);
+                log::info!("  expected : {}", item.expected);
+                log::info!("  produced : {}", result.produced.as_deref().unwrap_or(""));
             }
             results.push(result);
         }
@@ -396,6 +411,7 @@ fn run_eval_item(
     item: &EvalItem,
     sid: &str,
     model_tag: &str,
+    show_output: bool,
 ) -> Result<ItemResult> {
     if args.skip.skips(&item.input) {
         log::info!(
@@ -414,6 +430,7 @@ fn run_eval_item(
             edit_fallback: false,
             wer: word_error_rate(&item.expected, &item.input),
             exact: item.input == item.expected,
+            produced: show_output.then(|| item.input.clone()),
         });
     }
 
@@ -448,6 +465,7 @@ fn run_eval_item(
         edit_fallback,
         wer: word_error_rate(&item.expected, &produced),
         exact: produced == item.expected,
+        produced: show_output.then(|| produced.clone()),
     })
 }
 
@@ -588,9 +606,17 @@ fn timer_fields(outcome: &GenerateOutcome) -> (u32, u32, u32, f64) {
 /// punctuation and casing are two of the three things the polish pass
 /// exists to fix, so normalising them away would score the pass on a
 /// task it was not asked to do.
+///
+/// Line breaks are tokens, not whitespace. `new paragraph` and
+/// `new line` are inline editing commands whose whole job is to produce
+/// one, and a scorer that split on whitespace generally would treat a
+/// space and a newline as the same thing — scoring zero errors for a
+/// model that silently ignored the command.
 fn word_error_rate(reference: &str, hypothesis: &str) -> f64 {
-    let r: Vec<&str> = reference.split_whitespace().collect();
-    let h: Vec<&str> = hypothesis.split_whitespace().collect();
+    let r = tokenize_for_wer(reference);
+    let h = tokenize_for_wer(hypothesis);
+    let r: Vec<&str> = r.iter().map(String::as_str).collect();
+    let h: Vec<&str> = h.iter().map(String::as_str).collect();
     if r.is_empty() {
         return if h.is_empty() { 0.0 } else { 1.0 };
     }
@@ -606,6 +632,20 @@ fn word_error_rate(reference: &str, hypothesis: &str) -> f64 {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[h.len()] as f64 / r.len() as f64
+}
+
+/// Split into scoring tokens: whitespace-separated words, with every
+/// line break emitted as its own `\n` token so newline handling is
+/// scored rather than silently normalised away.
+fn tokenize_for_wer(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, line) in s.split('\n').enumerate() {
+        if i > 0 {
+            out.push("\\n".to_string());
+        }
+        out.extend(line.split_whitespace().map(str::to_string));
+    }
+    out
 }
 
 fn percentile(sorted_ms: &[u128], q: f64) -> u128 {
@@ -799,6 +839,29 @@ mod tests {
         // Insertion: hypothesis has an extra word.
         let ins = word_error_rate("a b c", "a b x c");
         assert!((ins - 1.0 / 3.0).abs() < 1e-9, "got {ins}");
+    }
+
+    #[test]
+    fn word_error_rate_scores_a_missing_line_break() {
+        // `new line` / `new paragraph` exist to produce a break. A
+        // scorer that split on whitespace generally gave this a free
+        // pass, which is why the command category read 0.000.
+        let reference = "Add two spare belts.\nAdd one drive coupling.";
+        let ignored_command = "Add two spare belts. Add one drive coupling.";
+        assert!(
+            word_error_rate(reference, ignored_command) > 0.0,
+            "a model that ignored the line-break command must not score zero"
+        );
+        assert_eq!(word_error_rate(reference, reference), 0.0);
+    }
+
+    #[test]
+    fn tokenize_for_wer_emits_breaks_as_their_own_token() {
+        assert_eq!(tokenize_for_wer("a b"), vec!["a", "b"]);
+        assert_eq!(tokenize_for_wer("a\nb"), vec!["a", "\\n", "b"]);
+        // A blank line is still exactly one break token per newline.
+        assert_eq!(tokenize_for_wer("a\n\nb"), vec!["a", "\\n", "\\n", "b"]);
+        assert_eq!(tokenize_for_wer(""), Vec::<String>::new());
     }
 
     #[test]

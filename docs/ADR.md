@@ -1999,7 +1999,10 @@ over the same items.
 Measured on it (3 reps × 26 items, M5 Pro 24 GB, `bench/README.md`
 §6 follow-up):
 
-| Configuration | p50 | p95 | `legacy-bench-sample` | mean WER | exact |
+Quality columns are schema-1 measurements; see the correction below.
+Latency is unaffected by it.
+
+| Configuration | p50 | p95 | `legacy-bench-sample` | mean WER (schema 1) | exact |
 |---|---|---|---|---|---|
 | **4B Q6_K full-text (shipping)** | **444 ms** | 1219 ms | 1209 ms | **0.139** | 17/26 |
 | 4B + skip < 4 words | 446 ms | 1222 ms | 1221 ms | 0.139 | 17/26 |
@@ -2021,11 +2024,42 @@ judgement I made. Per-category latency and quality are published so the
 blended figure can be re-weighted.
 
 **Polish remains opt-in.** `PolishMode` already defaults to `Off` and
-that does not change. The reason is no longer latency; it is that the
-`technical` category scores WER 0.847 on the 4B — spoken version numbers
-and identifiers are where polish does real damage. That is a quality
-defect deserving its own issue, and it is the strongest current argument
-for the default.
+that does not change. The reason is no longer latency — it is that the
+quality case for turning polish on has not been made on this eval set,
+not that a specific defect has been proven.
+
+> **Correction (2026-09-04, review round 1).** An earlier revision of
+> this ADR justified the default with "the `technical` category scores
+> WER 0.847 on the 4B — spoken version numbers and identifiers are where
+> polish does real damage". That claim was unsupported and backwards.
+> `src/polish.rs` system-prompt rule 7 says "Preserve technical terms,
+> names, and code-like fragments exactly as transcribed", and the model
+> obeys it. Re-run with `--show-output`:
+>
+> ```
+> input    : Um, bump serde to one point zero point two one nine in Cargo dot toml.
+> produced : Bump serde to one point zero point two one nine in Cargo dot toml.
+> ```
+>
+> Filler removed, casing fixed, identifier preserved. The 0.847 came
+> from two eval items (`technical-01`, `technical-03`) whose `expected`
+> demanded spoken-to-written conversion the prompt forbids — they
+> penalised the model for correct behaviour. `eval.json` schema 2
+> derives their expected text from the prompt rules alone and the
+> category scores **0.091**. Whether polish damages identifiers is
+> **unmeasured**; nothing in this set tests it.
+>
+> A second defect was found in the scorer: it split on whitespace, so a
+> model emitting a space where `new paragraph` required a line break
+> scored zero errors. Fixed, and the `command` category moves
+> **0.000 → 0.059** — the 4B ignores the line-break command in two of
+> four items. That one is a real polish defect, and it was hidden.
+>
+> Under schema 2 with the corrected scorer the 4B blends to **WER 0.061,
+> 18/26 exact** (from 0.139, 17/26). Inputs never changed, so every
+> latency number in this ADR stands. The 2B, 0.8B, and edits-only rows
+> carry schema-1 quality and are not comparable; re-measuring them needs
+> another bench turn.
 
 **Rejected, with reasons.**
 
@@ -2075,7 +2109,18 @@ for the default.
   streaming recognizer — [ADR-0023](#0023--speculative-decode-on-the-endpoint-candidate)'s
   speculative ASR already produces the provisional transcript.
 
-**Follow-ups filed by this work.** Polish quality on technical terms
-(WER 0.847, the worst category on every model measured); grammar-
-constrained edits-only for a long-form mode; end-to-end measurement of
-speculative polish once the streamer hook lands.
+**Follow-ups filed by this work.**
+
+1. **Inline editing commands are ignored.** The 4B produces
+   `Ship the parts Monday. Invoice follows separately.` where
+   `new paragraph` requires a line break — two of four `command` items.
+   Real, reproducible, and previously invisible because the scorer was
+   newline-blind.
+2. **Re-measure quality for the 2B, 0.8B, and edits-only rows** under
+   `eval.json` schema 2 and the corrected scorer. Needs a bench turn.
+3. **Filler removal misses** — `and, you know,` survives in
+   `technical-03`.
+4. Grammar-constrained edits-only for a long-form mode.
+5. End-to-end measurement of speculative polish once the streamer hook
+   lands, including the hit rate that the byte-identical
+   provisional/confirmed comparison actually achieves.

@@ -513,7 +513,11 @@ where
 pub struct Speculation {
     provisional: String,
     cancel: Arc<AtomicBool>,
-    worker: JoinHandle<Result<String>>,
+    /// `None` only after [`Speculation::confirm`] or
+    /// [`Speculation::cancel`] has taken it. Optional so [`Drop`] can
+    /// reap a speculation the caller abandoned without moving out of a
+    /// type that implements `Drop`.
+    worker: Option<JoinHandle<Result<String>>>,
 }
 
 /// Sentinel error the cancel flag raises inside the decode loop. Never
@@ -566,7 +570,7 @@ impl Speculation {
         Self {
             provisional,
             cancel,
-            worker,
+            worker: Some(worker),
         }
     }
 
@@ -583,24 +587,42 @@ impl Speculation {
     /// `None` when the speaker kept talking and the transcript changed —
     /// the caller must run a fresh polish, and this call has already
     /// cancelled the stale one.
-    pub fn confirm(self, confirmed: &str) -> Option<Result<String>> {
+    ///
+    /// The comparison is **byte-identical**, deliberately: anything
+    /// looser risks pasting a polish of text the speaker did not
+    /// finally say. The cost is hit rate. A provisional and a confirmed
+    /// transcript that differ only by a trailing period or a
+    /// capitalisation the recognizer revised still miss, so the
+    /// real-world hit rate will sit below the rate at which speakers
+    /// actually stop talking. That rate is unmeasured — it needs the
+    /// streamer hook and a capture corpus.
+    pub fn confirm(mut self, confirmed: &str) -> Option<Result<String>> {
         if confirmed != self.provisional {
-            self.cancel();
+            self.abandon();
             return None;
         }
-        Some(self.join())
+        self.worker.take().map(Self::reap)
     }
 
     /// Abandon the speculation. Signals the worker and waits for it to
     /// notice, so the polish lock is free before the caller starts
     /// anything else with the same backend.
-    pub fn cancel(self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        let _ = self.join();
+    pub fn cancel(mut self) {
+        self.abandon();
     }
 
-    fn join(self) -> Result<String> {
-        match self.worker.join() {
+    /// Signal the worker and wait for it. Idempotent: a second call
+    /// finds `worker` already taken and does nothing, which is what
+    /// makes `cancel()` followed by [`Drop`] safe.
+    fn abandon(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = Self::reap(worker);
+        }
+    }
+
+    fn reap(worker: JoinHandle<Result<String>>) -> Result<String> {
+        match worker.join() {
             Ok(result) => result,
             // A panic inside polish is already handled for the
             // synchronous path by `app::run_polish_isolated`'s
@@ -611,6 +633,18 @@ impl Speculation {
                 panic_payload_message(&payload)
             )),
         }
+    }
+}
+
+/// Dropping a `Speculation` without resolving it must not detach the
+/// worker. The worker holds the backend's polish lock for its whole
+/// decode, so a leaked one blocks the next real polish for up to a full
+/// generation — the exact latency this type exists to remove. `Drop`
+/// therefore cancels and joins, making an early return or a `?` in the
+/// caller safe.
+impl Drop for Speculation {
+    fn drop(&mut self) {
+        self.abandon();
     }
 }
 
@@ -1747,6 +1781,47 @@ mod tests {
         let backend: Arc<dyn PolishBackend> = Arc::clone(&recorder) as Arc<dyn PolishBackend>;
         Speculation::start(backend, on_settings(), "hello".to_string()).cancel();
         assert_eq!(recorder.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dropping_a_speculation_does_not_detach_the_worker() {
+        // A dropped speculation must not leave a worker holding the
+        // backend's polish lock — that would block the next real polish
+        // for a whole decode, which is worse than never speculating.
+        // The lock is the thing under test: if `Drop` failed to join,
+        // this `lock()` would still be contended when we reach it.
+        let recorder = Arc::new(RecordingBackend::default());
+        let backend: Arc<dyn PolishBackend> = Arc::clone(&recorder) as Arc<dyn PolishBackend>;
+        drop(Speculation::start(
+            backend,
+            on_settings(),
+            "hello".to_string(),
+        ));
+        assert_eq!(
+            recorder.seen.lock().unwrap().len(),
+            1,
+            "Drop must join the worker, not detach it"
+        );
+    }
+
+    #[test]
+    fn cancel_then_drop_is_not_a_double_join() {
+        // `cancel` takes the handle; the subsequent `Drop` must find it
+        // already gone rather than panicking on a second join.
+        let recorder = Arc::new(RecordingBackend::default());
+        let backend: Arc<dyn PolishBackend> = Arc::clone(&recorder) as Arc<dyn PolishBackend>;
+        Speculation::start(backend, on_settings(), "hello".to_string()).cancel();
+        assert_eq!(recorder.seen.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn confirm_then_drop_is_not_a_double_join() {
+        let backend: Arc<dyn PolishBackend> = Arc::new(FakeBackend);
+        let out = Speculation::start(backend, on_settings(), "hi".to_string())
+            .confirm("hi")
+            .expect("transcript matched")
+            .unwrap();
+        assert_eq!(out, "[clean] hi");
     }
 
     #[test]

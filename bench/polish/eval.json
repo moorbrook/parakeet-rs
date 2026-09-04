@@ -1,13 +1,13 @@
 {
-  "schema": 1,
-  "description": "Polish quality + latency eval set. Each item is a raw ASR transcript as Parakeet TDT 0.6B v3 would emit it (already capitalised and punctuated per the NVIDIA model card) paired with the polished text the pass is supposed to produce. `bench_llm --eval` runs every item through a polish variant, scores word-level edit distance against `expected`, and reports completion percentiles over the same items, so the quality column and the latency column describe one population.\n\nCategory mix is chosen to match real dictation rather than worst case: most utterances need nothing or need one filler removed. The historical `bench_llm` SAMPLE_INPUT is retained as `legacy-bench-sample` so the 1225 ms p50 in bench/README.md §6 stays comparable.",
+  "schema": 2,
+  "description": "Polish quality + latency eval set. Each item is a raw ASR transcript as Parakeet TDT 0.6B v3 would emit it (already capitalised and punctuated per the NVIDIA model card) paired with the polished text the pass is supposed to produce. `bench_llm --eval` runs every item through a polish variant, scores word-level edit distance against `expected`, and reports completion percentiles over the same items, so the quality column and the latency column describe one population.\n\nCategory mix is an ASSUMPTION about real dictation, not a measurement of it: it assumes most utterances need nothing or need one filler removed. Nothing has been sampled to check that, so the blended percentiles it produces must be read alongside the per-category table. The historical `bench_llm` SAMPLE_INPUT is retained as `legacy-bench-sample` so the 1225 ms p50 in bench/README.md §6 stays comparable.",
   "categories": {
     "clean": "Nothing to fix. Polish must return the input unchanged.",
     "short": "Under 4 words. Prompt rule 6 says return unchanged.",
     "filler-light": "One or two filler words. The common case.",
     "filler-heavy": "Filler on nearly every clause. Worst case.",
     "command": "Inline editing commands the speaker dictated.",
-    "technical": "Identifiers, versions, and code fragments that must survive verbatim.",
+    "technical": "Identifiers, versions, and code fragments that must survive verbatim. Schema 2 corrected technical-01 and technical-03: their v1 `expected` demanded spoken-to-written conversion ('one point zero point two one nine' -> '1.0.219', 'colon colon' -> '::') which system-prompt rule 7 explicitly forbids, so they penalised the model for obeying the prompt. Expected text is now derived from the prompt rules alone.",
     "long": "Multi-sentence transcript that exercises the output cap."
   },
   "items": [
@@ -147,7 +147,7 @@
       "id": "technical-01",
       "category": "technical",
       "input": "Um, bump serde to one point zero point two one nine in Cargo dot toml.",
-      "expected": "Bump serde to 1.0.219 in Cargo.toml."
+      "expected": "Bump serde to one point zero point two one nine in Cargo dot toml."
     },
     {
       "id": "technical-02",
@@ -159,7 +159,7 @@
       "id": "technical-03",
       "category": "technical",
       "input": "Call polish_streaming with PolishMode colon colon On and, you know, check the return.",
-      "expected": "Call polish_streaming with PolishMode::On and check the return."
+      "expected": "Call polish_streaming with PolishMode colon colon On and check the return."
     },
     {
       "id": "long-01",
