@@ -12,17 +12,19 @@ machine, and a hand-authored MIL program compiled, loaded and evaluated on the e
 ad-hoc signed binary with no entitlements and no Core ML in the process. That answers the
 feasibility question the issue asked.
 
-It does not answer the latency question in our favour. The decoder we would want to move is a
-two-layer LSTM, and `lstm` has no engine path on any Apple silicon family including M5
-(2606.22283, Table A.12, p.255). Core ML is already running that step off the engine, so a direct
-port would not remove a Core ML ANE dispatch, it would replace a CPU LSTM with a hand-unrolled
-gate graph paying a 0.07 to 0.23 ms engine dispatch floor per step. Orion measured exactly this
-shape of loss on GPT-2 124M, where CPU decode at 283 tok/s beat ANE decode at 170 tok/s
-(2603.06728, p.13).
+The latency case is weaker. The decoder we would want to move is a two-layer LSTM, and `lstm`
+has no engine path on any Apple silicon family including M5 (2606.22283, Table A.12, p.255).
+Almost certainly Core ML runs that step off the engine already, which g38m is measuring. A direct
+port replaces a CPU LSTM with a hand-unrolled gate graph paying a 0.07 to 0.23 ms engine dispatch
+floor per step. Orion measured this shape of loss on GPT-2 124M, where CPU decode at 283 tok/s beat
+ANE decode at 170 tok/s (2603.06728, p.14 and p.16).
 
-Revisit only if g38m reports both of: decoder-loop time dominating the 66 ms at 5 s, and a
-measured per-call Core ML overhead well above 0.25 ms. If instead the encoder or a fixed
-per-utterance cost owns the time, the encoder bucket path is the thing to look at, not the decoder.
+The one design that would change the arithmetic is described in section 4: a single fused program
+per frame, with the emit-versus-advance branch turned into arithmetic. Every operation it needs is
+engine-native. That is a real lever, and it is also several weeks of work on a private API.
+
+Revisit if g38m reports the decoder loop owning the 66 ms at 5 s. If a fixed per-utterance cost or
+the encoder owns it instead, the encoder bucket path is the thing to look at.
 
 ## 1. The call sequence
 
@@ -54,13 +56,13 @@ multi-output programs need uniform allocation sizes and alphabetically ordered n
 #19), and evaluation needs roughly 49 KB of surface regardless of tensor size (#4).
 
 **C route (ANEForge, and the arch paper's own listings).** The `e5rt_*` family exported from
-`Espresso.framework`: `e5rt_e5_compiler_create_with_config`, `e5rt_e5_compiler_compile`,
-`e5rt_program_library_retain_program_function`, `e5rt_program_function_load_for_execution`,
-`e5rt_precompiled_compute_op_create_options_create_with_program_function`,
-`e5rt_execution_stream_operation_create_precompiled_compute_operation_with_options`,
-`e5rt_buffer_object_alloc`, `e5rt_io_port_bind_buffer_object`, `e5rt_execution_stream_create`,
-then a hot loop of `prepare_op_for_encode` / `encode_operation` / `execute_sync` / `reset`
-(2606.22283, Listing 6.1, p.38). Device mask 0x4 selects the engine.
+`Espresso.framework`, in four phases: compile (`e5rt_e5_compiler_create_with_config`,
+`e5rt_e5_compiler_compile`), load (`e5rt_program_library_retain_program_function`,
+`e5rt_program_function_load_for_execution`, then the precompiled-compute-op options and operation
+constructors), bind (`e5rt_buffer_object_alloc`, `e5rt_..._retain_input_port`,
+`e5rt_io_port_bind_buffer_object`), and a hot loop of `prepare_op_for_encode` / `encode_operation`
+/ `execute_sync` / `reset` (2606.22283, Listing 6.1, p.38). Device mask 0x4 selects the engine.
+All 17 of these symbols resolve on this machine.
 
 ## 2. Reachable from Rust, and what signing is needed
 
@@ -105,16 +107,16 @@ best: stride=16 channel-major, max relative error vs fp32 CPU reference 0.51953
 PARITY FAIL
 ```
 
-The API path is proven. Numeric parity is not. The second run scored the output buffer under four
-row strides in both channel-major and transposed order, and none reproduced the reference; packed
-stride 16 was merely the least wrong. The remaining suspect is the engine's internal activation
-tiling, which the papers describe as packed `[1,C,1,S]` from byte 0 (#20) but which the netplist
-grammar exposes as an `InputInterleave` / `OutputInterleave` factor (2606.22283, §6.2, p.38). Input
-and output layout are wrong together if they are wrong at all, so sweeping output strides alone
-cannot recover it.
-
-The next experiment is an identity program, `out = identity(x)` over the same surfaces, which
-reveals the permutation in one dispatch. Deferred while g38m owns the bench.
+The API path is proven and numeric parity remains open. The second run scored the output buffer
+under four row strides in both channel-major and transposed order, and none reproduced the
+reference; packed stride 16 was merely the least wrong. The suspect is the engine's internal activation
+tiling, described in the papers as packed `[1,C,1,S]` from byte 0 (#20) yet exposed by the netplist
+grammar as an `InputInterleave` / `OutputInterleave` factor (2606.22283, §6.2, p.38). Input and
+output layout are wrong together if they are wrong at all, so sweeping output strides alone cannot
+recover it. Orion reached full token agreement with the same 32-byte rows (C=768, S=16), so row
+padding alone is an unlikely culprit. The next experiment is an identity program, `out =
+identity(x)`, run over several values of C as well as S so channel tiling and row stride separate.
+Deferred while g38m owns the bench.
 
 ## 4. Resident state against the Parakeet decoder
 
@@ -124,20 +126,32 @@ then bind one buffer object to both ports, so the engine updates it in place acr
 1, 2, 3, 4 over four dispatches. The native `state` type is gated and does not lower.
 
 Mapped onto our decoder: `parakeet_unified_decoder` takes `h_in`, `c_in` as fp32 `[2,1,640]` and
-returns `h_out`, `c_out`. Aliasing those would keep 2 x 2 x 640 fp16 values resident, saving about
-10 KB of copies per step. That is the whole saving.
+returns `h_out`, `c_out`. Aliasing those keeps 2 x 2 x 640 values resident, saving about 10 KB of
+copies per step, which is the whole of what aliasing alone buys.
 
-Dispatch count does not improve. The emit-versus-advance decision after the joint's argmax is host
-control flow, so the loop stays at roughly 62 frames x (1 decoder + 1 to n joint) per 5 s utterance,
-the same count g38m is measuring today. What changes is the cost of each dispatch, from Core ML's
-per-prediction overhead down toward the 0.07 to 0.23 ms engine floor (2606.22283, p.85; ANEForge
-reports about 90 us for a small fused program). Whether that is a saving at all depends on what
-g38m measures Core ML actually charging.
+Ported one-for-one, dispatch count is unchanged. The emit-versus-advance decision after the joint's
+argmax is host control flow, so the loop stays at roughly 62 frames x (1 decoder + 1 to n joint)
+per 5 s utterance, the count g38m is measuring today. What changes is the cost of each dispatch,
+from Core ML's per-prediction overhead down toward the 0.07 to 0.23 ms engine floor (2606.22283,
+p.85; ANEForge reports about 90 us for a small fused program).
 
-Against that sits the LSTM. Table A.12 (p.255) gives `lstm` as no-path on M1 through M5, note
-"unroll on host". A direct-route decoder means hand-unrolling both layers into conv, matmul,
-sigmoid and tanh, roughly 8 to 16 ops per layer, then fusing them into one program so the floor is
-paid once. Doable. Not obviously faster than the CPU path Core ML already uses for a 640-wide cell.
+The issue's "one dispatch per frame" is reachable by a different construction. Unroll `max_symbols`
+decoder-plus-joint steps into a single program and turn the branch into arithmetic: `reduce_argmax`
+over the joint logits, `equal` against a constant index vector to build the embedding selector,
+`matmul` against the embedding table in place of a `gather`, and `select` on `token != blank` to
+choose between the updated and the unchanged LSTM state. Compute is then fixed and no step depends
+on a host decision, so h and c stay resident and the frame costs one dispatch. Appendix A gives
+every one of those operations as native on all families through M5: `equal`, `not_equal` and
+`select` (p.250), `reduce_argmax` and `reduce_max` (p.252), `cast` (p.254), `matmul` (p.249).
+`one_hot` has no path (p.253) and is exactly what the equal-against-constant construction replaces.
+At 62 frames that is 62 dispatches against 62 x (1 + n), and the wasted compute from running all
+`max_symbols` steps every frame is small next to the floor for a 640-wide cell.
+
+The LSTM still has to be unrolled by hand. Table A.12 (p.255) gives `lstm` as no-path on M1 through
+M5, note "unroll on host", so both layers become conv, matmul, sigmoid and tanh, roughly 8 to 16
+ops per layer. Combined with the unrolled symbol steps that is a program of a few hundred
+operations, well inside the 16 to 64 op depth range where the engine reaches 94% utilization
+(2603.06728, p.4).
 
 ## 5. Risks
 
@@ -148,18 +162,21 @@ paid once. Doable. Not obviously faster than the CPU path Core ML already uses f
 | Signing | Low | Ad-hoc signing worked here with no entitlements. Notarized-bundle behaviour untested. |
 | Undiscovered layout contract | High, current blocker | Parity failed and the papers do not fully specify the activation tiling. |
 | Compile and program caps | Medium | About 119 compiles per process (#5) and near 128 loaded programs per process (2606.22283, p.85). A bucketed encoder would need a cache budget. |
-| Maintenance | High | Two of us would be maintaining a private-API runtime for a single-user dictation app. |
+| Maintenance | High | A private-API runtime for a single-user app is standing maintenance, re-verified every macOS release. |
 
 ## Deferred timing, to run when g38m releases the bench
 
-```
-# 1. Fix layout first: identity program probe, one dispatch.
-./ane_identity_probe
+Both probes below still need writing; neither exists yet.
 
-# 2. Bare dispatch floor, 1000 evaluations of the matmul program, p50/p95.
+```
+# 1. Fix layout first. Identity program over several C and S values, one dispatch each,
+#    so channel tiling and row stride separate.
+./ane_identity_probe --channels 64,128,768 --seq 16,32
+
+# 2. Bare dispatch floor. 1000 evaluations of the already-compiled matmul program, p50/p95.
 ./ane_direct_matmul --repeat 1000 --report-percentiles
 
-# 3. Compare against the same shape through Core ML MLComputeUnits.cpuAndNeuralEngine.
+# 3. The same shape through Core ML with MLComputeUnits.cpuAndNeuralEngine, for the delta.
 cargo run --release --bin bench_asr -- --stage-timers
 ```
 
