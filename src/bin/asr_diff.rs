@@ -32,6 +32,7 @@ use parakeet_dictation::asr_eval::{
 };
 use parakeet_dictation::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
 use parakeet_dictation::performance;
+use parakeet_dictation::resample::{to_target_rate, TARGET_SAMPLE_RATE};
 use parakeet_dictation::settings::SettingsStore;
 use parakeet_dictation::wav::read_wav_mono;
 use parakeet_dictation::{vocabulary, warmup};
@@ -341,12 +342,17 @@ fn run(args: &Args) -> anyhow::Result<bool> {
     let wav_inputs = wavs
         .iter()
         .map(|wav| {
-            let (samples, sample_rate) = read_wav_mono(wav)?;
+            let (fixture, fixture_rate) = read_wav_mono(wav)?;
+            // Both backends see what production hands `Asr::recognize`: 16 kHz
+            // mono, converted by the project's own resampler. The corpus is
+            // stored at 48 kHz, so without this the sherpa arm would be gated
+            // on audio no user path produces any more. ADR-0030.
+            let samples = to_target_rate(&fixture, fixture_rate)?.into_owned();
             let name = wav.file_name().map_or_else(
                 || "unknown".into(),
                 |name| name.to_string_lossy().to_string(),
             );
-            Ok((name, samples, sample_rate))
+            Ok((name, samples, TARGET_SAMPLE_RATE))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let mut transcripts: BTreeMap<String, String> = BTreeMap::new();

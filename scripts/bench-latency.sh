@@ -32,8 +32,10 @@ cd "$(dirname "$0")/.."
 
 REPS="${REPS:-30}"
 WARMUP_REPS="${WARMUP_REPS:-3}"
-# Match the typical macOS default-input sample rate so the bench exercises
-# the same sherpa-onnx resample path the live app pays.
+# Fixtures stay at the typical macOS default-input rate so these runs remain
+# comparable with the published baselines. Since ADR-0030 `bench_asr` converts
+# the fixture to 16 kHz once at load, outside the measured loop, which is what
+# production capture now hands the recognizer.
 SAMPLE_RATE="${SAMPLE_RATE:-48000}"
 LENGTHS=(1 3 5 10 20)
 WAV_DIR="bench/audio"

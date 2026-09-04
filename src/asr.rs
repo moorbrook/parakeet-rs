@@ -53,7 +53,9 @@ pub trait AsrBackend: Send + Sync {
 /// interval: `mel_ms + encoder_ms + decode_loop_ms + post_ms == total_ms`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct StageReport {
-    /// 48 kHz to 16 kHz conversion inside the worker, before any model runs.
+    /// Sample-rate conversion inside the worker, before any model runs. Near
+    /// zero since ADR-0030: Rust hands the worker 16 kHz and FluidAudio's
+    /// converter returns matching-rate input untouched.
     pub resample_ms: f64,
     /// Fixed 15 s encoder windows the utterance was split into.
     pub windows: u32,
