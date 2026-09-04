@@ -2192,7 +2192,14 @@ selection. sherpa remains reachable through Core ML load failure and
   (1024 SentencePiece pieces), longest-match from the left, with `▁` prefixed
   to each word. The bundle ships the inventory but not the merge ranks a
   faithful BPE encoder needs, so this approximates the model's own
-  segmentation; a disagreement costs biasing on that term, not correctness.
+  segmentation. A disagreement costs biasing on that term rather than
+  correctness, but it is the failure mode with no alarm: a term with no piece
+  at all is reported rejected, while a term split the wrong way is reported
+  accepted and boosts a path the joint never walks. The worker therefore echoes
+  the pieces it chose for every accepted term, which Rust logs at info and
+  exposes through `Asr::contextual_vocabulary`. That is the whole mitigation —
+  the split is inspectable, not verified. Verifying it needs either the merge
+  ranks or a decode of audio containing the term.
 - The token sequences build an Aho-Corasick trie with failure arcs. Each node
   carries `nodeScore` (the boost accumulated along its path), `endScore` (the
   part a completed entry has banked, including through the output link when the

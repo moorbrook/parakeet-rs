@@ -274,19 +274,27 @@ struct PieceVocabulary {
         longestPiece = pieces.keys.map(\.count).max() ?? 0
     }
 
+    /// One piece of a tokenized term: what it spells, and which logit it is.
+    struct Piece {
+        let text: String
+        let id: Int
+    }
+
     /// Tokenize one vocabulary term, or return `nil` when some part of it has
     /// no piece at all.
     ///
     /// Longest-match from the left. The bundle ships the piece inventory but
     /// not the merge ranks a faithful BPE encoder needs, so this is an
-    /// approximation of the segmentation the model itself would produce; it
-    /// agrees with it on the ordinary case of a word built from whole pieces,
-    /// and a disagreement costs biasing on that term rather than correctness.
+    /// approximation of the segmentation the model itself would produce.
     ///
-    /// A `nil` is the case the user has to be told about: the term is boosting
-    /// nothing, and on the sherpa path the equivalent silent drop is exactly
-    /// what `crate::vocabulary`'s token validation exists to catch.
-    func encode(_ term: String) -> [Int]? {
+    /// The two failure modes are not equally visible, which is why the pieces
+    /// come back rather than only the ids. A term with no piece at all returns
+    /// `nil` and is reported as rejected. A term that tokenizes *differently*
+    /// from the way the model would emit it looks accepted and boosts a path
+    /// the joint never walks — nothing detects that, so the segmentation is
+    /// echoed to the caller and logged, which is the only handle anyone has on
+    /// it short of decoding audio that contains the term.
+    func encode(_ term: String) -> [Piece]? {
         var characters: [Character] = []
         for word in term.split(whereSeparator: \.isWhitespace) {
             characters.append(contentsOf: Self.wordStart)
@@ -294,7 +302,7 @@ struct PieceVocabulary {
         }
         guard !characters.isEmpty else { return nil }
 
-        var tokens: [Int] = []
+        var tokens: [Piece] = []
         var index = 0
         while index < characters.count {
             var matched = false
@@ -303,7 +311,7 @@ struct PieceVocabulary {
             while length >= 1 {
                 let piece = String(characters[index..<(index + length)])
                 if let id = ids[piece] {
-                    tokens.append(id)
+                    tokens.append(Piece(text: piece, id: id))
                     index += length
                     matched = true
                     break
@@ -325,7 +333,16 @@ struct PieceVocabulary {
 /// from a Core ML continuation, so the access is locked.
 final class ContextBiasStore: @unchecked Sendable {
     struct Report {
+        /// One accepted term and the pieces it was split into. Echoed so a
+        /// segmentation that disagrees with the model's own is at least
+        /// visible; see `PieceVocabulary.encode`.
+        struct Encoded {
+            let term: String
+            let pieces: [String]
+        }
+
         let accepted: Int
+        let encoded: [Encoded]
         let rejected: [String]
     }
 
@@ -362,10 +379,13 @@ final class ContextBiasStore: @unchecked Sendable {
         terms: [String], score: Float, vocabulary: PieceVocabulary, blankIndex: Int
     ) -> Report {
         var entries: [[Int]] = []
+        var encoded: [Report.Encoded] = []
         var rejected: [String] = []
         for term in terms {
-            if let tokens = vocabulary.encode(term), !tokens.isEmpty {
-                entries.append(tokens)
+            if let pieces = vocabulary.encode(term), !pieces.isEmpty {
+                entries.append(pieces.map(\.id))
+                encoded.append(
+                    Report.Encoded(term: term, pieces: pieces.map(\.text)))
             } else {
                 rejected.append(term)
             }
@@ -376,6 +396,6 @@ final class ContextBiasStore: @unchecked Sendable {
         lock.lock()
         storedGraph = graph
         lock.unlock()
-        return Report(accepted: entries.count, rejected: rejected)
+        return Report(accepted: entries.count, encoded: encoded, rejected: rejected)
     }
 }

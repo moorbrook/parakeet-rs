@@ -191,16 +191,16 @@ struct PieceVocabularyTests {
 
     @Test("a term is matched longest-piece-first")
     func longestMatchWins() {
-        #expect(pieces.encode("New") == [5])
-        #expect(pieces.encode("Newer") == [5, 2, 8])
+        #expect(pieces.encode("New")?.map(\.id) == [5])
+        #expect(pieces.encode("Newer")?.map(\.id) == [5, 2, 8])
     }
 
     @Test("every word is marked word-initial")
     func everyWordIsMarkedWordInitial() {
         // Without the marker on the second word the boost targets the mid-word
         // spelling and the decode renders "NewYork".
-        #expect(pieces.encode("New York") == [5, 6, 7, 8, 9])
-        #expect(pieces.encode("  New   York  ") == [5, 6, 7, 8, 9])
+        #expect(pieces.encode("New York")?.map(\.id) == [5, 6, 7, 8, 9])
+        #expect(pieces.encode("  New   York  ")?.map(\.id) == [5, 6, 7, 8, 9])
     }
 
     @Test("a term with no piece for some part of it is rejected, not truncated")
@@ -217,6 +217,16 @@ struct PieceVocabularyTests {
         #expect(pieces.encode("") == nil)
     }
 
+    @Test("a term's pieces come back, so a wrong split is at least visible")
+    func encodeReportsThePiecesItChose() {
+        // Longest-match is not the model's own BPE. A term split differently
+        // from the way the model emits it is accepted and boosts a path the
+        // joint never walks, and nothing detects that — the split itself is
+        // the only evidence, so it has to survive out of the tokenizer.
+        #expect(pieces.encode("New")?.map(\.text) == ["▁New"])
+        #expect(pieces.encode("Newer")?.map(\.text) == ["▁New", "e", "r"])
+    }
+
     @Test("the store reports which terms the inventory could not represent")
     func storeReportsRejections() {
         let store = ContextBiasStore()
@@ -224,6 +234,8 @@ struct PieceVocabularyTests {
             terms: ["IBM", "Zzz", "New York"], score: 2, vocabulary: pieces, blankIndex: 1024)
         #expect(report.accepted == 2)
         #expect(report.rejected == ["Zzz"])
+        #expect(report.encoded.map(\.term) == ["IBM", "New York"])
+        #expect(report.encoded[1].pieces == ["▁New", "▁Y", "o", "r", "k"])
         #expect(store.graph != nil)
     }
 
@@ -234,6 +246,7 @@ struct PieceVocabularyTests {
         #expect(store.graph != nil)
         let report = store.set(terms: [], score: 2, vocabulary: pieces, blankIndex: 1024)
         #expect(report.accepted == 0)
+        #expect(report.encoded.isEmpty)
         #expect(store.graph == nil)
     }
 }

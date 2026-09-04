@@ -21,7 +21,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::asr::{Asr, AsrBackend, AsrBackendMetadata, Decoded, StageReport, VocabularyStatus};
+use crate::asr::{
+    Asr, AsrBackend, AsrBackendMetadata, Decoded, EncodedTerm, StageReport, VocabularyStatus,
+};
 use crate::resample::{to_target_rate, TARGET_SAMPLE_RATE};
 use crate::windows::TokenSpan;
 
@@ -498,6 +500,16 @@ impl CoreMlWorkerBackend {
                      inventory — skipped"
                 );
             }
+            // Logged rather than summarized: a term whose split disagrees with
+            // the model's own segmentation is accepted and boosts nothing, and
+            // this line is the only place that shows it.
+            for entry in &status.encoded {
+                log::info!(
+                    "vocabulary: {:?} biased as {:?}",
+                    entry.term,
+                    entry.pieces.join(" ")
+                );
+            }
             log::info!(
                 "contextual biasing ON (score {}): {} of {} terms active",
                 config.vocabulary_score,
@@ -667,6 +679,7 @@ impl WorkerProcess {
             accepted: response
                 .vocabulary_accepted
                 .ok_or_else(|| anyhow!("Core ML vocabulary response omitted the accepted count"))?,
+            encoded: response.vocabulary_encoded.unwrap_or_default(),
             rejected: response.vocabulary_rejected.unwrap_or_default(),
         })
     }
@@ -712,6 +725,7 @@ struct WorkerResponse {
     stages: Option<StageReport>,
     vocabulary_accepted: Option<u32>,
     vocabulary_rejected: Option<Vec<String>>,
+    vocabulary_encoded: Option<Vec<EncodedTerm>>,
     /// One entry per RNNT emission, on the request's own timeline. Absent from
     /// `ready` and failure frames, and from any worker built before the Hold
     /// window merge needed them.
@@ -862,7 +876,11 @@ mod tests {
         // nothing with nothing anywhere to explain it.
         let payload = br#"{
             "kind": "vocabulary", "ok": true,
-            "vocabulary_accepted": 2, "vocabulary_rejected": ["Zzz"]
+            "vocabulary_accepted": 2, "vocabulary_rejected": ["Zzz"],
+            "vocabulary_encoded": [
+                {"term": "IBM", "pieces": ["\u2581I", "BM"]},
+                {"term": "New York", "pieces": ["\u2581New", "\u2581York"]}
+            ]
         }"#;
         let response: WorkerResponse = serde_json::from_slice(payload).expect("valid response");
         response.require_success("vocabulary").expect("ok");
@@ -871,6 +889,13 @@ mod tests {
             response.vocabulary_rejected.as_deref(),
             Some(&["Zzz".to_string()][..])
         );
+        // The segmentation is the only signal that separates a term which is
+        // biasing the model's own token path from one that is accepted and
+        // boosting a path the joint never walks.
+        let encoded = response.vocabulary_encoded.expect("segmentation present");
+        assert_eq!(encoded[0].term, "IBM");
+        assert_eq!(encoded[0].pieces, vec!["▁I", "BM"]);
+        assert_eq!(encoded[1].pieces, vec!["▁New", "▁York"]);
     }
 
     #[test]
@@ -903,6 +928,7 @@ mod tests {
             stages: None,
             vocabulary_accepted: None,
             vocabulary_rejected: None,
+            vocabulary_encoded: None,
             token_spans: None,
         };
         let error = response

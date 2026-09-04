@@ -927,13 +927,15 @@ which resolves below that — is the column that says anything.
 | 10 s | 39.927 ms | 39.904 ms | -0.1% | 42.516 / 42.540 ms |
 | 20 s | 81.199 ms | 81.323 ms | +0.2% | 87.856 / 87.952 ms |
 
-The acceptance criterion was 15% at five seconds. The 5 s row is the only one
-that moves, and the stage CSVs say it is not biasing overhead: the biased
-decode emitted 40 prediction steps and 101 joint evaluations against 35 and 96
-unbiased, because the boost changed the transcript on that TTS fixture. Five
-extra steps at the measured ~0.18 ms each account for the whole 0.87 ms. The
-per-call cost of biasing is a few dozen adds and subtractions on a 1025-wide
-logit vector, against a 1025×640 matrix-vector product, and does not register.
+The acceptance criterion was 15% at five seconds. The 5 s row is the only
+latency that moves, and the stage CSVs say it is not biasing overhead: the
+biased decode emitted 40 prediction steps and 101 joint evaluations against 35
+and 96 unbiased, because the boost changed the transcript on that TTS fixture.
+Five extra steps at the measured ~0.18 ms each account for the whole 0.87 ms.
+The 20 s fixture's transcript changed too — 123 steps against 122 — but one
+extra step is below the noise on an 81 ms decode. The per-call cost of biasing
+is a few dozen adds and subtractions on a 1025-wide logit vector, against a
+1025×640 matrix-vector product, and does not register.
 
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 

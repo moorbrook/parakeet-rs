@@ -601,6 +601,14 @@ final class RnntJointNetwork {
     /// the model's own. See `ContextBias.swift` for where the numbers come
     /// from. An empty `bias` — the no-vocabulary default — leaves the
     /// arithmetic below byte-for-byte what it was.
+    ///
+    /// Adding and subtracting the boost is not exactly invertible in fp32: a
+    /// biased token's logit can come back an ULP from where it started, which
+    /// moves that token's reported confidence in the last bit. The argmax is
+    /// unaffected, since it runs on the biased values by design, and the
+    /// confidence is a diagnostic. Restoring from a saved copy instead would
+    /// cost a 1025-float copy on every joint call to protect a bit nothing
+    /// reads.
     func decide(
         encoderProjection: UnsafePointer<Float>,
         decoderProjection: [Float],

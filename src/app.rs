@@ -757,11 +757,15 @@ fn load_asr_blocking(settings: &SettingsStore, warm: bool) -> anyhow::Result<(Ar
 
     // A vocabulary that can't be read costs the user their custom terms, not
     // their backend: the worker biases toward whatever we hand it, and an empty
-    // list is the unbiased path the quality gate measures.
+    // list is the unbiased path the quality gate measures. It is still said out
+    // loud — the app's log goes nowhere the user will look, and silently
+    // dictating unbiased is exactly the failure this whole module exists to
+    // avoid.
     let terms = match crate::vocabulary::terms(&settings.vocabulary_path()) {
         Ok(terms) => terms,
         Err(error) => {
-            log::error!("vocabulary unreadable, optimized backend will run unbiased: {error:#}");
+            log::error!("vocabulary unreadable, decoding without biasing: {error:#}");
+            menubar::set_status_text("Vocabulary unreadable — biasing off");
             Vec::new()
         }
     };

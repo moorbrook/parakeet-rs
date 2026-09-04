@@ -81,14 +81,34 @@ pub trait AsrBackend: Send + Sync {
 
 /// A backend's verdict on the custom vocabulary it was asked to bias toward.
 ///
-/// `rejected` carries the user's own words, so it is for logging and for the
-/// settings UI; reports record only the counts.
+/// `encoded` and `rejected` carry the user's own words, so they are for logs
+/// and for anything that shows the user what happened to their vocabulary;
+/// quality reports record only the counts.
+///
+/// Acceptance is weaker than it looks. The worker splits each term with the
+/// model bundle's piece inventory by longest match, because the bundle ships
+/// the inventory but not the merge ranks a faithful BPE encoder would need. A
+/// term whose longest-match split differs from the segmentation the model
+/// actually emits is *accepted* and biases a path the joint never walks, and
+/// nothing downstream detects that. `encoded` is the only handle on it: it
+/// reports the split the worker chose, per term, so a term that is doing
+/// nothing can at least be recognized by eye.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VocabularyStatus {
     /// Terms the model's token inventory could represent.
     pub accepted: u32,
-    /// Terms it could not, which are therefore boosting nothing.
+    /// Each accepted term and the pieces it was split into.
+    pub encoded: Vec<EncodedTerm>,
+    /// Terms it could not represent at all, which are therefore boosting
+    /// nothing.
     pub rejected: Vec<String>,
+}
+
+/// One accepted vocabulary term, and the pieces the worker split it into.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+pub struct EncodedTerm {
+    pub term: String,
+    pub pieces: Vec<String>,
 }
 
 /// Where one utterance's decode time went inside the recognizer.

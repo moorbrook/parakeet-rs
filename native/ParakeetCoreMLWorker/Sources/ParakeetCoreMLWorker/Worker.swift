@@ -282,6 +282,11 @@ private struct WorkerResponse: Encodable {
     /// Terms it could not, so the app can tell the user which of their words
     /// are doing nothing rather than dropping them silently.
     let vocabularyRejected: [String]?
+    /// Each accepted term and the pieces it was split into. A term can
+    /// tokenize successfully and still bias a path the model never emits, and
+    /// nothing detects that; echoing the segmentation is what makes it
+    /// inspectable.
+    let vocabularyEncoded: [EncodedTerm]?
     let tokenSpans: [TokenSpan]?
 
     static func ready(loadSeconds: Double) -> Self {
@@ -296,11 +301,12 @@ private struct WorkerResponse: Encodable {
             stages: nil,
             vocabularyAccepted: nil,
             vocabularyRejected: nil,
+            vocabularyEncoded: nil,
             tokenSpans: nil
         )
     }
 
-    static func vocabulary(accepted: Int, rejected: [String]) -> Self {
+    static func vocabulary(_ report: ContextBiasStore.Report) -> Self {
         Self(
             kind: "vocabulary",
             ok: true,
@@ -310,8 +316,11 @@ private struct WorkerResponse: Encodable {
             decodeSeconds: nil,
             resampleSeconds: nil,
             stages: nil,
-            vocabularyAccepted: accepted,
-            vocabularyRejected: rejected,
+            vocabularyAccepted: report.accepted,
+            vocabularyRejected: report.rejected,
+            vocabularyEncoded: report.encoded.map {
+                EncodedTerm(term: $0.term, pieces: $0.pieces)
+            },
             tokenSpans: nil
         )
     }
@@ -334,6 +343,7 @@ private struct WorkerResponse: Encodable {
             stages: stages,
             vocabularyAccepted: nil,
             vocabularyRejected: nil,
+            vocabularyEncoded: nil,
             tokenSpans: tokenSpans
         )
     }
@@ -350,9 +360,16 @@ private struct WorkerResponse: Encodable {
             stages: nil,
             vocabularyAccepted: nil,
             vocabularyRejected: nil,
+            vocabularyEncoded: nil,
             tokenSpans: nil
         )
     }
+}
+
+/// One accepted vocabulary term as the worker tokenized it.
+private struct EncodedTerm: Encodable {
+    let term: String
+    let pieces: [String]
 }
 
 /// The `PRKV` control frame's JSON body.
@@ -468,8 +485,13 @@ private struct ParakeetCoreMLWorker {
                         modelDirectory: modelDirectory,
                         pieces: &pieces
                     )
-                    try writeResponse(
-                        .vocabulary(accepted: report.accepted, rejected: report.rejected))
+                    for entry in report.encoded {
+                        let pieces = entry.pieces.joined(separator: " ")
+                        let line =
+                            "parakeet-coreml-worker: vocabulary \(entry.term) -> \(pieces)\n"
+                        FileHandle.standardError.write(Data(line.utf8))
+                    }
+                    try writeResponse(.vocabulary(report))
                 } catch {
                     try writeResponse(.failure(kind: "vocabulary", error: error))
                 }
