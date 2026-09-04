@@ -43,6 +43,9 @@ struct Args {
     worker: Option<PathBuf>,
     model_dir: Option<PathBuf>,
     mode: BenchMode,
+    arm: Arm,
+    idle_gap_ms: u64,
+    keepalive_ms: u64,
 }
 
 /// Which dictation UX the harness reproduces.
@@ -53,6 +56,46 @@ enum BenchMode {
     /// Hold: the hotkey release owns the endpoint. The harness releases at the
     /// fixture's measured acoustic end, which is the earliest a user could.
     Hold,
+}
+
+/// Idle/keep-warm treatment applied before each repetition.
+///
+/// Unlike the `bench_asr` variant, the recording interval here is real: the
+/// fixture plays through the loopback in the time it actually takes. So the
+/// arms differ only in the idle gap before the press and in what runs between
+/// the press and the release.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Arm {
+    /// Repetitions back to back, as the existing Hold baseline runs them.
+    Warm,
+    /// `--idle-gap-ms` of silence before the press, and nothing after it.
+    Cold,
+    /// Idle gap, then one prime dispatch at the press edge.
+    Prime,
+    /// Idle gap, then a keep-alive dispatch every `--keepalive-ms` from the
+    /// press until just before the release.
+    Cadence,
+}
+
+impl Arm {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "warm" => Ok(Self::Warm),
+            "cold" => Ok(Self::Cold),
+            "prime" => Ok(Self::Prime),
+            "cadence" => Ok(Self::Cadence),
+            _ => bail!("unknown arm {value:?}; expected warm, cold, prime, or cadence"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::Cold => "cold",
+            Self::Prime => "prime",
+            Self::Cadence => "cadence",
+        }
+    }
 }
 
 fn parse_mode(value: &str) -> anyhow::Result<BenchMode> {
@@ -129,6 +172,9 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut worker = None;
     let mut model_dir = None;
     let mut mode = BenchMode::VadAutoStop;
+    let mut arm = Arm::Warm;
+    let mut idle_gap_ms: u64 = 0;
+    let mut keepalive_ms: u64 = 250;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -155,6 +201,23 @@ fn parse_args() -> anyhow::Result<Args> {
             "--backend" => {
                 backend =
                     Backend::parse(&it.next().ok_or_else(|| anyhow!("--backend needs a name"))?)?;
+            }
+            "--arm" => {
+                arm = Arm::parse(&it.next().ok_or_else(|| anyhow!("--arm needs a name"))?)?;
+            }
+            "--idle-gap-ms" => {
+                idle_gap_ms = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--idle-gap-ms needs a number"))?
+                    .parse()
+                    .context("--idle-gap-ms")?;
+            }
+            "--keepalive-ms" => {
+                keepalive_ms = it
+                    .next()
+                    .ok_or_else(|| anyhow!("--keepalive-ms needs a number"))?
+                    .parse()
+                    .context("--keepalive-ms")?;
             }
             "--strategy" => {
                 strategy = parse_strategy(
@@ -218,6 +281,9 @@ fn parse_args() -> anyhow::Result<Args> {
         worker,
         model_dir,
         mode,
+        arm,
+        idle_gap_ms,
+        keepalive_ms,
     })
 }
 
@@ -231,10 +297,17 @@ fn print_usage() {
          \x20                [--expected 'reference transcript']\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\
          \x20                [--mode vad|hold]\n\
-         \x20                [--hold-windows off|MIN,MAX]\n\n\
+         \x20                [--hold-windows off|MIN,MAX]\n\
+         \x20                [--arm warm|cold|prime|cadence]\n\
+         \x20                [--idle-gap-ms N] [--keepalive-ms N]\n\n\
          Plays WAV through the named loopback device and measures the\n\
          production capture -> VAD -> ASR path. The device must expose\n\
-         both input and output at the WAV sample rate."
+         both input and output at the WAV sample rate.\n\
+         \n\
+         `--arm` selects the idle treatment. Every arm but `warm` sleeps\n\
+         `--idle-gap-ms` before the press so the Neural Engine gates off;\n\
+         `prime` then fires one dispatch at the press edge and `cadence`\n\
+         re-primes every `--keepalive-ms` until just before the release."
     );
 }
 
@@ -260,6 +333,16 @@ fn main() -> ExitCode {
 }
 
 fn run(args: &Args) -> anyhow::Result<()> {
+    if args.arm == Arm::Cadence && args.keepalive_ms == 0 {
+        bail!("--arm cadence needs a nonzero --keepalive-ms");
+    }
+    if args.arm == Arm::Cadence && args.mode != BenchMode::Hold {
+        // VAD mode has no host-visible endpoint edge to stop the cadence at,
+        // so a keep-alive would still hold the worker's pipe when the decode
+        // starts and the measurement would include waiting for it. The Tap
+        // cadence arm is `bench_asr --arm cadence`, which owns both edges.
+        bail!("--arm cadence is only defined for --mode hold");
+    }
     let store = SettingsStore::new()?;
     let asr = Arc::new(load_backend(args, &store)?);
 
@@ -294,6 +377,15 @@ fn run(args: &Args) -> anyhow::Result<()> {
             false,
         )?;
     }
+    // `scripts/bench-idle.py` attributes every phase_timer line that follows
+    // this marker to the arm it names, which keeps the arm out of the shared
+    // PhaseTimer format and out of `streamer.rs`.
+    log::info!(
+        "idle_arm arm={} idle_gap_ms={} record_gap_ms=audio keepalive_ms={}",
+        args.arm.as_str(),
+        args.idle_gap_ms,
+        args.keepalive_ms
+    );
     for rep in 0..args.reps {
         run_one(
             args,
@@ -355,6 +447,12 @@ fn run_one(
         BenchMode::VadAutoStop => Mode::VadAutoStop,
         BenchMode::Hold => Mode::Manual,
     };
+    // Only measured repetitions pay the idle gap: warmup reps exist to compile
+    // the Core ML graph, and sleeping a minute in front of each one buys
+    // nothing.
+    if emit && args.arm != Arm::Warm {
+        std::thread::sleep(Duration::from_millis(args.idle_gap_ms));
+    }
     let (session, outcome_rx) = streamer::start_with_strategy_on_device(
         &store.vad_path(),
         streamer_mode,
@@ -364,6 +462,21 @@ fn run_one(
         args.hold_windows,
         Some(&args.device),
     )?;
+    // The press edge. The mic is open and the fixture has not started playing,
+    // which is where `App::on_hotkey_press` would fire the prime.
+    let mut keep_alive = None;
+    if emit {
+        match args.arm {
+            Arm::Prime => warmup::prime_engine(&asr)?,
+            Arm::Cadence => {
+                keep_alive = Some(warmup::KeepAlive::start(
+                    asr.clone(),
+                    Duration::from_millis(args.keepalive_ms),
+                ));
+            }
+            Arm::Warm | Arm::Cold => {}
+        }
+    }
     let playback = start_playback(&args.device, samples.clone(), sample_rate)?;
     let audio_s = samples.len() as f32 / sample_rate as f32;
     let timeout = Duration::from_secs_f32(audio_s + 15.0);
@@ -375,8 +488,20 @@ fn run_one(
     let hold_release = if args.mode == BenchMode::Hold {
         let acoustic_end = wait_for_acoustic_end(&playback, timeout)
             .with_context(|| format!("waiting for playback end on repetition {rep}"))?;
+        // Stop the cadence here rather than at the release: `stop` joins, and
+        // the worker serializes on one pipe, so an in-flight keep-alive would
+        // otherwise sit in front of the decode this repetition is measuring.
+        // Joining during the remaining wait keeps it off the release edge.
+        let keep_alive_dispatches = keep_alive.take().map(warmup::KeepAlive::stop);
         if let Some(remaining) = acoustic_end.checked_duration_since(Instant::now()) {
             std::thread::sleep(remaining);
+        }
+        if let Some(dispatches) = keep_alive_dispatches {
+            log::info!(
+                "idle_keepalive arm={} idle_gap_ms={} dispatches={dispatches}",
+                args.arm.as_str(),
+                args.idle_gap_ms
+            );
         }
         let release = Instant::now();
         session.finalize();

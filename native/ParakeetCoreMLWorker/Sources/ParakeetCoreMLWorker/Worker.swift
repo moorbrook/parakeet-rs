@@ -38,6 +38,10 @@ private struct WorkerOptions {
     let longComputeUnits: MLComputeUnits
     let longRegimeSeconds: UInt32
     let emitStageTimings: Bool
+    /// Short-window encoder buckets: `nil` means discover them in the model
+    /// directory, an empty array disables them, and an explicit list is used
+    /// verbatim.
+    let encoderBuckets: [Int]?
 
     static func parse(_ arguments: [String]) throws -> Self {
         var modelDirectory: URL?
@@ -46,6 +50,7 @@ private struct WorkerOptions {
         var longComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
         var longRegimeSeconds: UInt32 = 8
         var emitStageTimings = false
+        var encoderBuckets: [Int]?
         var index = 0
         while index < arguments.count {
             switch arguments[index] {
@@ -92,6 +97,14 @@ private struct WorkerOptions {
                     )
                 }
                 longRegimeSeconds = seconds
+            case "--encoder-buckets":
+                index += 1
+                guard index < arguments.count else {
+                    throw WorkerError.invalidArgument(
+                        "--encoder-buckets needs auto, none, or a comma-separated list of seconds"
+                    )
+                }
+                encoderBuckets = try parseEncoderBuckets(arguments[index])
             case "--emit-stage-timings":
                 emitStageTimings = true
             case "-h", "--help":
@@ -99,7 +112,7 @@ private struct WorkerOptions {
                     "usage: parakeet-coreml-worker [--model-dir DIR | --model-root DIR] "
                     + "[--compute-units NAME | --short-compute-units NAME "
                     + "--long-compute-units NAME --long-regime-seconds N] "
-                    + "[--emit-stage-timings]\n"
+                    + "[--encoder-buckets auto|none|N,N,...] [--emit-stage-timings]\n"
                 FileHandle.standardError.write(
                     Data(usage.utf8)
                 )
@@ -118,8 +131,26 @@ private struct WorkerOptions {
             shortComputeUnits: shortComputeUnits,
             longComputeUnits: longComputeUnits,
             longRegimeSeconds: longRegimeSeconds,
-            emitStageTimings: emitStageTimings
+            emitStageTimings: emitStageTimings,
+            encoderBuckets: encoderBuckets
         )
+    }
+
+    private static func parseEncoderBuckets(_ value: String) throws -> [Int]? {
+        switch value {
+        case "auto": return nil
+        case "none": return []
+        default:
+            let seconds = try value.split(separator: ",").map { field -> Int in
+                guard let parsed = Int(field), (1..<15).contains(parsed) else {
+                    throw WorkerError.invalidArgument(
+                        "--encoder-buckets entries must be whole seconds between 1 and 14"
+                    )
+                }
+                return parsed
+            }
+            return Array(Set(seconds)).sorted()
+        }
     }
 
     private static func parseComputeUnits(_ value: String) throws -> MLComputeUnits {
@@ -234,7 +265,32 @@ private struct ParakeetCoreMLWorker {
                 options: options
             )
         }
+        let modelDirectory =
+            options.modelDirectory
+            ?? options.modelRoot?
+                .appendingPathComponent(Repo.parakeetUnified.folderName, isDirectory: true)
+        var buckets = EncoderBuckets.empty
+        if let modelDirectory {
+            let windows =
+                options.encoderBuckets
+                ?? EncoderBuckets.availableWindows(in: modelDirectory, precision: .int8)
+            if !windows.isEmpty {
+                // Bucket encoders are short by construction, so they follow the
+                // short regime's compute units.
+                buckets = try await EncoderBuckets.load(
+                    windows: windows,
+                    directory: modelDirectory,
+                    computeUnits: options.shortComputeUnits,
+                    precision: .int8
+                )
+            }
+        }
         let loadSeconds = seconds(since: loadStart)
+        if !buckets.isEmpty {
+            let windows = buckets.descriptions.joined(separator: ", ")
+            FileHandle.standardError.write(
+                Data("parakeet-coreml-worker: encoder buckets \(windows)\n".utf8))
+        }
 
         // Installed after loading so Core ML's private MLModel subclasses are
         // registered and can be wrapped; see StageProfiler.install().
@@ -269,9 +325,18 @@ private struct ParakeetCoreMLWorker {
                 let resampleSeconds = seconds(since: resampleStart)
 
                 let thresholdSamples = Int(options.longRegimeSeconds) * 16_000
-                let manager = modelSamples.count >= thresholdSamples
-                    ? (longManager ?? shortManager)
-                    : shortManager
+                let isLongRegime = modelSamples.count >= thresholdSamples
+                // Buckets are loaded with the short regime's compute units, so
+                // they may only serve a request the regime would have run with
+                // those same units.
+                let regimeComputeUnits =
+                    isLongRegime ? options.longComputeUnits : options.shortComputeUnits
+                let bucketManager =
+                    regimeComputeUnits == options.shortComputeUnits
+                    ? buckets.manager(forSampleCount: modelSamples.count) : nil
+                let manager =
+                    bucketManager
+                    ?? (isLongRegime ? (longManager ?? shortManager) : shortManager)
                 let decodeStart = ContinuousClock.now
                 let profileStart =
                     options.emitStageTimings ? StageProfiler.shared.beginUtterance() : 0

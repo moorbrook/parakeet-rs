@@ -100,16 +100,22 @@ PARAKEET_COREML_MODEL_DIR="$HOME/Library/Application Support/com.parakeet.rs/mod
 
 `bench_asr --stage-timings` makes the worker report where a decode went, by
 wrapping `MLModel`'s prediction implementations at runtime and attributing each
-dispatch by its input feature names. FluidAudio stays a pinned dependency; no
-file in it is patched. Medians of 30 repetitions on the 4.967 s fixture:
-encoder 25.5 ms, resample 22.7 ms, RNNT decode loop 15.2 ms, mel 3.1 ms, IPC
-0.42 ms.
+dispatch by its input feature names. The profiler patches nothing: it wraps the
+prediction entry points at runtime. Medians of 30 repetitions on the 4.967 s
+fixture: encoder 25.5 ms, resample 22.7 ms, RNNT decode loop 15.2 ms, mel
+3.1 ms, IPC 0.42 ms.
+
+Two of those stages have since moved and this section is the record of the
+measurement, not of current cost. ADR-0030 retired the resample, and short-window
+encoder buckets cut encoder and mel on utterances under 8 s; the two sections
+below carry the current numbers.
 
 Two structural facts came out of it. The offline path zero-pads every utterance
-to the fixed 15 s encoder window, so encoder time is 25.5 ms whether the audio
-is 0.74 s or 8.15 s; with mel that is 28.6 ms of length-independent work and 80%
-of the 1 s result. And the 48 kHz to 16 kHz resample costs a linear 4.6 ms per
-second of input, which exceeds the decode loop at every measured length.
+to the fixed 15 s encoder window, so encoder time was 25.5 ms whether the audio
+was 0.74 s or 8.15 s; with mel that was 28.6 ms of length-independent work and
+80% of the 1 s result. And the 48 kHz to 16 kHz resample cost a linear 4.6 ms
+per second of input, which exceeded the decode loop at every measured length.
+Both are what the two sections below went on to remove.
 
 The decoder and joint-decision models run `cpuOnly` and the encoder runs
 `cpuAndNeuralEngine`, read off the live models rather than inferred from the
@@ -140,6 +146,68 @@ leaving every other number plausible.
 
 Full tables, dispatch counts, and method are in
 [`bench/README.md`](../../bench/README.md).
+
+## Short-utterance encoder cost — 2026-09-04
+
+With the resample retired by ADR-0030, the encoder is the whole of the
+short-utterance floor: it is compiled at a fixed 15 s mel window and every
+utterance is zero-padded to it, so a one-second utterance paid 26.0 ms of
+encoder and 3.2 ms of mel out of a 32.7 ms result. Compiling the same NVIDIA
+checkpoint at shorter windows and dispatching each utterance to the narrowest
+one that holds it removes most of that. **A one-second utterance now costs
+7.7 ms of encoder and 0.7 ms of mel instead of 26.0 and 3.2, taking the
+worker-internal call from 32.4 to 11.3 ms.** At 2.8 s the encoder is 9.7 ms
+against 25.3, at 4.9 s 9.98 against 25.4, and at 7.0 s 12.5 against 25.6;
+utterances past the longest bucket are unchanged. Buckets of 2, 5 and 8 seconds
+cost 1.77 GB of disk and take peak RSS from 0.10 to 0.19 GiB.
+
+The bucket runs predate the ADR-0030 merge, so both arms still paid the
+worker-side resample, which is why the numbers above are worker totals excluding
+it rather than end-to-end p50. The unchanged arm's encoder and mel reproduce the
+post-ADR-0030 per-stage table within 0.7 ms and its worker totals within 1.1 ms
+at every fixture, which is what makes the two comparable.
+
+Quality is unchanged and checked at the transcript, not the score: matched
+ten-repetition gold runs differing only in model directory both give 5.434783%
+WER and 3.571429% CER with zero spread, and every hypothesis is byte-identical
+between the two arms. Corpus decode p50 falls from 0.4534 s to 0.3397 s
+(75.1× to 100.2× RTFx).
+
+Encoder cost is close to linear in the compiled window but not exactly: it rises
+7.5 µs per mel frame from 201 to 801 frames, 30.7 µs per frame from 801 to 1201,
+and 5.4 µs again to 1501. About 6 ms is fixed cost that no shorter window
+removes. That shape is why 8 s is worth compiling and 12 s is not, and it is
+unexplained. The compute plan behind it, and the per-operation device
+assignments for all three models, are in [`COMPUTE_PLAN.md`](COMPUTE_PLAN.md);
+the full tables are in [`bench/README.md`](../../bench/README.md).
+
+This needed a three-file change to FluidAudio, which hardcodes the 15 s window.
+The package is a local path override reconstituted by
+`scripts/reconstitute-fluidaudio.sh` from the pinned upstream revision plus
+`native/ParakeetCoreMLWorker/patches/fluidaudio-offline-window.patch`; nothing
+of FluidAudio is checked in but the patch, and the change is written to be
+offered upstream.
+
+## Mel and resample cost — 2026-09-04
+
+Both sub-checks the encoder-bucketing work carried are now answered, and neither
+leaves a follow-up.
+
+The native Swift mel cost 3.1 ms at every utterance length, for the same reason
+the encoder was flat: `UnifiedMelExtractor` is built at the batch layout's
+window and computed 1501 frames whether or not the audio filled them. Bucketing
+fixed it as a side effect — a 2 s bucket computes 201 frames and mel drops to
+0.71 ms, a 5 s bucket to 1.34 ms. At those numbers mel is 6% of the remaining
+one-second call and moving log-mel into the Core ML graph, which Voz does, would
+be arguing over half a millisecond. Not worth doing on this evidence.
+
+The double resample is gone, retired by ADR-0030 rather than by this work: Rust
+already converted the same audio to 16 kHz for Silero VAD, so converting again
+in the worker was the redundant copy and it was on the critical path after the
+endpoint. Converting once in the capture callback took the worker's resample
+stage from 4.6 ms per second of 48 kHz input to 0.001 ms and halved measured IPC
+by shrinking the payload. There is nothing left to file: the stage no longer
+exists.
 
 ## Core ML runtime-plan tuner — 2026-08-11
 
@@ -207,3 +275,56 @@ therefore rejected as a production backend. Full artifact identities,
 per-category rows, native-build evidence, replay commands, and packaging
 analysis are in [`QWEN3_ASR_EVALUATION.md`](QWEN3_ASR_EVALUATION.md). The raw
 reports and machine-verifiable summary are under `bench/qwen3-asr/`.
+
+## Neural Engine idle re-wake — 2026-09-04 (kata snx0)
+
+Measured before fajz moved resampling into the capture callbacks and before
+fgzt's bucketed encoders landed, so the absolute milliseconds below describe
+the pre-merge path. Every arm paid the same conditions and the arm-to-arm
+comparisons the decision rests on are unaffected.
+
+The Neural Engine power-gates when idle, and between dictations this app is
+idle for seconds to minutes. Measured on an M5 Pro at `bench/idle-*.csv`, a
+fully cold decode of the 1 s fixture costs 26.5 ms more than a back-to-back one
+at p50, and the encoder — the only stage on the engine — accounts for 25.4 ms
+of it. Warmth decays gradually: nothing measurable at a 100 ms gap, about 3 ms
+by 2 s, half the total by 5 s, plateau by 10 s.
+
+Three treatments were measured against cold at 1 s and 5 s in both Tap Fast and
+Hold. Deltas are the arm against `cold`, positive meaning faster:
+
+| mode | fixture | prime p50 | prime p95 | cadence p50 | cadence p95 |
+|---|---|---:|---:|---:|---:|
+| Tap Fast | 1 s | +24.0 ms | **+60.9 ms** | +26.0 ms | +37.3 ms |
+| Tap Fast | 5 s | +22.0 ms | **+27.4 ms** | +12.0 ms | +6.5 ms |
+| Hold | 1 s | +73.0 ms | **+70.6 ms** | +76.0 ms | +71.0 ms |
+
+**Decision: ship the hotkey-down prime, reject the keep-alive cadence.**
+
+The prime clears the 10 ms p95 bar by a wide margin everywhere it was measured
+cleanly, and it costs one silent 0.5 s dispatch per hotkey press. It ships on
+by default behind `Settings::prime_engine_on_keydown`, fired from
+`App::on_hotkey_press` through `warmup::EnginePrimer`, which spawns so the
+event-tap callback never blocks and drops a second request while the first is
+in flight.
+
+The cadence is rejected on two counts. It buys the warmest encoder of the three
+arms and still loses to the prime on total latency, badly in the tail — 65.2
+against 41.6 ms at p95 on the 1 s Tap Fast fixture — because its dispatches
+contend with the decode that follows them for the worker's single pipe. And it
+costs 2.41 s of worker CPU per minute against a measured zero when idle, which
+is the "measurable battery cost" the issue set as its rejection condition. The
+engine's own draw is on top of that and was not measured: `powermetrics
+--samplers ane_power` needs root and no interactive sudo was available.
+
+The prime recovers less at 5 s than at 1 s, and that is inherent rather than a
+tuning problem: five seconds of talking is already half the cool-down, so a
+dispatch fired at the press has partly decayed by the endpoint. Closing that
+remainder needs a dispatch nearer the endpoint, which is what the cadence was,
+and the cadence costs more than it returns.
+
+The 5 s Hold rows are omitted from the table above because they do not separate
+at n=12. Hold's `warm` arm still plays the fixture, so it sits about one
+utterance from its own previous dispatch rather than back to back, which at 5 s
+leaves an expected cold-to-warm separation of roughly 10 ms - inside the noise
+at that sample size. `bench/README.md` records the rows and the reasoning.
