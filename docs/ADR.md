@@ -2004,11 +2004,27 @@ finished file.
   emission frames are 80 ms apart and the same word is routinely stamped a frame
   apart by two windows. A single shared function word is not accepted as
   agreement.
-- **When they agree on nothing** the seam falls to the midpoint of the overlap.
-  Each window is truncated at one edge — the earlier one on the right, the later
-  one on the left — so the midpoint is where each is least damaged, and a word
-  straddling it is taken from the window that decoded it whole. This never
-  duplicates and never reorders.
+- **When they agree on nothing** both sides are kept whole, and only a leading
+  run of the later window that exactly repeats what the earlier one ended with
+  is removed. A disagreement is not evidence that either window is wrong, so
+  nothing may be dropped on suspicion; an earlier rule that cut the earlier
+  window at the midpoint of the overlap deleted real speech whenever the later
+  window had not in fact re-decoded it. Timestamps cannot close this seam
+  either, because emission lag lets a word only the later window heard carry an
+  earlier stamp than the last word of the earlier one.
+
+  Two costs are accepted here. A word the earlier window truncated
+  mid-utterance survives beside the later window's complete copy, because a
+  fragment does not match its whole form — a visible stutter, which a reader can
+  correct, in place of a deleted clause, which looks like something the speaker
+  never said. And that repeat check compares the whole trailing run of the
+  earlier window against the whole leading run of the later one, rather than
+  only the overlap region, and prefers the longest match, so a phrase the
+  speaker genuinely said twice across a seam could be collapsed to one. It needs
+  the repetition to fall exactly at the seam and to survive normalization on
+  both sides; the probability is low and the alternative — bounding the check to
+  the overlap — reintroduces the timestamp dependency the rest of this decision
+  removes.
 
 **Rejected: aligning on time instead of text.** Splitting the overlap at a fixed
 instant needs no agreement search and is one line. It also cuts words in half
