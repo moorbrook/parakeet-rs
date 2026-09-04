@@ -1,11 +1,21 @@
-//! User vocabulary → sherpa-onnx contextual biasing ("hotwords").
+//! The user's custom vocabulary, and its translation for the sherpa fallback.
 //!
 //! Dictation fails predictably on words the language model has never
 //! weighted highly: proper nouns, product names, trade jargon,
-//! colleagues' surnames. sherpa-onnx supports contextual biasing for
-//! offline transducers, which is exactly the fix — but the on-disk
-//! format it expects is not something a user can reasonably be asked to
-//! write. This module owns that translation.
+//! colleagues' surnames. Contextual biasing is the fix, and there are two
+//! implementations of it behind [`crate::asr::AsrBackend`].
+//!
+//! The shipping Core ML path biases inside the native worker: [`terms`]
+//! hands it the terms verbatim and the worker tokenizes them with the
+//! model's own piece inventory, builds an Aho-Corasick context trie, and
+//! adds the boost to the joint logits before the argmax (ADR-0022
+//! contextual-biasing amendment, `native/.../ContextBias.swift`). Nothing
+//! in this module is involved beyond parsing the file.
+//!
+//! The rest of this module is the sherpa-onnx fallback's hotwords format,
+//! which is reached only by `PARAKEET_ASR_BACKEND=sherpa` or a Core ML
+//! load failure. sherpa wants an on-disk token file that no user could
+//! reasonably be asked to write, so we generate it.
 //!
 //! ## The format, and why we generate it
 //!
@@ -28,12 +38,13 @@
 //!
 //! ## Cost
 //!
-//! Biasing requires `decoding_method="modified_beam_search"` — greedy
-//! decoding rejects a hotwords file outright (the recognizer fails to
-//! construct). Beam search measured **+13%** decode time on the 5 s
-//! bench fixture (396 → 448 ms). We therefore only switch away from
-//! greedy when the user actually has vocabulary entries; an empty or
-//! absent file costs nothing.
+//! On the sherpa fallback, biasing requires
+//! `decoding_method="modified_beam_search"` — greedy decoding rejects a
+//! hotwords file outright (the recognizer fails to construct). Beam
+//! search measured **+13%** decode time on the 5 s bench fixture
+//! (396 → 448 ms). We therefore only switch away from greedy when the
+//! user actually has vocabulary entries; an empty or absent file costs
+//! nothing.
 
 use std::path::{Path, PathBuf};
 
@@ -66,15 +77,20 @@ pub fn parse_terms(raw: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Whether the user's vocabulary contains at least one active term.
+/// The user's active terms, in file order.
 ///
-/// Backend selection uses this inexpensive check before loading a model:
-/// Parakeet Unified is the fast default, while a non-empty vocabulary keeps
-/// the sherpa backend whose contextual-biasing graph preserves that feature.
-pub fn has_terms(path: &Path) -> Result<bool> {
+/// This is what the Core ML worker is given. It does not encode anything:
+/// the tokenizer that turns a term into the model's SentencePiece pieces
+/// ships inside the model bundle, so the encoding [`encode_term`] performs
+/// for sherpa has no counterpart on that path — the worker owns it, and
+/// reports back which terms its inventory could not represent.
+///
+/// A missing file is an empty vocabulary, not an error: the template is
+/// written on first launch and a user may delete it.
+pub fn terms(path: &Path) -> Result<Vec<String>> {
     match std::fs::read_to_string(path) {
-        Ok(raw) => Ok(!parse_terms(&raw).is_empty()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(raw) => Ok(parse_terms(&raw).into_iter().map(str::to_string).collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
     }
 }
@@ -265,8 +281,7 @@ pub const TEMPLATE: &str = "\
 #   Ghostty
 #   New York
 #
-# Lines starting with # are ignored. An empty list costs nothing;
-# a non-empty one makes decoding roughly 13% slower.
+# Lines starting with # are ignored.
 ";
 
 /// Create `path` with [`TEMPLATE`] if it doesn't exist yet. Never
@@ -357,14 +372,14 @@ mod tests {
     }
 
     #[test]
-    fn has_terms_treats_missing_and_comment_only_files_as_empty() {
+    fn terms_treats_missing_and_comment_only_files_as_empty() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("vocabulary.txt");
-        assert!(!has_terms(&path).unwrap());
+        assert!(terms(&path).unwrap().is_empty());
         std::fs::write(&path, "# template only\n\n").unwrap();
-        assert!(!has_terms(&path).unwrap());
-        std::fs::write(&path, "# template\nKubernetes\n").unwrap();
-        assert!(has_terms(&path).unwrap());
+        assert!(terms(&path).unwrap().is_empty());
+        std::fs::write(&path, "# template\nKubernetes\nNew York\n").unwrap();
+        assert_eq!(terms(&path).unwrap(), vec!["Kubernetes", "New York"]);
     }
 
     #[test]

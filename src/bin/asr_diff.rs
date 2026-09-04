@@ -266,13 +266,6 @@ fn run(args: &Args) -> anyhow::Result<bool> {
             store.encoder_path().display()
         );
     }
-    if args.backend == Backend::CoreMlUnified && args.vocabulary.is_some() {
-        anyhow::bail!(
-            "--vocabulary is not supported by the coreml-unified challenger; \
-             run the unbiased quality/performance gate first"
-        );
-    }
-
     // Translate the vocabulary the same way the app does, into a temp
     // file — the point of this harness is to measure the *shipping*
     // encoding, so it must not reimplement it.
@@ -284,11 +277,19 @@ fn run(args: &Args) -> anyhow::Result<bool> {
         "parakeet-asr-diff-hotwords.{}.txt",
         std::process::id()
     ));
-    let hotwords = match &args.vocabulary {
-        Some(v) => vocabulary::prepare(v, &generated, Some(&store.tokens_path()))?,
-        None => None,
+    // The generated hotwords file is the sherpa fallback's format. The Core ML
+    // worker tokenizes the terms itself against the model bundle's inventory,
+    // so that path sends the terms and never writes a file.
+    let hotwords = match (&args.vocabulary, args.backend) {
+        (Some(v), Backend::Sherpa) => {
+            vocabulary::prepare(v, &generated, Some(&store.tokens_path()))?
+        }
+        _ => None,
     };
-    let decoding = decoding_metadata(args, hotwords.as_deref())?;
+    let terms = match &args.vocabulary {
+        Some(path) => vocabulary::terms(path)?,
+        None => Vec::new(),
+    };
     // Removed on every exit path below via this guard.
     let _cleanup = TempFileGuard(generated.clone());
     match &hotwords {
@@ -296,6 +297,11 @@ fn run(args: &Args) -> anyhow::Result<bool> {
             "biasing ON (score {}) from {}",
             args.hotword_score,
             p.display()
+        ),
+        None if !terms.is_empty() => eprintln!(
+            "biasing ON (score {}): {} terms sent to the Core ML worker",
+            args.hotword_score,
+            terms.len()
         ),
         None => eprintln!("biasing OFF (greedy decoding)"),
     }
@@ -321,11 +327,20 @@ fn run(args: &Args) -> anyhow::Result<bool> {
             if let Some(model_dir) = &args.model_dir {
                 config.set_existing_model_directory(model_dir);
             }
+            config.set_vocabulary(terms.clone(), args.hotword_score);
             let (asr, worker_load_seconds) = load_coreml_worker(&config)?;
             eprintln!("Core ML worker ready in {worker_load_seconds:.3}s");
             asr
         }
     };
+    let decoding = decoding_metadata(args, hotwords.as_deref(), asr.contextual_vocabulary())?;
+    if let Some(status) = asr.contextual_vocabulary() {
+        eprintln!(
+            "Core ML worker accepted {} of {} vocabulary terms",
+            status.accepted,
+            terms.len()
+        );
+    }
     let model_load_seconds = model_load_started.elapsed().as_secs_f64();
     let mut peak_resident_bytes = process_tree_resident_bytes(&asr)?;
 
@@ -611,7 +626,16 @@ fn run_metadata(
     })
 }
 
-fn decoding_metadata(args: &Args, hotwords: Option<&Path>) -> anyhow::Result<DecodeMetadata> {
+fn decoding_metadata(
+    args: &Args,
+    hotwords: Option<&Path>,
+    worker_vocabulary: Option<parakeet_dictation::asr::VocabularyStatus>,
+) -> anyhow::Result<DecodeMetadata> {
+    // Two implementations of the same feature: sherpa's hotwords file, and the
+    // worker's own context trie. `active` is true when either is in force, so a
+    // report cannot claim biasing that nothing is doing.
+    let worker_active = worker_vocabulary.is_some_and(|status| status.accepted > 0);
+    let active = hotwords.is_some() || worker_active;
     let vocabulary_requested = args.vocabulary.is_some();
     let vocabulary_raw = args.vocabulary.as_deref().map(std::fs::read).transpose()?;
     let vocabulary_terms_requested = vocabulary_raw
@@ -622,13 +646,17 @@ fn decoding_metadata(args: &Args, hotwords: Option<&Path>) -> anyhow::Result<Dec
         method: if hotwords.is_some() {
             "modified_beam_search".to_string()
         } else if args.backend == Backend::CoreMlUnified {
-            "coreml_unified_greedy".to_string()
+            if worker_active {
+                "coreml_unified_greedy_biased".to_string()
+            } else {
+                "coreml_unified_greedy".to_string()
+            }
         } else {
             "greedy_search".to_string()
         },
         contextual_vocabulary_requested: vocabulary_requested,
-        contextual_vocabulary_active: hotwords.is_some(),
-        hotword_score: hotwords.map(|_| args.hotword_score),
+        contextual_vocabulary_active: active,
+        hotword_score: active.then_some(args.hotword_score),
         vocabulary_terms_requested,
         vocabulary_sha256: vocabulary_raw.as_deref().map(sha256_bytes),
         generated_hotwords_sha256: hotwords.map(sha256_file).transpose()?,

@@ -1,9 +1,11 @@
 //! Stable local-ASR facade and the sherpa fallback backend.
 //!
 //! The app prefers the resident native Core ML Parakeet Unified worker and
-//! selects sherpa-onnx when contextual vocabulary is active or specialized
-//! model setup fails. Each backend remains resident across hotkey presses so
-//! model loading and Core ML graph compilation stay off the dictation path.
+//! selects sherpa-onnx only when specialized model setup fails or the
+//! environment asks for it explicitly. Custom vocabulary no longer forces that
+//! choice: the worker biases natively. Each backend remains resident across
+//! hotkey presses so model loading and Core ML graph compilation stay off the
+//! dictation path.
 //!
 //! ADR-0015 layer 3: every `recognize` call records decode-time vs audio-time
 //! (RTFx). On this M5 Pro, CoreML-resident execution should sit comfortably
@@ -44,6 +46,26 @@ pub trait AsrBackend: Send + Sync {
     fn last_stage_report(&self) -> Option<StageReport> {
         None
     }
+
+    /// What the backend made of a custom vocabulary it was given, or `None`
+    /// when it was given none. The sherpa fallback returns `None` because its
+    /// hotword graph reports nothing back — its equivalent diagnostic is
+    /// `crate::vocabulary`'s token validation, which runs before the model.
+    fn contextual_vocabulary(&self) -> Option<VocabularyStatus> {
+        None
+    }
+}
+
+/// A backend's verdict on the custom vocabulary it was asked to bias toward.
+///
+/// `rejected` carries the user's own words, so it is for logging and for the
+/// settings UI; reports record only the counts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VocabularyStatus {
+    /// Terms the model's token inventory could represent.
+    pub accepted: u32,
+    /// Terms it could not, which are therefore boosting nothing.
+    pub rejected: Vec<String>,
 }
 
 /// Where one utterance's decode time went inside the recognizer.
@@ -286,6 +308,11 @@ impl Asr {
     /// Stage breakdown of the most recent decode, when the backend collects one.
     pub fn last_stage_report(&self) -> Option<StageReport> {
         self.backend.last_stage_report()
+    }
+
+    /// The active contextual vocabulary, when this backend has one.
+    pub fn contextual_vocabulary(&self) -> Option<VocabularyStatus> {
+        self.backend.contextual_vocabulary()
     }
 
     pub fn recognize(&self, samples: &[f32], sample_rate: u32) -> Result<String> {

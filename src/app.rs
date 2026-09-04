@@ -752,17 +752,20 @@ fn load_asr_blocking(settings: &SettingsStore, warm: bool) -> anyhow::Result<(Ar
     // can never be newer than the bytes this build actually consumed.
     let biasing = Biasing::sample(settings);
 
-    let has_vocabulary = match crate::vocabulary::has_terms(&settings.vocabulary_path()) {
-        Ok(has_terms) => has_terms,
+    // A vocabulary that can't be read costs the user their custom terms, not
+    // their backend: the worker biases toward whatever we hand it, and an empty
+    // list is the unbiased path the quality gate measures.
+    let terms = match crate::vocabulary::terms(&settings.vocabulary_path()) {
+        Ok(terms) => terms,
         Err(error) => {
             log::error!("vocabulary unreadable, optimized backend will run unbiased: {error:#}");
-            false
+            Vec::new()
         }
     };
 
     let backend_override = configured_asr_backend_override()?;
-    if !has_vocabulary && backend_override == AsrBackendOverride::Auto {
-        match load_optimized_asr(settings) {
+    if backend_override == AsrBackendOverride::Auto {
+        match load_optimized_asr(settings, &terms, biasing.score) {
             Ok(asr) => return Ok((Arc::new(asr), biasing)),
             Err(error) => {
                 log::warn!(
@@ -771,8 +774,6 @@ fn load_asr_blocking(settings: &SettingsStore, warm: bool) -> anyhow::Result<(Ar
                 menubar::set_status_text("Optimized model unavailable — loading fallback…");
             }
         }
-    } else if has_vocabulary {
-        log::info!("custom vocabulary is active; selecting sherpa contextual-biasing backend");
     } else {
         log::info!("PARAKEET_ASR_BACKEND=sherpa; selecting explicit fallback backend");
     }
@@ -815,7 +816,11 @@ fn load_asr_blocking(settings: &SettingsStore, warm: bool) -> anyhow::Result<(Ar
     Ok((Arc::new(asr), biasing))
 }
 
-fn load_optimized_asr(settings: &SettingsStore) -> anyhow::Result<Asr> {
+fn load_optimized_asr(
+    settings: &SettingsStore,
+    vocabulary: &[String],
+    vocabulary_score: f32,
+) -> anyhow::Result<Asr> {
     use anyhow::Context as _;
 
     let app_model_directory = settings.coreml_model_dir();
@@ -837,6 +842,7 @@ fn load_optimized_asr(settings: &SettingsStore) -> anyhow::Result<Asr> {
 
     let mut config = CoreMlWorkerConfig::discover()?;
     config.set_existing_model_directory(&app_model_directory);
+    config.set_vocabulary(vocabulary.to_vec(), vocabulary_score);
     let long_plan_warmup_seconds = configure_coreml_runtime_plan(settings, &mut config)?;
     menubar::set_status_text("Loading optimized recogniser…");
 

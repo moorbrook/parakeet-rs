@@ -21,10 +21,17 @@ use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::asr::{Asr, AsrBackend, AsrBackendMetadata, Decoded, StageReport};
+use crate::asr::{Asr, AsrBackend, AsrBackendMetadata, Decoded, StageReport, VocabularyStatus};
 use crate::resample::{to_target_rate, TARGET_SAMPLE_RATE};
 
 const PROTOCOL_MAGIC: [u8; 4] = *b"PRKT";
+/// Control frame carrying the custom vocabulary. A distinct magic rather than a
+/// protocol version bump: the audio frame is unchanged, and a worker that
+/// predates this frame refuses it by magic instead of reading its length as a
+/// sample rate.
+const VOCABULARY_MAGIC: [u8; 4] = *b"PRKV";
+/// Structural cap on the vocabulary payload, matching the worker's.
+const MAX_VOCABULARY_BYTES: usize = 1 << 20;
 const PROTOCOL_VERSION: u32 = 1;
 const MIN_SAMPLE_RATE: u32 = 8_000;
 const MAX_SAMPLE_RATE: u32 = 384_000;
@@ -36,7 +43,10 @@ const WORKER_NAME: &str = "parakeet-coreml-worker";
 pub const COREML_MODEL_FOLDER: &str = "parakeet-unified-en-0.6b";
 
 /// Paths needed to start the native Core ML worker.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Not `Eq`: `vocabulary_score` is an `f32`, and the app compares configured
+/// biasing through `Biasing`, which owns that comparison deliberately.
+#[derive(Clone, Debug, PartialEq)]
 pub struct CoreMlWorkerConfig {
     pub worker_path: PathBuf,
     pub model_source: CoreMlModelSource,
@@ -49,6 +59,14 @@ pub struct CoreMlWorkerConfig {
     pub emit_stage_timings: bool,
     /// Which implementation of the greedy RNNT loop the worker runs.
     pub rnnt_engine: CoreMlRnntEngine,
+    /// Terms to bias recognition toward, sent once at spawn so the worker
+    /// builds its context trie a single time rather than per utterance. Empty
+    /// is the default and costs the decode loop one nil check per window.
+    pub vocabulary: Vec<String>,
+    /// Per-token log-probability boost applied to the biased tokens. Read only
+    /// when `vocabulary` is non-empty; sherpa's `hotwords_score` is the
+    /// reference for what the number means.
+    pub vocabulary_score: f32,
 }
 
 /// The two implementations of the transducer decode loop the worker can run.
@@ -143,6 +161,8 @@ impl CoreMlWorkerConfig {
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
             emit_stage_timings: false,
             rnnt_engine: CoreMlRnntEngine::default(),
+            vocabulary: Vec::new(),
+            vocabulary_score: 0.0,
         }
     }
 
@@ -155,6 +175,8 @@ impl CoreMlWorkerConfig {
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
             emit_stage_timings: false,
             rnnt_engine: CoreMlRnntEngine::default(),
+            vocabulary: Vec::new(),
+            vocabulary_score: 0.0,
         }
     }
 
@@ -172,6 +194,16 @@ impl CoreMlWorkerConfig {
 
     pub fn set_rnnt_engine(&mut self, engine: CoreMlRnntEngine) {
         self.rnnt_engine = engine;
+    }
+
+    /// Bias recognition toward `terms` with a per-token boost of `score`.
+    ///
+    /// The terms go over the wire as written: the tokenizer that turns them
+    /// into the model's pieces lives in the model bundle, which only the worker
+    /// has open.
+    pub fn set_vocabulary(&mut self, terms: Vec<String>, score: f32) {
+        self.vocabulary = terms;
+        self.vocabulary_score = score;
     }
 
     pub fn set_compute_units(&mut self, compute_units: CoreMlComputeUnits) {
@@ -248,6 +280,8 @@ struct CoreMlWorkerBackend {
     load_seconds: f64,
     /// Stage breakdown from the most recent result, when the worker reports one.
     last_stages: Mutex<Option<StageReport>>,
+    /// What the worker made of the vocabulary, or `None` when none was sent.
+    vocabulary: Option<VocabularyStatus>,
 }
 
 impl CoreMlWorkerBackend {
@@ -303,6 +337,34 @@ impl CoreMlWorkerBackend {
             .load_seconds
             .ok_or_else(|| anyhow!("Core ML ready response omitted load_seconds"))?;
 
+        // A vocabulary the worker cannot apply is fatal here rather than
+        // logged: the caller asked for biasing, and a worker that silently
+        // decoded without it would look like a quality regression with no
+        // trace of its cause.
+        let vocabulary = if config.vocabulary.is_empty() {
+            None
+        } else {
+            Some(
+                process
+                    .set_vocabulary(&config.vocabulary, config.vocabulary_score)
+                    .context("sending the custom vocabulary to the Core ML worker")?,
+            )
+        };
+        if let Some(status) = &vocabulary {
+            for term in &status.rejected {
+                log::warn!(
+                    "vocabulary: {term:?} can't be represented by this model's token \
+                     inventory — skipped"
+                );
+            }
+            log::info!(
+                "contextual biasing ON (score {}): {} of {} terms active",
+                config.vocabulary_score,
+                status.accepted,
+                config.vocabulary.len()
+            );
+        }
+
         Ok(Self {
             process: Mutex::new(process),
             metadata: AsrBackendMetadata {
@@ -319,6 +381,7 @@ impl CoreMlWorkerBackend {
             },
             load_seconds,
             last_stages: Mutex::new(None),
+            vocabulary,
         })
     }
 }
@@ -367,6 +430,10 @@ impl AsrBackend for CoreMlWorkerBackend {
     fn last_stage_report(&self) -> Option<StageReport> {
         self.last_stages.lock().clone()
     }
+
+    fn contextual_vocabulary(&self) -> Option<VocabularyStatus> {
+        self.vocabulary.clone()
+    }
 }
 
 struct WorkerProcess {
@@ -397,6 +464,30 @@ impl WorkerProcess {
         Ok(())
     }
 
+    /// Send the `PRKV` control frame and read the worker's verdict on it.
+    fn set_vocabulary(&mut self, terms: &[String], score: f32) -> Result<VocabularyStatus> {
+        let payload = serde_json::to_vec(&VocabularyRequest { terms, score })
+            .context("encoding the vocabulary request")?;
+        if payload.len() > MAX_VOCABULARY_BYTES {
+            bail!(
+                "vocabulary payload is {} bytes, over the {MAX_VOCABULARY_BYTES}-byte limit",
+                payload.len()
+            );
+        }
+        let length = u32::try_from(payload.len()).context("vocabulary payload exceeds u32")?;
+        self.stdin.write_all(&encode_vocabulary_header(length))?;
+        self.stdin.write_all(&payload)?;
+        self.stdin.flush()?;
+        let response = self.read_response()?;
+        response.require_success("vocabulary")?;
+        Ok(VocabularyStatus {
+            accepted: response
+                .vocabulary_accepted
+                .ok_or_else(|| anyhow!("Core ML vocabulary response omitted the accepted count"))?,
+            rejected: response.vocabulary_rejected.unwrap_or_default(),
+        })
+    }
+
     fn read_response(&mut self) -> Result<WorkerResponse> {
         let mut length = [0_u8; 4];
         self.stdout.read_exact(&mut length)?;
@@ -418,6 +509,14 @@ impl Drop for WorkerProcess {
     }
 }
 
+/// The `PRKV` frame's JSON body. Borrowed, so a large vocabulary is not cloned
+/// on its way to the worker.
+#[derive(Serialize)]
+struct VocabularyRequest<'a> {
+    terms: &'a [String],
+    score: f32,
+}
+
 #[derive(Debug, Deserialize)]
 struct WorkerResponse {
     kind: String,
@@ -428,6 +527,8 @@ struct WorkerResponse {
     decode_seconds: Option<f64>,
     resample_seconds: Option<f64>,
     stages: Option<StageReport>,
+    vocabulary_accepted: Option<u32>,
+    vocabulary_rejected: Option<Vec<String>>,
 }
 
 impl WorkerResponse {
@@ -471,6 +572,15 @@ fn encode_header(sample_rate: u32, sample_count: u32) -> [u8; 16] {
     header
 }
 
+/// magic, protocol version, JSON payload length, reserved.
+fn encode_vocabulary_header(payload_bytes: u32) -> [u8; 16] {
+    let mut header = [0_u8; 16];
+    header[..4].copy_from_slice(&VOCABULARY_MAGIC);
+    header[4..8].copy_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    header[8..12].copy_from_slice(&payload_bytes.to_le_bytes());
+    header
+}
+
 fn validate_request(sample_count: usize, sample_rate: u32) -> Result<u32> {
     if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate) {
         bail!(
@@ -508,6 +618,69 @@ mod tests {
     }
 
     #[test]
+    fn vocabulary_frame_is_distinguishable_from_an_audio_frame() {
+        // The worker dispatches on the magic, so an audio header must never be
+        // readable as a vocabulary one: a length read as a sample rate would
+        // fail the range check rather than transcribe garbage, but the frames
+        // still have to be told apart before that.
+        let vocabulary = encode_vocabulary_header(1234);
+        assert_eq!(&vocabulary[..4], b"PRKV");
+        assert_ne!(&vocabulary[..4], &encode_header(16_000, 1)[..4]);
+        assert_eq!(u32::from_le_bytes(vocabulary[4..8].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_le_bytes(vocabulary[8..12].try_into().unwrap()),
+            1234
+        );
+        assert_eq!(&vocabulary[12..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn vocabulary_request_sends_the_terms_verbatim() {
+        // The worker tokenizes them against the model bundle, so anything this
+        // side does to a term (case folding, the sherpa word-start marker)
+        // would bias a word the user did not write.
+        let terms = vec!["IBM".to_string(), "New York".to_string()];
+        let payload = serde_json::to_string(&VocabularyRequest {
+            terms: &terms,
+            score: 2.0,
+        })
+        .unwrap();
+        assert_eq!(payload, r#"{"terms":["IBM","New York"],"score":2.0}"#);
+    }
+
+    #[test]
+    fn vocabulary_response_reports_accepted_and_rejected_terms() {
+        // Rejected terms are the diagnostic the sherpa path gets from its own
+        // token validation. Losing them means a user's word silently boosts
+        // nothing with nothing anywhere to explain it.
+        let payload = br#"{
+            "kind": "vocabulary", "ok": true,
+            "vocabulary_accepted": 2, "vocabulary_rejected": ["Zzz"]
+        }"#;
+        let response: WorkerResponse = serde_json::from_slice(payload).expect("valid response");
+        response.require_success("vocabulary").expect("ok");
+        assert_eq!(response.vocabulary_accepted, Some(2));
+        assert_eq!(response.vocabulary_rejected.as_deref(), Some(&["Zzz".to_string()][..]));
+    }
+
+    #[test]
+    fn a_result_response_carries_no_vocabulary_fields() {
+        let payload = br#"{"kind": "result", "ok": true, "text": "hi", "decode_seconds": 0.04}"#;
+        let response: WorkerResponse = serde_json::from_slice(payload).expect("valid result");
+        assert!(response.vocabulary_accepted.is_none());
+        assert!(response.vocabulary_rejected.is_none());
+    }
+
+    #[test]
+    fn an_empty_vocabulary_leaves_the_config_unbiased() {
+        let mut config = CoreMlWorkerConfig::new("worker", "model");
+        assert!(config.vocabulary.is_empty());
+        config.set_vocabulary(vec!["IBM".to_string()], 2.0);
+        assert_eq!(config.vocabulary, vec!["IBM".to_string()]);
+        assert_eq!(config.vocabulary_score, 2.0);
+    }
+
+    #[test]
     fn failed_response_preserves_worker_error() {
         let response = WorkerResponse {
             kind: "result".to_string(),
@@ -518,6 +691,8 @@ mod tests {
             decode_seconds: None,
             resample_seconds: None,
             stages: None,
+            vocabulary_accepted: None,
+            vocabulary_rejected: None,
         };
         let error = response
             .require_success("result")
