@@ -430,7 +430,7 @@ pub fn open(mtm: MainThreadMarker) {
         mtm,
         &[
             "Tap — pause-friendly auto-stop",
-            "Tap Fast — 150 ms auto-stop",
+            "Tap Fast — 90 ms auto-stop",
             "Hold — release to paste",
         ],
         match settings.as_ref().map(|s| s.trigger_mode) {

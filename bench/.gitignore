@@ -19,3 +19,4 @@ asr-quality.json
 !polish/
 !polish/*.csv
 !polish/eval.json
+endpoint-sweep/

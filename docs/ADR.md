@@ -1529,7 +1529,8 @@ the independent confirming detector a product policy:
   this safer behavior without a settings-file rewrite.
 - **Tap Fast** is an explicit 150 ms option (five windows, 160 ms after
   quantization) for short commands. It preserves ADR-0023's matched 3× latency
-  gate exactly.
+  gate exactly. *(Superseded by [ADR-0031](#0031--tap-fast-confirms-at-90-ms-punctuation-rejected-as-an-endpoint-signal), which measured the
+  window down to 90 ms.)*
 - **Hold** remains release-to-paste and does not depend on VAD to stop.
 
 The threshold is centralized in `EndpointPolicy` and passed to both the local
@@ -1917,12 +1918,118 @@ tail flush remains after the stream is dropped.
 
 ---
 
+## 0031 — Tap Fast confirms at 90 ms; punctuation rejected as an endpoint signal
+
+**Status:** **Accepted — implemented and measured.**
+
+**Context.** After ADR-0030 the Tap path stopped collecting decode savings.
+The `phase_timer` line said why: `t_asr_start=4966`, `t_asr_done=5013`,
+`t_vad_endpoint=5094`. The speculative decode finished about 80 ms before the
+150 ms confirming Silero state released, and `dur_post_endpoint_ms` was 0 to
+1 ms. Taking time out of the decode widened that margin instead of shortening
+the result. Only the confirmation window moved Tap's number.
+
+**Decision.** Tap Fast confirms after 90 ms of Silero silence instead of 150 ms.
+`FAST_CONFIRMATION_MS` is 90; both the confirming Silero state and the candidate
+tracker consume audio in 512-sample frames, so the earliest commit is the third
+silent frame, 96 ms, exactly as ADR-0025's 150 ms became 160 ms. The shipped
+constant is 90 ms and every table here reports measured latency, so 96 ms never
+appears as a figure — it is only what the quantizer does with 90. Long-form keeps
+750 ms. The resolved window is passed as a value rather than derived from the
+policy inside each consumer, so the confirming Silero state, the local candidate
+tracker, and the sweep benchmark cannot disagree.
+
+90 ms is where the curve stops. Every 60 ms repetition reports
+`t_asr_done == t_vad_endpoint`: `asr.recognize()` runs synchronously on the VAD
+watcher thread and blocks frame intake, so below roughly 90 ms the decode is the
+floor and a shorter window buys nothing. That decode is bimodal at 54 and 94 ms,
+which is the next lever and is not addressed here.
+
+**A punctuation-aware early commit was implemented, measured, and removed.** The
+mechanism committed at a shorter window when the provisional transcript ended in
+sentence-final punctuation, reopening on resumed speech. Three measurements
+killed it:
+
+1. It does not fire on real speech. The model ends the human single-sentence
+   fixture `...amidst the tents,` with a comma in all 30 repetitions, leaving
+   that row identical to its control at 59.0 ms p50.
+2. Where it fires it is worth nothing over a plain shorter window. On the
+   synthesized fixture, 150 ms gated at 90 ms and an ungated 90 ms give the same
+   distribution over 30 repetitions: 148.5 ms p50 both, means 139.4 and 141.8 ms.
+   Their 15-repetition p50s differ, 145.0 against 125.0 ms, because a 15-sample
+   median lands on either side of the bimodal decode's cluster boundary; the
+   means there differ by 4.4 ms.
+3. Its premise is false. Long-form at 750 ms with a 90 ms punctuated window cut
+   the multi-sentence fixture 15/15, and the provisional transcript at its
+   reviewed 544 ms intra-utterance pause reads `...to greet the arrival of the
+   young princess.` The model emits a sentence-final period mid-utterance, which
+   is exactly where a pause policy must hold.
+
+So punctuation is not an end-of-utterance signal, and the mechanism is gone
+rather than left unreachable. Avenue 3 of the issue — a FluidAudio Parakeet EOU
+streaming model, or a prosody feature on the last 300 ms — was not prototyped;
+result 3 is the argument for why a real acoustic predictor, not a text cue,
+would be the thing to try.
+
+This supersedes ADR-0025's Tap Fast threshold. It does not change ADR-0023's
+stop authority: the confirming Silero state remains the only state allowed to
+end a recording, and the candidate state still only starts a provisional decode.
+
+**Gate.** `scripts/bench-endpoint-sweep.sh` sweeps the window over three
+fixtures and reports two oracles per row, because neither alone is sound.
+`false_cuts` counts commits landing before Core Audio's predicted instant for
+the fixture's last sample above -80 dBFS; the LibriSpeech fixtures carry room
+tone above that floor, so a short window can miss that marker with every word
+intact. `mismatches` compares the transcript against the fixture reference and
+is the oracle for lost speech. `bench_e2e --tolerate-false-cuts` counts early
+commits and continues instead of aborting on the first, which is what a rate
+requires, and keeps the Core ML worker warm across repetitions.
+
+**Evidence.** M5 Pro 24 GB, release builds, speculative Core ML, two warmups and
+30 measured repetitions:
+
+| fixture | 150 ms | 90 ms | delta p50 |
+|---|---:|---:|---:|
+| 4.854 s synthesized | 182.0 ms p50 / 183.5 mean | 148.5 ms p50 / 141.8 mean | **-33.5 ms** |
+| 3.505 s human | 59.0 ms p50 / 58.1 mean | 13.0 ms p50 / 10.1 mean | **-46.0 ms** |
+
+The human fixture's absolute figures are offset low: Silero calls silence inside
+the LibriSpeech room tone that keeps the -80 dBFS acoustic-end marker alive, so
+the marker sits later than the speech does. Compare the deltas, not the
+absolutes.
+
+False cuts were 0/30 in every row. The issue asked for at least 40 ms off p50:
+human speech gives 46.0 ms, the synthesized fixture 33.5 ms, and that fixture's
+mean improves by 41.7 ms. The shortfall is the bimodal decode pinning p50 to a
+cluster boundary rather than a property of the window.
+
+Both existing gates were re-run unchanged and pass. The long-pause endpoint gate
+holds 0/30 false stops at 667.0 ms p50 single and 635.0 ms p50 / 647.5 ms p95
+multi. The frozen end-to-end comparison is now pinned to `--confirmation-ms 150`
+so it stays like-for-like against the historical numbers regardless of the
+shipping window, and reads 594.5 → 182.0 ms p50 (**3.27×**) and 635.1 →
+203.6 ms p95 (**3.12×**).
+
+Full tables and the rejected mechanism's rows are in
+[`docs/asr/PERF.md`](asr/PERF.md).
+
+**Consequences.** Tap Fast tolerates a shorter hesitation before committing. That
+is the mode's stated bargain — ADR-0025 made Long-form the default precisely
+because a false stop loses speech — and neither corpus fixture lost a word at
+90 ms. Below 90 ms nothing improves until the decode stops blocking the VAD
+watcher, which is the work this ADR hands on.
+
+The sweep harness can no longer reproduce the punctuation rows; they are
+reachable at the commit named in the change log.
+
+---
+
 ## Target status index
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
 |---|---|---|---|
 | Accelerated Core ML path present | [0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage) + [0015](#0015--coreml-ep-verification-protocol) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped + measured** — native worker quality/latency gates pass; the sherpa fallback retains its CoreML symbol/runtime checks | exact per-op placement remains Apple-managed |
-| <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) + [0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) | **Shipped + measured** — Tap Fast is 182.0 ms p50 on the representative 5 s bucket; pause-friendly Tap remains below 1 s on the endpoint corpus | nothing |
+| <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) + [0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) + [0031](#0031--tap-fast-confirms-at-90-ms-punctuation-rejected-as-an-endpoint-signal) | **Shipped + measured** — Tap Fast is 148.5 ms p50 on the representative 5 s bucket, down 33.5 ms, and 46.0 ms faster on the 3.505 s human fixture (13.0 ms measured, offset low by that fixture's marker); pause-friendly Tap remains below 1 s on the endpoint corpus | nothing |
 | Live partial transcripts | [0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) | **Out of scope** — no quality-preserving streaming model won; speculative final decode provides the measured latency win | a new candidate must beat the existing quality/latency/resource gates |
 | CPU+ANE requested and performance-gated | [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans) | **Shipped** — explicit tuner retained CPU+ANE on the M5 Pro after all challengers failed the ≥5%/quality/memory gates | Core ML owns final per-op placement |
 | ≤5 GB resident set with polish On | [0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation) + [0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped** — native tray shell, resident Core ML worker, and Qwen mmap/lifecycle | nothing |
@@ -1945,6 +2052,17 @@ tail flush remains after the stream is dropped.
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-09-04** — [ADR-0031](#0031--tap-fast-confirms-at-90-ms-punctuation-rejected-as-an-endpoint-signal)
+  accepted and implemented. Tap Fast confirms after 90 ms of Silero silence
+  instead of 150 ms: 182.0 to 148.5 ms p50 on the synthesized 5 s fixture and
+  59.0 to 13.0 ms on the 3.505 s human fixture, whose absolutes sit low because
+  its acoustic-end marker survives into the room tone; 0/30 false cuts and both
+  existing gates unchanged. A punctuation-aware early commit was built and measured
+  alongside it and is rejected: the model emits a sentence-final period at the
+  endpoint corpus's 544 ms intra-utterance pause, so it cut that fixture 15/15,
+  and where it was safe it matched a plain 90 ms window. Its implementation and
+  benchmark rows are reachable at commit `b2cc586`.
 
 - **2026-09-04** — [ADR-0030](#0030--one-16-khz-resampler-in-rust-run-during-capture)
   accepted and implemented. One Kaldi sinc resampler in `src/resample.rs`,

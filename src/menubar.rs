@@ -289,7 +289,7 @@ fn refresh_on_main(
         };
         let mode_label = match trigger_mode {
             TriggerMode::Tap => "Mode: Tap (pause-friendly auto-stop)".to_string(),
-            TriggerMode::TapFast => "Mode: Tap Fast (150 ms auto-stop)".to_string(),
+            TriggerMode::TapFast => "Mode: Tap Fast (90 ms auto-stop)".to_string(),
             TriggerMode::Hold => "Mode: Hold (release to paste)".to_string(),
         };
         let (symbol, header_label, toggle_label, toggle_enabled) = match state {
