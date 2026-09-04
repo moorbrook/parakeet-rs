@@ -318,16 +318,15 @@ impl CoreMlWorkerConfig {
             CoreMlModelVariant::Unified => None,
             CoreMlModelVariant::TdtV3 => std::env::var_os("PARAKEET_COREML_TDT_V3_MODEL_DIR"),
         };
-        let model_directory = match variant_directory
-            .or_else(|| std::env::var_os("PARAKEET_COREML_MODEL_DIR"))
-        {
-            Some(path) => PathBuf::from(path),
-            None => dirs::data_dir()
-                .ok_or_else(|| anyhow!("macOS application-support directory is unavailable"))?
-                .join("FluidAudio")
-                .join("Models")
-                .join(model_variant.folder_name()),
-        };
+        let model_directory =
+            match variant_directory.or_else(|| std::env::var_os("PARAKEET_COREML_MODEL_DIR")) {
+                Some(path) => PathBuf::from(path),
+                None => dirs::data_dir()
+                    .ok_or_else(|| anyhow!("macOS application-support directory is unavailable"))?
+                    .join("FluidAudio")
+                    .join("Models")
+                    .join(model_variant.folder_name()),
+            };
         let mut config = Self::new(worker_path, model_directory);
         config.set_model_variant(model_variant)?;
         Ok(config)

@@ -193,10 +193,10 @@ fn parse_args() -> anyhow::Result<Args> {
                     .context("parsing --tdt-chunk-concurrency")?;
             }
             "--tdt-decode-compute-units" => {
-                tdt_decode_compute_units = Some(CoreMlComputeUnits::parse(
-                    &it.next()
-                        .ok_or_else(|| anyhow!("--tdt-decode-compute-units needs a name"))?,
-                )?);
+                tdt_decode_compute_units =
+                    Some(CoreMlComputeUnits::parse(&it.next().ok_or_else(|| {
+                        anyhow!("--tdt-decode-compute-units needs a name")
+                    })?)?);
             }
             "--stage-timings" => {
                 stage_timings = true;
@@ -717,8 +717,8 @@ mod tests {
         stages.windows = 2;
         stages.encoder_calls = 2;
         stages.preprocessor_calls = 3;
-        let error = validate_stage_report(&stages)
-            .expect_err("a mismatched mel front-end count must fail");
+        let error =
+            validate_stage_report(&stages).expect_err("a mismatched mel front-end count must fail");
         assert!(error.to_string().contains("mel front-end dispatches"));
     }
 
@@ -791,9 +791,10 @@ mod tests {
     fn a_report_claiming_both_engines_fails() {
         let mut stages = healthy_native();
         stages.decoder_calls = 35;
-        let error =
-            validate_stage_report(&stages).expect_err("both engines at once must fail");
-        assert!(error.to_string().contains("cannot have run on both engines"));
+        let error = validate_stage_report(&stages).expect_err("both engines at once must fail");
+        assert!(error
+            .to_string()
+            .contains("cannot have run on both engines"));
     }
 
     #[test]
@@ -802,8 +803,7 @@ mod tests {
         stages.windows = 2;
         stages.encoder_calls = 2;
         stages.native_decoder_steps = 1;
-        let error =
-            validate_stage_report(&stages).expect_err("too few native steps must fail");
+        let error = validate_stage_report(&stages).expect_err("too few native steps must fail");
         assert!(error.to_string().contains("decoder steps"));
     }
 }
