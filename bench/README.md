@@ -375,6 +375,133 @@ The change is the retired resample plus a smaller second term: the pipe carries
 the 22.5 ms measured. Every other stage held: mel 3.19 against 3.23 ms, encoder
 25.97 against 26.04, profiled transcribe interval 44.79 against 44.87.
 
+## Bucketed short-window encoders: M5 Pro 24 GB (2026-09-04)
+
+With the resample retired, the encoder is the whole of the short-utterance
+floor: 26.0 ms of a 32.7 ms one-second result, and flat, because the offline
+encoder is compiled at one fixed 15 s mel window and `UnifiedAsrManager`
+zero-pads every utterance to it. `scripts/build-bucket-encoder.py` exports the
+same NVIDIA checkpoint at shorter windows through FluidInference's `mobius`
+pipeline, and the worker sends each utterance to the narrowest compiled window
+that holds it. Buckets are discovered by filename in the model directory, so the
+two arms below differ only in which `--model-dir` the worker was given.
+
+Encoder cost against compiled window, `parakeet-encoder-probe` on zero inputs,
+ten predictions after three warmups:
+
+| window | mel frames | encoder frames | predict p50 |
+|---:|---:|---:|---:|
+| 2 s | 201 | 26 | 7.70 ms |
+| 5 s | 501 | 63 | 9.64 ms |
+| 8 s | 801 | 101 | 12.21 ms |
+| 12 s | 1201 | 151 | 24.48 ms |
+| 15 s (shipped) | 1501 | 188 | 26.11 ms |
+
+The curve bends: 7.5 µs per frame from 201 to 801, 30.7 µs from 801 to 1201,
+5.4 µs from 1201 to 1501. That bend is unexplained. It is why an 8 s window is
+worth having and a 12 s one is not, and why extrapolating from the short end
+would have been wrong: about 6 ms of the encoder is fixed cost no shorter window
+removes. Derivation and method are in
+[`docs/asr/COMPUTE_PLAN.md`](../docs/asr/COMPUTE_PLAN.md).
+
+Matched 30-repetition runs, three warmups, release build
+(`bench/coreml-unified-rerun-stages.csv` against
+`bench/coreml-unified-buckets-stages.csv`). Machine 80 to 92% idle throughout.
+
+| fixture | captured | bucket taken | encoder before | encoder after | mel before | mel after |
+|---|---:|---|---:|---:|---:|---:|
+| `1s_48000` | 0.816 s | 2 s | 25.98 ms | **7.71 ms** | 3.18 ms | 0.71 ms |
+| `3s_48000` | 2.828 s | 5 s | 25.31 ms | **9.74 ms** | 3.06 ms | 1.28 ms |
+| `5s_48000` | 4.854 s | 5 s | 25.45 ms | **9.98 ms** | 3.11 ms | 1.34 ms |
+| 7 s cut | 7.000 s | 8 s | 25.60 ms | **12.45 ms** | 3.10 ms | 1.89 ms |
+| `10s_48000` | 8.062 s | none | 25.55 ms | 25.60 ms | 3.14 ms | 3.16 ms |
+| `20s_48000` | 15.755 s | none | 51.88 ms | 51.16 ms | 6.22 ms | 6.05 ms |
+
+Mel falls with the encoder because `UnifiedMelExtractor` is built at the
+layout's window, so a 2 s bucket computes 201 mel frames instead of 1501.
+
+These runs predate the merge of ADR-0030, so both arms still paid the
+worker-side resample. That does not touch these two columns, and the check is in
+the table: the "before" arm's encoder and mel reproduce the post-ADR-0030
+per-stage table above within 0.7 ms at every fixture, which is what licenses
+reading the two tables together.
+
+Worker total, which excludes resample in both arms and is therefore directly
+comparable to the post-ADR-0030 numbers above:
+
+| fixture | captured | worker total before | after | saved |
+|---|---:|---:|---:|---:|
+| `1s_48000` | 0.816 s | 32.40 ms | **11.26 ms** | −21.1 ms |
+| `3s_48000` | 2.828 s | 37.08 ms | **19.78 ms** | −17.3 ms |
+| `5s_48000` | 4.854 s | 43.98 ms | **27.01 ms** | −17.0 ms |
+| 7 s cut | 7.000 s | 49.70 ms | **35.61 ms** | −14.1 ms |
+| `10s_48000` | 8.062 s | 52.91 ms | 52.89 ms | 0.0 ms |
+| `20s_48000` | 15.755 s | 112.61 ms | 110.77 ms | −1.8 ms |
+
+The "before" column agrees with the independently measured post-ADR-0030 worker
+totals in the per-stage table above to within 1.1 ms at every fixture, and the
+"after" column was checked directly on the merged code: a single 4.854 s
+decode with ADR-0030's 16 kHz capture path reports resample 0.001 ms, mel
+1.43 ms, encoder 10.01 ms and worker total 27.17 ms, against the 27.01 ms in
+the table. ASR p50 is worker total plus IPC, which is 0.11 to 0.27 ms across
+this range, so a one-second utterance goes from about 32 ms to about 11 ms of
+ASR. Repeated end-to-end p50 on the merged code has not been re-measured; when
+it is, it belongs in the per-stage table above rather than here.
+
+The 8.062 s fixture is unchanged twice over: it is 128,992 samples against the
+8 s bucket's 128,000, missing by 62 ms of audio, and it is also past the 8 s
+long-regime threshold. No stock fixture lands between 5 and 8 seconds, so the
+8 s bucket is measured on a 7.0 s cut of the gold corpus's 14.225 s
+`librispeech-multi` recording — real speech, trimmed with `soundfile` rather
+than newly synthesized. The 15.755 s fixture needs two 15 s windows either way.
+
+Every row has identical Core ML dispatch counts in both arms, which is what says
+the decode path did not change: 7/17, 20/55, 36/96, 48/135, 55/155 and 119/349
+decoder/joint calls respectively.
+
+At one second the remaining 11.3 ms is encoder 7.71, decode loop 2.83, mel 0.71
+and post 0.03. The length-independent encoder-and-mel share of the ASR call
+falls from 91% to 75%; what is left is a smaller fixed cost of the same kind,
+and the decode loop, which grows at 0.25 ms per 80 ms frame and now dominates
+past about 3 seconds of audio.
+
+Quality is unchanged. Matched ten-repetition gold runs, same corpus and worker,
+differing only in model directory:
+
+| arm | WER | CER | corpus decode p50 | p95 | RTFx p50 | peak RSS | load |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 15 s only | 5.434783% | 3.571429% | 0.4534 s | 0.4682 s | 75.1× | 0.10 GiB | 0.107 s |
+| buckets 2/5/8 | 5.434783% | 3.571429% | **0.3397 s** | **0.3879 s** | **100.2×** | 0.19 GiB | 0.495 s |
+
+Both are 5 word edits of 92 and 17 character edits of 476, with zero WER and CER
+spread and zero changed outputs across ten repetitions, so the bucket arm sits
+exactly on the frozen baseline and passes its 0.00-point regression cap. Every
+hypothesis is byte-identical between the two arms, checked field by field rather
+than inferred from equal scores. The gold corpus routes one fixture to the 2 s
+bucket, five to the 5 s, and the 14.225 s fixture to the unbucketed path; the
+7 s cut covers the 8 s bucket, and it is byte-identical too. Those corpus
+timings also predate ADR-0030 in both arms.
+
+Each bucket is a separate 590 MB compiled program, so 2/5/8 costs 1.77 GB of
+disk on top of the shipped 569 MB encoder. Resident memory is far cheaper
+because Core ML maps the weights: 0.10 to 0.19 GiB. The first load of a bucket
+compiles a Core ML plan and takes about 6 s; the plan cache is persistent, so
+warm load is 0.495 s against 0.107 s. That cold cost is behind a blocking read
+in the Rust worker handshake and is tracked as kata hrs0. The ANE's ~128
+loaded-program cap is not close at three buckets.
+
+```bash
+scripts/build-bucket-encoder.py --seconds 5    # ~90 s per bucket, 1 to 14
+BACKEND=coreml-unified OUT_CSV=bench/coreml-unified-buckets.csv \
+    PARAKEET_COREML_MODEL_DIR=<dir with bucket encoders> scripts/bench-latency.sh
+REPETITIONS=10 COREML_WORKER=target/release/parakeet-coreml-worker \
+    COREML_MODEL_DIR=<dir with bucket encoders> scripts/bench-gold.sh
+```
+
+Bucket artifacts are not on Hugging Face and the Rust download and verification
+path knows nothing about them, so a stock model directory has no buckets and
+behaves exactly as the tables above describe.
+
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 
 Hold (press-and-hold) had no measured release-to-text number; the tables above
@@ -690,6 +817,7 @@ Swap `--variant edits-only`, `--skip-min-words 4`, `--prompt-cache`, or
 | `coreml-unified.csv`         | Generated shipping-backend ASR percentiles.     |
 | `*-boundary.csv`             | Generated Rust/worker boundary measurements.    |
 | `*-stages.csv`               | Generated per-stage breakdown and Core ML dispatch counts. |
+| `coreml-unified-buckets*.csv` | Generated bucketed short-window encoder runs. |
 | `hold.{log,csv}`             | Generated Hold-mode release-to-transcript runs. |
 | `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |
 | `endpoint-*.{log,csv}`       | Generated pause-friendly endpoint gate runs.   |
