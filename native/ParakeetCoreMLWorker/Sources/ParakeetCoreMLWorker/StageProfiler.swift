@@ -27,6 +27,10 @@ final class StageProfiler: @unchecked Sendable {
     static let shared = StageProfiler()
 
     enum Stage: UInt8 {
+        /// TDT's mel front end is a Core ML graph (`Preprocessor.mlmodelc`,
+        /// pinned to CPU by FluidAudio). Unified computes mel in Swift and
+        /// never produces this stage.
+        case preprocessor
         case encoder
         case decoder
         case joint
@@ -45,11 +49,16 @@ final class StageProfiler: @unchecked Sendable {
         /// Set by the caller since it happens outside the profiled interval.
         var resampleMs: Double = 0
         let windows: Int
+        let preprocessorCalls: Int
         let encoderCalls: Int
         let decoderCalls: Int
         let jointCalls: Int
         let otherCalls: Int
+        /// Host-side work before a mel or encoder dispatch. For Unified this
+        /// is the whole mel front end; for TDT it is only the marshalling
+        /// around `preprocessorMs`.
         let melMs: Double
+        let preprocessorMs: Double
         let encoderMs: Double
         let decodeLoopMs: Double
         let decodeLoopDispatchMs: Double
@@ -164,7 +173,7 @@ final class StageProfiler: @unchecked Sendable {
     }
 
     private static func describe(_ placements: [Stage: MLComputeUnits]) -> String {
-        [Stage.encoder, .decoder, .joint]
+        [Stage.preprocessor, .encoder, .decoder, .joint]
             .compactMap { stage -> String? in
                 guard let placement = placements[stage] else { return nil }
                 return "\(name(of: stage))=\(name(of: placement))"
@@ -174,6 +183,7 @@ final class StageProfiler: @unchecked Sendable {
 
     private static func name(of stage: Stage) -> String {
         switch stage {
+        case .preprocessor: "preprocessor"
         case .encoder: "encoder"
         case .decoder: "decoder"
         case .joint: "joint"
@@ -199,16 +209,21 @@ final class StageProfiler: @unchecked Sendable {
         endNanoseconds: UInt64,
         computeUnits: String
     ) -> Report {
+        var preprocessorCalls = 0
         var encoderCalls = 0
         var decoderCalls = 0
         var jointCalls = 0
         var otherCalls = 0
+        var preprocessorNanoseconds: UInt64 = 0
         var encoderNanoseconds: UInt64 = 0
         var decoderNanoseconds: UInt64 = 0
         var jointNanoseconds: UInt64 = 0
         for event in timeline {
             let elapsed = event.endNanoseconds &- event.startNanoseconds
             switch event.stage {
+            case .preprocessor:
+                preprocessorCalls += 1
+                preprocessorNanoseconds &+= elapsed
             case .encoder:
                 encoderCalls += 1
                 encoderNanoseconds &+= elapsed
@@ -233,12 +248,23 @@ final class StageProfiler: @unchecked Sendable {
         var openEncoderEnd: UInt64?
         var lastEnd = startNanoseconds
         for event in timeline {
-            if event.stage == .encoder {
+            switch event.stage {
+            case .preprocessor:
+                // A mel dispatch opens the next window, so it closes the
+                // previous window's decode loop rather than extending it.
+                if let encoderEnd = openEncoderEnd {
+                    decodeLoopNanoseconds &+= lastEnd &- encoderEnd
+                    openEncoderEnd = nil
+                }
+                melNanoseconds &+= event.startNanoseconds &- min(previousEnd, event.startNanoseconds)
+            case .encoder:
                 if let encoderEnd = openEncoderEnd {
                     decodeLoopNanoseconds &+= lastEnd &- encoderEnd
                 }
                 melNanoseconds &+= event.startNanoseconds &- min(previousEnd, event.startNanoseconds)
                 openEncoderEnd = event.endNanoseconds
+            case .decoder, .joint, .other:
+                break
             }
             previousEnd = max(previousEnd, event.endNanoseconds)
             lastEnd = max(lastEnd, event.endNanoseconds)
@@ -249,11 +275,13 @@ final class StageProfiler: @unchecked Sendable {
 
         return Report(
             windows: encoderCalls,
+            preprocessorCalls: preprocessorCalls,
             encoderCalls: encoderCalls,
             decoderCalls: decoderCalls,
             jointCalls: jointCalls,
             otherCalls: otherCalls,
             melMs: milliseconds(melNanoseconds),
+            preprocessorMs: milliseconds(preprocessorNanoseconds),
             encoderMs: milliseconds(encoderNanoseconds),
             decodeLoopMs: milliseconds(decodeLoopNanoseconds),
             decodeLoopDispatchMs: milliseconds(decoderNanoseconds &+ jointNanoseconds),
@@ -273,7 +301,10 @@ final class StageProfiler: @unchecked Sendable {
     /// (`UnifiedFeatureProviders.swift`), so the input alone identifies the model.
     static func classify(_ input: MLFeatureProvider) -> Stage {
         let names = input.featureNames
+        // `mel` is the encoder input for both graph sets; TDT's mel front end
+        // is a separate graph taking the raw waveform.
         if names.contains("mel") { return .encoder }
+        if names.contains("audio_signal") { return .preprocessor }
         if names.contains("encoder_step") { return .joint }
         if names.contains("targets") { return .decoder }
         return .other

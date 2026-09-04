@@ -30,7 +30,7 @@ use parakeet_dictation::asr::{Asr, AsrBackendMetadata, AsrConfig, Decoded};
 use parakeet_dictation::asr_eval::{
     self, DecodeMetadata, GoldManifest, QualityReport, RunMetadata,
 };
-use parakeet_dictation::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
+use parakeet_dictation::coreml_worker::{load_coreml_worker, CoreMlModelVariant, CoreMlWorkerConfig};
 use parakeet_dictation::performance;
 use parakeet_dictation::resample::{to_target_rate, TARGET_SAMPLE_RATE};
 use parakeet_dictation::settings::SettingsStore;
@@ -61,6 +61,8 @@ struct Args {
 enum Backend {
     Sherpa,
     CoreMlUnified,
+    /// The TDT 0.6B v3 challenger, through the same worker (kata f0zg).
+    CoreMlTdtV3,
 }
 
 impl Backend {
@@ -68,7 +70,18 @@ impl Backend {
         match value {
             "sherpa" => Ok(Self::Sherpa),
             "coreml-unified" => Ok(Self::CoreMlUnified),
-            _ => anyhow::bail!("unknown backend {value:?}; expected sherpa or coreml-unified"),
+            "coreml-tdt-v3" => Ok(Self::CoreMlTdtV3),
+            _ => anyhow::bail!(
+                "unknown backend {value:?}; expected sherpa, coreml-unified, or coreml-tdt-v3"
+            ),
+        }
+    }
+
+    fn model_variant(self) -> Option<CoreMlModelVariant> {
+        match self {
+            Self::Sherpa => None,
+            Self::CoreMlUnified => Some(CoreMlModelVariant::Unified),
+            Self::CoreMlTdtV3 => Some(CoreMlModelVariant::TdtV3),
         }
     }
 }
@@ -192,7 +205,7 @@ fn print_usage() {
     eprintln!(
         "usage: asr_diff [--record | --gold JSON] [--audio-dir DIR]\n\
         \x20               [--baseline JSON] [--json-out JSON]\n\
-        \x20               [--backend sherpa|coreml-unified]\n\
+        \x20               [--backend sherpa|coreml-unified|coreml-tdt-v3]\n\
         \x20               [--worker PATH] [--model-dir DIR]\n\
         \x20               [--repetitions N]\n\
         \x20               [--vocabulary FILE] [--hotword-score N]\n\
@@ -300,7 +313,11 @@ fn run(args: &Args) -> anyhow::Result<bool> {
             hotwords: hotwords.as_deref(),
             hotwords_score: args.hotword_score,
         })?,
-        Backend::CoreMlUnified => {
+        Backend::CoreMlUnified | Backend::CoreMlTdtV3 => {
+            let variant = args
+                .backend
+                .model_variant()
+                .expect("a Core ML backend names a model variant");
             let mut config = CoreMlWorkerConfig::discover()?;
             if let Some(worker) = &args.worker {
                 config.worker_path.clone_from(worker);
@@ -308,6 +325,7 @@ fn run(args: &Args) -> anyhow::Result<bool> {
             if let Some(model_dir) = &args.model_dir {
                 config.set_existing_model_directory(model_dir);
             }
+            config.set_model_variant(variant)?;
             let (asr, worker_load_seconds) = load_coreml_worker(&config)?;
             eprintln!("Core ML worker ready in {worker_load_seconds:.3}s");
             asr

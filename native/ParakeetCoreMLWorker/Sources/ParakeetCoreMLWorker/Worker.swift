@@ -9,7 +9,7 @@ private let maximumAudioSeconds: UInt64 = 30 * 60
 private let maximumLongRegimeSeconds: UInt32 = 60
 private let maximumResponseBytes = 4 * 1024 * 1024
 
-private enum WorkerError: LocalizedError {
+enum WorkerError: LocalizedError {
     case invalidArgument(String)
     case truncatedRequest
     case invalidMagic
@@ -34,6 +34,7 @@ private enum WorkerError: LocalizedError {
 private struct WorkerOptions {
     let modelDirectory: URL?
     let modelRoot: URL?
+    let modelVariant: ModelVariant
     let shortComputeUnits: MLComputeUnits
     let longComputeUnits: MLComputeUnits
     let longRegimeSeconds: UInt32
@@ -46,6 +47,7 @@ private struct WorkerOptions {
     static func parse(_ arguments: [String]) throws -> Self {
         var modelDirectory: URL?
         var modelRoot: URL?
+        var modelVariant: ModelVariant = .unified
         var shortComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
         var longComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
         var longRegimeSeconds: UInt32 = 8
@@ -66,6 +68,12 @@ private struct WorkerOptions {
                     throw WorkerError.invalidArgument("--model-root needs a path")
                 }
                 modelRoot = URL(fileURLWithPath: arguments[index], isDirectory: true)
+            case "--model-variant":
+                index += 1
+                guard index < arguments.count else {
+                    throw WorkerError.invalidArgument("--model-variant needs a name")
+                }
+                modelVariant = try ModelVariant.parse(arguments[index])
             case "--compute-units":
                 index += 1
                 guard index < arguments.count else {
@@ -110,6 +118,7 @@ private struct WorkerOptions {
             case "-h", "--help":
                 let usage =
                     "usage: parakeet-coreml-worker [--model-dir DIR | --model-root DIR] "
+                    + "[--model-variant unified|tdt-v3] "
                     + "[--compute-units NAME | --short-compute-units NAME "
                     + "--long-compute-units NAME --long-regime-seconds N] "
                     + "[--encoder-buckets auto|none|N,N,...] [--emit-stage-timings]\n"
@@ -125,9 +134,20 @@ private struct WorkerOptions {
         guard modelDirectory == nil || modelRoot == nil else {
             throw WorkerError.invalidArgument("--model-dir and --model-root are mutually exclusive")
         }
+        // `--model-root` hands the directory to FluidAudio's downloader, which
+        // resolves against mutable `main`. The Unified pack survives that only
+        // because Rust verifies it against a pinned revision first (ADR-0024);
+        // no such gate exists for TDT, so it must name a directory that is
+        // already on disk.
+        if modelVariant == .tdtV3 && modelDirectory == nil {
+            throw WorkerError.invalidArgument(
+                "--model-variant tdt-v3 requires --model-dir; it has no integrity-gated download"
+            )
+        }
         return Self(
             modelDirectory: modelDirectory,
             modelRoot: modelRoot,
+            modelVariant: modelVariant,
             shortComputeUnits: shortComputeUnits,
             longComputeUnits: longComputeUnits,
             longRegimeSeconds: longRegimeSeconds,
@@ -241,7 +261,7 @@ private struct ParakeetCoreMLWorker {
             computeUnits: options.shortComputeUnits,
             options: options
         )
-        let longManager: UnifiedAsrManager?
+        let longManager: TranscriptionEngine?
         if options.longComputeUnits == options.shortComputeUnits {
             longManager = nil
         } else {
@@ -255,7 +275,10 @@ private struct ParakeetCoreMLWorker {
             ?? options.modelRoot?
                 .appendingPathComponent(Repo.parakeetUnified.folderName, isDirectory: true)
         var buckets = EncoderBuckets.empty
-        if let modelDirectory {
+        // Bucket encoders are Unified-only artifacts. TDT v3's published
+        // encoder takes a fixed [1, 128, 1501] mel — the same 15 s window —
+        // so short windows would need their own conversion (kata fgzt).
+        if options.modelVariant == .unified, let modelDirectory {
             let windows =
                 options.encoderBuckets
                 ?? EncoderBuckets.availableWindows(in: modelDirectory, precision: .int8)
@@ -271,6 +294,8 @@ private struct ParakeetCoreMLWorker {
             }
         }
         let loadSeconds = seconds(since: loadStart)
+        FileHandle.standardError.write(
+            Data("parakeet-coreml-worker: model variant \(options.modelVariant.rawValue)\n".utf8))
         if !buckets.isEmpty {
             let windows = buckets.descriptions.joined(separator: ", ")
             FileHandle.standardError.write(
@@ -318,7 +343,8 @@ private struct ParakeetCoreMLWorker {
                     isLongRegime ? options.longComputeUnits : options.shortComputeUnits
                 let bucketManager =
                     regimeComputeUnits == options.shortComputeUnits
-                    ? buckets.manager(forSampleCount: modelSamples.count) : nil
+                    ? buckets.manager(forSampleCount: modelSamples.count).map(
+                        TranscriptionEngine.unified) : nil
                 let manager =
                     bucketManager
                     ?? (isLongRegime ? (longManager ?? shortManager) : shortManager)
@@ -351,19 +377,43 @@ private struct ParakeetCoreMLWorker {
     private static func loadManager(
         computeUnits: MLComputeUnits,
         options: WorkerOptions
-    ) async throws -> UnifiedAsrManager {
+    ) async throws -> TranscriptionEngine {
         let configuration = MLModelConfiguration()
         configuration.computeUnits = computeUnits
-        let manager = UnifiedAsrManager(
-            configuration: configuration,
-            encoderPrecision: .int8
-        )
-        if let modelDirectory = options.modelDirectory {
-            try await manager.loadModels(from: modelDirectory)
-        } else {
-            try await manager.loadModels(to: options.modelRoot, configuration: nil)
+        switch options.modelVariant {
+        case .unified:
+            let manager = UnifiedAsrManager(
+                configuration: configuration,
+                encoderPrecision: .int8
+            )
+            if let modelDirectory = options.modelDirectory {
+                try await manager.loadModels(from: modelDirectory)
+            } else {
+                try await manager.loadModels(to: options.modelRoot, configuration: nil)
+            }
+            return .unified(manager)
+        case .tdtV3:
+            guard let modelDirectory = options.modelDirectory else {
+                throw WorkerError.invalidArgument("--model-variant tdt-v3 requires --model-dir")
+            }
+            // `AsrModels.load` reaches the repository through `ModelHub`, which
+            // fetches anything missing from HuggingFace `main`. Offline mode
+            // turns that into a typed error naming the missing files, so a
+            // directory this worker was pointed at is the only thing it can
+            // ever run.
+            ModelHub.offlineMode = true
+            let models = try await AsrModels.load(
+                from: modelDirectory,
+                configuration: configuration,
+                version: .v3,
+                encoderPrecision: .int8
+            )
+            let manager = AsrManager()
+            try await manager.loadModels(models)
+            return .tdt(
+                TdtSession(manager: manager, decoderLayers: AsrModelVersion.v3.decoderLayers)
+            )
         }
-        return manager
     }
 }
 

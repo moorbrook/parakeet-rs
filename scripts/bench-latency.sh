@@ -15,7 +15,7 @@
 #   bench/audio/{1,3,5,10,20}s.wav     — synthesized once, kept on rerun.
 #   bench/raw.log                       — every iteration's phase_timer line.
 #   bench/baseline.csv (or $OUT_CSV)    — per-mode-per-length percentile table.
-#   bench/*-stages.csv                  — per-stage breakdown (coreml-unified only).
+#   bench/*-stages.csv                  — per-stage breakdown (Core ML backends only).
 #
 # Usage:
 #   scripts/bench-latency.sh                   # defaults
@@ -23,6 +23,9 @@
 #   BACKEND=coreml-unified \
 #       OUT_CSV=bench/coreml-unified.csv \
 #       scripts/bench-latency.sh                # shipping native Core ML backend
+#   BACKEND=coreml-tdt-v3 \
+#       OUT_CSV=bench/coreml-tdt-v3.csv \
+#       scripts/bench-latency.sh                # the TDT v3 challenger (kata f0zg)
 #   OUT_CSV=bench/experiment.csv \
 #       scripts/bench-latency.sh                # name an experiment output
 
@@ -44,13 +47,13 @@ OUT_CSV="${OUT_CSV:-bench/baseline.csv}"
 BACKEND="${BACKEND:-sherpa}"
 # The native worker can report where its decode time went (resample, mel,
 # encoder, RNNT loop) plus its Core ML dispatch counts. sherpa has no
-# equivalent seam, so the flag is only passed to the native backend.
+# equivalent seam, so the flag is only passed to the native backends.
 STAGE_TIMINGS="${STAGE_TIMINGS:-1}"
 
 case "$BACKEND" in
-    sherpa|coreml-unified) ;;
+    sherpa|coreml-unified|coreml-tdt-v3) ;;
     *)
-        echo "unknown BACKEND=$BACKEND (expected sherpa or coreml-unified)" >&2
+        echo "unknown BACKEND=$BACKEND (expected sherpa, coreml-unified, or coreml-tdt-v3)" >&2
         exit 2
         ;;
 esac
@@ -92,7 +95,7 @@ for len in "${LENGTHS[@]}"; do
 done
 
 # Step 2 — release build (debug numbers are useless for latency comparison).
-if [[ "$BACKEND" == "coreml-unified" ]]; then
+if [[ "$BACKEND" != "sherpa" ]]; then
     echo "Building native Core ML worker…"
     scripts/build-coreml-worker.sh
 fi
@@ -106,7 +109,7 @@ for len in "${LENGTHS[@]}"; do
     wav="$WAV_DIR/${len}s_${SAMPLE_RATE}.wav"
     echo "Benching $wav (backend=$BACKEND, warmup=$WARMUP_REPS, reps=$REPS)…"
     stage_args=()
-    if [[ "$BACKEND" == "coreml-unified" && "$STAGE_TIMINGS" != "0" ]]; then
+    if [[ "$BACKEND" != "sherpa" && "$STAGE_TIMINGS" != "0" ]]; then
         stage_args=(--stage-timings)
     fi
     "$BENCH_BIN" --backend "$BACKEND" --wav "$wav" \
@@ -127,7 +130,7 @@ echo
 echo "Wrote $BOUNDARY_CSV"
 cat "$BOUNDARY_CSV"
 
-if [[ "$BACKEND" == "coreml-unified" && "$STAGE_TIMINGS" != "0" ]]; then
+if [[ "$BACKEND" != "sherpa" && "$STAGE_TIMINGS" != "0" ]]; then
     STAGES_CSV="${OUT_CSV%.csv}-stages.csv"
     uv run --quiet scripts/bench-stages.py --log "$RAW_LOG" --out "$STAGES_CSV"
     echo

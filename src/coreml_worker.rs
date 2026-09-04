@@ -34,12 +34,63 @@ pub const DEFAULT_LONG_REGIME_SECONDS: u32 = 8;
 pub const MAX_LONG_REGIME_SECONDS: u32 = 60;
 const WORKER_NAME: &str = "parakeet-coreml-worker";
 pub const COREML_MODEL_FOLDER: &str = "parakeet-unified-en-0.6b";
+pub const COREML_TDT_V3_MODEL_FOLDER: &str = "parakeet-tdt-0.6b-v3";
+
+/// Which Parakeet graph set the worker loads.
+///
+/// `Unified` is the shipping default (ADR-0022). `TdtV3` is the multilingual
+/// TDT 0.6B v3 conversion, present so it can be measured against Unified on
+/// the same corpus and stage profiler (kata f0zg). It is not a production
+/// path: Rust has no pinned download and integrity gate for it, so it can only
+/// be pointed at a directory that is already on disk.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CoreMlModelVariant {
+    #[default]
+    Unified,
+    TdtV3,
+}
+
+impl CoreMlModelVariant {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unified => "unified",
+            Self::TdtV3 => "tdt-v3",
+        }
+    }
+
+    /// Directory name FluidAudio derives from its repository enum. The worker
+    /// re-appends it to the parent of the directory it is given, so a model
+    /// directory under any other name fails to load.
+    pub const fn folder_name(self) -> &'static str {
+        match self {
+            Self::Unified => COREML_MODEL_FOLDER,
+            Self::TdtV3 => COREML_TDT_V3_MODEL_FOLDER,
+        }
+    }
+
+    pub const fn model_description(self) -> &'static str {
+        match self {
+            Self::Unified => "Parakeet Unified EN 0.6B offline 15s",
+            Self::TdtV3 => "Parakeet TDT 0.6B v3 multilingual offline 15s",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "unified" => Ok(Self::Unified),
+            "tdt-v3" => Ok(Self::TdtV3),
+            _ => bail!("unknown Core ML model variant {value:?}; expected unified or tdt-v3"),
+        }
+    }
+}
 
 /// Paths needed to start the native Core ML worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CoreMlWorkerConfig {
     pub worker_path: PathBuf,
     pub model_source: CoreMlModelSource,
+    pub model_variant: CoreMlModelVariant,
     pub short_compute_units: CoreMlComputeUnits,
     pub long_compute_units: CoreMlComputeUnits,
     pub long_regime_seconds: u32,
@@ -105,6 +156,7 @@ impl CoreMlWorkerConfig {
         Self {
             worker_path: worker_path.into(),
             model_source: CoreMlModelSource::ExistingDirectory(model_directory.into()),
+            model_variant: CoreMlModelVariant::Unified,
             short_compute_units: CoreMlComputeUnits::default(),
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
@@ -116,6 +168,7 @@ impl CoreMlWorkerConfig {
         Self {
             worker_path: worker_path.into(),
             model_source: CoreMlModelSource::DownloadRoot(model_root.into()),
+            model_variant: CoreMlModelVariant::Unified,
             short_compute_units: CoreMlComputeUnits::default(),
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
@@ -129,6 +182,21 @@ impl CoreMlWorkerConfig {
 
     pub fn set_download_root(&mut self, model_root: impl Into<PathBuf>) {
         self.model_source = CoreMlModelSource::DownloadRoot(model_root.into());
+    }
+
+    /// Select the graph set. `TdtV3` is an evaluation path with no
+    /// Rust-managed download, so it requires an existing model directory.
+    pub fn set_model_variant(&mut self, variant: CoreMlModelVariant) -> Result<()> {
+        if variant == CoreMlModelVariant::TdtV3
+            && matches!(self.model_source, CoreMlModelSource::DownloadRoot(_))
+        {
+            bail!(
+                "the tdt-v3 model variant has no integrity-gated download; point it at an \
+                 existing model directory instead of a download root"
+            );
+        }
+        self.model_variant = variant;
+        Ok(())
     }
 
     pub fn set_emit_stage_timings(&mut self, emit: bool) {
@@ -167,15 +235,22 @@ impl CoreMlWorkerConfig {
             Some(path) => PathBuf::from(path),
             None => discover_worker_path()?,
         };
+        let model_variant = match std::env::var("PARAKEET_COREML_MODEL_VARIANT") {
+            Ok(value) => CoreMlModelVariant::parse(&value)?,
+            Err(std::env::VarError::NotPresent) => CoreMlModelVariant::default(),
+            Err(error) => return Err(error).context("reading PARAKEET_COREML_MODEL_VARIANT"),
+        };
         let model_directory = match std::env::var_os("PARAKEET_COREML_MODEL_DIR") {
             Some(path) => PathBuf::from(path),
             None => dirs::data_dir()
                 .ok_or_else(|| anyhow!("macOS application-support directory is unavailable"))?
                 .join("FluidAudio")
                 .join("Models")
-                .join(COREML_MODEL_FOLDER),
+                .join(model_variant.folder_name()),
         };
-        Ok(Self::new(worker_path, model_directory))
+        let mut config = Self::new(worker_path, model_directory);
+        config.set_model_variant(model_variant)?;
+        Ok(config)
     }
 }
 
@@ -219,7 +294,16 @@ impl CoreMlWorkerBackend {
                 validate_directory(path, "Core ML model")?;
                 ("--model-dir", path)
             }
-            CoreMlModelSource::DownloadRoot(path) => ("--model-root", path),
+            CoreMlModelSource::DownloadRoot(path) => {
+                if config.model_variant != CoreMlModelVariant::Unified {
+                    bail!(
+                        "the {} model variant has no integrity-gated download and cannot be \
+                         started from a download root",
+                        config.model_variant.as_str()
+                    );
+                }
+                ("--model-root", path)
+            }
         };
 
         let mut command = Command::new(&config.worker_path);
@@ -232,6 +316,13 @@ impl CoreMlWorkerBackend {
             .arg(config.long_compute_units.as_str())
             .arg("--long-regime-seconds")
             .arg(config.long_regime_seconds.to_string());
+        // Only when it differs from the default, so the shipping worker's
+        // command line is exactly what ADR-0022 measured.
+        if config.model_variant != CoreMlModelVariant::default() {
+            command
+                .arg("--model-variant")
+                .arg(config.model_variant.as_str());
+        }
         if config.emit_stage_timings {
             command.arg("--emit-stage-timings");
         }
@@ -266,7 +357,7 @@ impl CoreMlWorkerBackend {
             process: Mutex::new(process),
             metadata: AsrBackendMetadata {
                 backend: "fluid-audio-worker".to_string(),
-                model: "Parakeet Unified EN 0.6B offline 15s".to_string(),
+                model: config.model_variant.model_description().to_string(),
                 quantization: "int8 encoder".to_string(),
                 execution_provider: format!(
                     "Core ML short={} long={} threshold={}s",
@@ -513,6 +604,61 @@ mod tests {
         // the frame identity is checked at runtime by
         // `bench_asr::validate_stage_report`, which is where a moved Core ML
         // entry point gets caught.
+    }
+
+    #[test]
+    fn tdt_result_response_carries_the_mel_front_end_stage() {
+        // TDT's mel front end is a Core ML graph, so it appears as its own
+        // stage. Pins the two field names the Unified payload above cannot.
+        let payload = br#"{
+            "kind": "result", "ok": true, "text": "hello",
+            "decode_seconds": 0.044, "resample_seconds": 0.0,
+            "stages": {
+                "resample_ms": 0.0, "windows": 1, "preprocessor_calls": 1,
+                "encoder_calls": 1, "decoder_calls": 12, "joint_calls": 40,
+                "other_calls": 0, "mel_ms": 0.42, "preprocessor_ms": 6.1,
+                "encoder_ms": 25.9, "decode_loop_ms": 9.2,
+                "decode_loop_dispatch_ms": 8.8, "decoder_dispatch_ms": 3.1,
+                "joint_dispatch_ms": 5.7, "post_ms": 0.05, "total_ms": 41.67,
+                "compute_units": "preprocessor=cpu-only encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only"
+            }
+        }"#;
+        let response: WorkerResponse = serde_json::from_slice(payload).expect("valid result");
+        let stages = response.stages.expect("stages present");
+        assert_eq!(stages.preprocessor_calls, 1);
+        assert!((stages.preprocessor_ms - 6.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn model_variant_names_round_trip_and_keep_unified_as_the_default() {
+        assert_eq!(CoreMlModelVariant::default(), CoreMlModelVariant::Unified);
+        for candidate in [CoreMlModelVariant::Unified, CoreMlModelVariant::TdtV3] {
+            assert_eq!(
+                CoreMlModelVariant::parse(candidate.as_str()).unwrap(),
+                candidate
+            );
+        }
+        assert!(CoreMlModelVariant::parse("tdt").is_err());
+        assert_eq!(
+            CoreMlModelVariant::TdtV3.folder_name(),
+            COREML_TDT_V3_MODEL_FOLDER
+        );
+    }
+
+    #[test]
+    fn tdt_refuses_a_download_root_because_nothing_verifies_it() {
+        let mut config = CoreMlWorkerConfig::download_to("worker", "root");
+        let error = config
+            .set_model_variant(CoreMlModelVariant::TdtV3)
+            .expect_err("an unverified download root must be refused");
+        assert!(error.to_string().contains("integrity-gated download"));
+        assert_eq!(config.model_variant, CoreMlModelVariant::Unified);
+
+        let mut config = CoreMlWorkerConfig::new("worker", "model");
+        config
+            .set_model_variant(CoreMlModelVariant::TdtV3)
+            .expect("an existing directory is the supported source");
+        assert_eq!(config.model_variant, CoreMlModelVariant::TdtV3);
     }
 
     #[test]

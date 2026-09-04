@@ -502,6 +502,93 @@ Bucket artifacts are not on Hugging Face and the Rust download and verification
 path knows nothing about them, so a stock model directory has no buckets and
 behaves exactly as the tables above describe.
 
+## Parakeet TDT 0.6B v3 challenger: M5 Pro 24 GB (2026-09-04)
+
+TDT predicts a duration per emitted token and skips encoder frames, so its
+decoder work scales with tokens rather than frames. FluidAudio's published
+benchmarks put TDT v3 at 155.6× RTFx against 123.3× for Unified batch on the
+same int8-on-ANE setup, which is the reason to try it. It is loaded through the
+same worker behind `--model-variant tdt-v3` (kata f0zg); the default is
+unchanged.
+
+The graph set is `FluidInference/parakeet-tdt-0.6b-v3-coreml` at revision
+`7dd20fe6b1797d35f5e3307e8b1732d9a178edfe`, fetched by
+`scripts/fetch-tdt-v3-model.py`; per-file byte lengths and SHA-256 digests are
+in [`tdt-v3-model-manifest.json`](tdt-v3-model-manifest.json). Four compiled
+graphs plus the vocabulary, 469 MB on disk.
+
+**The encoder window is the same 15 s.** `Encoder.mlmodelc` takes a fixed
+`[1, 128, 1501]` mel — 1,501 frames at a 10 ms hop — and emits 188 encoder
+frames at 8× subsampling, which is byte-for-byte the shape the Unified offline
+encoder takes. So the bucketed short-window work above does not carry over:
+TDT would need its own re-conversion at each window before it could pay the
+same short-utterance saving.
+
+### The duration head cuts joint calls, and it does not help
+
+One 14.225 s fixture, one 15 s window, one repetition each, release build,
+`--stage-timings`:
+
+| | preprocessor calls | encoder calls | decoder calls | joint calls | joint dispatch |
+|---|---:|---:|---:|---:|---:|
+| Unified | 0 | 1 | 84 | **261** | 26.02 ms |
+| TDT v3 | 1 | 1 | 82 | **92** | 26.27 ms |
+
+The frame skipping is real: 92 joint predictions against Unified's 261, a 2.84×
+reduction on identical audio. It buys nothing. `JointDecisionv3` also emits
+`top_k_ids` and `top_k_logits` at K=64 for script-aware filtering, and
+FluidAudio's TDT loader places the decoder and joint on CPU+ANE where the
+Unified loader pins them CPU-only. Per-call joint cost rises by about the same
+factor the call count falls, and total joint dispatch lands within 1% of
+Unified.
+
+The rest of the stage split moves against TDT as well. Its mel front end is a
+Core ML graph (`Preprocessor.mlmodelc`, CPU-only) rather than Swift, which is
+1.04 ms of dispatch plus 0.24 ms of marshalling against Unified's 3.18 ms — a
+small win. The tail is not: post-dispatch work is 14.83 ms for TDT against
+0.11 ms for Unified, and worker total is 81.42 ms against 67.79 ms.
+
+### Quality: a hard fail on the English gate
+
+Same seven-fixture gold corpus, same worker, one repetition:
+
+| arm | WER | CER |
+|---|---:|---:|
+| Unified (frozen baseline, 10 reps) | **5.434783%** | **3.571429%** |
+| TDT v3 (1 rep) | 7.61% | 3.99% |
+
+TDT's own worst category is custom-vocabulary at 45.45% WER, and commands at
+17.07%; a matched per-category Unified row is not yet measured.
+
+The manifest's regression cap is 0.00 points, so the bar is WER ≤ 5.434783%
+exactly. TDT is 2.18 points over it. On a 92-word corpus one extra word error
+is 1.09 points, so this is a five-word-edit baseline against a nine-word-edit
+challenger, not a rounding difference. Its absolute WER still sits under the
+8.00% ceiling; the gate that fails is the regression one.
+
+The errors are the shape the multilingual-versus-EN-tuned split predicts:
+
+| fixture | reference | TDT v3 |
+|---|---|---|
+| `slurp-stock-ibm-close` | "Is IBM up today?" | "It's I PM up today." |
+| `slurp-alarm-seven-thirty-close` | "Please wake me up at seven thirty AM." | "Please wake me up at seven hundred and thirty AM." |
+| `slurp-music-olly-tactics-close` | "Hey Olly, play playlist Tactics from music." | "Hey Ollie, play playlist tactics for music." |
+
+Unified transcribes all three within the frozen baseline. The two categories
+that carry dictation — spoken numbers and proper nouns under command phrasing —
+are exactly where TDT loses.
+
+### Reproducing
+
+```bash
+scripts/fetch-tdt-v3-model.py           # 469 MB, pinned revision, SHA-256 verified
+BACKEND=coreml-tdt-v3 OUT_CSV=bench/coreml-tdt-v3.csv \
+    PARAKEET_COREML_MODEL_DIR="$HOME/Library/Application Support/com.parakeet.rs/models/coreml/parakeet-tdt-0.6b-v3" \
+    scripts/bench-latency.sh
+REPETITIONS=10 COREML_WORKER=target/release/parakeet-coreml-worker \
+    scripts/bench-gold.sh                # runs the TDT arm when the model is present
+```
+
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 
 Hold (press-and-hold) had no measured release-to-text number; the tables above

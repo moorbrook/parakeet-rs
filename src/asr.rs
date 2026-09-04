@@ -50,7 +50,8 @@ pub trait AsrBackend: Send + Sync {
 ///
 /// The native worker derives these from its Core ML dispatch timeline, so the
 /// call counts are exact and the durations partition the worker-internal decode
-/// interval: `mel_ms + encoder_ms + decode_loop_ms + post_ms == total_ms`.
+/// interval:
+/// `mel_ms + preprocessor_ms + encoder_ms + decode_loop_ms + post_ms == total_ms`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct StageReport {
     /// Sample-rate conversion inside the worker, before any model runs. Near
@@ -59,14 +60,25 @@ pub struct StageReport {
     pub resample_ms: f64,
     /// Fixed 15 s encoder windows the utterance was split into.
     pub windows: u32,
+    /// Mel-front-end Core ML dispatches. Zero for Parakeet Unified, which
+    /// computes mel in Swift; one per window for TDT v3, whose front end is a
+    /// `Preprocessor` graph. Defaulted so a payload captured before the stage
+    /// existed still deserializes.
+    #[serde(default)]
+    pub preprocessor_calls: u32,
     pub encoder_calls: u32,
     pub decoder_calls: u32,
     pub joint_calls: u32,
     /// Core ML predictions that matched none of the three known input shapes.
     /// A nonzero value means the pipeline changed and the split is suspect.
     pub other_calls: u32,
-    /// Swift log-mel extraction, measured as the gap before each encoder call.
+    /// Host-side work before each mel or encoder call. For Unified that is the
+    /// whole Swift log-mel extraction; for TDT it is only the marshalling
+    /// around `preprocessor_ms`.
     pub mel_ms: f64,
+    /// Time inside the TDT mel front-end dispatches. Zero for Unified.
+    #[serde(default)]
+    pub preprocessor_ms: f64,
     pub encoder_ms: f64,
     /// Wall time inside the greedy RNNT loop, dispatch plus loop overhead.
     pub decode_loop_ms: f64,

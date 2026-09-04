@@ -275,3 +275,38 @@ therefore rejected as a production backend. Full artifact identities,
 per-category rows, native-build evidence, replay commands, and packaging
 analysis are in [`QWEN3_ASR_EVALUATION.md`](QWEN3_ASR_EVALUATION.md). The raw
 reports and machine-verifiable summary are under `bench/qwen3-asr/`.
+
+## Parakeet TDT 0.6B v3 challenger — 2026-09-04
+
+**No-go.** TDT 0.6B v3 measures 7.61% WER / 3.99% CER on the gold corpus
+against the frozen Unified baseline of 5.434783% / 3.571429%. The manifest sets
+`max_wer_regression_percent` to 0.00, so the bar is WER ≤ 5.434783% exactly and
+TDT misses it by 2.18 points. On a 92-word corpus one extra word edit is 1.09
+points; this is nine word edits against five, not a rounding difference. The
+absolute 8.00% ceiling is not what fails. Keep Unified as the default and do
+not open a switch issue.
+
+The latency case that motivated the trial does not survive measurement either.
+TDT's duration head does cut joint predictions 2.84× on a 14.225 s fixture —
+92 against Unified's 261 — but `JointDecisionv3` also computes K=64 top-K
+outputs and FluidAudio's TDT loader places the decoder and joint on CPU+ANE
+where the Unified loader pins them CPU-only, so per-call cost rises by about
+the factor the count falls and total joint dispatch lands within 1% of Unified.
+Worker total on that fixture is 81.42 ms against 67.79 ms, and post-dispatch
+work is 14.83 ms against 0.11 ms.
+
+TDT's published Core ML encoder takes a fixed `[1, 128, 1501]` mel, the same
+15 s window the Unified offline encoder takes, so the bucketed short-window
+encoders would need a separate TDT re-conversion at each window before TDT
+could pay the same short-utterance saving.
+
+The evaluation path stays in the tree so the numbers can be re-checked against
+a future conversion: `--model-variant tdt-v3` on the worker,
+`PARAKEET_COREML_MODEL_VARIANT` / `--backend coreml-tdt-v3` in the bench, and
+`scripts/fetch-tdt-v3-model.py` for the pinned artifact. It is deliberately not
+reachable from the shipping download path: TDT has no Rust integrity gate, so
+the worker refuses `--model-root` for it and forbids FluidAudio's downloader.
+Reopen if a conversion appears that is EN-competitive on this corpus, or if the
+top-K outputs become optional in the joint graph. Full tables, the artifact
+manifest and the replay commands are in
+[`../../bench/README.md`](../../bench/README.md).
