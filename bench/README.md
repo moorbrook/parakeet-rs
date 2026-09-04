@@ -511,6 +511,108 @@ Bucket artifacts are not on Hugging Face and the Rust download and verification
 path knows nothing about them, so a stock model directory has no buckets and
 behaves exactly as the tables above describe.
 
+## Native RNNT decode loop: M5 Pro 24 GB (2026-09-04)
+
+With bucketing and the resample retired, the greedy transducer loop was the
+largest stage left on a short utterance. It issued one `decoderModel.prediction`
+per emitted token and one `jointDecisionModel.prediction` per frame and per
+token, each a separate Core ML call against a dispatch floor near 100 µs.
+Neither model has a Neural Engine path — the prediction network is a two-layer
+LSTM, which Core ML places `cpuOnly` by necessity ([`COMPUTE_PLAN.md`](../docs/asr/COMPUTE_PLAN.md))
+— so the dispatch bought nothing but the driver round trip.
+
+`--rnnt-engine native` runs both programs in the worker process on the weights
+read out of the same two `.mlmodelc` bundles. `--rnnt-engine coreml` keeps
+FluidAudio's loop, so both arms are one build apart.
+
+Medians over 30 measured repetitions per bucket, three warmups, 48 kHz fixtures,
+release build, 2/5/8 s bucket encoders, machine 84 to 93% idle throughout
+(`bench/coreml-unified-rnnt-coreml-stages.csv` against
+`bench/coreml-unified-rnnt-native-stages.csv`).
+
+| fixture | windows | decoder steps | joint steps | Core ML calls in the loop | loop, `coreml` | loop, `native` |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.740 s | 1 | 7 | 16 | 23 → **0** | 2.91 ms | **1.40 ms** |
+| 2.507 s | 1 | 20 | 51 | 71 → **0** | 8.15 ms | **3.73 ms** |
+| 4.967 s | 2 | 49 | 134 | 183 → **0** | 20.77 ms | **8.63 ms** |
+| 8.150 s | 1 | 57 | 158 | 215 → **0** | 24.21 ms | **9.92 ms** |
+| 15.691 s | 2 | 122 | 342 | 464 → **0** | 52.33 ms | **21.42 ms** |
+
+The step counts are identical in both arms at every length, which is the check
+that says the loop decoded the same way rather than merely faster: the native
+engine reports them as `native_decoder_steps` and `native_joint_steps`, and the
+decoded-frame identity reads either pair. The gold corpus produces
+byte-identical hypotheses on all seven fixtures, at 5.43% WER / 3.57% CER over
+10 repetitions with no nondeterministic output.
+
+Whole-decode effect, same runs:
+
+| fixture | worker total, `coreml` | worker total, `native` | ASR p50, `coreml` | ASR p50, `native` |
+|---|---:|---:|---:|---:|
+| 0.740 s | 11.71 ms | **10.22 ms** | 11.0 ms | **10.0 ms** |
+| 2.507 s | 19.09 ms | **15.89 ms** | 19.0 ms | **15.5 ms** |
+| 4.967 s | 42.41 ms | **30.16 ms** | 42.0 ms | **30.0 ms** |
+| 8.150 s | 52.82 ms | **38.36 ms** | 53.0 ms | **38.0 ms** |
+| 15.691 s | 109.37 ms | **78.11 ms** | 109.0 ms | **78.0 ms** |
+
+### The 5 ms target was missed
+
+Kata 2564 asked for the loop under 5 ms at 5 s. It is 8.63 ms: 2.4x faster, not
+4x. The remaining cost is weight traffic, not dispatch. One prediction-network
+step reads 13.1 MB of fp16 weights and the 4.967 s fixture takes 49 of them,
+plus 134 joint decisions at 1.3 MB each — about 780 MB for one utterance, which
+no amount of dispatch removal touches.
+
+The next lever is the embedding-input product. The first LSTM layer computes
+`W_ih · embed[token]`, which depends only on the token, so all 1025 of them can
+be precomputed into a 10.5 MB fp32 table of partial sums. That drops the first
+layer's input matrix — 3.3 MB of the 13.1 MB — from every step, about 25% of the
+loop's traffic, and changes nothing but the order the fp32 sum is accumulated
+in. It is not implemented here.
+
+### How many threads the row product splits across
+
+The gate product is split across row slices with `concurrentPerform`; slices are
+independent and accumulate separately, so the split cannot change a result.
+`PARAKEET_RNNT_THREADS` sets the count, `PARAKEET_RNNT_JOINT_THREADS` the count
+for the joint's two smaller products. Medians of 20 repetitions on the 4.967 s
+fixture:
+
+| slices | joint slices 1 | joint slices 2 |
+|---:|---:|---:|
+| 1 | 16.25 ms | 16.13 ms |
+| 2 | 11.30 ms | 11.05 ms |
+| 3 | 9.49 ms | 9.41 ms |
+| 4 | **8.46 ms** | 8.38 ms |
+| 5 | 8.14 ms | — |
+| 6 | 10.85 ms | 10.93 ms |
+
+Scaling holds to four and breaks at six, which is where the work starts landing
+on efficiency cores. Five is 4% faster than four and one slice from that cliff;
+the compiled default is four, on the shoulder rather than the edge. Splitting
+the joint's products buys about 1% and widens the spread, so it defaults to one.
+
+```bash
+MD=<dir with bucket encoders>
+REPS=30 BACKEND=coreml-unified MODEL_DIR="$MD" RNNT_ENGINE=coreml \
+    OUT_CSV=bench/coreml-unified-rnnt-coreml.csv scripts/bench-latency.sh
+REPS=30 BACKEND=coreml-unified MODEL_DIR="$MD" RNNT_ENGINE=native \
+    OUT_CSV=bench/coreml-unified-rnnt-native.csv scripts/bench-latency.sh
+PARAKEET_RNNT_THREADS=4 ./target/release/bench_asr --backend coreml-unified \
+    --model-dir "$MD" --wav bench/audio/5s_48000.wav --reps 20 --warmup-reps 3 \
+    --stage-timings --rnnt-engine native
+```
+
+### A bucket artifact these runs exposed
+
+The 4.967 s fixture runs **two** encoder windows, and pays 19.3 ms of encoder
+rather than 9.6. `EncoderBuckets.select` routes on `sampleCount <= seconds *
+16_000`, but a window only decodes `windowSamples / frameSamples * frameSamples`
+— 79,360 samples for the 5 s bucket, not 80,000. An utterance between those two
+numbers is routed to a bucket that cannot cover it in one window, and the last
+112 samples cost a second full encoder pass. It affects both arms equally, so
+the comparison above stands; it belongs to the bucketing work rather than here.
+
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 
 Hold (press-and-hold) had no measured release-to-text number; the tables above
