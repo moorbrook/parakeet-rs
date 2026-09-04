@@ -82,6 +82,24 @@ pub enum TapPressOutcome {
     Ignored(DictationState),
 }
 
+impl TapPressOutcome {
+    /// Whether this press should wake the Neural Engine.
+    ///
+    /// Every outcome that changed the FSM does: the user who just started a
+    /// session is about to speak into it, and the one who cancelled is usually
+    /// about to press again. `Ignored` does not. A press the FSM refused
+    /// arrives while a decode is already running — a final decode in
+    /// `Transcribing`, or a Hold tail window — and the Core ML worker
+    /// serializes on one pipe, so a prime spawned there queues in front of the
+    /// transcript the user is waiting for.
+    pub fn primes_engine(&self) -> bool {
+        match self {
+            Self::ClaimedListening | Self::CancelledLive | Self::QueuedCancel => true,
+            Self::Ignored(_) => false,
+        }
+    }
+}
+
 /// Outcome of [`DictationFsm::on_press_hold`].
 #[derive(Debug)]
 pub enum HoldPressOutcome {
@@ -90,6 +108,17 @@ pub enum HoldPressOutcome {
     ClaimedListening,
     /// Wrong state for a hold press; nothing happened.
     Ignored(DictationState),
+}
+
+impl HoldPressOutcome {
+    /// Whether this press should wake the Neural Engine. See
+    /// [`TapPressOutcome::primes_engine`] for why `Ignored` must not.
+    pub fn primes_engine(&self) -> bool {
+        match self {
+            Self::ClaimedListening => true,
+            Self::Ignored(_) => false,
+        }
+    }
 }
 
 /// Outcome of [`DictationFsm::on_release_hold`].
@@ -409,5 +438,66 @@ mod tests {
             fsm.on_press_tap(),
             TapPressOutcome::ClaimedListening
         ));
+    }
+
+    #[test]
+    fn every_acting_tap_outcome_primes_the_engine() {
+        assert!(TapPressOutcome::ClaimedListening.primes_engine());
+        assert!(TapPressOutcome::CancelledLive.primes_engine());
+        assert!(TapPressOutcome::QueuedCancel.primes_engine());
+        assert!(HoldPressOutcome::ClaimedListening.primes_engine());
+    }
+
+    #[test]
+    fn ignored_press_never_primes_the_engine() {
+        // A prime spawned here would queue on the worker's single pipe in
+        // front of the decode that made the FSM ignore the press.
+        for state in [
+            DictationState::ModelLoading,
+            DictationState::Idle,
+            DictationState::Listening,
+            DictationState::Transcribing,
+            DictationState::Polishing,
+        ] {
+            assert!(
+                !TapPressOutcome::Ignored(state).primes_engine(),
+                "tap Ignored({state:?}) must not prime"
+            );
+            assert!(
+                !HoldPressOutcome::Ignored(state).primes_engine(),
+                "hold Ignored({state:?}) must not prime"
+            );
+        }
+    }
+
+    #[test]
+    fn tap_press_while_transcribing_is_ignored_and_does_not_prime() {
+        let fsm = DictationFsm::new();
+        fsm.set_state(DictationState::Transcribing);
+        let outcome = fsm.on_press_tap();
+        assert!(matches!(outcome, TapPressOutcome::Ignored(_)));
+        assert!(!outcome.primes_engine());
+    }
+
+    #[test]
+    fn hold_press_while_listening_is_ignored_and_does_not_prime() {
+        let fsm = DictationFsm::new();
+        fsm.set_state(DictationState::Listening);
+        let outcome = fsm.on_press_hold();
+        assert!(matches!(outcome, HoldPressOutcome::Ignored(_)));
+        assert!(!outcome.primes_engine());
+    }
+
+    #[test]
+    fn first_press_of_a_new_session_still_primes() {
+        // The prime is what hides the ANE re-wake; gating it on the outcome
+        // must not cost the cold press its wake.
+        let fsm = DictationFsm::new();
+        fsm.set_state(DictationState::Idle);
+        assert!(fsm.on_press_tap().primes_engine());
+
+        let fsm = DictationFsm::new();
+        fsm.set_state(DictationState::Idle);
+        assert!(fsm.on_press_hold().primes_engine());
     }
 }
