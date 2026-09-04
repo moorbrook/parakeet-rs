@@ -401,6 +401,133 @@ The change is the retired resample plus a smaller second term: the pipe carries
 the 22.5 ms measured. Every other stage held: mel 3.19 against 3.23 ms, encoder
 25.97 against 26.04, profiled transcribe interval 44.79 against 44.87.
 
+## Bucketed short-window encoders: M5 Pro 24 GB (2026-09-04)
+
+With the resample retired, the encoder is the whole of the short-utterance
+floor: 26.0 ms of a 32.7 ms one-second result, and flat, because the offline
+encoder is compiled at one fixed 15 s mel window and `UnifiedAsrManager`
+zero-pads every utterance to it. `scripts/build-bucket-encoder.py` exports the
+same NVIDIA checkpoint at shorter windows through FluidInference's `mobius`
+pipeline, and the worker sends each utterance to the narrowest compiled window
+that holds it. Buckets are discovered by filename in the model directory, so the
+two arms below differ only in which `--model-dir` the worker was given.
+
+Encoder cost against compiled window, `parakeet-encoder-probe` on zero inputs,
+ten predictions after three warmups:
+
+| window | mel frames | encoder frames | predict p50 |
+|---:|---:|---:|---:|
+| 2 s | 201 | 26 | 7.70 ms |
+| 5 s | 501 | 63 | 9.64 ms |
+| 8 s | 801 | 101 | 12.21 ms |
+| 12 s | 1201 | 151 | 24.48 ms |
+| 15 s (shipped) | 1501 | 188 | 26.11 ms |
+
+The curve bends: 7.5 µs per frame from 201 to 801, 30.7 µs from 801 to 1201,
+5.4 µs from 1201 to 1501. That bend is unexplained. It is why an 8 s window is
+worth having and a 12 s one is not, and why extrapolating from the short end
+would have been wrong: about 6 ms of the encoder is fixed cost no shorter window
+removes. Derivation and method are in
+[`docs/asr/COMPUTE_PLAN.md`](../docs/asr/COMPUTE_PLAN.md).
+
+Matched 30-repetition runs, three warmups, release build
+(`bench/coreml-unified-rerun-stages.csv` against
+`bench/coreml-unified-buckets-stages.csv`). Machine 80 to 92% idle throughout.
+
+| fixture | captured | bucket taken | encoder before | encoder after | mel before | mel after |
+|---|---:|---|---:|---:|---:|---:|
+| `1s_48000` | 0.816 s | 2 s | 25.98 ms | **7.71 ms** | 3.18 ms | 0.71 ms |
+| `3s_48000` | 2.828 s | 5 s | 25.31 ms | **9.74 ms** | 3.06 ms | 1.28 ms |
+| `5s_48000` | 4.854 s | 5 s | 25.45 ms | **9.98 ms** | 3.11 ms | 1.34 ms |
+| 7 s cut | 7.000 s | 8 s | 25.60 ms | **12.45 ms** | 3.10 ms | 1.89 ms |
+| `10s_48000` | 8.062 s | none | 25.55 ms | 25.60 ms | 3.14 ms | 3.16 ms |
+| `20s_48000` | 15.755 s | none | 51.88 ms | 51.16 ms | 6.22 ms | 6.05 ms |
+
+Mel falls with the encoder because `UnifiedMelExtractor` is built at the
+layout's window, so a 2 s bucket computes 201 mel frames instead of 1501.
+
+These runs predate the merge of ADR-0030, so both arms still paid the
+worker-side resample. That does not touch these two columns, and the check is in
+the table: the "before" arm's encoder and mel reproduce the post-ADR-0030
+per-stage table above within 0.7 ms at every fixture, which is what licenses
+reading the two tables together.
+
+Worker total, which excludes resample in both arms and is therefore directly
+comparable to the post-ADR-0030 numbers above:
+
+| fixture | captured | worker total before | after | saved |
+|---|---:|---:|---:|---:|
+| `1s_48000` | 0.816 s | 32.40 ms | **11.26 ms** | −21.1 ms |
+| `3s_48000` | 2.828 s | 37.08 ms | **19.78 ms** | −17.3 ms |
+| `5s_48000` | 4.854 s | 43.98 ms | **27.01 ms** | −17.0 ms |
+| 7 s cut | 7.000 s | 49.70 ms | **35.61 ms** | −14.1 ms |
+| `10s_48000` | 8.062 s | 52.91 ms | 52.89 ms | 0.0 ms |
+| `20s_48000` | 15.755 s | 112.61 ms | 110.77 ms | −1.8 ms |
+
+The "before" column agrees with the independently measured post-ADR-0030 worker
+totals in the per-stage table above to within 1.1 ms at every fixture, and the
+"after" column was checked directly on the merged code: a single 4.854 s
+decode with ADR-0030's 16 kHz capture path reports resample 0.001 ms, mel
+1.43 ms, encoder 10.01 ms and worker total 27.17 ms, against the 27.01 ms in
+the table. ASR p50 is worker total plus IPC, which is 0.11 to 0.27 ms across
+this range, so a one-second utterance goes from about 32 ms to about 11 ms of
+ASR. Repeated end-to-end p50 on the merged code has not been re-measured; when
+it is, it belongs in the per-stage table above rather than here.
+
+The 8.062 s fixture is unchanged twice over: it is 128,992 samples against the
+8 s bucket's 128,000, missing by 62 ms of audio, and it is also past the 8 s
+long-regime threshold. No stock fixture lands between 5 and 8 seconds, so the
+8 s bucket is measured on a 7.0 s cut of the gold corpus's 14.225 s
+`librispeech-multi` recording — real speech, trimmed with `soundfile` rather
+than newly synthesized. The 15.755 s fixture needs two 15 s windows either way.
+
+Every row has identical Core ML dispatch counts in both arms, which is what says
+the decode path did not change: 7/17, 20/55, 36/96, 48/135, 55/155 and 119/349
+decoder/joint calls respectively.
+
+At one second the remaining 11.3 ms is encoder 7.71, decode loop 2.83, mel 0.71
+and post 0.03. The length-independent encoder-and-mel share of the ASR call
+falls from 91% to 75%; what is left is a smaller fixed cost of the same kind,
+and the decode loop, which grows at 0.25 ms per 80 ms frame and now dominates
+past about 3 seconds of audio.
+
+Quality is unchanged. Matched ten-repetition gold runs, same corpus and worker,
+differing only in model directory:
+
+| arm | WER | CER | corpus decode p50 | p95 | RTFx p50 | peak RSS | load |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 15 s only | 5.434783% | 3.571429% | 0.4534 s | 0.4682 s | 75.1× | 0.10 GiB | 0.107 s |
+| buckets 2/5/8 | 5.434783% | 3.571429% | **0.3397 s** | **0.3879 s** | **100.2×** | 0.19 GiB | 0.495 s |
+
+Both are 5 word edits of 92 and 17 character edits of 476, with zero WER and CER
+spread and zero changed outputs across ten repetitions, so the bucket arm sits
+exactly on the frozen baseline and passes its 0.00-point regression cap. Every
+hypothesis is byte-identical between the two arms, checked field by field rather
+than inferred from equal scores. The gold corpus routes one fixture to the 2 s
+bucket, five to the 5 s, and the 14.225 s fixture to the unbucketed path; the
+7 s cut covers the 8 s bucket, and it is byte-identical too. Those corpus
+timings also predate ADR-0030 in both arms.
+
+Each bucket is a separate 590 MB compiled program, so 2/5/8 costs 1.77 GB of
+disk on top of the shipped 569 MB encoder. Resident memory is far cheaper
+because Core ML maps the weights: 0.10 to 0.19 GiB. The first load of a bucket
+compiles a Core ML plan and takes about 6 s; the plan cache is persistent, so
+warm load is 0.495 s against 0.107 s. That cold cost is behind a blocking read
+in the Rust worker handshake and is tracked as kata hrs0. The ANE's ~128
+loaded-program cap is not close at three buckets.
+
+```bash
+scripts/build-bucket-encoder.py --seconds 5    # ~90 s per bucket, 1 to 14
+BACKEND=coreml-unified OUT_CSV=bench/coreml-unified-buckets.csv \
+    PARAKEET_COREML_MODEL_DIR=<dir with bucket encoders> scripts/bench-latency.sh
+REPETITIONS=10 COREML_WORKER=target/release/parakeet-coreml-worker \
+    COREML_MODEL_DIR=<dir with bucket encoders> scripts/bench-gold.sh
+```
+
+Bucket artifacts are not on Hugging Face and the Rust download and verification
+path knows nothing about them, so a stock model directory has no buckets and
+behaves exactly as the tables above describe.
+
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 
 Hold (press-and-hold) had no measured release-to-text number; the tables above
@@ -466,6 +593,206 @@ cannot overlap any decode with the tail of the utterance.
 ```bash
 REPS=30 WARMUP_REPS=2 BACKEND=coreml-unified scripts/bench-hold.sh
 ```
+
+## ANE idle re-wake A/B: cold, prime, keep-alive (kata snx0)
+
+The Neural Engine hard power-gates when idle. Published measurements put the
+cold re-wake after an idle gap at tens to hundreds of milliseconds, with
+per-dispatch cost climbing once the gap reaches about 100 ms (arXiv 2606.22283,
+p.58-59 and p.84). Between dictations this app is idle for seconds to minutes,
+so the endpoint decode may be paying that re-wake on every utterance.
+
+`scripts/bench-idle.sh` measures four arms. They differ only in how long the
+engine has gone without a dispatch when the measured decode starts:
+
+| arm | silence before the decode |
+|---|---|
+| `warm` | none - repetitions run back to back |
+| `cold` | the idle gap plus the recording interval |
+| `prime` | the recording interval; one dispatch fires at the hotkey-down edge |
+| `cadence` | at most `KEEPALIVE_MS` |
+
+The recording interval stands in for the user speaking, and it is the whole
+point of the ladder: a hotkey-down prime helps only if the engine's warmth
+survives the 1 s or 5 s of talking that follows it. `bench_asr` simulates that
+interval with `--record-gap-ms` (default: the fixture's own length); in
+`bench_e2e --mode hold` it is real, because the fixture plays through the
+loopback in the time it takes.
+
+Arms are tagged with an `idle_arm` log marker rather than a new `phase_timer`
+field, so nothing in the production timing path changes.
+
+The shipping prime drops a second request while one is in flight rather than
+queueing it. It cannot cancel the first, so a press-release short enough to end
+while a prime is still running puts that endpoint decode behind one dispatch on
+the worker's single pipe, about 30 to 50 ms. It is bounded at one dispatch and
+only reachable on a press that found the engine cold - the case that was going
+to pay a re-wake regardless.
+`scripts/bench-idle.py` attributes each timed line to the marker above it,
+warns about any line it cannot label, and carries `encoder_ms` from the stage
+profiler alongside the latency percentiles - the encoder is the only stage on
+the engine, so its delta separates a Neural Engine re-wake from a cold CPU.
+
+```bash
+# Find the cool-down knee first. If it sits well below 60 s, the matrix runs
+# at that gap instead and takes minutes rather than hours.
+scripts/bench-idle.sh sweep
+
+IDLE_GAP_MS=60000 REPS=20 scripts/bench-idle.sh tap
+IDLE_GAP_MS=60000 REPS=20 scripts/bench-idle.sh hold
+scripts/bench-idle.sh energy
+```
+
+**The numbers in the four tables below were measured before fajz moved
+resampling into the capture callbacks and before fgzt's bucketed short-window
+encoders landed.** They were taken with one 15 s encoder and with the 48 kHz to
+16 kHz conversion still inside the measured decode, so the absolute
+milliseconds no longer describe the current path and should not be compared
+against any table elsewhere in this file. Every arm within a table paid the
+same conditions, so the comparisons between arms - which are what the decision
+rests on - still hold. Re-run `scripts/bench-idle.sh` to refresh the absolute
+figures.
+
+One interaction to know about if bucket artifacts are installed. The prime
+sends 0.5 s of silence, and `EncoderBuckets.select` routes a request to the
+narrowest window that holds it, so with buckets present the prime warms the
+narrowest bucket's encoder rather than the one a 5 s utterance will use. The
+engine's power gate is a hardware unit and any dispatch lifts it, so the
+re-wake this experiment measured should still be paid by the prime; a
+per-program load cost, which a single 15 s encoder could not expose, would not
+be. No bucket artifacts were installed on the machine that produced these
+tables, so the worker used the stock encoder throughout and the numbers are
+unaffected. Worth re-measuring once buckets ship.
+
+### Cool-down knee: M5 Pro 24 GB (2026-09-04)
+
+`scripts/bench-idle.sh sweep`, 1 s fixture, 8 repetitions per gap, three
+warmups, `--record-gap-ms 0` so the decode follows the idle interval directly
+and the measured cost is the re-wake alone. Machine at 87.6% idle, load average
+6.35 (`bench/idle-sweep.csv`):
+
+| idle gap | n | p50 | p95 | encoder p50 | encoder p95 |
+|---|---:|---:|---:|---:|---:|
+| 0 (back to back) | 8 | **37.0 ms** | 38.3 ms | **25.59 ms** | 26.33 ms |
+| 100 ms | 8 | 37.0 ms | 40.3 ms | 25.63 ms | 29.00 ms |
+| 500 ms | 8 | 38.0 ms | 39.6 ms | 26.30 ms | 29.05 ms |
+| 2 s | 8 | 40.0 ms | 43.3 ms | 29.38 ms | 32.81 ms |
+| 5 s | 8 | 52.5 ms | 59.6 ms | 41.15 ms | 49.67 ms |
+| 10 s | 8 | 55.5 ms | 109.5 ms | 44.75 ms | 75.38 ms |
+| 60 s | 8 | **63.5 ms** | 90.7 ms | **51.00 ms** | 62.13 ms |
+
+The re-wake is real and it is on the engine. A fully cold decode costs 26.5 ms
+more than a back-to-back one at p50, and the encoder - the only stage this
+pipeline places on the Neural Engine - accounts for 25.4 ms of that. The other
+stages are flat across the whole sweep.
+
+The decay is gradual rather than a cliff: nothing measurable at 100 ms, about
+3 ms by 2 s, half the total by 5 s, and the plateau by 10 s. That shape is what
+decides whether a hotkey-down prime can work, because the prime has to survive
+the user talking. The 10 s and 60 s rows are within noise of each other at
+n=8, so the matrices below use a 10 s gap as fully cold.
+
+### Tap Fast: M5 Pro 24 GB (2026-09-04)
+
+`IDLE_GAP_MS=10000 REPS=15 scripts/bench-idle.sh tap`, three warmups, ASR
+decode only. Machine at 79.4% idle, load average 4.07 (`bench/idle-tap.csv`):
+
+| fixture | arm | n | p50 | p95 | encoder p50 |
+|---|---|---:|---:|---:|---:|
+| 1 s | warm | 15 | **36.0 ms** | **37.0 ms** | 25.84 ms |
+| 1 s | cold | 15 | 63.0 ms | 102.5 ms | 51.91 ms |
+| 1 s | prime | 15 | **39.0 ms** | **41.6 ms** | 28.52 ms |
+| 1 s | cadence | 15 | 37.0 ms | 65.2 ms | 26.62 ms |
+| 5 s | warm | 15 | **65.0 ms** | **71.4 ms** | 25.36 ms |
+| 5 s | cold | 15 | 102.0 ms | 144.7 ms | 49.64 ms |
+| 5 s | prime | 15 | **80.0 ms** | **117.3 ms** | 30.77 ms |
+| 5 s | cadence | 15 | 90.0 ms | 138.2 ms | 29.17 ms |
+
+Against cold, the hotkey-down prime removes 60.9 ms at p95 and 24.0 ms at p50
+on the 1 s fixture, and 27.4 ms at p95 and 22.0 ms at p50 on the 5 s fixture.
+The encoder is where it comes from: 51.9 ms cold against 28.5 ms primed at 1 s.
+
+At 1 s the prime lands within 4.6 ms of the back-to-back floor at p95, because
+only about a second passes between it and the decode. At 5 s it recovers most
+but not all of the gap, which the sweep predicts: five seconds of talking is
+already half the cool-down.
+
+The cadence arm has the warmest encoder of the three treated arms at both
+lengths and still loses to the prime on total latency, badly in the tail: 65.2
+against 41.6 ms at p95 on the 1 s fixture. Its dispatches contend for the
+worker's single pipe and for the CPU with the decode that follows them, and
+that costs more than the engine warmth it buys.
+
+### Hold: M5 Pro 24 GB (2026-09-04)
+
+`IDLE_GAP_MS=10000 REPS=12 scripts/bench-idle.sh hold`, two warmups,
+`BlackHole 2ch` loopback, release-to-transcript. Machine at 89.8% idle, load
+average 2.66 (`bench/idle-hold.csv`). `bench_e2e` does not run the stage
+profiler, so there is no encoder column here:
+
+| fixture | arm | n | p50 | p95 |
+|---|---|---:|---:|---:|
+| 1 s | warm | 12 | 53.0 ms | 70.0 ms |
+| 1 s | cold | 12 | 126.0 ms | 140.6 ms |
+| 1 s | prime | 12 | **53.0 ms** | **70.0 ms** |
+| 1 s | cadence | 12 | 50.0 ms | 69.6 ms |
+| 5 s | warm | 12 | 122.0 ms | 160.0 ms |
+| 5 s | cold | 12 | 117.0 ms | 188.2 ms |
+| 5 s | prime | 12 | **94.5 ms** | **146.6 ms** |
+| 5 s | cadence | 12 | 121.5 ms | 136.7 ms |
+
+The 1 s row is the clean one and it is the largest effect measured anywhere in
+this experiment: the prime removes 73.0 ms at p50 and 70.6 ms at p95, matching
+the warm arm exactly.
+
+That 73 ms is larger than the mechanism accounts for. The sweep prices the
+encoder re-wake at 25.4 ms, and Tap Fast's cold penalty at 1 s is 27.0 ms at
+p50, which matches it. Hold's is nearly three times that, and `bench_e2e` does
+not run the stage profiler, so there is no encoder column here to attribute the
+remainder to. Something else in the Hold path is also paying for the idle gap -
+the capture stream, the loopback device, or CPU frequency, none of which the
+isolated ASR bench exercises. The direction and the ordering are not in doubt,
+and the prime removes whatever it is along with the encoder cost, but the 25.4
+ms re-wake explains only about a third of the Hold number. Running
+`bench_e2e` with stage timings would settle it.
+
+Read the `warm` column here differently than in the Tap Fast table. `warm`
+skips the idle gap but still plays the fixture, so each of its decodes follows
+the previous one by the playback plus session setup - the same gap structure
+the `prime` arm has. That is why warm and prime are identical at 1 s, and it
+means the Hold `warm` column is not the back-to-back floor the Tap Fast one is.
+
+It also explains the 5 s rows, which should not be read as a ranking. Warm
+there sits about 5 s from its previous dispatch, which the sweep prices at
+roughly 15 ms of encoder, so the expected cold-to-warm separation is only about
+10 ms - inside the spread the p95 column shows at n=12. Cold landing below warm
+at p50 is noise around a small expected difference, not a contradiction. Only
+the 1 s Hold row and the Tap Fast table above carry the decision, and the
+acceptance metric is prime against cold, which separates cleanly in every row
+that counts.
+
+### Cadence energy: M5 Pro 24 GB (2026-09-04)
+
+`ENERGY_WINDOW_S=60 scripts/bench-idle.sh energy`. Two matched 60 s windows
+differing only in whether the 250 ms keep-alive is dispatching, measured as the
+resident worker's cumulative CPU time:
+
+| window | worker CPU over 60 s |
+|---|---:|
+| idle control | **0.00 s** |
+| 250 ms keep-alive | **2.41 s** |
+
+The cadence costs 2.41 seconds of worker CPU per minute it runs - about 4% of
+one core, continuously, against a genuine zero when the app is idle. At roughly
+240 dispatches per window that is about 10 ms of host CPU per keep-alive.
+
+**The Neural Engine's own power draw was not measured.** `powermetrics
+--samplers ane_power` requires root and no interactive sudo was available on
+this machine, so the figure above is the host-side cost only and the true cost
+of the cadence is higher by whatever the engine draws to stay awake.
+
+Results and the ship/no-ship decision are recorded in
+[`../docs/asr/PERF.md`](../docs/asr/PERF.md).
 
 ## Baseline: M5 Pro 24 GB (2026-05-16, pre-§2 CoreML cache)
 
@@ -543,6 +870,164 @@ Replay:
     --reps 30 --warmup-reps 3 2> bench/llm-4b-raw.log
 ```
 
+## §6 follow-up: polish latency and quality on an eval set (2026-09-04, M5 Pro 24 GB)
+
+Kata 0tpp. Everything above measures **one** transcript — the hardcoded
+`SAMPLE_INPUT`, 55 output tokens at the model's decode rate. That is the
+structural bound, not a p50 over anything a user dictates, and it is
+what the "1000 ms NOT MET" verdict was recorded against.
+
+`bench/polish/eval.json` is a 26-item eval set with the polished text
+each item should produce. `bench_llm --eval` runs it, scores word-level
+error rate against `expected` (casing and punctuation included — those
+are two of the three things polish exists to fix), and reports latency
+and quality over the same population.
+
+Machine load before each run: `Load Avg` 1.0–2.3, CPU ≥ 87 % idle.
+3 repetitions × 26 items = 78 measured decodes per row. Repetitions are
+low deliberately: within-item variance is negligible (§6's p99/p50 =
+1.04), so the percentiles are driven by *which item* it is, not by
+run-to-run noise. `p99` over 78 samples is a single item and is not
+quoted below.
+
+**Skipped items enter the percentiles as 0 ms.** The `skip < 4 words`
+row bypasses the model for three items and records them at zero, which
+is the latency the user experiences. It is not a decode time, and that
+row's distribution is therefore not the same shape as the others.
+
+> ### Quality-column correction (2026-09-04)
+>
+> The WER column below was first measured against `eval.json` schema 1
+> with a whitespace-splitting scorer. Both had defects, found in review:
+>
+> - **`technical` was measured wrong.** `technical-01` and `technical-03`
+>   expected spoken-to-written conversion (`one point zero point two one
+>   nine` → `1.0.219`, `colon colon` → `::`) that system-prompt rule 7
+>   explicitly forbids — "Preserve technical terms, names, and code-like
+>   fragments exactly as transcribed". They penalised the model for
+>   obeying the prompt. Schema 2 derives their expected text from the
+>   prompt rules alone. The category's WER falls **0.847 → 0.091**.
+> - **`command` was scored blind.** The scorer split on whitespace, so a
+>   model that emitted a space where `new paragraph` required a line
+>   break scored zero errors. It now tokenises breaks. The category's
+>   WER rises **0.000 → 0.059**, exposing a real defect: on
+>   `command-01` and `command-04` the 4B produced
+>   `Ship the parts Monday. Invoice follows separately.` — correct
+>   punctuation, no line break.
+>
+> Inputs did not change, so **every latency number below is unaffected**.
+> Only the 4B row's quality has been re-measured under schema 2
+> (blended **WER 0.061, 18/26 exact**, recomputed from the unchanged
+> categories plus a deterministic re-run of the two corrected ones).
+> The 2B, 0.8B, and edits-only rows still carry schema-1 quality and are
+> **not comparable to it**; re-measuring them needs another bench turn.
+
+| Variant | p50 | p95 | `legacy-bench-sample` | mean WER | exact | mean out tokens |
+|---|---|---|---|---|---|---|
+| **4B Q6_K full-text (shipping)** | **444 ms** | 1219 ms | 1209 ms | **0.139** | 17/26 | 18.7 |
+| 4B full-text + skip < 4 words | 446 ms | 1222 ms | 1221 ms | 0.139 | 17/26 | 18.3 |
+| 4B full-text + context reuse | 424 ms | 1220 ms | 1198 ms | 0.139 | 17/26 | 18.7 |
+| 4B edits-only | 600 ms | 2438 ms | 2421 ms | 0.321 | 9/26 | 26.3 |
+| 2B Q6_K full-text | 230 ms | 572 ms | 571 ms | 0.185 | 13/26 | 20.5 |
+| 0.8B Q6_K full-text | 141 ms | 338 ms | 330 ms | 0.249 | 11/26 | 21.6 |
+
+**The shipping configuration meets the <1000 ms p50 target on the eval
+set.** The `legacy-bench-sample` column shows why the two verdicts
+differ: that one item costs 1209 ms in the same run whose p50 is 444 ms.
+
+### Composition caveat — read this before quoting the p50
+
+The eval set's composition was a judgement call, and composition
+determines the blended p50. Nine of 26 items are zero-change by
+construction. Per-category numbers are published so the blended figure
+can be re-weighted against a different view of what real dictation looks
+like:
+
+| Category | n | 4B p50 | 4B max | 4B WER | 2B p50 | 2B WER |
+|---|---|---|---|---|---|---|
+| clean | 6 | 429 ms | 514 ms | 0.000 | 197 ms | 0.000 |
+| short | 3 | 299 ms | 326 ms | 0.000 | 147 ms | 0.000 |
+| filler-light | 6 | 446 ms | 492 ms | 0.042 | 212 ms | 0.173 |
+| command | 4 | 439 ms | 503 ms | 0.000 | 251 ms | 0.211 |
+| technical | 3 | 609 ms | 652 ms | 0.847 | 298 ms | 0.681 |
+| filler-heavy | 3 | 857 ms | 1219 ms | 0.257 | 391 ms | 0.258 |
+| long | 1 | 2812 ms | 2812 ms | 0.060 | 1400 ms | 0.103 |
+
+(WER columns here are schema 1; see the correction box above. Latency is
+unaffected.)
+
+Latency tracks output length almost exactly; quality does not.
+
+**Retracted:** an earlier revision of this section claimed the
+`technical` category showed "spoken version numbers and identifiers are
+where polish does real damage". That was wrong, and backwards. Re-run
+with `--show-output`, the 4B **preserves** identifiers exactly as rule 7
+instructs:
+
+```
+input    : Um, bump serde to one point zero point two one nine in Cargo dot toml.
+produced : Bump serde to one point zero point two one nine in Cargo dot toml.
+```
+
+Filler removed, casing fixed, identifier untouched — correct on every
+count. The 0.847 was my eval set demanding a conversion the prompt
+forbids. Whether polish damages identifiers is **unmeasured**: no item
+in this set tests it, because the prompt tells the model not to touch
+them.
+
+The genuine defects the corrected metrics surface are smaller and
+different: the 4B leaves `and, you know,` in `technical-03`, and ignores
+the `new line` / `new paragraph` commands in two of four `command`
+items.
+
+### Findings per avenue
+
+- **Edits-only is worse on both axes.** The model answers with the
+  corrected transcript instead of an edit list in 17 of 26 items, on the
+  4B, with an explicit prohibition and a worked example in the prompt.
+  The arithmetic does not favour it even when it works: full-text
+  averages 18.7 output tokens, an `OLD ==> NEW` line costs 5–8 tokens
+  per fix because `OLD` must carry enough context to be unique, and the
+  variant measured 26.3. A GBNF grammar (`LlamaSampler::grammar`, and
+  the `sampler` feature is already on) would force the `==>` structure
+  but cannot stop `<whole input> ==> <corrected>`, which parses cleanly
+  and doubles the tokens.
+- **Prompt caching is unavailable on this model family.** Qwen 3.5 is a
+  hybrid Gated-DeltaNet architecture (ADR-0018); its recurrent state
+  carries no per-token position, so `llama_memory_seq_rm` refuses
+  partial sequence removal. `mean_reused_prompt_tokens=0.0` on every
+  run. The same refused operation is what draft-model speculative
+  decoding would need for rollback, so that avenue is blocked too. What
+  the `--prompt-cache` row actually measures is **context reuse** — not
+  re-allocating a `LlamaContext` per call — worth 20 ms (444 → 424),
+  consistent with the 29 ms TTFT bounding it.
+- **Skipping short utterances helps the mean, not the p50.** It fires on
+  3/26 items with identical quality, and moves the mean 591 → 556 ms.
+  The p50 is unchanged (444 → 446) because the items it removes were
+  already the fastest ones; taking three items off the bottom does not
+  move the middle.
+- **Neither smaller model is a free swap.** The 2B cuts p95 from 1219 to
+  572 ms and the structural-bound item from 1209 to 571 ms, at WER 0.185
+  vs 0.139 and 13/26 vs 17/26 exact. It is a tail fix bought with
+  quality. The 0.8B is faster still and clearly worse.
+
+Fixed-sample replays for cross-checking against §6 above (15 reps):
+4B Q6_K **p50 1202 ms** (§6 recorded 1225), 2B Q6_K p50 565 ms.
+
+Replay:
+
+```bash
+LLM="$HOME/Library/Application Support/com.parakeet.rs/llm"
+./target/release/bench_llm \
+    --model "$LLM/qwen3.5-4b-q6_k/Qwen3.5-4B-Q6_K.gguf" \
+    --eval bench/polish/eval.json --variant full-text \
+    --reps 3 --tag qwen3.5-4b-q6_k --csv bench/polish/variants.csv \
+    2> bench/llm-4b-fulltext-raw.log
+```
+
+Swap `--variant edits-only`, `--skip-min-words 4`, `--prompt-cache`, or
+`--model` for the other rows.
+
 ## Files
 
 | Path                         | Purpose                                          |
@@ -558,8 +1043,13 @@ Replay:
 | `coreml-unified.csv`         | Generated shipping-backend ASR percentiles.     |
 | `*-boundary.csv`             | Generated Rust/worker boundary measurements.    |
 | `*-stages.csv`               | Generated per-stage breakdown and Core ML dispatch counts. |
+| `coreml-unified-buckets*.csv` | Generated bucketed short-window encoder runs. |
 | `hold.{log,csv}`             | Generated Hold-mode release-to-transcript runs. |
+| `idle-*.{log,csv}`           | Generated ANE idle re-wake A/B runs (sweep, tap, hold, energy). |
 | `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |
 | `endpoint-*.{log,csv}`       | Generated pause-friendly endpoint gate runs.   |
 | `endpoint-sweep*.{csv,/}`    | Generated confirmation-window sweep rows and logs. |
 | `polish-backends.csv`        | Historical §6 Phase-0 2B polish measurements.  |
+| `polish/eval.json`           | Polish quality eval set: 26 transcripts with expected output. |
+| `polish/variants.csv`        | Generated per-variant polish latency/quality summary. |
+| `llm-*-raw.log`              | Generated `llm_timer` / `llm_eval_*` lines per polish variant run. |

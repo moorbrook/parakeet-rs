@@ -3,6 +3,11 @@ audio/
 !gold/audio/*.wav
 raw.log
 hold.log
+idle-sweep.log
+idle-tap.log
+idle-hold.log
+idle-energy.log
+idle-energy-*.powermetrics
 # `asr_diff` baseline. Machine-local: the fixtures come from macOS `say`,
 # so the transcripts depend on the local TTS voice and OS version.
 # Record your own with `asr_diff --record`.
@@ -11,4 +16,7 @@ asr-quality.json
 *-quality.json
 *.csv
 !cleanup-backends.csv
+!polish/
+!polish/*.csv
+!polish/eval.json
 endpoint-sweep/

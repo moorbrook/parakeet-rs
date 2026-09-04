@@ -1,0 +1,13 @@
+model,variant,metric,mean,p50,p95,p99
+qwen3.5-4b-q6_k,full-text,total_ms,591.1,444,1219,2812
+qwen3.5-4b-q6_k,full-text,mean_wer,0.1394,,,
+qwen3.5-4b-q6_k,full-text+skip4,total_ms,556.3,446,1222,2817
+qwen3.5-4b-q6_k,full-text+skip4,mean_wer,0.1394,,,
+qwen3.5-4b-q6_k,full-text+cache,total_ms,571.0,424,1220,2784
+qwen3.5-4b-q6_k,full-text+cache,mean_wer,0.1394,,,
+qwen3.5-4b-q6_k,edits-only,total_ms,857.1,600,2438,2928
+qwen3.5-4b-q6_k,edits-only,mean_wer,0.3212,,,
+qwen3.5-2b-q6_k,full-text,total_ms,291.9,230,572,1411
+qwen3.5-2b-q6_k,full-text,mean_wer,0.1846,,,
+qwen3.5-0.8b-q6_k,full-text,total_ms,177.2,141,338,812
+qwen3.5-0.8b-q6_k,full-text,mean_wer,0.2494,,,

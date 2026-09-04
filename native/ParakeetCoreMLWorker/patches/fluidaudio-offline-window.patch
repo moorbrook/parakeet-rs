@@ -1,0 +1,130 @@
+diff --git a/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedAsrManager.swift b/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedAsrManager.swift
+index 04d4f7f0..252cf6b8 100644
+--- a/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedAsrManager.swift
++++ b/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedAsrManager.swift
+@@ -11,8 +11,8 @@ import Foundation
+ struct UnifiedBatchLayout {
+     let config: UnifiedConfig
+ 
+-    /// Fixed encoder window (15 s @ 16 kHz).
+-    var windowSamples: Int { 15 * config.sampleRate }
++    /// Fixed encoder window, matching the compiled encoder export.
++    var windowSamples: Int { config.offlineWindowSeconds * config.sampleRate }
+     /// Frame-aligned audio decoded per window.
+     var chunkSamples: Int { windowSamples / config.frameSamples * config.frameSamples }
+     /// Frame-aligned overlap between adjacent windows (2 s).
+@@ -108,7 +108,9 @@ public actor UnifiedAsrManager {
+         do {
+             self.encoder = try await MLModel.load(
+                 contentsOf: directory.appendingPathComponent(
+-                    names.offlineEncoderFile(precision: encoderPrecision)),
++                    names.offlineEncoderFile(
++                        precision: encoderPrecision,
++                        windowSeconds: config.offlineWindowSeconds)),
+                 configuration: encoderConfig
+             )
+         } catch {
+@@ -136,7 +138,9 @@ public actor UnifiedAsrManager {
+         )
+         self.swiftMel = UnifiedMelExtractor(windowSamples: layout.windowSamples, nMels: config.melFeatures)
+ 
+-        logger.info("Parakeet Unified offline models loaded (15 s window, 2 s overlap).")
++        logger.info(
++            "Parakeet Unified offline models loaded (\(config.offlineWindowSeconds) s window, "
++                + "\(layout.overlapSamples / config.sampleRate) s overlap).")
+     }
+ 
+     /// Download models from HuggingFace (if needed) and load them.
+@@ -162,17 +166,27 @@ public actor UnifiedAsrManager {
+ 
+         let cacheDir = modelsBaseDir.appendingPathComponent(repo.folderName)
+ 
++        // Only the 15 s offline encoder is published, so a shorter window is
++        // something the caller built and placed itself. Asking ModelHub for it
++        // would fail the download on a file the repository does not have, so
++        // the required set names the encoder only for the published window; a
++        // missing short-window bundle surfaces as a load error below instead.
++        var requiredFiles: Set<String> = [
++            ModelNames.ParakeetUnified.decoderFile,
++            ModelNames.ParakeetUnified.jointDecisionFile,
++            ModelNames.ParakeetUnified.vocab,
++        ]
++        if config.offlineWindowSeconds == 15 {
++            requiredFiles.insert(
++                ModelNames.ParakeetUnified.offlineEncoderFile(precision: encoderPrecision))
++        }
++
+         // Completeness-checked download + purge-and-retry on load failure: a
+         // bare directory-existence gate mistook an interrupted encoder fetch
+         // for a warm cache and bricked loading permanently (issue #819).
+         try await ModelHub.loadWithRecovery(
+             repo, directory: modelsBaseDir,
+-            requiredFiles: [
+-                ModelNames.ParakeetUnified.offlineEncoderFile(precision: encoderPrecision),
+-                ModelNames.ParakeetUnified.decoderFile,
+-                ModelNames.ParakeetUnified.jointDecisionFile,
+-                ModelNames.ParakeetUnified.vocab,
+-            ],
++            requiredFiles: requiredFiles,
+             variant: encoderPrecision == .fp16 ? "offline-fp16" : "offline",
+             progressHandler: progressHandler
+         ) {
+diff --git a/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedConfig.swift b/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedConfig.swift
+index 3cb7d7c0..7abe6616 100644
+--- a/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedConfig.swift
++++ b/Sources/FluidAudio/ASR/Parakeet/Unified/UnifiedConfig.swift
+@@ -39,6 +39,11 @@ public struct UnifiedConfig: Sendable {
+     public let decoderHidden: Int
+     public let blankIdx: Int
+     public let maxSymbolsPerFrame: Int
++    /// Offline batch encoder window in seconds. The offline encoder is exported
++    /// at one fixed mel length and every utterance is zero-padded to it, so this
++    /// must match the compiled encoder bundle named by
++    /// `ModelNames.ParakeetUnified.offlineEncoderFile(precision:windowSeconds:)`.
++    public let offlineWindowSeconds: Int
+ 
+     /// Default streaming export: [70, 13, 13] = 5.6 s left, 1.04 s chunk,
+     /// 1.04 s right (2.08 s theoretical latency — the model card's best-WER
+@@ -53,7 +58,8 @@ public struct UnifiedConfig: Sendable {
+         decoderLayers: Int = 2,
+         decoderHidden: Int = 640,
+         blankIdx: Int = 1024,
+-        maxSymbolsPerFrame: Int = 10
++        maxSymbolsPerFrame: Int = 10,
++        offlineWindowSeconds: Int = 15
+     ) {
+         self.leftFrames = leftFrames
+         self.chunkFrames = chunkFrames
+@@ -65,6 +71,7 @@ public struct UnifiedConfig: Sendable {
+         self.decoderHidden = decoderHidden
+         self.blankIdx = blankIdx
+         self.maxSymbolsPerFrame = maxSymbolsPerFrame
++        self.offlineWindowSeconds = offlineWindowSeconds
+     }
+ 
+     // MARK: Streaming-window derived sizes
+diff --git a/Sources/FluidAudio/ModelNames.swift b/Sources/FluidAudio/ModelNames.swift
+index cbab37ce..7ab16174 100644
+--- a/Sources/FluidAudio/ModelNames.swift
++++ b/Sources/FluidAudio/ModelNames.swift
+@@ -588,8 +588,18 @@ public enum ModelNames {
+             return precision == .int8 ? "\(base)_int8.mlmodelc" : "\(base).mlmodelc"
+         }
+ 
+-        public static func offlineEncoderFile(precision: UnifiedEncoderPrecision) -> String {
+-            precision == .int8 ? offlineEncoderInt8File : offlineEncoderFp16File
++        /// Offline encoder bundle name. The encoder is exported at one fixed
++        /// mel length, so a shorter window is a distinct file: the shipped
++        /// 15 s export keeps its historical name and any other window carries a
++        /// `_<seconds>s` suffix (e.g. `parakeet_unified_encoder_5s_int8.mlmodelc`).
++        public static func offlineEncoderFile(
++            precision: UnifiedEncoderPrecision, windowSeconds: Int = 15
++        ) -> String {
++            guard windowSeconds != 15 else {
++                return precision == .int8 ? offlineEncoderInt8File : offlineEncoderFp16File
++            }
++            let base = "parakeet_unified_encoder_\(windowSeconds)s"
++            return precision == .int8 ? "\(base)_int8.mlmodelc" : "\(base).mlmodelc"
+         }
+ 
+         public static func requiredModels(variant: String?) -> Set<String> {
