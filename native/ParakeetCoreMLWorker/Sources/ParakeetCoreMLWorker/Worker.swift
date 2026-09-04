@@ -37,6 +37,7 @@ private struct WorkerOptions {
     let shortComputeUnits: MLComputeUnits
     let longComputeUnits: MLComputeUnits
     let longRegimeSeconds: UInt32
+    let emitStageTimings: Bool
 
     static func parse(_ arguments: [String]) throws -> Self {
         var modelDirectory: URL?
@@ -44,6 +45,7 @@ private struct WorkerOptions {
         var shortComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
         var longComputeUnits: MLComputeUnits = .cpuAndNeuralEngine
         var longRegimeSeconds: UInt32 = 8
+        var emitStageTimings = false
         var index = 0
         while index < arguments.count {
             switch arguments[index] {
@@ -90,11 +92,14 @@ private struct WorkerOptions {
                     )
                 }
                 longRegimeSeconds = seconds
+            case "--emit-stage-timings":
+                emitStageTimings = true
             case "-h", "--help":
                 let usage =
                     "usage: parakeet-coreml-worker [--model-dir DIR | --model-root DIR] "
                     + "[--compute-units NAME | --short-compute-units NAME "
-                    + "--long-compute-units NAME --long-regime-seconds N]\n"
+                    + "--long-compute-units NAME --long-regime-seconds N] "
+                    + "[--emit-stage-timings]\n"
                 FileHandle.standardError.write(
                     Data(usage.utf8)
                 )
@@ -112,7 +117,8 @@ private struct WorkerOptions {
             modelRoot: modelRoot,
             shortComputeUnits: shortComputeUnits,
             longComputeUnits: longComputeUnits,
-            longRegimeSeconds: longRegimeSeconds
+            longRegimeSeconds: longRegimeSeconds,
+            emitStageTimings: emitStageTimings
         )
     }
 
@@ -138,6 +144,7 @@ private struct WorkerResponse: Encodable {
     let loadSeconds: Double?
     let decodeSeconds: Double?
     let resampleSeconds: Double?
+    let stages: StageProfiler.Report?
 
     static func ready(loadSeconds: Double) -> Self {
         Self(
@@ -147,11 +154,17 @@ private struct WorkerResponse: Encodable {
             error: nil,
             loadSeconds: loadSeconds,
             decodeSeconds: nil,
-            resampleSeconds: nil
+            resampleSeconds: nil,
+            stages: nil
         )
     }
 
-    static func result(text: String, decodeSeconds: Double, resampleSeconds: Double) -> Self {
+    static func result(
+        text: String,
+        decodeSeconds: Double,
+        resampleSeconds: Double,
+        stages: StageProfiler.Report?
+    ) -> Self {
         Self(
             kind: "result",
             ok: true,
@@ -159,7 +172,8 @@ private struct WorkerResponse: Encodable {
             error: nil,
             loadSeconds: nil,
             decodeSeconds: decodeSeconds,
-            resampleSeconds: resampleSeconds
+            resampleSeconds: resampleSeconds,
+            stages: stages
         )
     }
 
@@ -171,7 +185,8 @@ private struct WorkerResponse: Encodable {
             error: error.localizedDescription,
             loadSeconds: nil,
             decodeSeconds: nil,
-            resampleSeconds: nil
+            resampleSeconds: nil,
+            stages: nil
         )
     }
 }
@@ -205,6 +220,22 @@ private struct ParakeetCoreMLWorker {
             )
         }
         let loadSeconds = seconds(since: loadStart)
+
+        // Installed after loading so Core ML's private MLModel subclasses are
+        // registered and can be wrapped; see StageProfiler.install().
+        if options.emitStageTimings {
+            let wrapped = StageProfiler.shared.install()
+            guard !wrapped.isEmpty else {
+                throw WorkerError.invalidArgument(
+                    "--emit-stage-timings found no MLModel prediction selector to wrap"
+                )
+            }
+            FileHandle.standardError.write(
+                Data(
+                    "parakeet-coreml-worker: stage timings via \(wrapped.joined(separator: "; "))\n"
+                        .utf8)
+            )
+        }
         try writeResponse(.ready(loadSeconds: loadSeconds))
 
         let input = FileHandle.standardInput
@@ -227,13 +258,23 @@ private struct ParakeetCoreMLWorker {
                     ? (longManager ?? shortManager)
                     : shortManager
                 let decodeStart = ContinuousClock.now
+                let profileStart =
+                    options.emitStageTimings ? StageProfiler.shared.beginUtterance() : 0
                 let text = try await manager.transcribe(modelSamples)
+                var stages =
+                    options.emitStageTimings
+                    ? StageProfiler.shared.endUtterance(
+                        startNanoseconds: profileStart, endNanoseconds: StageProfiler.now()
+                    )
+                    : nil
+                stages?.resampleMs = resampleSeconds * 1_000
                 let decodeSeconds = seconds(since: decodeStart)
                 try writeResponse(
                     .result(
                         text: text,
                         decodeSeconds: decodeSeconds,
-                        resampleSeconds: resampleSeconds
+                        resampleSeconds: resampleSeconds,
+                        stages: stages
                     )
                 )
             } catch {

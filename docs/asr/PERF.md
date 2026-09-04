@@ -96,6 +96,51 @@ PARAKEET_COREML_MODEL_DIR="$HOME/Library/Application Support/com.parakeet.rs/mod
   OUT_CSV=bench/coreml-unified.csv scripts/bench-latency.sh
 ```
 
+## Per-stage attribution and Hold baseline — 2026-09-04
+
+`bench_asr --stage-timings` makes the worker report where a decode went, by
+wrapping `MLModel`'s prediction implementations at runtime and attributing each
+dispatch by its input feature names. FluidAudio stays a pinned dependency; no
+file in it is patched. Medians of 30 repetitions on the 4.967 s fixture:
+encoder 25.5 ms, resample 22.7 ms, RNNT decode loop 15.2 ms, mel 3.1 ms, IPC
+0.42 ms.
+
+Two structural facts came out of it. The offline path zero-pads every utterance
+to the fixed 15 s encoder window, so encoder time is 25.5 ms whether the audio
+is 0.74 s or 8.15 s; with mel that is 28.6 ms of length-independent work and 80%
+of the 1 s result. And the 48 kHz to 16 kHz resample costs a linear 4.6 ms per
+second of input, which exceeds the decode loop at every measured length.
+
+The decoder and joint-decision models run `cpuOnly` and the encoder runs
+`cpuAndNeuralEngine`, read off the live models rather than inferred from the
+request. Forcing the encoder to `cpu-only` moves it from 26.0 ms to 86.0 ms,
+which is the evidence that the ANE is engaged.
+
+Hold mode had no measured release-to-text number until now.
+`scripts/bench-hold.sh` releases at the fixture's predicted acoustic end and
+stops at transcript-ready: 54.0 ms p50 at 1 s, 106.5 ms at 5 s, 231.5 ms at 20 s,
+with p95 of 79.5 / 158.6 / 280.6 ms. The 15 ms `run_manual` poll contributes a
+median 8 to 12 ms, capture shutdown about 1 ms, and the remainder is ASR, which
+runs 9 to 42% slower than the isolated bench, not monotonically in length,
+because capture is still live in the same process.
+
+Enabling the profiler costs nothing measurable: matched 30-repetition runs at
+1 s and 5 s are within 0.2 ms, and at 10 s an interleaved eight-block on/off A/B
+puts the per-block delta at -0.17 ms median with the sign flipping between
+blocks. Absolute stage times need a quiet machine, which is the larger effect: a
+repeat under a competing job reproduced the dispatch counts exactly and kept the
+encoder flat, with the CPU-side stages 10 to 20% higher.
+
+The stage split is validated at runtime, not just by construction. `bench_asr`
+fails a run whose report has no encoder dispatches, whose `windows` and
+`encoder_calls` disagree, or that contains an unattributed prediction, and
+`scripts/bench-stages.py` repeats those checks before writing a CSV. Without
+that, a moved Core ML entry point would report the affected stage as free while
+leaving every other number plausible.
+
+Full tables, dispatch counts, and method are in
+[`bench/README.md`](../../bench/README.md).
+
 ## Core ML runtime-plan tuner — 2026-08-11
 
 Release worker, ten corpus repetitions and three model-load repetitions on the

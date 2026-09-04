@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::asr::{Asr, AsrBackend, AsrBackendMetadata, Decoded};
+use crate::asr::{Asr, AsrBackend, AsrBackendMetadata, Decoded, StageReport};
 
 const PROTOCOL_MAGIC: [u8; 4] = *b"PRKT";
 const PROTOCOL_VERSION: u32 = 1;
@@ -35,6 +35,10 @@ pub struct CoreMlWorkerConfig {
     pub short_compute_units: CoreMlComputeUnits,
     pub long_compute_units: CoreMlComputeUnits,
     pub long_regime_seconds: u32,
+    /// Ask the worker to report a per-stage breakdown with every result. The
+    /// bench turns this on; the dictation path leaves the worker's Core ML
+    /// dispatch path untouched.
+    pub emit_stage_timings: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +100,7 @@ impl CoreMlWorkerConfig {
             short_compute_units: CoreMlComputeUnits::default(),
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
+            emit_stage_timings: false,
         }
     }
 
@@ -106,6 +111,7 @@ impl CoreMlWorkerConfig {
             short_compute_units: CoreMlComputeUnits::default(),
             long_compute_units: CoreMlComputeUnits::default(),
             long_regime_seconds: DEFAULT_LONG_REGIME_SECONDS,
+            emit_stage_timings: false,
         }
     }
 
@@ -115,6 +121,10 @@ impl CoreMlWorkerConfig {
 
     pub fn set_download_root(&mut self, model_root: impl Into<PathBuf>) {
         self.model_source = CoreMlModelSource::DownloadRoot(model_root.into());
+    }
+
+    pub fn set_emit_stage_timings(&mut self, emit: bool) {
+        self.emit_stage_timings = emit;
     }
 
     pub fn set_compute_units(&mut self, compute_units: CoreMlComputeUnits) {
@@ -189,6 +199,8 @@ struct CoreMlWorkerBackend {
     process: Mutex<WorkerProcess>,
     metadata: AsrBackendMetadata,
     load_seconds: f64,
+    /// Stage breakdown from the most recent result, when the worker reports one.
+    last_stages: Mutex<Option<StageReport>>,
 }
 
 impl CoreMlWorkerBackend {
@@ -202,7 +214,8 @@ impl CoreMlWorkerBackend {
             CoreMlModelSource::DownloadRoot(path) => ("--model-root", path),
         };
 
-        let mut child = Command::new(&config.worker_path)
+        let mut command = Command::new(&config.worker_path);
+        command
             .arg(model_flag)
             .arg(model_path)
             .arg("--short-compute-units")
@@ -210,7 +223,11 @@ impl CoreMlWorkerBackend {
             .arg("--long-compute-units")
             .arg(config.long_compute_units.as_str())
             .arg("--long-regime-seconds")
-            .arg(config.long_regime_seconds.to_string())
+            .arg(config.long_regime_seconds.to_string());
+        if config.emit_stage_timings {
+            command.arg("--emit-stage-timings");
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -251,6 +268,7 @@ impl CoreMlWorkerBackend {
                 ),
             },
             load_seconds,
+            last_stages: Mutex::new(None),
         })
     }
 }
@@ -271,6 +289,7 @@ impl AsrBackend for CoreMlWorkerBackend {
             .read_response()
             .context("reading Core ML worker result")?;
         response.require_success("result")?;
+        *self.last_stages.lock() = response.stages.clone();
         let decode_seconds = response
             .decode_seconds
             .ok_or_else(|| anyhow!("Core ML result omitted decode_seconds"))?
@@ -287,6 +306,10 @@ impl AsrBackend for CoreMlWorkerBackend {
         let pid = self.process.lock().child.id();
         crate::performance::resident_bytes(pid)
             .with_context(|| format!("reading Core ML worker {pid} resident set"))
+    }
+
+    fn last_stage_report(&self) -> Option<StageReport> {
+        self.last_stages.lock().clone()
     }
 }
 
@@ -348,6 +371,7 @@ struct WorkerResponse {
     load_seconds: Option<f64>,
     decode_seconds: Option<f64>,
     resample_seconds: Option<f64>,
+    stages: Option<StageReport>,
 }
 
 impl WorkerResponse {
@@ -437,11 +461,51 @@ mod tests {
             load_seconds: None,
             decode_seconds: None,
             resample_seconds: None,
+            stages: None,
         };
         let error = response
             .require_success("result")
             .expect_err("failure response must not pass");
         assert!(error.to_string().contains("model rejected input"));
+    }
+
+    #[test]
+    fn result_response_carries_the_worker_stage_breakdown() {
+        // Field names are the worker's `convertToSnakeCase` encoding of
+        // StageProfiler.Report, so a rename on either side must break here
+        // rather than silently deserialize `stages` as absent.
+        let payload = br#"{
+            "kind": "result", "ok": true, "text": "hello",
+            "decode_seconds": 0.044, "resample_seconds": 0.023,
+            "stages": {
+                "resample_ms": 22.976, "windows": 1, "encoder_calls": 1,
+                "decoder_calls": 35, "joint_calls": 96, "other_calls": 0,
+                "mel_ms": 3.08, "encoder_ms": 25.959, "decode_loop_ms": 15.84,
+                "decode_loop_dispatch_ms": 15.135, "decoder_dispatch_ms": 5.359,
+                "joint_dispatch_ms": 9.776, "post_ms": 0.066, "total_ms": 44.944,
+                "compute_units": "encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only"
+            }
+        }"#;
+        let response: WorkerResponse = serde_json::from_slice(payload).expect("valid result");
+        response.require_success("result").expect("ok result");
+        let stages = response.stages.expect("stages present");
+        assert_eq!(stages.windows, 1);
+        assert_eq!(stages.joint_calls, 96);
+        assert_eq!(stages.encoder_calls, 1);
+        assert_eq!(stages.other_calls, 0);
+        assert!(stages.compute_units.contains("decoder=cpu-only"));
+        // This is a wire-format test over a captured payload, so it pins the
+        // field names and types only. Whether a live pipeline still satisfies
+        // the frame identity is checked at runtime by
+        // `bench_asr::validate_stage_report`, which is where a moved Core ML
+        // entry point gets caught.
+    }
+
+    #[test]
+    fn absent_stage_breakdown_is_not_an_error() {
+        let payload = br#"{"kind": "result", "ok": true, "text": "hi", "decode_seconds": 0.04}"#;
+        let response: WorkerResponse = serde_json::from_slice(payload).expect("valid result");
+        assert!(response.stages.is_none());
     }
 
     #[test]

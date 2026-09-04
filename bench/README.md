@@ -71,6 +71,10 @@ BACKEND=coreml-unified OUT_CSV=bench/coreml-unified.csv \
 # Production capture + VAD + ASR, frozen serial baseline vs optimized path.
 # Requires a duplex Core Audio loopback named "BlackHole 2ch".
 scripts/bench-end-to-end.sh
+
+# Hold mode: release-to-transcript through the same production path.
+# Also requires the "BlackHole 2ch" loopback.
+scripts/bench-hold.sh
 ```
 
 ## What is and isn't measured
@@ -90,9 +94,10 @@ It **does not** exercise:
 
 So `scripts/bench-latency.sh` is **ASR-only**. Use
 `scripts/bench-end-to-end.sh` for the production capture, resampling, dual-VAD,
-endpoint, session-shutdown, and ASR path. That harness stops at
-transcript-ready rather than typing into the user's focused app; the only
-excluded production step is the synchronous synthetic-Unicode event post
+endpoint, session-shutdown, and ASR path, and `scripts/bench-hold.sh` for the
+Hold path, where the hotkey release replaces the VAD endpoint. Both harnesses
+stop at transcript-ready rather than typing into the user's focused app; the
+only excluded production step is the synchronous synthetic-Unicode event post
 (sub-ms per chord; see ADR-0019).
 
 ## End-to-end 3x result: M5 Pro 24 GB (2026-08-10)
@@ -173,6 +178,194 @@ The companion gold run passed at **2.38% WER / 2.22% CER** against limits of
 4% / 3%, with 40% exact formatting and 74.4× aggregate model-reported RTFx.
 This is a five-item macOS `say` smoke corpus, not a claim about real-user WER;
 the representative-speech gate described above still applies before a release.
+
+## Per-stage breakdown: M5 Pro 24 GB (2026-09-04)
+
+`bench_asr --stage-timings` starts the worker with `--emit-stage-timings`, and
+the worker then reports where each decode went. `scripts/bench-latency.sh`
+passes the flag automatically for `BACKEND=coreml-unified` and reduces the
+`asr_stages` log lines into `*-stages.csv` through `scripts/bench-stages.py`.
+
+The decode pipeline lives in FluidAudio's `UnifiedAsrManager` and
+`UnifiedRnntDecoder`, which are a pinned dependency this project depends on
+rather than vendors. The worker therefore measures from outside: at startup it
+replaces the prediction implementations of `MLModel` and its registered
+subclasses with timing wrappers that call straight through, and attributes each
+dispatch to a stage by the input feature names FluidAudio's providers declare
+(`mel` for the encoder, `targets` for the decoder, `encoder_step` for the
+joint). Stage boundaries come from the resulting dispatch timeline: mel is the
+gap before an encoder dispatch, the RNNT loop is everything from an encoder
+dispatch to the last dispatch of that window. Nothing in the pinned package is
+patched, and the shipping dictation path never installs the wrappers.
+
+Medians over 30 measured repetitions per bucket, three warmups, 48 kHz
+fixtures, release build (`bench/coreml-unified-stages.csv`):
+
+| fixture | resample | mel | encoder | RNNT loop | post | worker total | IPC | ASR p50 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.740 s | 3.41 ms | 3.07 ms | **25.55 ms** | 2.98 ms | 0.04 ms | 35.2 ms | 0.16 ms | 36.0 ms |
+| 2.507 s | 11.46 ms | 3.08 ms | **25.48 ms** | 8.40 ms | 0.05 ms | 48.5 ms | 0.26 ms | 49.0 ms |
+| 4.967 s | 22.71 ms | 3.06 ms | **25.49 ms** | 15.21 ms | 0.06 ms | 66.5 ms | 0.42 ms | 67.0 ms |
+| 8.150 s | 37.77 ms | 3.32 ms | **26.03 ms** | 25.40 ms | 0.08 ms | 92.6 ms | 0.60 ms | 94.0 ms |
+| 15.691 s | 72.57 ms | 6.13 ms | **51.59 ms** | 54.40 ms | 0.13 ms | 184.9 ms | 1.11 ms | 187.0 ms |
+
+Worker total is resample plus the profiled transcribe interval; it sits 0.7 to
+1.0 ms under the `asr_boundary` internal time, which is the response encode and
+the Swift work outside the profiled window. IPC is unchanged from the
+2026-08-11 boundary measurement and remains under 0.6% of the call.
+
+Enabling the profiler costs nothing measurable. Matched 30-repetition runs with
+and without `--stage-timings` measured 35.51 against 35.51 ms at 1 s and 67.09
+against 66.92 ms at 5 s. The 10 s bucket, which has the most dispatches of any
+single-window fixture, was measured with eight interleaved on/off blocks of 15
+repetitions so that machine drift hits both arms equally: the per-block delta
+has a median of -0.17 ms and a mean of -0.38 ms, and its sign flips across
+blocks, so the effect is below the noise. The interception is two clock reads
+and a lock per dispatch; the class sweep that finds the entry points stops once
+all three stages have dispatched, and the model placement is read once per stage
+rather than per call.
+
+These absolute numbers need a quiet machine, which matters more than the
+profiler does. Against the 2026-08-11 published baseline the 1, 3, 5, and 20 s
+buckets land within about 2 ms, and 10 s is roughly 5 ms higher; the interleaved
+A/B above rules the profiler out as the cause. A separate repeat under a
+competing job reproduced the dispatch counts exactly and kept the encoder flat
+at 26.4 to 28.5 ms, with resample and the decode loop 10 to 20% higher. The
+shape of the breakdown is stable; the millisecond values are not, so compare
+against the ASR-only p50 column from the same run.
+
+The encoder cost does not depend on utterance length. `UnifiedAsrManager`
+zero-pads every window to a fixed 15 s buffer (240,000 samples, 1,501 mel
+frames) and runs the full offline encoder graph on it, so a 0.74 s utterance
+pays the same 25.5 ms as an 8.15 s one. The 15.691 s fixture exceeds the 15 s
+window and needs a second one, which doubles both mel and encoder.
+`chunkStarts` adds that second window only past 240,000 samples, so a 14 s
+utterance still runs a single encoder pass.
+
+### Core ML dispatch counts per utterance
+
+| fixture | windows | encoder calls | decoder calls | joint calls | decoded frames | per joint | per decoder |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0.740 s | 1 | 1 | 7 | 16 | 10 | 107 µs | 158 µs |
+| 2.507 s | 1 | 1 | 20 | 51 | 32 | 100 µs | 143 µs |
+| 4.967 s | 1 | 1 | 35 | 96 | 62 | 99 µs | 142 µs |
+| 8.150 s | 1 | 1 | 57 | 158 | 102 | 101 µs | 147 µs |
+| 15.691 s | 2 | 2 | 122 | 342 | 222 | 101 µs | 145 µs |
+
+Decoded frames are `joint_calls - (decoder_calls - windows)`, since the greedy
+loop issues one joint per frame plus one per emitted token, and one decoder call
+per window plus one per emitted token. Every bucket matches its 80 ms frame
+arithmetic: 4.967 s of audio decodes 62 frames. That agreement is what
+validates the counts.
+
+The agreement is also checked at runtime, because a stage whose Core ML entry
+point stops being intercepted reports zero cost while every other number stays
+plausible. `bench_asr` fails the run when a report has no encoder dispatches,
+when `windows` and `encoder_calls` disagree, or when any prediction goes
+unattributed, and `scripts/bench-stages.py` repeats those checks before writing
+a CSV. The encoder is the stage worth naming here: losing it also drives
+`windows` to zero, which leaves the frame identity intact and the row
+believable.
+
+Per-frame loop cost is flat at roughly 0.25 ms across all lengths. The dispatch
+floor of about 100 µs per joint call is the dominant term inside the loop:
+`decode_loop_dispatch_ms` accounts for 95% of `decode_loop_ms` at every bucket,
+so the Swift-side loop work (encoder-step extraction, `MLMultiArray`
+allocation) is not where the loop time goes.
+
+### Which compute unit runs each stage
+
+The encoder runs on `cpuAndNeuralEngine`; the decoder and the joint-decision
+model both run `cpuOnly`. The `compute_units` column reports
+`MLModelConfiguration.computeUnits` read off each live model object at dispatch
+time, so it records the placement Core ML actually used rather than the one the
+worker asked for. It matches the pinned FluidAudio
+source, where `UnifiedAsrManager.loadModels` builds a separate `cpuOnly`
+configuration for the decoder and joint and comments that only the encoder uses
+ANE or GPU.
+
+The ANE is genuinely carrying the encoder. Eight repetitions on the 4.967 s
+fixture at each placement:
+
+| encoder placement | encoder median |
+|---|---:|
+| `cpu-and-neural-engine` | 26.05 ms |
+| `cpu-only` | 86.01 ms |
+
+`cpu-and-gpu` produces no result at all. The worker dies during warmup with
+`MPSGraphExecutable.mm:5070: failed assertion 'Error: MLIR pass manager failed'`,
+the int8-on-MPSGraph failure FluidAudio's own loader comments on and coerces
+away from for `.all`.
+
+```bash
+BACKEND=coreml-unified OUT_CSV=bench/coreml-unified.csv scripts/bench-latency.sh
+./target/release/bench_asr --backend coreml-unified --wav bench/audio/5s_48000.wav \
+    --reps 8 --warmup-reps 3 --stage-timings --compute-units cpu-only
+```
+
+### Where the 66 ms at 5 s goes
+
+No single stage owns it. On the 4.967 s fixture the 66.5 ms of worker-internal
+time is encoder 25.5 ms (38%), resample 22.7 ms (34%), RNNT decode loop 15.2 ms
+(23%), and mel 3.1 ms (5%), with IPC at 0.42 ms and post-processing under
+0.1 ms. The 35 ms floor at 1 s is owned by the encoder: the offline path pads
+every utterance to the fixed 15 s window, so 25.5 ms of encoder plus 3.1 ms of
+mel is length-independent work that a one-word utterance pays in full, and that
+28.6 ms is 80% of the 1 s result. The growth from 35 ms to 66 ms is split nearly
+evenly between resample, which costs a linear 4.6 ms per second of 48 kHz input
+and adds 19.3 ms, and the decode loop, which costs 0.25 ms per 80 ms frame and
+adds 12.2 ms. The prior hypothesis that the per-frame RNNT loop accounts for the
+gap over encoder arithmetic is half right: the loop is real, it is entirely on
+the CPU, and roughly 100 µs of each 0.25 ms frame is a single joint dispatch,
+but at every measured length the 48 kHz to 16 kHz resample costs more than the
+loop does.
+
+## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
+
+Hold (press-and-hold) had no measured release-to-text number; the tables above
+and the end-to-end gate both cover Tap, where Silero VAD owns the endpoint. In
+Hold the hotkey release is the endpoint, so `scripts/bench-hold.sh` runs
+`bench_e2e --mode hold`: it plays each fixture through the loopback device,
+waits for Core Audio's predicted instant of the last audible sample, releases
+there, and stops the clock at transcript-ready. Releasing at the acoustic end
+is the earliest a user could, so these are floor numbers for the mode.
+
+30 measured repetitions per bucket, two warmups, `BlackHole 2ch` loopback,
+resident Core ML worker (`bench/hold.csv`):
+
+| bucket | captured audio | n | mean | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 s | 0.800 s | 30 | 58.0 ms | **54.0 ms** | 79.5 ms | 80.7 ms |
+| 3 s | 2.571 s | 30 | 71.5 ms | **67.0 ms** | 97.7 ms | 108.5 ms |
+| 5 s | 5.035 s | 30 | 117.9 ms | **106.5 ms** | 158.6 ms | 160.4 ms |
+| 10 s | 8.213 s | 30 | 144.1 ms | **137.5 ms** | 184.5 ms | 190.4 ms |
+| 20 s | 15.755 s | 30 | 238.5 ms | **231.5 ms** | 280.6 ms | 288.8 ms |
+
+Bucket labels are nominal. The captured-audio column is the median measured
+duration, and it is what these latencies belong to: the "20 s" row is a 15.755 s
+utterance, which is only just over the 15 s encoder window, and the "10 s" row is
+8.2 s. Budget against the captured column, not the label.
+
+Medians of the parts, from the same `phase_timer` lines:
+
+| bucket | captured audio | release to observed | capture stop and join | ASR | total p50 |
+|---|---:|---:|---:|---:|---:|
+| 1 s | 0.800 s | 8.0 ms | 0.0 ms | 44.5 ms | 54.0 ms |
+| 3 s | 2.571 s | 8.0 ms | 0.0 ms | 53.5 ms | 67.0 ms |
+| 5 s | 5.035 s | 9.5 ms | 1.0 ms | 95.0 ms | 106.5 ms |
+| 10 s | 8.213 s | 9.5 ms | 1.0 ms | 122.0 ms | 137.5 ms |
+| 20 s | 15.755 s | 12.0 ms | 1.0 ms | 219.5 ms | 231.5 ms |
+
+`run_manual` polls its signal channel every 15 ms, which is the 8 to 12 ms
+median seen in the first column and up to 15 ms in the tail. Capture shutdown
+and the mono fold cost about 1 ms. Everything else is ASR, which runs 9 to 42%
+slower here than in the isolated bench, not monotonically in length, because the
+capture stream is still live in the same process. Hold also never sets `early_transcript`, so unlike Tap it
+cannot overlap any decode with the tail of the utterance.
+
+```bash
+REPS=30 WARMUP_REPS=2 BACKEND=coreml-unified scripts/bench-hold.sh
+```
 
 ## Baseline: M5 Pro 24 GB (2026-05-16, pre-§2 CoreML cache)
 
@@ -264,6 +457,8 @@ Replay:
 | `baseline.csv`               | Aggregated ASR baseline (pre-CoreML-cache).      |
 | `coreml-unified.csv`         | Generated shipping-backend ASR percentiles.     |
 | `*-boundary.csv`             | Generated Rust/worker boundary measurements.    |
+| `*-stages.csv`               | Generated per-stage breakdown and Core ML dispatch counts. |
+| `hold.{log,csv}`             | Generated Hold-mode release-to-transcript runs. |
 | `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |
 | `endpoint-*.{log,csv}`       | Generated pause-friendly endpoint gate runs.   |
 | `polish-backends.csv`        | Historical §6 Phase-0 2B polish measurements.  |
