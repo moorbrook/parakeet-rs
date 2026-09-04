@@ -23,6 +23,7 @@ use parakeet_dictation::settings::SettingsStore;
 use parakeet_dictation::streamer::{self, EndpointStrategy, Mode, Outcome};
 use parakeet_dictation::warmup;
 use parakeet_dictation::wav::read_wav_mono;
+use parakeet_dictation::windows::HoldWindowConfig;
 
 const DEFAULT_REPS: usize = 30;
 const DEFAULT_WARMUP_REPS: usize = 2;
@@ -36,6 +37,7 @@ struct Args {
     backend: Backend,
     strategy: EndpointStrategy,
     endpoint_policy: EndpointPolicy,
+    hold_windows: HoldWindowConfig,
     /// Sweep override for the confirmation window.
     confirmation_ms: Option<u32>,
     /// Count false cuts and transcript mismatches instead of aborting on the
@@ -134,6 +136,27 @@ fn parse_strategy(value: &str) -> anyhow::Result<EndpointStrategy> {
     }
 }
 
+/// `off`, or `MIN,MAX` in seconds. The Hold table needs both the windowed and
+/// the original serial path measured through the same binary on the same run.
+fn parse_hold_windows(value: &str) -> anyhow::Result<HoldWindowConfig> {
+    if value == "off" {
+        return Ok(HoldWindowConfig {
+            enabled: false,
+            ..HoldWindowConfig::default()
+        });
+    }
+    let (min, max) = value
+        .split_once(',')
+        .ok_or_else(|| anyhow!("--hold-windows expects off or MIN,MAX in seconds"))?;
+    let config = HoldWindowConfig {
+        enabled: true,
+        min_seconds: min.trim().parse().context("--hold-windows minimum")?,
+        max_seconds: max.trim().parse().context("--hold-windows maximum")?,
+    };
+    config.validate().map_err(|reason| anyhow!(reason))?;
+    Ok(config)
+}
+
 fn parse_endpoint_policy(value: &str) -> anyhow::Result<EndpointPolicy> {
     match value {
         "fast" => Ok(EndpointPolicy::Fast),
@@ -149,6 +172,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut backend = Backend::Sherpa;
     let mut strategy = EndpointStrategy::Serial;
     let mut endpoint_policy = EndpointPolicy::LongForm;
+    let mut hold_windows = HoldWindowConfig::default();
     let mut confirmation_ms = None;
     let mut tolerate_false_cuts = false;
     let mut device = DEFAULT_DEVICE.to_string();
@@ -215,6 +239,12 @@ fn parse_args() -> anyhow::Result<Args> {
                         .ok_or_else(|| anyhow!("--endpoint-policy needs a name"))?,
                 )?;
             }
+            "--hold-windows" => {
+                hold_windows = parse_hold_windows(
+                    &it.next()
+                        .ok_or_else(|| anyhow!("--hold-windows needs off or MIN,MAX"))?,
+                )?;
+            }
             "--confirmation-ms" => {
                 confirmation_ms = Some(
                     it.next()
@@ -264,6 +294,7 @@ fn parse_args() -> anyhow::Result<Args> {
         backend,
         strategy,
         endpoint_policy,
+        hold_windows,
         confirmation_ms,
         tolerate_false_cuts,
         device,
@@ -289,6 +320,7 @@ fn print_usage() {
          \x20                [--expected 'reference transcript']\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\
          \x20                [--mode vad|hold]\n\
+         \x20                [--hold-windows off|MIN,MAX]\n\
          \x20                [--arm warm|cold|prime|cadence]\n\
          \x20                [--idle-gap-ms N] [--keepalive-ms N]\n\n\
          Plays WAV through the named loopback device and measures the\n\
@@ -374,7 +406,10 @@ fn run(args: &Args) -> anyhow::Result<()> {
         args.device
     );
 
-    log::info!("endpoint config: confirmation_ms={}", args.confirmation_ms());
+    log::info!(
+        "endpoint config: confirmation_ms={}",
+        args.confirmation_ms()
+    );
 
     for rep in 0..args.warmup_reps {
         run_one(
@@ -479,6 +514,7 @@ fn run_one(
         asr.clone(),
         args.strategy,
         args.confirmation_ms(),
+        args.hold_windows,
         Some(&args.device),
     )?;
     // The press edge. The mic is open and the fixture has not started playing,

@@ -182,6 +182,16 @@ private struct WorkerOptions {
     }
 }
 
+/// One RNNT emission on the request's own timeline. `text` is the detokenized
+/// piece with the SentencePiece word-start marker already rendered as a leading
+/// space, so the Rust side can group tokens into words without a vocabulary.
+/// Rust's Hold-mode window merge aligns neighbouring windows on these.
+private struct TokenSpan: Encodable {
+    let text: String
+    let startS: Double
+    let endS: Double
+}
+
 private struct WorkerResponse: Encodable {
     let kind: String
     let ok: Bool
@@ -191,6 +201,7 @@ private struct WorkerResponse: Encodable {
     let decodeSeconds: Double?
     let resampleSeconds: Double?
     let stages: StageProfiler.Report?
+    let tokenSpans: [TokenSpan]?
 
     static func ready(loadSeconds: Double) -> Self {
         Self(
@@ -201,7 +212,8 @@ private struct WorkerResponse: Encodable {
             loadSeconds: loadSeconds,
             decodeSeconds: nil,
             resampleSeconds: nil,
-            stages: nil
+            stages: nil,
+            tokenSpans: nil
         )
     }
 
@@ -209,7 +221,8 @@ private struct WorkerResponse: Encodable {
         text: String,
         decodeSeconds: Double,
         resampleSeconds: Double,
-        stages: StageProfiler.Report?
+        stages: StageProfiler.Report?,
+        tokenSpans: [TokenSpan]
     ) -> Self {
         Self(
             kind: "result",
@@ -219,7 +232,8 @@ private struct WorkerResponse: Encodable {
             loadSeconds: nil,
             decodeSeconds: decodeSeconds,
             resampleSeconds: resampleSeconds,
-            stages: stages
+            stages: stages,
+            tokenSpans: tokenSpans
         )
     }
 
@@ -232,7 +246,8 @@ private struct WorkerResponse: Encodable {
             loadSeconds: nil,
             decodeSeconds: nil,
             resampleSeconds: nil,
-            stages: nil
+            stages: nil,
+            tokenSpans: nil
         )
     }
 }
@@ -341,7 +356,12 @@ private struct ParakeetCoreMLWorker {
                 let decodeStart = ContinuousClock.now
                 let profileStart =
                     options.emitStageTimings ? StageProfiler.shared.beginUtterance() : 0
-                let text = try await manager.transcribe(modelSamples)
+                // `transcribeWithTimings` runs the same decode as
+                // `transcribe` and reads the emission frames the greedy RNNT
+                // decoder already recorded, so the token spans cost nothing
+                // beyond the frame→seconds conversion.
+                let transcription = try await manager.transcribeWithTimings(modelSamples)
+                let text = transcription.text
                 var stages =
                     options.emitStageTimings
                     ? StageProfiler.shared.endUtterance(
@@ -355,7 +375,10 @@ private struct ParakeetCoreMLWorker {
                         text: text,
                         decodeSeconds: decodeSeconds,
                         resampleSeconds: resampleSeconds,
-                        stages: stages
+                        stages: stages,
+                        tokenSpans: transcription.tokenTimings.map {
+                            TokenSpan(text: $0.token, startS: $0.startTime, endS: $0.endTime)
+                        }
                     )
                 )
             } catch {

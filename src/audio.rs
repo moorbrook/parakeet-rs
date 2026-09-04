@@ -320,9 +320,7 @@ fn forward_samples(sinks: &CaptureSinks, floats: &[f32]) {
     sinks.callback.record(started.elapsed().as_micros() as u64);
 }
 
-fn open_device(
-    device_name: Option<&str>,
-) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
+fn open_device(device_name: Option<&str>) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
     let host = cpal::default_host();
     let device = match device_name {
         Some(name) => host
@@ -433,7 +431,11 @@ mod tests {
         let summary = stats.summary();
         assert_eq!(summary.count, 100);
         assert_eq!(summary.max_micros, 300);
-        assert!((summary.mean_micros - 12.9).abs() < 0.05, "{}", summary.mean_micros);
+        assert!(
+            (summary.mean_micros - 12.9).abs() < 0.05,
+            "{}",
+            summary.mean_micros
+        );
         assert_eq!(summary.p99_micros, 10);
         assert!(!summary.p99_saturated);
     }

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::asr::{Asr, AsrBackend, AsrBackendMetadata, Decoded, StageReport};
 use crate::resample::{to_target_rate, TARGET_SAMPLE_RATE};
+use crate::windows::TokenSpan;
 
 const PROTOCOL_MAGIC: [u8; 4] = *b"PRKT";
 const PROTOCOL_VERSION: u32 = 1;
@@ -323,12 +324,15 @@ impl CoreMlWorkerBackend {
     }
 }
 
-impl AsrBackend for CoreMlWorkerBackend {
-    fn metadata(&self) -> &AsrBackendMetadata {
-        &self.metadata
-    }
-
-    fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
+impl CoreMlWorkerBackend {
+    /// One request/response round trip. Both trait entry points share it so the
+    /// text a caller gets can never disagree with the spans beside it.
+    fn decode(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        require_spans: bool,
+    ) -> Result<(Decoded, Vec<TokenSpan>)> {
         validate_request(samples.len(), sample_rate)?;
         // Production capture already delivers 16 kHz, so this borrows. File-fed
         // callers (the gold corpus is 48 kHz) convert here rather than leaving
@@ -350,12 +354,51 @@ impl AsrBackend for CoreMlWorkerBackend {
             .decode_seconds
             .ok_or_else(|| anyhow!("Core ML result omitted decode_seconds"))?
             + response.resample_seconds.unwrap_or(0.0);
+        // Only the caller that asked for spans may fail for their absence. The
+        // plain path does not read them, and it is the fallback every Hold
+        // window failure lands on — making it depend on a field it ignores
+        // would defeat the fallback for exactly the worker that needs it.
+        let spans = match (&response.token_spans, require_spans) {
+            (Some(spans), _) => spans.iter().map(TokenSpan::from).collect(),
+            (None, false) => Vec::new(),
+            (None, true) => bail!(
+                "Core ML result omitted token_spans; this worker predates the \
+                 Hold window merge and must be rebuilt"
+            ),
+        };
 
-        Ok(Decoded {
-            text: response.text.unwrap_or_default(),
-            audio_seconds: samples.len() as f32 / sample_rate as f32,
-            decode_seconds: decode_seconds as f32,
-        })
+        Ok((
+            Decoded {
+                text: response.text.unwrap_or_default(),
+                audio_seconds: samples.len() as f32 / sample_rate as f32,
+                decode_seconds: decode_seconds as f32,
+            },
+            spans,
+        ))
+    }
+}
+
+impl AsrBackend for CoreMlWorkerBackend {
+    fn metadata(&self) -> &AsrBackendMetadata {
+        &self.metadata
+    }
+
+    fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
+        Ok(self
+            .decode(samples, sample_rate, /* require_spans = */ false)?
+            .0)
+    }
+
+    fn reports_token_spans(&self) -> bool {
+        true
+    }
+
+    fn transcribe_with_token_spans(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<(Decoded, Vec<TokenSpan>)> {
+        self.decode(samples, sample_rate, /* require_spans = */ true)
     }
 
     fn auxiliary_resident_bytes(&self) -> Result<u64> {
@@ -428,6 +471,30 @@ struct WorkerResponse {
     decode_seconds: Option<f64>,
     resample_seconds: Option<f64>,
     stages: Option<StageReport>,
+    /// One entry per RNNT emission, on the request's own timeline. Absent from
+    /// `ready` and failure frames, and from any worker built before the Hold
+    /// window merge needed them.
+    token_spans: Option<Vec<WireTokenSpan>>,
+}
+
+/// Wire form of one emission. Separate from [`TokenSpan`] so the worker's
+/// `convertToSnakeCase` field names are pinned here rather than in the module
+/// the merge logic lives in.
+#[derive(Clone, Debug, Deserialize)]
+struct WireTokenSpan {
+    text: String,
+    start_s: f64,
+    end_s: f64,
+}
+
+impl From<&WireTokenSpan> for TokenSpan {
+    fn from(wire: &WireTokenSpan) -> Self {
+        Self {
+            text: wire.text.clone(),
+            start_s: wire.start_s as f32,
+            end_s: wire.end_s as f32,
+        }
+    }
 }
 
 impl WorkerResponse {
@@ -518,6 +585,7 @@ mod tests {
             decode_seconds: None,
             resample_seconds: None,
             stages: None,
+            token_spans: None,
         };
         let error = response
             .require_success("result")
@@ -557,6 +625,40 @@ mod tests {
         // the frame identity is checked at runtime by
         // `bench_asr::validate_stage_report`, which is where a moved Core ML
         // entry point gets caught.
+    }
+
+    #[test]
+    fn result_response_carries_the_worker_token_spans() {
+        // Field names are the worker's `convertToSnakeCase` encoding of its
+        // `TokenSpan`, and the piece keeps the leading space the tokenizer's
+        // word-start marker became — that space is what groups tokens into
+        // words on this side.
+        let payload = br#"{
+            "kind": "result", "ok": true, "text": "Hi there.", "decode_seconds": 0.04,
+            "token_spans": [
+                {"text": " Hi", "start_s": 0.08, "end_s": 0.16},
+                {"text": " there", "start_s": 0.24, "end_s": 0.32},
+                {"text": ".", "start_s": 0.32, "end_s": 0.40}
+            ]
+        }"#;
+        let response: WorkerResponse = serde_json::from_slice(payload).expect("valid result");
+        let wire = response.token_spans.expect("token spans present");
+        let spans: Vec<TokenSpan> = wire.iter().map(TokenSpan::from).collect();
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].text, " Hi");
+        assert!((spans[2].end_s - 0.40).abs() < 1e-6);
+        let words = crate::windows::words_from_tokens(&spans, 0.0);
+        assert_eq!(crate::windows::words_to_text(&words), "Hi there.");
+    }
+
+    #[test]
+    fn a_worker_without_token_spans_still_serves_the_plain_decode() {
+        // The plain decode is where every Hold window failure falls back to,
+        // so it must not depend on a field it never reads. Only the span-aware
+        // entry point may refuse a worker that predates them.
+        let payload = br#"{"kind": "result", "ok": true, "text": "hi", "decode_seconds": 0.04}"#;
+        let response: WorkerResponse = serde_json::from_slice(payload).expect("valid result");
+        assert!(response.token_spans.is_none());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::asr::Asr;
 use crate::audio::{AudioCapture, Recording};
@@ -22,6 +22,9 @@ use crate::endpointing::{
 };
 use crate::performance::{next_session_id, PhaseTimer, PhaseTimerMode};
 use crate::vad::Vad;
+use crate::windows::{
+    merge_words, words_to_text, HoldWindowConfig, SeamOutcome, WindowPlanner, Word,
+};
 
 /// If the user starts dictation and says nothing within this window, give up.
 const NO_SPEECH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -30,6 +33,12 @@ const NO_SPEECH_TIMEOUT: Duration = Duration::from_secs(5);
 /// keeps the key held. Matches the VAD's `max_speech_duration` so both modes
 /// have the same upper bound on a single utterance.
 const MANUAL_MAX_RECORDING: Duration = Duration::from_secs(30);
+
+/// How long the Hold loop blocks on the audio tap before re-checking the
+/// hotkey signal. This is the floor on release-to-observed latency, so it is
+/// deliberately shorter than a capture callback period rather than the 15 ms
+/// sleep that used to cost 12-14 ms of the measured baseline.
+const MANUAL_POLL: Duration = Duration::from_millis(3);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -145,6 +154,7 @@ pub fn start(
     mode: Mode,
     asr: Arc<Asr>,
     endpoint_policy: EndpointPolicy,
+    hold_windows: HoldWindowConfig,
 ) -> Result<(Session, OutcomeRx)> {
     start_with_strategy_on_device(
         vad_model,
@@ -152,6 +162,7 @@ pub fn start(
         asr,
         EndpointStrategy::Speculative,
         endpoint_policy.confirmation_ms(),
+        hold_windows,
         None,
     )
 }
@@ -165,6 +176,7 @@ pub fn start_with_strategy_on_device(
     asr: Arc<Asr>,
     endpoint_strategy: EndpointStrategy,
     confirmation_ms: u32,
+    hold_windows: HoldWindowConfig,
     input_device: Option<&str>,
 ) -> Result<(Session, OutcomeRx)> {
     let (tap_tx, tap_rx) = channel::<Vec<f32>>();
@@ -203,6 +215,16 @@ pub fn start_with_strategy_on_device(
         None
     };
 
+    // Hold's own Silero state is NOT loaded here. Tap pays that load before the
+    // spawn because its VAD owns the endpoint and the session is meaningless
+    // without it; Hold's only chooses window boundaries, and the first one
+    // cannot arrive for seconds. Loading it on this side would put 100-300 ms
+    // on the hotkey-down edge, the same edge that fires the engine prime, for
+    // no benefit — so `run_manual` builds it as its first act instead, while
+    // capture is already running and the tap is already buffering.
+    let hold_vad_model = vad_model.to_path_buf();
+    let hold_asr = Arc::clone(&asr);
+
     let join = std::thread::Builder::new()
         .name(match mode {
             Mode::VadAutoStop => "vad-watcher".into(),
@@ -227,7 +249,14 @@ pub fn start_with_strategy_on_device(
                     }),
                     None => Outcome::Error(anyhow!("VadAutoStop spawned without a VAD model")),
                 },
-                Mode::Manual => run_manual(capture, tap_rx, signal_rx, timer),
+                Mode::Manual => run_manual(
+                    capture,
+                    tap_rx,
+                    signal_rx,
+                    timer,
+                    // Built here, on the watcher thread, not on the caller's.
+                    build_hold_windowing(&hold_vad_model, &hold_asr, hold_windows),
+                ),
             };
             let _ = outcome_tx.send(outcome);
         })
@@ -240,6 +269,100 @@ pub fn start_with_strategy_on_device(
         },
         OutcomeRx(outcome_rx),
     ))
+}
+
+/// Decode a recording exactly as a Hold session would have, from a buffer
+/// rather than a live microphone.
+///
+/// Quality harnesses need to compare a windowed transcript against the plain
+/// single-pass one on the same audio, which the live path cannot give them
+/// without a loopback device and a real hold. The VAD, the planner, and the
+/// merge are the same code; only the audio source and the threading differ,
+/// and the merge is order-deterministic so decoding the windows in sequence
+/// here yields the transcript the session would have produced.
+pub fn decode_hold_windowed(
+    asr: &Asr,
+    vad_model: &Path,
+    samples: &[f32],
+    config: HoldWindowConfig,
+) -> Result<String> {
+    config.validate().map_err(|reason| anyhow!(reason))?;
+    if !asr.reports_token_spans() {
+        bail!("this recognizer reports no word boundaries, so windows cannot be joined");
+    }
+    let vad = Vad::load_candidate(vad_model, 1).context("loading Silero for windowed decode")?;
+    let mut planner = WindowPlanner::new(config, u64::from(WINDOW_SAMPLES));
+    let mut merged: Vec<Word> = Vec::new();
+
+    let frames = samples.len() / WINDOW_SAMPLES as usize;
+    for index in 0..frames {
+        let frame =
+            &samples[index * WINDOW_SAMPLES as usize..(index + 1) * WINDOW_SAMPLES as usize];
+        vad.accept_waveform(frame);
+        vad.drain_segments();
+        let Some(cut) = planner.observe_frame(vad.detected()) else {
+            continue;
+        };
+        let from = cut.start as usize;
+        let to = (cut.end as usize).min(samples.len());
+        if from >= to {
+            continue;
+        }
+        let words = asr.recognize_window(&samples[from..to], SAMPLE_RATE, cut.start_seconds())?;
+        merged = merge_words(&merged, &words, cut.start_seconds()).0;
+    }
+
+    let tail_start = (planner.open_window_start() as usize).min(samples.len());
+    let tail_start_s = tail_start as f32 / SAMPLE_RATE as f32;
+    let tail = asr.recognize_window(&samples[tail_start..], SAMPLE_RATE, tail_start_s)?;
+    merged = merge_words(&merged, &tail, tail_start_s).0;
+    Ok(words_to_text(&merged))
+}
+
+/// Build the Hold-mode window state, or `None` with a reason logged. Never an
+/// error: dictation must still work when windowing cannot.
+///
+/// Called from the Hold watcher thread rather than from `start`, so the Silero
+/// load stays off the hotkey-down edge. Audio captured while it runs is not
+/// lost: `AudioCapture` is already accumulating the recording and the tap is an
+/// unbounded channel, so the first loop iteration drains whatever queued up and
+/// the planner sees every frame in order.
+fn build_hold_windowing(
+    vad_model: &Path,
+    asr: &Arc<Asr>,
+    config: HoldWindowConfig,
+) -> Option<HoldWindowing> {
+    if !config.enabled {
+        log::debug!("hold windowing off by configuration");
+        return None;
+    }
+    if !asr.reports_token_spans() {
+        log::info!("hold windowing off: this recognizer reports no word boundaries");
+        return None;
+    }
+    if let Err(reason) = config.validate() {
+        log::warn!("hold windowing off: {reason}");
+        return None;
+    }
+    let vad = match Vad::load_candidate(vad_model, 1) {
+        Ok(vad) => vad,
+        Err(error) => {
+            log::warn!("hold windowing off: loading Silero failed: {error:#}");
+            return None;
+        }
+    };
+    let decoder = match WindowDecoder::spawn(asr.clone()) {
+        Ok(decoder) => decoder,
+        Err(error) => {
+            log::warn!("hold windowing off: {error:#}");
+            return None;
+        }
+    };
+    Some(HoldWindowing {
+        vad,
+        planner: WindowPlanner::new(config, u64::from(WINDOW_SAMPLES)),
+        decoder,
+    })
 }
 
 fn run_vad(run: VadRun) -> Outcome {
@@ -397,43 +520,325 @@ fn finish_at_vad_endpoint(
     finish_with_recording(capture, timer, early_transcript)
 }
 
+/// One window handed to the background decoder. `start_s` is where the window
+/// begins in the recording, which is also where its overlap with the previous
+/// window begins.
+struct WindowJob {
+    samples: Vec<f32>,
+    start_s: f32,
+    queued_at: Instant,
+    is_tail: bool,
+}
+
+/// What the background decoder produced for a whole held recording.
+#[derive(Default)]
+struct WindowSummary {
+    words: Vec<Word>,
+    windows: usize,
+    seams: Vec<SeamOutcome>,
+    /// How long the tail window sat behind an already-running window decode.
+    /// Inherent: the worker serves one request at a time.
+    tail_queue_wait: Duration,
+    tail_decode: Duration,
+    /// First failure. Any failure abandons the whole windowed transcript and
+    /// the session falls back to decoding the recording in one pass, so a seam
+    /// bug can never lose what the user said.
+    error: Option<String>,
+}
+
+/// Background decoder for Hold-mode windows.
+///
+/// One thread, one job queue, results merged as they arrive. A single thread is
+/// what the worker protocol wants anyway — it serves one request at a time —
+/// and joining it before the session ends keeps a stray decode from holding the
+/// worker while the next session starts.
+struct WindowDecoder {
+    job_tx: Option<Sender<WindowJob>>,
+    join: JoinHandle<WindowSummary>,
+}
+
+impl WindowDecoder {
+    fn spawn(asr: Arc<Asr>) -> Result<Self> {
+        let (job_tx, job_rx) = channel::<WindowJob>();
+        let join = std::thread::Builder::new()
+            .name("hold-windows".into())
+            .spawn(move || {
+                let mut summary = WindowSummary::default();
+                for job in job_rx {
+                    let queued_for = job.queued_at.elapsed();
+                    let started = Instant::now();
+                    if summary.error.is_none() {
+                        match asr.recognize_window(&job.samples, SAMPLE_RATE, job.start_s) {
+                            Ok(next) => {
+                                let (merged, seam) =
+                                    merge_words(&summary.words, &next, job.start_s);
+                                summary.words = merged;
+                                summary.seams.push(seam);
+                            }
+                            Err(error) => summary.error = Some(format!("{error:#}")),
+                        }
+                        summary.windows += 1;
+                    }
+                    if job.is_tail {
+                        summary.tail_queue_wait = queued_for;
+                        summary.tail_decode = started.elapsed();
+                    }
+                }
+                summary
+            })
+            .context("spawning the Hold window decoder")?;
+        Ok(Self {
+            job_tx: Some(job_tx),
+            join,
+        })
+    }
+
+    /// Queue a window. A send failure means the decoder thread died, which is
+    /// reported when the session joins it.
+    fn submit(&self, samples: Vec<f32>, start_s: f32, is_tail: bool) {
+        if let Some(tx) = &self.job_tx {
+            let _ = tx.send(WindowJob {
+                samples,
+                start_s,
+                queued_at: Instant::now(),
+                is_tail,
+            });
+        }
+    }
+
+    /// Close the queue and wait for every submitted window.
+    fn finish(mut self) -> WindowSummary {
+        self.job_tx = None;
+        self.join.join().unwrap_or_else(|_| WindowSummary {
+            error: Some("Hold window decoder panicked".to_string()),
+            ..WindowSummary::default()
+        })
+    }
+}
+
+/// Silero state and the cut planner for one held recording.
+struct HoldWindowing {
+    vad: Vad,
+    planner: WindowPlanner,
+    decoder: WindowDecoder,
+}
+
 fn run_manual(
     capture: AudioCapture,
     tap_rx: Receiver<Vec<f32>>,
     signal_rx: Receiver<Signal>,
     mut timer: PhaseTimer,
+    mut windowing: Option<HoldWindowing>,
 ) -> Outcome {
     let session_start = Instant::now();
+    // Only needed while windows are being cut: the recording itself is
+    // accumulated by `AudioCapture`, and `capture.stop()` is the authority for
+    // what a window contains. The tap is read for VAD and to know how far the
+    // recording has got.
+    let mut window_buf: Vec<f32> = Vec::with_capacity(WINDOW_SAMPLES as usize * 4);
+    let mut frame: Vec<f32> = Vec::with_capacity(WINDOW_SAMPLES as usize);
+    let mut cut_audio: Vec<f32> = Vec::with_capacity(SAMPLE_RATE as usize * 8);
+    let mut cut_audio_start: u64 = 0;
+
     loop {
         // Check controller signals every tick.
         match signal_rx.try_recv() {
-            Ok(Signal::Cancel) => return finish(capture, Outcome::Cancelled),
+            Ok(Signal::Cancel) => {
+                if let Some(windowing) = windowing {
+                    // Drains rather than aborts. `finish` closes the queue and
+                    // waits for the windows already submitted; there is no way
+                    // to cancel a request the worker has started, and abandoning
+                    // the thread would leave one holding the worker's single
+                    // pipe into the next session. Worst case is one window's
+                    // decode, tens of milliseconds, on a path the user has
+                    // already walked away from.
+                    let _ = windowing.decoder.finish();
+                }
+                return finish(capture, Outcome::Cancelled);
+            }
             // Hold-mode endpoint = hotkey release. Mark the endpoint
-            // HERE (release entry), NOT inside `finish_with_recording`.
-            // `finish_with_recording` runs `capture.stop()` which
-            // joins the audio thread — that gap (a few ms) is the
-            // user's actual release-to-paste latency and shouldn't
-            // be excluded from `dur_post_endpoint_ms`.
+            // HERE (release entry), NOT inside `finish_manual`.
+            // `finish_manual` runs `capture.stop()` which joins the
+            // audio thread — that gap (a few ms) is the user's actual
+            // release-to-paste latency and shouldn't be excluded from
+            // `dur_post_endpoint_ms`.
             Ok(Signal::Finalize) => {
                 timer.mark_vad_endpoint();
-                return finish_with_recording(capture, timer, None);
+                return finish_manual(capture, timer, windowing);
             }
             Err(_) => {}
         }
+
         // Drain the tap so the capture thread doesn't back up its channel.
-        // We don't need the chunks for anything in Manual mode — the audio
-        // is also being accumulated into AudioCapture's internal buffer,
-        // which is what `capture.stop()` returns.
-        while tap_rx.try_recv().is_ok() {}
+        // Blocking briefly on the first chunk replaces the old fixed sleep:
+        // it wakes on audio rather than on a timer, so the release edge is
+        // seen sooner.
+        let mut chunk = match tap_rx.recv_timeout(MANUAL_POLL) {
+            Ok(chunk) => Some(chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Capture ended under us. The recording is still whatever
+                // `AudioCapture` accumulated, so give up on windowing rather
+                // than on the session, and stop spinning on a dead channel.
+                // Join the decoder rather than dropping it: an in-flight window
+                // would otherwise hold the worker's single pipe into whatever
+                // runs next.
+                if let Some(windowing) = windowing.take() {
+                    log::warn!("audio tap closed during hold; decoding the recording in one pass");
+                    let _ = windowing.decoder.finish();
+                }
+                std::thread::sleep(MANUAL_POLL);
+                None
+            }
+        };
+        while let Some(samples) = chunk {
+            if let Some(state) = &mut windowing {
+                window_buf.extend_from_slice(&samples);
+                cut_audio.extend_from_slice(&samples);
+                while window_buf.len() >= WINDOW_SAMPLES as usize {
+                    frame.clear();
+                    frame.extend(window_buf.drain(..WINDOW_SAMPLES as usize));
+                    state.vad.accept_waveform(&frame);
+                    state.vad.drain_segments();
+                    let Some(cut) = state.planner.observe_frame(state.vad.detected()) else {
+                        continue;
+                    };
+                    // `cut_audio` starts at `cut_audio_start`; both bounds are
+                    // inside it by construction, since the planner never cuts
+                    // past what it has been fed and never rewinds before the
+                    // window it just closed.
+                    let from = (cut.start.saturating_sub(cut_audio_start)) as usize;
+                    let to = (cut.end.saturating_sub(cut_audio_start)) as usize;
+                    let to = to.min(cut_audio.len());
+                    if from >= to {
+                        log::warn!("hold window {from}..{to} is empty; skipping the cut");
+                        continue;
+                    }
+                    log::debug!(
+                        "hold window {:.2}s..{:.2}s ({:?}), next starts at {:.2}s",
+                        cut.start_seconds(),
+                        cut.end as f32 / SAMPLE_RATE as f32,
+                        cut.reason,
+                        cut.overlap_start_seconds(),
+                    );
+                    state
+                        .decoder
+                        .submit(cut_audio[from..to].to_vec(), cut.start_seconds(), false);
+                    // Keep only what the next window still needs.
+                    let keep = (cut.next_start.saturating_sub(cut_audio_start)) as usize;
+                    cut_audio.drain(..keep.min(cut_audio.len()));
+                    cut_audio_start = cut.next_start;
+                }
+            }
+            chunk = tap_rx.try_recv().ok();
+        }
 
         if session_start.elapsed() > MANUAL_MAX_RECORDING {
             // Auto-cap fallback for "user forgot to release". Mark
             // the cap-hit moment as the endpoint so latency math
             // doesn't include the post-cap stop+join overhead either.
             timer.mark_vad_endpoint();
-            return finish_with_recording(capture, timer, None);
+            return finish_manual(capture, timer, windowing);
         }
-        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
+/// Stop capture, decode whatever tail is left, and merge it onto the windows
+/// already decoded during the hold.
+fn finish_manual(
+    capture: AudioCapture,
+    mut timer: PhaseTimer,
+    windowing: Option<HoldWindowing>,
+) -> Outcome {
+    let recording = match capture.stop() {
+        Ok(recording) => recording,
+        Err(error) => {
+            if let Some(windowing) = windowing {
+                let _ = windowing.decoder.finish();
+            }
+            return Outcome::Error(error);
+        }
+    };
+    let Recording {
+        samples,
+        sample_rate,
+    } = recording;
+    if samples.is_empty() {
+        if let Some(windowing) = windowing {
+            let _ = windowing.decoder.finish();
+        }
+        return Outcome::Cancelled;
+    }
+    let audio_s = samples.len() as f32 / sample_rate as f32;
+    timer.mark_capture_end(audio_s);
+
+    let Some(HoldWindowing {
+        planner, decoder, ..
+    }) = windowing
+    else {
+        return Outcome::Speech {
+            samples,
+            sample_rate,
+            early_transcript: None,
+            timer,
+        };
+    };
+
+    // The planner counts on the VAD's 16 kHz timeline. Since ADR-0030 capture
+    // delivers exactly that, but check rather than slice on an assumption.
+    if sample_rate != SAMPLE_RATE {
+        log::warn!(
+            "hold windowing expected {SAMPLE_RATE} Hz capture, got {sample_rate};              decoding the recording in one pass"
+        );
+        let _ = decoder.finish();
+        return Outcome::Speech {
+            samples,
+            sample_rate,
+            early_transcript: None,
+            timer,
+        };
+    }
+
+    timer.mark_asr_start();
+    let tail_start = (planner.open_window_start() as usize).min(samples.len());
+    let tail_s = (samples.len() - tail_start) as f32 / SAMPLE_RATE as f32;
+    decoder.submit(
+        samples[tail_start..].to_vec(),
+        tail_start as f32 / SAMPLE_RATE as f32,
+        true,
+    );
+    let summary = decoder.finish();
+    timer.mark_asr_done();
+
+    let early_transcript = match summary.error {
+        Some(error) => {
+            log::warn!("hold window decode failed ({error}); decoding the recording in one pass");
+            None
+        }
+        None => {
+            let text = words_to_text(&summary.words);
+            log::info!(
+                "hold windows={} seams={:?} tail={tail_s:.2}s queued={:.1}ms decode={:.1}ms",
+                summary.windows,
+                summary.seams,
+                summary.tail_queue_wait.as_secs_f32() * 1_000.0,
+                summary.tail_decode.as_secs_f32() * 1_000.0,
+            );
+            // An empty merge on non-empty audio is indistinguishable from a
+            // seam that ate the transcript, so re-decode rather than paste
+            // nothing.
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+    };
+    Outcome::Speech {
+        samples,
+        sample_rate,
+        early_transcript,
+        timer,
     }
 }
 

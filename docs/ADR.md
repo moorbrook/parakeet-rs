@@ -2024,6 +2024,146 @@ reachable at the commit named in the change log.
 
 ---
 
+## 0032 — Hold decodes 6 s windows during the hold, joined on word agreement
+
+**Status:** **Accepted — implemented and measured.** Release-to-text p50 on the
+M5 Pro falls from 104.5 to 66.0 ms at an 8.1 s utterance and from 180.5 to
+65.0 ms at 16.6 s, with gold-corpus WER and CER unchanged at 5.43% / 3.57%.
+
+That result was re-measured after the seam-merge fixes and came back identical,
+transcript for transcript, so it belongs to the shipped code rather than to the
+version that was current when the arms were first run.
+
+It is weaker than it reads, though, and should not be cited without the caveat: six of the seven gold fixtures are under 4.3 s, so at a 6 s cap they
+decode as a single window and are identical to the plain path by construction.
+Only `librispeech-multi` (14.2 s) is actually cut, and it scored 0.00% WER. The
+rest of the multi-window evidence is loopback runs over `say`-generated audio,
+not human speech. A corpus with several 15 to 30 s human utterances would settle
+it; until one exists, treat the quality claim as "no regression detected on the
+evidence available" rather than as a measured equality. Tables and method in
+`bench/README.md`; the ledger entry is in `docs/asr/PERF.md`.
+
+**This is not ADR-0009's rejected streaming swap.** The recognizer is
+unchanged — the same offline full-attention Parakeet Unified encoder, the same
+int8 weights, the same 15 s windows inside the worker; only *when* windows are
+submitted and *how* their transcripts are joined changes, so none of the WER
+cost that sank the chunked-attention candidates applies here.
+
+**Context.** Hold (press-and-hold) had nothing overlapping its decode.
+`run_manual` drained the audio tap and threw the chunks away, and the first
+model call happened after the hotkey came up. The g38m instrumentation priced
+that: 72.5 ms p50 at a 4.9 s utterance, 125.0 ms at 8.1 s, 192.5 ms at 15.8 s,
+of which the ASR call alone was 61, 115.5, and 181 ms. The growth is structural,
+not a bug — the encoder costs about 26 ms per 15 s window plus roughly 3 ms per
+audio-second in the RNNT loop, and in Hold all of it lands after the endpoint.
+Tap does not have this problem: ADR-0023's speculative decode already runs
+during the endpoint confirmation window.
+
+**Decision.** Cut the held recording into windows while the key is still down
+and decode each one in the background, so that on release only the tail is left.
+Voz's recipe for long audio — "cut into 15 s windows at pauses and join on the
+words neighbouring windows agree on" — applied incrementally rather than to a
+finished file.
+
+- **Where to cut: at a fixed 6 s cap, not at pauses.** This is the one place the
+  implementation departs from Voz's description, and it was decided by
+  measurement. Cutting at pauses moved the gold corpus from 5.43% to **6.52%
+  WER** and 3.57% to 4.62% CER, failing the manifest's zero-regression gate.
+  The damage was not at the seams: it was in `commands` (12.20% to 14.63%) and
+  `numbers` (6.67% to 10.00%), fixtures two to four seconds long, where a pause
+  inside a short utterance split it in half and each half decoded worse than the
+  whole. Cutting only at the cap scored **5.43% WER and 3.57% CER, identical to
+  the plain single-pass decode** on every category.
+
+  This reproduces a result FluidAudio had already recorded in
+  `UnifiedAsrManager.decodedTokens`: silence-aligned window starts measured
+  about 1 WER point worse than a fixed stride on the 15 s offline encoder
+  (Earnings-22 long-form), with no artifact benefit, which is why their own
+  offline path uses a fixed grid. Two independent measurements of the same
+  effect is enough to ship against it.
+
+  The pause path is kept and still tested, because it costs nothing to keep and
+  the evidence against it is one small corpus plus one upstream note. It is
+  turned off by setting `hold_window_min_seconds` equal to the cap, so the cap
+  wins every race. Lowering it needs fresh evidence, not preference.
+
+  The cap is what bounds the tail the user waits for, which makes it the
+  release-to-text ceiling: 6 s of tail is roughly 26 ms of encoder plus 18 ms of
+  RNNT loop, and the measured p50 at a 16.6 s utterance is 65.0 ms.
+
+- **Pause detection, when enabled.** Hold runs one Silero state of its own, the
+  low-latency candidate detector, through `EndpointTracker` under the `Fast`
+  policy. That tracker fires `Confirmed` once per pause after 160 ms of silence
+  and reports the sample where the silence began; it re-arms when speech
+  resumes. Tap's endpoint authority is untouched — this tracker chooses window
+  boundaries and can never stop a recording.
+- **Overlap.** A pause cut hands the confirmation silence to the next window —
+  RNNT emission lags the acoustics, so a word spoken just before the pause can
+  be timestamped inside it, and the next window needs to contain that audio for
+  the merge to see the duplicate. A forced cut lands mid-speech and hands over
+  1.5 s, enough that the straddling word is decoded whole by the next window and
+  the merge has several words to agree on.
+- **How to join.** The worker now answers with `token_spans`: one entry per RNNT
+  emission, carrying the detokenized piece and its span in seconds. FluidAudio's
+  `transcribeWithTimings` runs the same decode as `transcribe` and reads
+  emission frames the greedy decoder already recorded, so this costs only the
+  frame-to-seconds conversion. Rust groups the pieces into words on the
+  tokenizer's word-start marker and merges two windows by finding the longest
+  run of words they agree on inside their shared audio, splicing there. Matching
+  is on letters only, case- and punctuation-insensitive, and never on time:
+  emission frames are 80 ms apart and the same word is routinely stamped a frame
+  apart by two windows. A single shared function word is not accepted as
+  agreement.
+- **When they agree on nothing** both sides are kept whole, and only a leading
+  run of the later window that exactly repeats what the earlier one ended with
+  is removed. A disagreement is not evidence that either window is wrong, so
+  nothing may be dropped on suspicion; an earlier rule that cut the earlier
+  window at the midpoint of the overlap deleted real speech whenever the later
+  window had not in fact re-decoded it. Timestamps cannot close this seam
+  either, because emission lag lets a word only the later window heard carry an
+  earlier stamp than the last word of the earlier one.
+
+  Two costs are accepted here. A word the earlier window truncated
+  mid-utterance survives beside the later window's complete copy, because a
+  fragment does not match its whole form — a visible stutter, which a reader can
+  correct, in place of a deleted clause, which looks like something the speaker
+  never said. And that repeat check compares the whole trailing run of the
+  earlier window against the whole leading run of the later one, rather than
+  only the overlap region, and prefers the longest match, so a phrase the
+  speaker genuinely said twice across a seam could be collapsed to one. It needs
+  the repetition to fall exactly at the seam and to survive normalization on
+  both sides; the probability is low and the alternative — bounding the check to
+  the overlap — reintroduces the timestamp dependency the rest of this decision
+  removes.
+
+**Rejected: aligning on time instead of text.** Splitting the overlap at a fixed
+instant needs no agreement search and is one line. It also cuts words in half
+whenever the two windows' emission frames disagree, which they do by
+construction. Text agreement is the only rule that can tell a duplicate from two
+different words at the same moment.
+
+**Rejected: submitting windows out of order.** The worker protocol serves one
+request at a time behind a mutex, so a second concurrent submission would only
+queue. One decoder thread with a job queue is what the protocol wants, and
+joining it before the session ends keeps a stray decode from holding the worker
+while the next session starts. The tail's wait behind an in-flight window is
+inherent and shows at p95 rather than p50.
+
+**Failure is always backwards.** Windowing turns itself off, with the reason
+logged, when the recognizer reports no word boundaries (sherpa), when the
+configuration is out of range, when Silero will not load, when the audio tap
+closes early, or when capture returns something other than 16 kHz. Any window
+decode error, and any merge that comes back empty on non-empty audio, abandons
+the windowed transcript and lets the app decode the recording in one pass. A
+seam bug can cost latency; it must never cost what the user said.
+
+**Configuration.** `hold_windows_enabled` (on), `hold_window_min_seconds` (6.0)
+and `hold_window_max_seconds` (6.0) in `settings.json` — equal, so pause cutting
+is off.
+`bench_e2e --hold-windows off|MIN,MAX` measures both paths through one binary,
+and `asr_diff --hold-windows MIN,MAX` decodes the gold corpus the windowed way
+so the seam merge is held to the same WER as the plain decode.
+
 ## Target status index
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -2063,6 +2203,16 @@ Anything not on this table is either accepted-and-done or out of scope.
   endpoint corpus's 544 ms intra-utterance pause, so it cut that fixture 15/15,
   and where it was safe it matched a plain 90 ms window. Its implementation and
   benchmark rows are reachable at commit `b2cc586`.
+
+- **2026-09-04** — [ADR-0032](#0032--hold-decodes-6-s-windows-during-the-hold-joined-on-word-agreement)
+  accepted and implemented. Hold cuts the held recording into 6 s windows,
+  decodes them in the background while the key is still down, and joins them on
+  the words neighbouring windows agree on, so release-to-text is the tail window
+  rather than the whole recording: 180.5 ms to 65.0 ms p50 at a 16.6 s
+  utterance. Cutting at Silero-confirmed pauses instead was implemented,
+  measured, and rejected — it cost 1.09 points of gold WER by splitting short
+  utterances — so the pause path ships disabled. The recognizer is unchanged;
+  this is not the streaming-model swap ADR-0009 rejected.
 
 - **2026-09-04** — [ADR-0030](#0030--one-16-khz-resampler-in-rust-run-during-capture)
   accepted and implemented. One Kaldi sinc resampler in `src/resample.rs`,

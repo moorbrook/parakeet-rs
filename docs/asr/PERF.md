@@ -442,6 +442,69 @@ per-category rows, native-build evidence, replay commands, and packaging
 analysis are in [`QWEN3_ASR_EVALUATION.md`](QWEN3_ASR_EVALUATION.md). The raw
 reports and machine-verifiable summary are under `bench/qwen3-asr/`.
 
+## Hold incremental windows — 2026-09-04 (kata ktfa, ADR-0032)
+
+Hold had nothing overlapping its decode: the first model call happened after
+the hotkey came up, so release-to-text grew with the recording. ADR-0032 cuts
+the held recording into windows while the key is still down, decodes each in
+the background, and joins them on the words neighbouring windows agree on, so
+what the user waits for is the tail window.
+
+Release-to-text p50, 30 repetitions per bucket, both arms back to back on the
+same quiet machine (`bench/hold.csv` against `bench/hold-serial.csv`):
+
+| captured audio | serial | windowed | p95 serial | p95 windowed |
+|---:|---:|---:|---:|---:|
+| 0.875 s | 48.5 ms | **36.0 ms** | 57.5 ms | 38.0 ms |
+| 2.891 s | 59.5 ms | **47.0 ms** | 69.8 ms | 65.5 ms |
+| 4.917 s | 64.5 ms | **58.5 ms** | 96.3 ms | 88.2 ms |
+| 8.128 s | 104.5 ms | **66.0 ms** | 146.6 ms | 76.0 ms |
+| 16.576 s | 180.5 ms | **65.0 ms** | 231.8 ms | 84.0 ms |
+| 16.139 s (multipause) | 177.5 ms | **62.0 ms** | 197.9 ms | 90.0 ms |
+
+Release-to-text stops growing with the recording past five seconds, which is the
+structural change: the encoder still costs what it costs, but all of it except
+the tail now runs while the user is still talking. The tail never waited behind
+an in-flight window at p95 in any bucket.
+
+Across the two multi-window buckets, 240 seams were merged over 30 repetitions
+each, 180 of them resolved by word agreement rather than by a silent overlap,
+and none duplicated or dropped a word.
+
+The three shortest buckets never cut a window — the per-session log shows
+`windows=1` on every repetition — so their 6 to 13 ms comes from replacing
+`run_manual`'s 15 ms sleep with a 3 ms blocking read on the audio tap, which
+recovers what the Hold baseline section attributes to that sleep.
+
+**Windows are cut at a fixed 6 s cap, not at pauses, and that is the measured
+decision.** Cutting at pauses moved gold WER from 5.43% to 6.52% and CER from
+3.57% to 4.62%, failing the manifest's zero-regression gate. The damage was in
+`commands` (12.20% to 14.63%) and `numbers` (6.67% to 10.00%) — fixtures two to
+four seconds long, where a pause inside a short utterance split it and each half
+decoded worse than the whole. Cutting only at the cap reproduced the plain
+transcript on every category: 5.43% WER, 3.57% CER, no change anywhere.
+
+FluidAudio had already measured the same effect and left the note in
+`UnifiedAsrManager.decodedTokens`: silence-aligned starts cost about 1 WER point
+against a fixed stride on the 15 s offline encoder, with no artifact benefit.
+Two independent measurements agreeing is enough to ship against pause alignment.
+The pause path is kept and tested but off by default, disabled by setting
+`hold_window_min_seconds` equal to the cap.
+
+The `6,6` PASS deserves one caveat: six of the seven gold fixtures are under
+4.3 s and decode as a single window in that arm, so they are identical to plain
+by construction. The one fixture long enough to cut, `librispeech-multi` at
+14.2 s, was cut and scored 0.00% WER. The multi-window evidence comes from there
+plus the 20 s and multipause loopback buckets.
+
+The join needs word boundaries, which the worker now reports as `token_spans`
+from FluidAudio's `transcribeWithTimings`. It runs the same decode as
+`transcribe` and reads emission frames the greedy RNNT decoder already recorded,
+so the spans cost only a frame-to-seconds conversion.
+
+Full tables, per-session window and seam counts, and the three gold arms are in
+[`bench/README.md`](../../bench/README.md).
+
 ## Neural Engine idle re-wake — 2026-09-04 (kata snx0)
 
 Measured before fajz moved resampling into the capture callbacks and before
