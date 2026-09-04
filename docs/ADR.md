@@ -24,7 +24,7 @@ ADRs target. Update whenever the code lands or a measurement is taken.
 | Paste path | `CGEventKeyboardSetUnicodeString` synthetic keystroke at `AnnotatedSession` tap layer (`src/ax_paste.rs`) | no clipboard mutation; works in terminals, browsers, native, Electron, IDEs | none — [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) shipped, supersedes ADR-0011 |
 | Smart formatting | In-process LLM polish pass: Qwen 3.5 4B Q6_K via llama-cpp-2 + Metal (`src/polish.rs`); opt-in via Settings → Polish → On | optional local polish, streaming output to cursor on word boundaries | none — [ADR-0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) shipped + amended (4B bump) |
 | Custom vocabulary | A plain-text vocabulary is tokenized with the model's own pieces and biased over the native joint output; the sherpa hotword path survives only as the fallback's implementation | explicit specialization without silently changing the generic model | none — ADR-0033 removed the fallback cliff; ADR-0028's bound on a global score change stands |
-| macOS permissions | Contextual Input Monitoring onboarding, just-in-time Microphone/Accessibility requests, a permanent dashboard, settings recovery links, and activation-time revocation detection | explain before requesting and remain usable when a grant is absent | implementation shipped in ADR-0029; destructive revocation confirmation remains issue #23 |
+| macOS permissions | Contextual Input Monitoring onboarding, just-in-time Microphone/Accessibility requests, a permanent dashboard, settings recovery links, activation-time revocation detection, and a stable self-signed local signing identity so grants survive rebuilds (ADR-0035) | explain before requesting and remain usable when a grant is absent | implementation shipped in ADR-0029; destructive revocation confirmation remains issue #23 |
 
 **Primary acceleration path complete.** ADR-0012 and ADR-0015 first proved the
 sherpa fallback's CoreML execution. ADR-0022 then moved the default path to a
@@ -2470,6 +2470,74 @@ not that a specific defect has been proven.
 
 ---
 
+## 0035 — Self-signed local identity so TCC grants survive rebuilds
+
+**Status:** Accepted. Kata 0bb3.
+
+**Context.** The Input Monitoring "Grant" button in the permission
+dashboard silently did nothing on rebuilt installs: no TCC prompt, no
+Settings pane, no dashboard refresh, no log line. `scripts/make-app.sh`
+signed every bundle ad hoc (`codesign -s -`). An ad-hoc signature has
+no stable identity, so TCC saw each rebuild as a brand-new app: the
+stored ListenEvent decision for the previous build no longer matched,
+`CGRequestListenEventAccess()` returned false without prompting, and
+the app was often not even listed in System Settings. The only
+recoveries were manual — `tccutil reset ListenEvent com.parakeet.rs` or
+adding the app by hand — and they expired on the next rebuild.
+
+**Decision.** Two changes, one per layer of the failure.
+
+1. `scripts/make-app.sh` signs with the self-signed "Code Signing"
+   certificate named `Parakeet Local Dev` in the login keychain
+   whenever that identity exists, instead of defaulting to ad hoc. A
+   self-signed identity yields a stable designated requirement across
+   rebuilds, so TCC grants keep matching. `PARAKEET_SIGN_ID` still
+   overrides (e.g. for Developer ID distribution builds). When the
+   identity is missing the script falls back to ad hoc and prints a
+   loud warning that TCC grants will not survive rebuilds, with a
+   pointer to the one-time certificate creation steps documented in
+   the script header (Keychain Access Certificate Assistant, or
+   `openssl` + `security import`; no personal details required).
+   Hardened Runtime (`--options runtime`) and entitlements stay
+   Developer-ID-only: they are required for notarisation but break
+   self-signed and ad-hoc bundles — under Hardened Runtime the dyld
+   team-ID check rejects the bundled dylibs (observed as
+   `dyld4::prepare` "different Team IDs" aborts on macOS 26.4.1).
+2. `src/permissions.rs` treats a `false` return from
+   `CGRequestListenEventAccess()` as "macOS will not prompt for this
+   build": it logs at warn level, opens System Settings → Privacy &
+   Security → Input Monitoring through the existing per-permission
+   deep-link with generic fallback, and refreshes the dashboard —
+   mirroring the `OpenSettings` branch's error handling instead of the
+   historic silent no-op. The decision and warning text are pure
+   functions, unit-tested without TCC calls.
+
+**Consequences.** A rebuilt-and-reinstalled Parakeet.app keeps its TCC
+identity, so an existing Input Monitoring grant keeps working and
+`codesign -dr -` stays byte-stable between builds; the recovery
+matrix in [docs/macos-permissions.md](./macos-permissions.md) gains
+the no-prompt fallback row. A self-signed certificate still cannot be
+notarised or pass Gatekeeper on other Macs — distribution keeps
+requiring Developer ID + notarisation, unchanged from the notes in
+`scripts/make-app.sh`. Machines without the `Parakeet Local Dev`
+identity get the old ad-hoc behaviour plus an explicit warning
+explaining why their grants do not survive rebuilds.
+
+**Rejected, with reasons.**
+
+- Keeping ad-hoc as the default and documenting `PARAKEET_SIGN_ID`
+  only. That is the status quo this ADR exists to end: defaults are
+  what rebuilds actually run, and the workaround has been repeatedly
+  rediscovered for months.
+- Hardened Runtime for the self-signed identity, for "notarisation
+  readiness". It breaks launch outright (team-ID mismatch aborts at
+  `dyld4::prepare`); local-dev bundles are never notarised anyway.
+- Making `tccutil reset` part of the build. It is a destructive,
+  machine-wide TCC mutation; the correct fix is a stable identity so
+  the reset is never needed.
+
+---
+
 ## Target status index
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -2498,6 +2566,18 @@ not that a specific defect has been proven.
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-09-04** — [ADR-0035](#0035--self-signed-local-identity-so-tcc-grants-survive-rebuilds)
+  accepted and implemented. Local builds now sign with the keychain's
+  self-signed `Parakeet Local Dev` identity by default instead of ad hoc,
+  so the TCC designated requirement is stable across rebuilds and stored
+  Input Monitoring / Microphone / Accessibility grants keep matching — the
+  root cause of the Input Monitoring Grant button silently doing nothing
+  on rebuilt installs. Ad-hoc remains as a loud-warned fallback when the
+  identity is absent. The Grant path additionally handles a false
+  `CGRequestListenEventAccess()` return by warning, opening the Input
+  Monitoring settings pane, and refreshing the dashboard rather than
+  no-oping silently.
 
 - **2026-09-04** — [ADR-0033](#0033--contextual-biasing-on-the-native-core-ml-path)
   accepted and implemented. Contextual biasing moved onto the native Core ML

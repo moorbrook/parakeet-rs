@@ -38,24 +38,30 @@ bundled sherpa-onnx fallback.
    open /Applications/Parakeet.app
    ```
 3. **Gatekeeper bypass**: macOS may refuse the first launch with "Apple
-   cannot verify this app is free of malware" because the bundle is
-   ad-hoc signed (not from a Developer ID). Right-click the app in
-   Finder → Open → Open Anyway. One-time confirmation.
+   cannot verify this app is free of malware" because the bundle is signed
+   with a local certificate instead of a Developer ID. Right-click the app
+   in Finder → Open → Open Anyway. One-time confirmation.
 
 For stable TCC permissions across rebuilds (so macOS doesn't treat each
-build as a new app and re-prompt for Microphone / Accessibility / Input
-Monitoring), generate a self-signed "Parakeet Local Dev" cert in
-Keychain Access, then:
-
-```bash
-PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
-```
+build as a new app and lose your Microphone / Accessibility / Input
+Monitoring grants), create a one-time self-signed "Code Signing"
+certificate named `Parakeet Local Dev` in Keychain Access (Certificate
+Assistant → Create Certificate…; Identity Type: Self Signed Root,
+Certificate Type: Code Signing). `scripts/make-app.sh` then signs with it
+automatically whenever it exists; without it the script falls back to an
+ad-hoc signature and warns that permission grants will not survive
+rebuilds. Details in
+[ADR-0035](docs/ADR.md#0035--self-signed-local-identity-so-tcc-grants-survive-rebuilds).
 
 ## First launch
 
 1. Parakeet explains **Input Monitoring**, the permission needed for its
    global hotkey. It stays running in the menu bar if you defer it, and does
-   not trigger a macOS permission prompt until you choose **Grant**.
+   not trigger a macOS permission prompt until you choose **Grant**. If
+   macOS suppresses that prompt (TCC already decided, or a rebuild changed
+   the app's signature), **Grant** opens System Settings → Privacy &
+   Security → Input Monitoring and logs what happened instead of failing
+   silently.
 2. The int8 Core ML model (~595 MB) and sherpa fallback/VAD bundle (~640 MB)
    download on first launch. They live under
    `~/Library/Application Support/com.parakeet.rs/models/`. All model downloads,

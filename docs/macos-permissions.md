@@ -28,6 +28,7 @@ unexplained generic restart instruction.
 | Microphone | Restricted | Open the Microphone privacy pane; explain that macOS/device policy controls it |
 | Microphone | Granted | Open the Microphone privacy pane so it can be reviewed or changed |
 | Input Monitoring | Not granted | Grant/register with `CGRequestListenEventAccess` |
+| Input Monitoring | Not granted, and TCC answers without prompting (decision cached, or stale after a rebuild changed the signature) | Warn, open the Input Monitoring privacy pane, refresh the dashboard |
 | Input Monitoring | Granted | Open the Input Monitoring privacy pane |
 | Accessibility | Not granted | Grant/register with `AXIsProcessTrustedWithOptions` and the prompt option |
 | Accessibility | Granted | Open the Accessibility privacy pane |
@@ -64,11 +65,15 @@ architecture; no Swift source is vendored.
 
 ## Signed release QA matrix
 
-Use a consistently signed bundle so TCC identity does not change between
-runs:
+`scripts/make-app.sh` signs with the login keychain's self-signed
+`Parakeet Local Dev` identity whenever it exists — no env var needed — so
+the TCC identity does not change between rebuilds. When the identity is
+missing it falls back to ad hoc with a printed warning; the one-time
+certificate creation steps are in the script header and in
+[ADR-0035](./ADR.md#0035--self-signed-local-identity-so-tcc-grants-survive-rebuilds).
 
 ```bash
-PARAKEET_SIGN_ID='Parakeet Local Dev' scripts/make-app.sh
+scripts/make-app.sh
 codesign --verify --deep --strict target/release/bundle/osx/Parakeet.app
 ```
 
