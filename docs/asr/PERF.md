@@ -184,7 +184,7 @@ the full tables are in [`bench/README.md`](../../bench/README.md).
 This needed a three-file change to FluidAudio, which hardcodes the 15 s window.
 The package is a local path override reconstituted by
 `scripts/reconstitute-fluidaudio.sh` from the pinned upstream revision plus
-`native/ParakeetCoreMLWorker/patches/fluidaudio-offline-window.patch`; nothing
+`native/ParakeetCoreMLWorker/patches/fluidaudio.patch`; nothing
 of FluidAudio is checked in but the patch, and the change is written to be
 offered upstream.
 
@@ -324,6 +324,56 @@ Replay:
 ```bash
 REPS=15 WARMUP_REPS=2 scripts/bench-endpoint-sweep.sh
 ```
+
+## Native RNNT decode loop — 2026-09-04 (kata 2564)
+
+With bucketing and the resample gone, the greedy transducer loop was the largest
+stage left on a short utterance. It ran through Core ML one dispatch at a time:
+one prediction-network step per emitted token, one joint evaluation per frame and
+per token, each against a floor near 100 µs. Neither model has a Neural Engine
+path, so the round trip bought nothing. The worker now reads the weights out of
+`parakeet_unified_decoder.mlmodelc` and
+`parakeet_unified_joint_decision_single_step.mlmodelc` and runs both programs in
+process, and the whole decode issues one Core ML dispatch: the encoder.
+
+The loop is 2.4x faster and the utterance 1.4x: at 4.967 s the loop drops from
+20.8 to 8.6 ms and the worker total from 42.4 to 30.2 ms, with 183 Core ML calls
+becoming none. The full per-length table is in
+[`bench/README.md`](../../bench/README.md). The 5 ms target the issue set is
+missed, and the reason is not dispatch: one prediction step reads 13.1 MB of
+fp16 weights and a 5 s utterance takes 49 of them. The next lever, unimplemented,
+is precomputing `W_ih · embed[token]` for all 1025 tokens, which removes a
+quarter of that traffic and changes only the order the fp32 sum accumulates in.
+
+Three things the loop can now do that the compiled graph could not, and they are
+most of the 2.4x: the encoder projection is one matrix product over the whole
+window instead of a matrix-vector product per joint call, the decoder-side
+projection is computed once per emitted token instead of once per call, and the
+softmax runs only when a token is actually emitted.
+
+The arithmetic is not bit-identical to Core ML and cannot be made so. Core ML's
+CPU `lstm` accumulates its recurrent matrix product in fp16: with a zero `h_in`,
+which drops that term, the two agree to about one fp16 ulp, and with a nonzero
+one they differ by up to 0.02. The native loop accumulates in fp32 over the same
+fp16 weights, which is the more accurate of the two, and reproduces every fp16
+rounding the exported program performs at an operation boundary. Over a 32-step
+trajectory the decoder output the joint consumes agrees to 0.014, and the
+divergence does not compound. `scripts/capture-rnnt-parity.py` measures all of
+this and captures the fixture the Swift tests replay; it also settled the one
+thing the MIL text does not say, the LSTM gate order, at `i, f, o, g` by a 70x
+margin over the next candidate. The empirical answer is the gold corpus: all
+seven fixtures produce byte-identical hypotheses over 10 repetitions, at the
+baseline 5.43% WER / 3.57% CER.
+
+The inner matrix-vector product is in C. Swift compiles
+`SIMD8<Float>(SIMD8<Float16>)` to an outlined runtime call with a register spill
+around it, which measured 356 ms against 15 ms for the same loop written with
+NEON intrinsics.
+
+This needed a second change to FluidAudio, in the same checked-in patch as the
+encoder window: a protocol for the decode loop and a factory the manager takes
+it from. `--rnnt-engine coreml` keeps the original path, which is how the two
+arms above were measured on one build.
 
 ## Core ML runtime-plan tuner — 2026-08-11
 

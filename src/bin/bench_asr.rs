@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use parakeet_dictation::asr::{Asr, AsrConfig, StageReport};
 use parakeet_dictation::coreml_worker::{
-    load_coreml_worker, CoreMlComputeUnits, CoreMlWorkerConfig,
+    load_coreml_worker, CoreMlComputeUnits, CoreMlRnntEngine, CoreMlWorkerConfig,
 };
 use parakeet_dictation::performance::{self, next_session_id, PhaseTimer, PhaseTimerMode};
 use parakeet_dictation::resample::{to_target_rate, TARGET_SAMPLE_RATE};
@@ -41,6 +41,7 @@ struct Args {
     model_dir: Option<PathBuf>,
     compute_units: CoreMlComputeUnits,
     stage_timings: bool,
+    rnnt_engine: CoreMlRnntEngine,
     arm: Arm,
     idle_gap_ms: u64,
     /// Interval between the idle gap and the measured decode, standing in for
@@ -117,6 +118,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut model_dir = None;
     let mut compute_units = CoreMlComputeUnits::default();
     let mut stage_timings = false;
+    let mut rnnt_engine = CoreMlRnntEngine::default();
     let mut arm = Arm::Warm;
     let mut idle_gap_ms: u64 = 0;
     let mut record_gap_ms: Option<u64> = None;
@@ -168,6 +170,12 @@ fn parse_args() -> anyhow::Result<Args> {
             "--stage-timings" => {
                 stage_timings = true;
             }
+            "--rnnt-engine" => {
+                rnnt_engine = CoreMlRnntEngine::parse(
+                    &it.next()
+                        .ok_or_else(|| anyhow!("--rnnt-engine needs a name"))?,
+                )?;
+            }
             "--arm" => {
                 arm = Arm::parse(&it.next().ok_or_else(|| anyhow!("--arm needs a name"))?)?;
             }
@@ -210,6 +218,7 @@ fn parse_args() -> anyhow::Result<Args> {
         model_dir,
         compute_units,
         stage_timings,
+        rnnt_engine,
         arm,
         idle_gap_ms,
         record_gap_ms,
@@ -223,7 +232,7 @@ fn print_usage() {
          \x20                [--backend sherpa|coreml-unified]\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\
          \x20                [--compute-units all|cpu-and-gpu|cpu-and-neural-engine|cpu-only]\n\
-         \x20                [--stage-timings]\n\
+         \x20                [--stage-timings] [--rnnt-engine native|coreml]\n\
          \x20                [--arm warm|cold|prime|cadence]\n\
          \x20                [--idle-gap-ms N] [--record-gap-ms N] [--keepalive-ms N]\n\
          \n\
@@ -430,6 +439,7 @@ fn load_backend(args: &Args, store: &SettingsStore) -> anyhow::Result<Asr> {
             }
             config.set_compute_units(args.compute_units);
             config.set_emit_stage_timings(args.stage_timings);
+            config.set_rnnt_engine(args.rnnt_engine);
             log::info!(
                 "loading Core ML worker {} with {:?}",
                 config.worker_path.display(),
@@ -469,20 +479,29 @@ fn validate_stage_report(stages: &StageReport) -> anyhow::Result<()> {
             stages.encoder_calls
         );
     }
-    if stages.decoder_calls < stages.windows {
+    // The decode loop runs either through Core ML or natively, never both, so
+    // the frame identity is checked against whichever engine reported steps.
+    if stages.decoder_calls != 0 && stages.native_decoder_steps != 0 {
         anyhow::bail!(
-            "stage profiler recorded {} decoder calls against {} windows; the greedy loop \
-             runs at least one decoder prediction per window",
+            "stage profiler recorded {} Core ML decoder calls and {} native decoder steps in \
+             one utterance; the decode loop cannot have run on both engines",
             stages.decoder_calls,
+            stages.native_decoder_steps
+        );
+    }
+    let decoder_steps = stages.decoder_calls + stages.native_decoder_steps;
+    let joint_steps = stages.joint_calls + stages.native_joint_steps;
+    if decoder_steps < stages.windows {
+        anyhow::bail!(
+            "stage profiler recorded {decoder_steps} decoder steps against {} windows; the \
+             greedy loop runs at least one prediction-network step per window",
             stages.windows
         );
     }
-    if stages.joint_calls < stages.decoder_calls - stages.windows {
+    if joint_steps < decoder_steps - stages.windows {
         anyhow::bail!(
-            "stage profiler recorded {} joint calls against {} decoder calls over {} windows, \
-             which implies a negative decoded-frame count",
-            stages.joint_calls,
-            stages.decoder_calls,
+            "stage profiler recorded {joint_steps} joint steps against {decoder_steps} decoder \
+             steps over {} windows, which implies a negative decoded-frame count",
             stages.windows
         );
     }
@@ -534,16 +553,20 @@ fn run_one(
         validate_stage_report(&stages)?;
         log::info!(
             "asr_stages session_id={sid} audio_s={audio_s:.3} resample_ms={:.3} windows={} \
-             encoder_calls={} decoder_calls={} joint_calls={} other_calls={} \
+             encoder_calls={} decoder_calls={} joint_calls={} \
+             native_decoder_steps={} native_joint_steps={} other_calls={} \
              mel_ms={:.3} encoder_ms={:.3} decode_loop_ms={:.3} \
              decode_loop_dispatch_ms={:.3} decoder_dispatch_ms={:.3} \
-             joint_dispatch_ms={:.3} post_ms={:.3} total_ms={:.3} \
+             joint_dispatch_ms={:.3} decode_loop_native_ms={:.3} \
+             post_ms={:.3} total_ms={:.3} \
              boundary_ms={:.3} compute_units={}",
             stages.resample_ms,
             stages.windows,
             stages.encoder_calls,
             stages.decoder_calls,
             stages.joint_calls,
+            stages.native_decoder_steps,
+            stages.native_joint_steps,
             stages.other_calls,
             stages.mel_ms,
             stages.encoder_ms,
@@ -551,6 +574,7 @@ fn run_one(
             stages.decode_loop_dispatch_ms,
             stages.decoder_dispatch_ms,
             stages.joint_dispatch_ms,
+            stages.decode_loop_native_ms,
             stages.post_ms,
             stages.total_ms,
             boundary_seconds * 1_000.0,
@@ -571,6 +595,8 @@ mod tests {
             encoder_calls: 1,
             decoder_calls: 35,
             joint_calls: 96,
+            native_decoder_steps: 0,
+            native_joint_steps: 0,
             other_calls: 0,
             mel_ms: 3.0,
             encoder_ms: 25.5,
@@ -578,6 +604,7 @@ mod tests {
             decode_loop_dispatch_ms: 14.5,
             decoder_dispatch_ms: 5.0,
             joint_dispatch_ms: 9.5,
+            decode_loop_native_ms: 0.0,
             post_ms: 0.06,
             total_ms: 43.8,
             compute_units: "encoder=cpu-and-neural-engine decoder=cpu-only joint=cpu-only"
@@ -627,6 +654,49 @@ mod tests {
         stages.encoder_calls = 2;
         stages.decoder_calls = 1;
         let error = validate_stage_report(&stages).expect_err("too few decoder calls must fail");
-        assert!(error.to_string().contains("decoder calls"));
+        assert!(error.to_string().contains("decoder steps"));
+    }
+
+    /// The native decode loop reports the same counts under the native fields
+    /// and leaves the Core ML ones at zero.
+    fn healthy_native() -> StageReport {
+        let mut stages = healthy();
+        stages.native_decoder_steps = stages.decoder_calls;
+        stages.native_joint_steps = stages.joint_calls;
+        stages.decoder_calls = 0;
+        stages.joint_calls = 0;
+        stages.decode_loop_native_ms = stages.decode_loop_dispatch_ms;
+        stages.decode_loop_dispatch_ms = 0.0;
+        stages.decoder_dispatch_ms = 0.0;
+        stages.joint_dispatch_ms = 0.0;
+        stages.compute_units =
+            "encoder=cpu-and-neural-engine decoder=native joint=native".to_string();
+        stages
+    }
+
+    #[test]
+    fn a_natively_decoded_report_passes() {
+        validate_stage_report(&healthy_native())
+            .expect("a loop with no Core ML dispatches must validate");
+    }
+
+    #[test]
+    fn a_report_claiming_both_engines_fails() {
+        let mut stages = healthy_native();
+        stages.decoder_calls = 35;
+        let error =
+            validate_stage_report(&stages).expect_err("both engines at once must fail");
+        assert!(error.to_string().contains("cannot have run on both engines"));
+    }
+
+    #[test]
+    fn fewer_native_steps_than_windows_fails() {
+        let mut stages = healthy_native();
+        stages.windows = 2;
+        stages.encoder_calls = 2;
+        stages.native_decoder_steps = 1;
+        let error =
+            validate_stage_report(&stages).expect_err("too few native steps must fail");
+        assert!(error.to_string().contains("decoder steps"));
     }
 }
