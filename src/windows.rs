@@ -35,6 +35,17 @@ pub const PAUSE_CONFIRMATION_MS: u32 = 150;
 /// instead, which is usually wordless.
 pub const FORCED_CUT_OVERLAP_S: f32 = 1.5;
 
+/// Upper bound on a configured window, set by the encoder's own window.
+///
+/// The Core ML encoder is compiled at a fixed 15 s mel window and the worker
+/// already splits anything longer across several of them
+/// ([`crate::asr::StageReport::windows`]). A hold window past that length
+/// therefore buys nothing the recognizer was not doing anyway, while the tail
+/// the user waits for on release — the thing `max_seconds` exists to bound —
+/// grows with it. Reject such a setting instead of accepting one that quietly
+/// undoes the point of windowing.
+pub const MAX_WINDOW_SECONDS: f32 = 15.0;
+
 /// Longest common run of words required before the merge splices on agreement.
 ///
 /// A hard floor, not a preference scaled to the overlap size. One shared word
@@ -185,7 +196,8 @@ pub struct HoldWindowConfig {
     pub min_seconds: f32,
     /// Cut regardless once the current window reaches this length. This is what
     /// bounds the tail decode the user actually waits for on release, so it is
-    /// the number that sets the release-to-text ceiling.
+    /// the number that sets the release-to-text ceiling. Capped at
+    /// [`MAX_WINDOW_SECONDS`].
     pub max_seconds: f32,
 }
 
@@ -202,7 +214,9 @@ impl Default for HoldWindowConfig {
 impl HoldWindowConfig {
     /// Reject a configuration that cannot produce a sane cut sequence rather
     /// than silently clamping it: a max below the forced-cut overlap would make
-    /// every window start before the previous one ended.
+    /// every window start before the previous one ended, and one above
+    /// [`MAX_WINDOW_SECONDS`] hands the recognizer a window it splits anyway
+    /// while leaving the release tail unbounded.
     pub fn validate(&self) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
@@ -223,6 +237,13 @@ impl HoldWindowConfig {
             return Err(format!(
                 "hold window maximum ({}) must exceed the forced-cut overlap of \
                  {FORCED_CUT_OVERLAP_S}s",
+                self.max_seconds
+            ));
+        }
+        if self.max_seconds > MAX_WINDOW_SECONDS {
+            return Err(format!(
+                "hold window maximum ({}) must not exceed the encoder window of \
+                 {MAX_WINDOW_SECONDS}s",
                 self.max_seconds
             ));
         }
@@ -957,6 +978,37 @@ mod tests {
             enabled: false,
             min_seconds: 0.0,
             max_seconds: 0.0,
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn a_window_longer_than_the_encoder_window_is_rejected() {
+        // The boundary itself is legal: one window, one encoder dispatch.
+        assert!(HoldWindowConfig {
+            min_seconds: MAX_WINDOW_SECONDS,
+            max_seconds: MAX_WINDOW_SECONDS,
+            ..HoldWindowConfig::default()
+        }
+        .validate()
+        .is_ok());
+        let too_long = HoldWindowConfig {
+            min_seconds: 6.0,
+            max_seconds: MAX_WINDOW_SECONDS + 0.01,
+            ..HoldWindowConfig::default()
+        }
+        .validate()
+        .expect_err("a window past the encoder window must be rejected");
+        assert!(
+            too_long.contains("encoder window"),
+            "message should name the cap, got {too_long}"
+        );
+        // Disabled still short-circuits ahead of the cap.
+        assert!(HoldWindowConfig {
+            enabled: false,
+            min_seconds: 6.0,
+            max_seconds: 3600.0,
         }
         .validate()
         .is_ok());
