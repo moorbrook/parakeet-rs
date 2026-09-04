@@ -17,7 +17,7 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use parakeet_dictation::asr::{Asr, AsrConfig};
 use parakeet_dictation::asr_eval::normalize_lexical;
 use parakeet_dictation::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
-use parakeet_dictation::endpointing::EndpointPolicy;
+use parakeet_dictation::endpointing::{EndpointConfig, EndpointPolicy};
 use parakeet_dictation::performance;
 use parakeet_dictation::settings::SettingsStore;
 use parakeet_dictation::streamer::{self, EndpointStrategy, Mode, Outcome};
@@ -36,6 +36,15 @@ struct Args {
     backend: Backend,
     strategy: EndpointStrategy,
     endpoint_policy: EndpointPolicy,
+    /// Sweep override for the ordinary confirmation window.
+    confirmation_ms: Option<u32>,
+    /// Sweep override for the punctuated window. The outer `Option` is
+    /// "was it given"; the inner one is the value, with `off` disabling it.
+    punctuated_ms: Option<Option<u32>>,
+    /// Count false cuts and transcript mismatches instead of aborting on the
+    /// first one. A rate needs every repetition, and restarting the process
+    /// per repetition would reload and re-warm the Core ML worker.
+    tolerate_false_cuts: bool,
     device: String,
     expected: Option<String>,
     worker: Option<PathBuf>,
@@ -85,6 +94,13 @@ fn parse_strategy(value: &str) -> anyhow::Result<EndpointStrategy> {
     }
 }
 
+fn parse_punctuated_ms(value: &str) -> anyhow::Result<Option<u32>> {
+    if value == "off" {
+        return Ok(None);
+    }
+    Ok(Some(value.parse().context("--punctuated-ms")?))
+}
+
 fn parse_endpoint_policy(value: &str) -> anyhow::Result<EndpointPolicy> {
     match value {
         "fast" => Ok(EndpointPolicy::Fast),
@@ -100,6 +116,9 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut backend = Backend::Sherpa;
     let mut strategy = EndpointStrategy::Serial;
     let mut endpoint_policy = EndpointPolicy::LongForm;
+    let mut confirmation_ms = None;
+    let mut punctuated_ms = None;
+    let mut tolerate_false_cuts = false;
     let mut device = DEFAULT_DEVICE.to_string();
     let mut expected = None;
     let mut worker = None;
@@ -144,6 +163,23 @@ fn parse_args() -> anyhow::Result<Args> {
                         .ok_or_else(|| anyhow!("--endpoint-policy needs a name"))?,
                 )?;
             }
+            "--confirmation-ms" => {
+                confirmation_ms = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--confirmation-ms needs a number"))?
+                        .parse()
+                        .context("--confirmation-ms")?,
+                );
+            }
+            "--punctuated-ms" => {
+                punctuated_ms = Some(parse_punctuated_ms(
+                    &it.next()
+                        .ok_or_else(|| anyhow!("--punctuated-ms needs a number or 'off'"))?,
+                )?);
+            }
+            "--tolerate-false-cuts" => {
+                tolerate_false_cuts = true;
+            }
             "--device" => {
                 device = it.next().ok_or_else(|| anyhow!("--device needs a name"))?;
             }
@@ -182,6 +218,9 @@ fn parse_args() -> anyhow::Result<Args> {
         backend,
         strategy,
         endpoint_policy,
+        confirmation_ms,
+        punctuated_ms,
+        tolerate_false_cuts,
         device,
         expected,
         worker,
@@ -196,6 +235,8 @@ fn print_usage() {
          \x20                [--backend sherpa|coreml-unified]\n\
          \x20                [--strategy serial|speculative]\n\
          \x20                [--endpoint-policy fast|long-form]\n\
+         \x20                [--confirmation-ms N] [--punctuated-ms N|off]\n\
+         \x20                [--tolerate-false-cuts]\n\
          \x20                [--device 'BlackHole 2ch']\n\
          \x20                [--expected 'reference transcript']\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\
@@ -227,6 +268,29 @@ fn main() -> ExitCode {
     }
 }
 
+impl Args {
+    /// Resolve the session's silence thresholds: the named policy first, then
+    /// any explicit sweep override.
+    fn endpoint_config(&self) -> EndpointConfig {
+        let mut config = self.endpoint_policy.config();
+        if let Some(ms) = self.confirmation_ms {
+            config.confirmation_ms = ms;
+        }
+        if let Some(punctuated) = self.punctuated_ms {
+            config.punctuated_confirmation_ms = punctuated;
+        }
+        config
+    }
+}
+
+/// What one repetition produced. A false cut is a commit that landed before
+/// playback reached the fixture's last audible sample.
+#[derive(Clone, Copy, Debug, Default)]
+struct RepResult {
+    false_cut: bool,
+    mismatch: bool,
+}
+
 fn run(args: &Args) -> anyhow::Result<()> {
     let store = SettingsStore::new()?;
     let asr = Arc::new(load_backend(args, &store)?);
@@ -251,6 +315,13 @@ fn run(args: &Args) -> anyhow::Result<()> {
         args.device
     );
 
+    let config = args.endpoint_config();
+    log::info!(
+        "endpoint config: confirmation_ms={} punctuated_ms={:?}",
+        config.confirmation_ms,
+        config.punctuated_confirmation_ms
+    );
+
     for rep in 0..args.warmup_reps {
         run_one(
             args,
@@ -262,8 +333,10 @@ fn run(args: &Args) -> anyhow::Result<()> {
             false,
         )?;
     }
+    let mut false_cuts = 0_usize;
+    let mut mismatches = 0_usize;
     for rep in 0..args.reps {
-        run_one(
+        let result = run_one(
             args,
             &store,
             asr.clone(),
@@ -272,7 +345,16 @@ fn run(args: &Args) -> anyhow::Result<()> {
             rep,
             true,
         )?;
+        false_cuts += usize::from(result.false_cut);
+        mismatches += usize::from(result.mismatch);
     }
+    log::info!(
+        "bench_e2e_summary reps={} false_cuts={false_cuts} mismatches={mismatches} \
+         confirmation_ms={} punctuated_ms={:?}",
+        args.reps,
+        config.confirmation_ms,
+        config.punctuated_confirmation_ms
+    );
     Ok(())
 }
 
@@ -318,7 +400,7 @@ fn run_one(
     sample_rate: u32,
     rep: usize,
     emit: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RepResult> {
     let streamer_mode = match args.mode {
         BenchMode::VadAutoStop => Mode::VadAutoStop,
         BenchMode::Hold => Mode::Manual,
@@ -328,7 +410,7 @@ fn run_one(
         streamer_mode,
         asr.clone(),
         args.strategy,
-        args.endpoint_policy,
+        args.endpoint_config(),
         Some(&args.device),
     )?;
     let playback = start_playback(&args.device, samples.clone(), sample_rate)?;
@@ -356,7 +438,25 @@ fn run_one(
         .0
         .recv_timeout(timeout)
         .with_context(|| format!("waiting for endpoint on repetition {rep}"))?;
-    let acoustic_end = hold_release.map_or_else(|| playback.acoustic_end(), Ok)?;
+    // In Tap the acoustic-end marker only exists once playback has rendered
+    // the fixture's last audible sample, so its absence *is* the false cut.
+    let acoustic_end = match hold_release.map_or_else(|| playback.acoustic_end(), Ok) {
+        Ok(end) => end,
+        Err(_) if args.tolerate_false_cuts => {
+            log::info!("bench_e2e false_cut rep={rep}");
+            drop(session);
+            // Let the fixture finish rendering so the next repetition starts
+            // from silence rather than mid-utterance.
+            wait_for_acoustic_end(&playback, timeout)
+                .with_context(|| format!("draining playback after a false cut on rep {rep}"))?;
+            drop(playback);
+            return Ok(RepResult {
+                false_cut: true,
+                mismatch: false,
+            });
+        }
+        Err(error) => return Err(error).context(format!("repetition {rep}")),
+    };
     drop(playback);
     drop(session);
 
@@ -394,20 +494,28 @@ fn run_one(
     if emit {
         timer.emit();
     }
+    let mut mismatch = false;
     if let Some(expected) = &args.expected {
         let wanted = normalize_lexical(expected);
         let got = normalize_lexical(&transcript);
         if wanted != got {
-            bail!(
-                "repetition {rep} transcript mismatch: expected {expected:?}, got {transcript:?}"
-            );
+            if !args.tolerate_false_cuts {
+                bail!(
+                    "repetition {rep} transcript mismatch: expected {expected:?}, got {transcript:?}"
+                );
+            }
+            mismatch = true;
+            log::info!("bench_e2e mismatch rep={rep} transcript={transcript:?}");
         }
     }
     log::info!(
         "bench_e2e rep={rep} measured={emit} strategy={:?} transcript={transcript:?}",
         args.strategy
     );
-    Ok(())
+    Ok(RepResult {
+        false_cut: false,
+        mismatch,
+    })
 }
 
 /// Block until the output stream reports the predicted instant of the

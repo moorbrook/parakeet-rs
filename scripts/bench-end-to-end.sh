@@ -6,6 +6,11 @@
 #   baseline:  sherpa recognizer after the unchanged serial VAD endpoint
 #   optimized: resident Core ML recognizer overlapped with that same endpoint
 #
+# Both variants pin the original 150 ms Tap Fast window and disable the
+# punctuation-aware commit, so this historical 3x comparison stays
+# like-for-like no matter what the shipping Fast defaults become. The current
+# defaults are measured by scripts/bench-endpoint-sweep.sh instead.
+#
 # BlackHole is selected explicitly. The script never changes system defaults.
 
 set -euo pipefail
@@ -33,6 +38,8 @@ RUST_LOG=info ./target/release/bench_e2e \
     --backend sherpa \
     --strategy serial \
     --endpoint-policy fast \
+    --confirmation-ms 150 \
+    --punctuated-ms off \
     --device "$DEVICE" \
     --wav "$WAV" \
     --expected "$EXPECTED" \
@@ -45,6 +52,8 @@ RUST_LOG=info ./target/release/bench_e2e \
     --backend coreml-unified \
     --strategy speculative \
     --endpoint-policy fast \
+    --confirmation-ms 150 \
+    --punctuated-ms off \
     --device "$DEVICE" \
     --wav "$WAV" \
     --expected "$EXPECTED" \
