@@ -109,7 +109,7 @@ Two structural facts came out of it. The offline path zero-pads every utterance
 to the fixed 15 s encoder window, so encoder time is 25.5 ms whether the audio
 is 0.74 s or 8.15 s; with mel that is 28.6 ms of length-independent work and 80%
 of the 1 s result. And the 48 kHz to 16 kHz resample costs a linear 4.6 ms per
-second of input, which exceeds the decode loop at every length up to 10 s.
+second of input, which exceeds the decode loop at every measured length.
 
 The decoder and joint-decision models run `cpuOnly` and the encoder runs
 `cpuAndNeuralEngine`, read off the live models rather than inferred from the
@@ -121,8 +121,14 @@ Hold mode had no measured release-to-text number until now.
 stops at transcript-ready: 54.0 ms p50 at 1 s, 106.5 ms at 5 s, 231.5 ms at 20 s,
 with p95 of 79.5 / 158.6 / 280.6 ms. The 15 ms `run_manual` poll contributes a
 median 8 to 12 ms, capture shutdown about 1 ms, and the remainder is ASR, which
-runs 25 to 40% slower than the isolated bench because capture is still live in
-the same process.
+runs 9 to 42% slower than the isolated bench, not monotonically in length,
+because capture is still live in the same process.
+
+Enabling the profiler costs under 0.2 ms per utterance, measured by matched
+30-repetition runs with and without `--stage-timings`. Absolute stage times need
+a quiet machine: a repeat under background CPU load reproduced the dispatch
+counts exactly and kept the encoder flat, with the CPU-side stages 10 to 20%
+higher.
 
 Full tables, dispatch counts, and method are in
 [`bench/README.md`](../../bench/README.md).

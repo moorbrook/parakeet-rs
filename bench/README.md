@@ -214,11 +214,25 @@ Worker total is resample plus the profiled transcribe interval; it sits 0.7 to
 the Swift work outside the profiled window. IPC is unchanged from the
 2026-08-11 boundary measurement and remains under 0.6% of the call.
 
+Enabling the profiler costs under 0.2 ms per utterance. Matched 30-repetition
+runs of the 1 s and 5 s buckets with and without `--stage-timings` measured
+35.51 against 35.51 ms and 67.09 against 66.92 ms of worker-internal time. The
+interception itself is two clock reads and a lock per dispatch; the class sweep
+that finds the entry points runs only until all three stages have dispatched.
+
+These absolute numbers need a quiet machine. A repeat with background CPU load
+reproduced the dispatch counts exactly and kept the encoder flat at 26.4 to
+28.5 ms, but the CPU-side stages (resample and the decode loop) came in 10 to
+20% higher. The shape of the breakdown is stable; the millisecond values are
+not, so compare against the ASR-only p50 column from the same run.
+
 The encoder cost does not depend on utterance length. `UnifiedAsrManager`
 zero-pads every window to a fixed 15 s buffer (240,000 samples, 1,501 mel
 frames) and runs the full offline encoder graph on it, so a 0.74 s utterance
-pays the same 25.5 ms as an 8.15 s one. The 15.691 s fixture crosses the 13 s
-window stride and needs two windows, which doubles both mel and encoder.
+pays the same 25.5 ms as an 8.15 s one. The 15.691 s fixture exceeds the 15 s
+window and needs a second one, which doubles both mel and encoder.
+`chunkStarts` adds that second window only past 240,000 samples, so a 14 s
+utterance still runs a single encoder pass.
 
 ### Core ML dispatch counts per utterance
 
@@ -246,9 +260,10 @@ allocation) is not where the loop time goes.
 ### Which compute unit runs each stage
 
 The encoder runs on `cpuAndNeuralEngine`; the decoder and the joint-decision
-model both run `cpuOnly`. This is not a request but a read of
-`MLModelConfiguration.computeUnits` off each live model object at dispatch
-time, reported in the `compute_units` column. It matches the pinned FluidAudio
+model both run `cpuOnly`. The `compute_units` column reports
+`MLModelConfiguration.computeUnits` read off each live model object at dispatch
+time, so it records the placement Core ML actually used rather than the one the
+worker asked for. It matches the pinned FluidAudio
 source, where `UnifiedAsrManager.loadModels` builds a separate `cpuOnly`
 configuration for the decoder and joint and comments that only the encoder uses
 ANE or GPU.
@@ -261,14 +276,33 @@ fixture at each placement:
 | `cpu-and-neural-engine` | 26.05 ms |
 | `cpu-only` | 86.01 ms |
 
-`cpu-and-gpu` produces no result: the int8 encoder fails MPSGraph's MLIR pass,
-which is the failure FluidAudio's own loader comments on and coerces away from.
+`cpu-and-gpu` produces no result at all. The worker dies during warmup with
+`MPSGraphExecutable.mm:5070: failed assertion 'Error: MLIR pass manager failed'`,
+the int8-on-MPSGraph failure FluidAudio's own loader comments on and coerces
+away from for `.all`.
 
 ```bash
 BACKEND=coreml-unified OUT_CSV=bench/coreml-unified.csv scripts/bench-latency.sh
 ./target/release/bench_asr --backend coreml-unified --wav bench/audio/5s_48000.wav \
     --reps 8 --warmup-reps 3 --stage-timings --compute-units cpu-only
 ```
+
+### Where the 66 ms at 5 s goes
+
+No single stage owns it. On the 4.967 s fixture the 66.5 ms of worker-internal
+time is encoder 25.5 ms (38%), resample 22.7 ms (34%), RNNT decode loop 15.2 ms
+(23%), and mel 3.1 ms (5%), with IPC at 0.42 ms and post-processing under
+0.1 ms. The 35 ms floor at 1 s is owned by the encoder: the offline path pads
+every utterance to the fixed 15 s window, so 25.5 ms of encoder plus 3.1 ms of
+mel is length-independent work that a one-word utterance pays in full, and that
+28.6 ms is 80% of the 1 s result. The growth from 35 ms to 66 ms is split nearly
+evenly between resample, which costs a linear 4.6 ms per second of 48 kHz input
+and adds 19.3 ms, and the decode loop, which costs 0.25 ms per 80 ms frame and
+adds 12.2 ms. The prior hypothesis that the per-frame RNNT loop accounts for the
+gap over encoder arithmetic is half right: the loop is real, it is entirely on
+the CPU, and roughly 100 µs of each 0.25 ms frame is a single joint dispatch,
+but at every measured length the 48 kHz to 16 kHz resample costs more than the
+loop does.
 
 ## Hold-mode baseline: M5 Pro 24 GB (2026-09-04)
 
@@ -303,31 +337,14 @@ Medians of the parts, from the same `phase_timer` lines:
 
 `run_manual` polls its signal channel every 15 ms, which is the 8 to 12 ms
 median seen in the first column and up to 15 ms in the tail. Capture shutdown
-and the mono fold cost about 1 ms. Everything else is ASR, which runs 25 to 40%
-slower here than in the isolated bench because the capture stream is still live
-in the same process. Hold also never sets `early_transcript`, so unlike Tap it
+and the mono fold cost about 1 ms. Everything else is ASR, which runs 9 to 42%
+slower here than in the isolated bench, not monotonically in length, because the
+capture stream is still live in the same process. Hold also never sets `early_transcript`, so unlike Tap it
 cannot overlap any decode with the tail of the utterance.
 
 ```bash
 REPS=30 WARMUP_REPS=2 BACKEND=coreml-unified scripts/bench-hold.sh
 ```
-
-### Where the 66 ms at 5 s goes
-
-No single stage owns it. On the 4.967 s fixture the 66.5 ms of worker-internal
-time is encoder 25.5 ms (38%), resample 22.7 ms (34%), RNNT decode loop 15.2 ms
-(23%), and mel 3.1 ms (5%), with IPC at 0.42 ms and post-processing under
-0.1 ms. The 35 ms floor at 1 s is owned by the encoder: the offline path pads
-every utterance to the fixed 15 s window, so 25.5 ms of encoder plus 3.1 ms of
-mel is length-independent work that a one-word utterance pays in full, and that
-28.6 ms is 80% of the 1 s result. The growth from 35 ms to 66 ms is split nearly
-evenly between resample, which costs a linear 4.6 ms per second of 48 kHz input
-and adds 19.3 ms, and the decode loop, which costs 0.25 ms per 80 ms frame and
-adds 12.2 ms. The prior hypothesis that the per-frame RNNT loop accounts for the
-gap over encoder arithmetic is half right: the loop is real, it is entirely on
-the CPU, and roughly 100 µs of each 0.25 ms frame is a single joint dispatch,
-but at every length up to 10 s the 48 kHz to 16 kHz resample costs more than the
-loop does.
 
 ## Baseline: M5 Pro 24 GB (2026-05-16, pre-§2 CoreML cache)
 

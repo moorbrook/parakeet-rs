@@ -95,7 +95,11 @@ final class StageProfiler: @unchecked Sendable {
 
     /// Begin a fresh timeline. Returns the start timestamp to anchor it.
     func beginUtterance() -> UInt64 {
-        install()
+        // Core ML registers some engine classes only once a prediction has run,
+        // so the sweep repeats until all three stages have been seen. It walks
+        // the whole Objective-C class list, which costs about 0.8 ms, so it
+        // stops as soon as the pipeline is fully covered.
+        if needsSweep() { install() }
         lock.lock()
         events.removeAll(keepingCapacity: true)
         recording = true
@@ -324,6 +328,13 @@ final class StageProfiler: @unchecked Sendable {
     /// Reserve a class/selector pair, returning false if it is already wrapped.
     /// Core ML registers some engine classes only once a prediction has run, so
     /// the sweep repeats before each utterance and must not double-wrap.
+    /// Whether any pipeline stage has yet to be observed dispatching.
+    private func needsSweep() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return ![Stage.encoder, .decoder, .joint].allSatisfy(observedComputeUnits.keys.contains)
+    }
+
     private func claim(_ key: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
