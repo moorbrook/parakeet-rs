@@ -100,16 +100,22 @@ PARAKEET_COREML_MODEL_DIR="$HOME/Library/Application Support/com.parakeet.rs/mod
 
 `bench_asr --stage-timings` makes the worker report where a decode went, by
 wrapping `MLModel`'s prediction implementations at runtime and attributing each
-dispatch by its input feature names. FluidAudio stays a pinned dependency; no
-file in it is patched. Medians of 30 repetitions on the 4.967 s fixture:
-encoder 25.5 ms, resample 22.7 ms, RNNT decode loop 15.2 ms, mel 3.1 ms, IPC
-0.42 ms.
+dispatch by its input feature names. The profiler patches nothing: it wraps the
+prediction entry points at runtime. Medians of 30 repetitions on the 4.967 s
+fixture: encoder 25.5 ms, resample 22.7 ms, RNNT decode loop 15.2 ms, mel
+3.1 ms, IPC 0.42 ms.
+
+Two of those stages have since moved and this section is the record of the
+measurement, not of current cost. ADR-0030 retired the resample, and short-window
+encoder buckets cut encoder and mel on utterances under 8 s; the two sections
+below carry the current numbers.
 
 Two structural facts came out of it. The offline path zero-pads every utterance
-to the fixed 15 s encoder window, so encoder time is 25.5 ms whether the audio
-is 0.74 s or 8.15 s; with mel that is 28.6 ms of length-independent work and 80%
-of the 1 s result. And the 48 kHz to 16 kHz resample costs a linear 4.6 ms per
-second of input, which exceeds the decode loop at every measured length.
+to the fixed 15 s encoder window, so encoder time was 25.5 ms whether the audio
+was 0.74 s or 8.15 s; with mel that was 28.6 ms of length-independent work and
+80% of the 1 s result. And the 48 kHz to 16 kHz resample cost a linear 4.6 ms
+per second of input, which exceeded the decode loop at every measured length.
+Both are what the two sections below went on to remove.
 
 The decoder and joint-decision models run `cpuOnly` and the encoder runs
 `cpuAndNeuralEngine`, read off the live models rather than inferred from the
