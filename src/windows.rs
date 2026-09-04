@@ -11,13 +11,23 @@
 //! This is the Voz long-audio recipe applied incrementally. It changes *when*
 //! windows are submitted and *how* they are joined; the recognizer is still the
 //! same offline full-attention encoder. It is not the streaming-model swap
-//! rejected in ADR-0009. See ADR-0031.
+//! rejected in ADR-0009. See ADR-0032.
 //!
 //! Everything here is pure: the planner consumes VAD verdicts one Silero frame
 //! at a time and emits cuts, and the merge consumes word spans. Neither touches
 //! audio, threads, or the recognizer, so both are unit-testable without a model.
 
-use crate::endpointing::{EndpointEvent, EndpointPolicy, EndpointTracker, SAMPLE_RATE};
+use crate::endpointing::{EndpointEvent, EndpointTracker, SAMPLE_RATE};
+
+/// Silence a pause must hold before it may close a window.
+///
+/// Deliberately its own number rather than `EndpointPolicy::Fast`'s. That one
+/// is a product decision about when Tap stops listening and has already been
+/// retuned once (150 ms to 90 ms, ADR-0031); window cutting is a different
+/// question with different evidence behind it, and a future Tap tuning must not
+/// silently move where Hold splits a recording. 150 ms is what the pause path
+/// was measured with.
+pub const PAUSE_CONFIRMATION_MS: u32 = 150;
 
 /// Overlap given to a forced (mid-speech) cut, so the word straddling the cut
 /// is decoded whole by the following window and the merge has real words to
@@ -171,7 +181,7 @@ pub struct HoldWindowConfig {
     /// That is a measured decision, not a placeholder: at 3.0 the gold corpus
     /// went from 5.43% to 6.52% WER because a pause inside a three-second
     /// command split it in half, and FluidAudio measured the same effect on
-    /// long-form audio. See ADR-0031.
+    /// long-form audio. See ADR-0032.
     pub min_seconds: f32,
     /// Cut regardless once the current window reaches this length. This is what
     /// bounds the tail decode the user actually waits for on release, so it is
@@ -247,7 +257,7 @@ impl WindowPlanner {
     pub fn new(config: HoldWindowConfig, frame_samples: u64) -> Self {
         Self {
             config,
-            tracker: EndpointTracker::new(EndpointPolicy::Fast),
+            tracker: EndpointTracker::new(PAUSE_CONFIRMATION_MS),
             frame_samples,
             processed: 0,
             window_start: 0,
@@ -807,13 +817,13 @@ mod tests {
             max_seconds: 100.0,
         };
         let mut planner = WindowPlanner::new(config, FRAME);
-        // 2 s of speech, then silence until the Fast policy confirms.
+        // 2 s of speech, then silence until the pause window confirms.
         let speech_frames = (2.0 * SAMPLE_RATE as f32 / FRAME as f32) as u64;
         for _ in 0..speech_frames {
             assert!(planner.observe_frame(true).is_none());
         }
         let mut cut = None;
-        for _ in 0..EndpointPolicy::Fast.confirmation_windows() {
+        for _ in 0..crate::endpointing::confirmation_windows(PAUSE_CONFIRMATION_MS) {
             if let Some(found) = planner.observe_frame(false) {
                 cut = Some(found);
                 break;
@@ -875,7 +885,7 @@ mod tests {
     fn the_shipping_default_never_cuts_at_a_pause() {
         // min == max leaves the length cap to win every race. A short
         // utterance with a pause in it must come out as one window: splitting
-        // one is what cost 1.09 points of gold WER. See ADR-0031.
+        // one is what cost 1.09 points of gold WER. See ADR-0032.
         let mut planner = WindowPlanner::new(HoldWindowConfig::default(), FRAME);
         let mut reasons = Vec::new();
         for frame in 0..2_000_u64 {

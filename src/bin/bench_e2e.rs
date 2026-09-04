@@ -38,6 +38,12 @@ struct Args {
     strategy: EndpointStrategy,
     endpoint_policy: EndpointPolicy,
     hold_windows: HoldWindowConfig,
+    /// Sweep override for the confirmation window.
+    confirmation_ms: Option<u32>,
+    /// Count false cuts and transcript mismatches instead of aborting on the
+    /// first one. A rate needs every repetition, and restarting the process
+    /// per repetition would reload and re-warm the Core ML worker.
+    tolerate_false_cuts: bool,
     device: String,
     expected: Option<String>,
     worker: Option<PathBuf>,
@@ -167,6 +173,8 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut strategy = EndpointStrategy::Serial;
     let mut endpoint_policy = EndpointPolicy::LongForm;
     let mut hold_windows = HoldWindowConfig::default();
+    let mut confirmation_ms = None;
+    let mut tolerate_false_cuts = false;
     let mut device = DEFAULT_DEVICE.to_string();
     let mut expected = None;
     let mut worker = None;
@@ -237,6 +245,17 @@ fn parse_args() -> anyhow::Result<Args> {
                         .ok_or_else(|| anyhow!("--hold-windows needs off or MIN,MAX"))?,
                 )?;
             }
+            "--confirmation-ms" => {
+                confirmation_ms = Some(
+                    it.next()
+                        .ok_or_else(|| anyhow!("--confirmation-ms needs a number"))?
+                        .parse()
+                        .context("--confirmation-ms")?,
+                );
+            }
+            "--tolerate-false-cuts" => {
+                tolerate_false_cuts = true;
+            }
             "--device" => {
                 device = it.next().ok_or_else(|| anyhow!("--device needs a name"))?;
             }
@@ -276,6 +295,8 @@ fn parse_args() -> anyhow::Result<Args> {
         strategy,
         endpoint_policy,
         hold_windows,
+        confirmation_ms,
+        tolerate_false_cuts,
         device,
         expected,
         worker,
@@ -293,6 +314,8 @@ fn print_usage() {
          \x20                [--backend sherpa|coreml-unified]\n\
          \x20                [--strategy serial|speculative]\n\
          \x20                [--endpoint-policy fast|long-form]\n\
+         \x20                [--confirmation-ms N]\n\
+         \x20                [--tolerate-false-cuts]\n\
          \x20                [--device 'BlackHole 2ch']\n\
          \x20                [--expected 'reference transcript']\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\
@@ -332,6 +355,23 @@ fn main() -> ExitCode {
     }
 }
 
+impl Args {
+    /// The session's silence window: the named policy, unless the sweep
+    /// overrode it with a value no policy names.
+    fn confirmation_ms(&self) -> u32 {
+        self.confirmation_ms
+            .unwrap_or_else(|| self.endpoint_policy.confirmation_ms())
+    }
+}
+
+/// What one repetition produced. A false cut is a commit that landed before
+/// playback reached the fixture's last audible sample.
+#[derive(Clone, Copy, Debug, Default)]
+struct RepResult {
+    false_cut: bool,
+    mismatch: bool,
+}
+
 fn run(args: &Args) -> anyhow::Result<()> {
     if args.arm == Arm::Cadence && args.keepalive_ms == 0 {
         bail!("--arm cadence needs a nonzero --keepalive-ms");
@@ -366,6 +406,11 @@ fn run(args: &Args) -> anyhow::Result<()> {
         args.device
     );
 
+    log::info!(
+        "endpoint config: confirmation_ms={}",
+        args.confirmation_ms()
+    );
+
     for rep in 0..args.warmup_reps {
         run_one(
             args,
@@ -377,6 +422,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
             false,
         )?;
     }
+    let mut false_cuts = 0_usize;
+    let mut mismatches = 0_usize;
     // `scripts/bench-idle.py` attributes every phase_timer line that follows
     // this marker to the arm it names, which keeps the arm out of the shared
     // PhaseTimer format and out of `streamer.rs`.
@@ -387,7 +434,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
         args.keepalive_ms
     );
     for rep in 0..args.reps {
-        run_one(
+        let result = run_one(
             args,
             &store,
             asr.clone(),
@@ -396,7 +443,15 @@ fn run(args: &Args) -> anyhow::Result<()> {
             rep,
             true,
         )?;
+        false_cuts += usize::from(result.false_cut);
+        mismatches += usize::from(result.mismatch);
     }
+    log::info!(
+        "bench_e2e_summary reps={} false_cuts={false_cuts} mismatches={mismatches} \
+         confirmation_ms={}",
+        args.reps,
+        args.confirmation_ms()
+    );
     Ok(())
 }
 
@@ -442,7 +497,7 @@ fn run_one(
     sample_rate: u32,
     rep: usize,
     emit: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RepResult> {
     let streamer_mode = match args.mode {
         BenchMode::VadAutoStop => Mode::VadAutoStop,
         BenchMode::Hold => Mode::Manual,
@@ -458,7 +513,7 @@ fn run_one(
         streamer_mode,
         asr.clone(),
         args.strategy,
-        args.endpoint_policy,
+        args.confirmation_ms(),
         args.hold_windows,
         Some(&args.device),
     )?;
@@ -514,10 +569,6 @@ fn run_one(
         .0
         .recv_timeout(timeout)
         .with_context(|| format!("waiting for endpoint on repetition {rep}"))?;
-    let acoustic_end = hold_release.map_or_else(|| playback.acoustic_end(), Ok)?;
-    drop(playback);
-    drop(session);
-
     let Outcome::Speech {
         samples,
         sample_rate,
@@ -532,6 +583,44 @@ fn run_one(
             Outcome::Speech { .. } => unreachable!("matched above"),
         };
     };
+
+    // In Tap the acoustic-end marker only exists once playback has rendered
+    // the fixture's last audible sample, so its absence *is* the false cut. A
+    // marker read that fails outright is a harness fault and still aborts.
+    let marker = match hold_release {
+        Some(release) => Some(release),
+        None => playback.acoustic_end_marker()?,
+    };
+    let acoustic_end = match marker {
+        Some(end) => end,
+        None if args.tolerate_false_cuts => {
+            // The provisional transcript is the evidence for *why* it cut:
+            // it shows how much of the utterance the decoder had when the
+            // window elapsed, and whether the cut point was a sentence end.
+            log::info!(
+                "bench_e2e false_cut rep={rep} provisional={:?}",
+                early_transcript.unwrap_or_default()
+            );
+            drop(session);
+            // Let the fixture finish rendering so the next repetition starts
+            // from silence rather than mid-utterance.
+            wait_for_acoustic_end(&playback, timeout)
+                .with_context(|| format!("draining playback after a false cut on rep {rep}"))?;
+            drop(playback);
+            return Ok(RepResult {
+                false_cut: true,
+                mismatch: false,
+            });
+        }
+        None => {
+            return Err(anyhow!(
+                "playback ended before emitting the acoustic-end marker"
+            ))
+            .context(format!("repetition {rep}"))
+        }
+    };
+    drop(playback);
+    drop(session);
 
     let transcript = match early_transcript {
         Some(text) => text,
@@ -552,20 +641,28 @@ fn run_one(
     if emit {
         timer.emit();
     }
+    let mut mismatch = false;
     if let Some(expected) = &args.expected {
         let wanted = normalize_lexical(expected);
         let got = normalize_lexical(&transcript);
         if wanted != got {
-            bail!(
-                "repetition {rep} transcript mismatch: expected {expected:?}, got {transcript:?}"
-            );
+            if !args.tolerate_false_cuts {
+                bail!(
+                    "repetition {rep} transcript mismatch: expected {expected:?}, got {transcript:?}"
+                );
+            }
+            mismatch = true;
+            log::info!("bench_e2e mismatch rep={rep} transcript={transcript:?}");
         }
     }
     log::info!(
         "bench_e2e rep={rep} measured={emit} strategy={:?} transcript={transcript:?}",
         args.strategy
     );
-    Ok(())
+    Ok(RepResult {
+        false_cut: false,
+        mismatch,
+    })
 }
 
 /// Block until the output stream reports the predicted instant of the
@@ -589,12 +686,21 @@ struct Playback {
 }
 
 impl Playback {
-    fn acoustic_end(&self) -> anyhow::Result<Instant> {
-        self.acoustic_end
+    /// `None` means playback has not yet rendered the fixture's last audible
+    /// sample. An `Err` is a harness fault, never a statement about the
+    /// recording — keeping the two apart is what stops a poisoned mutex from
+    /// being counted as a false cut.
+    fn acoustic_end_marker(&self) -> anyhow::Result<Option<Instant>> {
+        Ok(self
+            .acoustic_end
             .lock()
             .map_err(|_| anyhow!("acoustic-end marker mutex poisoned"))?
             .as_ref()
-            .copied()
+            .copied())
+    }
+
+    fn acoustic_end(&self) -> anyhow::Result<Instant> {
+        self.acoustic_end_marker()?
             .ok_or_else(|| anyhow!("playback ended before emitting the acoustic-end marker"))
     }
 }

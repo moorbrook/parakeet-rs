@@ -14,7 +14,7 @@
 #
 # HOLD_WINDOWS selects what the Hold path does during the hold: `off` is the
 # original serial behaviour (nothing decodes until release), `MIN,MAX` cuts
-# windows at pauses and decodes them in the background (ADR-0031). Run it both
+# windows at pauses and decodes them in the background (ADR-0032). Run it both
 # ways to get the before/after columns from one sitting.
 #
 # The `multipause` fixture is a long utterance with explicit 800 ms gaps, which

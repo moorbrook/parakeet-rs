@@ -27,7 +27,7 @@ pub enum TriggerMode {
     /// clause/sentence pauses before auto-pasting. A second tap cancels.
     #[default]
     Tap,
-    /// Original 150 ms auto-stop for short commands where minimum final-pause
+    /// 90 ms auto-stop for short commands where minimum final-pause
     /// latency matters more than tolerating a long pause.
     #[serde(rename = "tap_fast")]
     TapFast,
@@ -90,7 +90,7 @@ pub struct Settings {
     /// Shortest window a pause may close. Defaults to the same value as
     /// `hold_window_max_seconds`, which turns pause cutting off: cutting at
     /// pauses measured 1.09 points of gold WER worse than cutting at the cap.
-    /// Lower it only with fresh evidence. See ADR-0031.
+    /// Lower it only with fresh evidence. See ADR-0032.
     #[serde(default = "default_hold_window_min_seconds")]
     pub hold_window_min_seconds: f32,
     /// Longest window Hold mode accumulates before cutting. Hold decodes each

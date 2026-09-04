@@ -60,7 +60,7 @@ struct Args {
     /// When set, each fixture is decoded the way a Hold session would decode
     /// it — cut into windows at pauses and merged on word agreement — instead
     /// of in one pass. This is how the seam merge is held to the same WER as
-    /// the plain decode on the gold corpus. See ADR-0031.
+    /// the plain decode on the gold corpus. See ADR-0032.
     hold_windows: Option<HoldWindowConfig>,
 }
 

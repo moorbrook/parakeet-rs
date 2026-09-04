@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 
-use crate::endpointing::{EndpointPolicy, SPECULATIVE_MIN_SILENCE_S};
+use crate::endpointing::SPECULATIVE_MIN_SILENCE_S;
 
 /// Silero operates at 16 kHz natively.
 pub const VAD_SAMPLE_RATE: i32 = 16_000;
@@ -39,15 +39,14 @@ impl Vad {
         )
     }
 
-    pub fn load_confirming(
-        model: &Path,
-        num_threads: i32,
-        endpoint_policy: EndpointPolicy,
-    ) -> Result<Self> {
+    /// `confirmation_ms` is the resolved ordinary silence window for the
+    /// session, not a policy: the endpoint sweep benchmark supplies values the
+    /// two shipping policies do not name.
+    pub fn load_confirming(model: &Path, num_threads: i32, confirmation_ms: u32) -> Result<Self> {
         Self::load_with_durations(
             model,
             num_threads,
-            endpoint_policy.confirmation_ms() as f32 / 1_000.0,
+            confirmation_ms as f32 / 1_000.0,
             MIN_SPEECH_S,
         )
     }
