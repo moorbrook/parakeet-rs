@@ -32,16 +32,6 @@ import Foundation
 /// those are what the model was trained through rather than an artifact of the
 /// kernel.
 final class NativeRnntDecoder {
-    /// Row blocking of the LSTM gate matrices, decided by measurement against
-    /// the compiled model rather than by reading the MIL: input, forget,
-    /// output, cell. See `scripts/capture-rnnt-parity.py`.
-    private enum Gate: Int {
-        case input = 0
-        case forget = 1
-        case output = 2
-        case cell = 3
-    }
-
     private let prediction: RnntPredictionNetwork
     private let joint: RnntJointNetwork
     private let blankIndex: Int
@@ -57,16 +47,24 @@ final class NativeRnntDecoder {
     private static let cacheLock = NSLock()
     nonisolated(unsafe) private static var cache: [String: (RnntPredictionNetwork, RnntJointNetwork)] = [:]
 
-    /// Row slices the matrix kernels split across. Overridable because the best
-    /// value is a property of the machine, not of the model.
-    static let concurrency: Int = {
-        if let raw = ProcessInfo.processInfo.environment["PARAKEET_RNNT_THREADS"],
+    /// Row slices the LSTM gate product splits across. Overridable because the
+    /// best value is a property of the machine, not of the model.
+    static let concurrency = NativeRnntDecoder.threadCount("PARAKEET_RNNT_THREADS", default: 4)
+
+    /// The joint's two products are a tenth the size of the gate product, close
+    /// enough to `concurrentPerform`'s own cost that splitting them is not
+    /// obviously worth it, and they are the calls the loop makes most often.
+    static let jointConcurrency = NativeRnntDecoder.threadCount(
+        "PARAKEET_RNNT_JOINT_THREADS", default: 1)
+
+    private static func threadCount(_ variable: String, default fallback: Int) -> Int {
+        if let raw = ProcessInfo.processInfo.environment[variable],
             let value = Int(raw), value >= 1
         {
             return value
         }
-        return 4
-    }()
+        return fallback
+    }
 
     init(modelDirectory: URL, config: UnifiedConfig) throws {
         let key = modelDirectory.standardizedFileURL.path
@@ -135,13 +133,12 @@ extension NativeRnntDecoder: UnifiedRnntDecoding {
         var emissions: [UnifiedRnntEmission] = []
 
         var step = predictionStep(token: currentToken, hidden: currentHidden, cell: currentCell)
-        var decoderProjection = jointProjectDecoder(step.output)
 
         for frame in frameRange {
             let encoderProjection = projected.frame(frame - frameRange.lowerBound)
             for _ in 0..<maximumSymbolsPerFrame {
                 let decision = jointDecide(
-                    encoderProjection: encoderProjection, decoderProjection: decoderProjection)
+                    encoderProjection: encoderProjection, decoderProjection: step.projection)
                 if decision.token == blankIndex { break }
                 emissions.append(
                     UnifiedRnntEmission(
@@ -155,7 +152,6 @@ extension NativeRnntDecoder: UnifiedRnntDecoding {
                 currentCell = step.cell
                 step = predictionStep(
                     token: currentToken, hidden: currentHidden, cell: currentCell)
-                decoderProjection = jointProjectDecoder(step.output)
             }
         }
 
@@ -165,26 +161,33 @@ extension NativeRnntDecoder: UnifiedRnntDecoding {
         return emissions
     }
 
-    /// One prediction-network step, timed as the native counterpart of a
+    /// One prediction-network step and the joint projection of its output,
+    /// timed together as the native counterpart of one
     /// `decoderModel.prediction` dispatch.
+    ///
+    /// The projection belongs here because it changes only when a token is
+    /// emitted: it is hoisted out of the symbol loop the way the encoder
+    /// projection is hoisted out of the frame loop, and the compiled model
+    /// recomputed both on every call. Counting it as a step would also put the
+    /// native and Core ML joint counts out of step with each other, and the
+    /// frame arithmetic reads both.
     private func predictionStep(
         token: Int, hidden: [Float], cell: [Float]
-    ) -> RnntPredictionNetwork.Step {
+    ) -> Step {
         let start = StageProfiler.shared.nativeStart()
         let step = prediction.step(token: token, hidden: hidden, cell: cell)
+        let projection = joint.projectDecoder(step.output)
         StageProfiler.shared.recordNative(.nativeDecoder, since: start)
-        return step
+        return Step(hidden: step.hidden, cell: step.cell, projection: projection)
     }
 
-    /// The joint's decoder-side projection. It changes only when a token is
-    /// emitted, so it is hoisted out of the symbol loop the way the encoder
-    /// projection is hoisted out of the frame loop; the compiled model
-    /// recomputed both on every call.
-    private func jointProjectDecoder(_ decoderOutput: [Float]) -> [Float] {
-        let start = StageProfiler.shared.nativeStart()
-        let projection = joint.projectDecoder(decoderOutput)
-        StageProfiler.shared.recordNative(.nativeJoint, since: start)
-        return projection
+    /// A prediction-network step reduced to what the frame loop needs: the
+    /// state to keep if the next token is accepted, and the joint's projection
+    /// of the output.
+    private struct Step {
+        let hidden: [Float]
+        let cell: [Float]
+        let projection: [Float]
     }
 
     private func jointDecide(
@@ -534,7 +537,7 @@ final class RnntJointNetwork {
                         vector: vector.baseAddress!,
                         bias: bias.baseAddress!,
                         into: output.baseAddress!,
-                        chunks: NativeRnntDecoder.concurrency
+                        chunks: NativeRnntDecoder.jointConcurrency
                     )
                 }
             }
@@ -576,7 +579,7 @@ final class RnntJointNetwork {
                         vector: vector.baseAddress!,
                         bias: bias.baseAddress!,
                         into: output.baseAddress!,
-                        chunks: NativeRnntDecoder.concurrency
+                        chunks: NativeRnntDecoder.jointConcurrency
                     )
                 }
             }

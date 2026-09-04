@@ -200,13 +200,26 @@ final class Float16Matrix {
             multiply(vector: vector, bias: bias, into: out, rowRange: 0..<rows)
             return
         }
+        // The concurrent closure carries only the addresses and the row bounds;
+        // the slices write disjoint rows of `out` and read everything else, so
+        // there is nothing to synchronize. Named here rather than captured
+        // implicitly so that stays visible.
+        nonisolated(unsafe) let weights = storage
+        nonisolated(unsafe) let vector = vector
+        nonisolated(unsafe) let bias = bias
+        nonisolated(unsafe) let out = out
+        let columns = self.columns
+        let rows = self.rows
         let stride = (rows + chunks - 1) / chunks
         DispatchQueue.concurrentPerform(iterations: chunks) { chunk in
             let start = chunk * stride
             guard start < rows else { return }
-            multiply(
-                vector: vector, bias: bias, into: out,
-                rowRange: start..<min(start + stride, rows))
+            UnsafeRawPointer(weights).withMemoryRebound(
+                to: UInt16.self, capacity: rows * columns
+            ) { matrix in
+                parakeet_rnnt_matvec(
+                    matrix, vector, bias, out, columns, start, min(start + stride, rows))
+            }
         }
     }
 }

@@ -203,16 +203,25 @@ passes the flag automatically for `BACKEND=coreml-unified` and reduces the
 `asr_stages` log lines into `*-stages.csv` through `scripts/bench-stages.py`.
 
 The decode pipeline lives in FluidAudio's `UnifiedAsrManager` and
-`UnifiedRnntDecoder`, which are a pinned dependency this project depends on
-rather than vendors. The worker therefore measures from outside: at startup it
+`UnifiedRnntDecoder`, a pinned dependency this project depends on and patches
+rather than vendors (`native/ParakeetCoreMLWorker/patches/fluidaudio.patch`, two
+changes: the offline encoder window, and the hook the native decode loop is
+injected through). The worker measures from outside all the same: at startup it
 replaces the prediction implementations of `MLModel` and its registered
 subclasses with timing wrappers that call straight through, and attributes each
 dispatch to a stage by the input feature names FluidAudio's providers declare
 (`mel` for the encoder, `targets` for the decoder, `encoder_step` for the
 joint). Stage boundaries come from the resulting dispatch timeline: mel is the
 gap before an encoder dispatch, the RNNT loop is everything from an encoder
-dispatch to the last dispatch of that window. Nothing in the pinned package is
-patched, and the shipping dictation path never installs the wrappers.
+dispatch to the last dispatch of that window. The shipping dictation path never
+installs the wrappers.
+
+With `--rnnt-engine native` the decode loop issues no Core ML dispatches at all,
+so it reports its own steps instead: `native_decoder_steps` and
+`native_joint_steps` stand in for `decoder_calls` and `joint_calls`, and
+`decode_loop_native_ms` for `decode_loop_dispatch_ms`. The counts mean the same
+thing, so the frame identity below reads either pair; a row with both populated
+is rejected, since the loop runs on one engine per utterance.
 
 Medians over 30 measured repetitions per bucket, three warmups, 48 kHz
 fixtures, release build (`bench/coreml-unified-stages.csv`). The resample column

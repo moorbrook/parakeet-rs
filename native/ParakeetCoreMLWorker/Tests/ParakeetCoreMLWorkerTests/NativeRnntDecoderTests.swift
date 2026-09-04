@@ -1,4 +1,5 @@
 import CoreML
+import FluidAudio
 import Foundation
 import Testing
 
@@ -43,8 +44,12 @@ struct NativeRnntDecoderTests {
         let encoderDim: Int
         let vocabulary: Int
         let stepTolerance: Float
+        let probabilityTolerance: Float
         let decoderSteps: [Step]
         let jointCases: [JointCase]
+        /// Encoder frames built to emit from a freshly reset decoder, for the
+        /// loop-level test.
+        let loopFrames: [String]
     }
 
     /// Base64 little-endian fp16, widened. Every fixture value crossed an fp16
@@ -118,18 +123,62 @@ struct NativeRnntDecoderTests {
         }
     }
 
-    @Test("a fresh prediction network starts from zero state")
-    func firstStepStartsFromZeroState() throws {
-        guard let directory = Self.modelDirectory else { return }
+    @Test("the capture starts where a reset decoder does")
+    func captureStartsFromTheDecodersOwnStartingPoint() throws {
         let fixture = try Self.fixture()
         let first = try #require(fixture.decoderSteps.first)
-        // The capture starts the trajectory the way the decode loop does: blank
-        // token, zero state. A test that took the state from the fixture would
-        // not notice `reset()` handing out something else.
+        // Blank token, zero state. If `reset()` ever handed out something else
+        // the fixture would be measuring a trajectory the decoder never takes.
         #expect(first.token == fixture.vocabulary - 1)
         #expect(try Self.unpack(first.hIn).allSatisfy { $0 == 0 })
         #expect(try Self.unpack(first.cIn).allSatisfy { $0 == 0 })
-        _ = directory
+    }
+
+    @Test("reset returns the decoder to the state it was constructed in")
+    func resetRestoresTheStartingState() throws {
+        guard let directory = Self.modelDirectory else { return }
+        let config = UnifiedConfig()
+        let decoder = try NativeRnntDecoder(modelDirectory: directory, config: config)
+        // The frames are built to make the joint emit; what the test pins is
+        // that a second pass after `reset()` retraces the first exactly.
+        // Without the reset the carried LSTM state changes what the joint
+        // decides, so this fails if `reset()` misses either state tensor or the
+        // last token.
+        let fixture = try Self.fixture()
+        let steps = try fixture.loopFrames.map { try Self.unpack($0) }
+        #expect(steps.count > 1)
+        let frames = steps.count
+        let encoded = try Self.encoderOutput(steps, dimension: decoder.encoderDimension)
+        let first = try decoder.decode(
+            encoded: encoded, frameRange: 0..<frames, globalFrameOffset: 0)
+        let carried = try decoder.decode(
+            encoded: encoded, frameRange: 0..<frames, globalFrameOffset: 0)
+        try decoder.reset()
+        let afterReset = try decoder.decode(
+            encoded: encoded, frameRange: 0..<frames, globalFrameOffset: 0)
+
+        #expect(!first.isEmpty, "the fixture input must make the loop emit something")
+        #expect(first.map(\.token) == afterReset.map(\.token))
+        #expect(first.map(\.frame) == afterReset.map(\.frame))
+        #expect(
+            first.map(\.token) != carried.map(\.token),
+            "a second pass without reset must not retrace the first, or this proves nothing")
+    }
+
+    /// Frames laid out as the `[1, D, T]` encoder output the decoder reads.
+    private static func encoderOutput(
+        _ frames: [[Float]], dimension: Int
+    ) throws -> MLMultiArray {
+        let array = try MLMultiArray(
+            shape: [1, NSNumber(value: dimension), NSNumber(value: frames.count)],
+            dataType: .float32)
+        for (time, frame) in frames.enumerated() {
+            #expect(frame.count == dimension)
+            for channel in 0..<dimension {
+                array[channel * frames.count + time] = NSNumber(value: frame[channel])
+            }
+        }
+        return array
     }
 
     @Test("the joint picks the same token as the compiled model")
@@ -156,9 +205,17 @@ struct NativeRnntDecoderTests {
                 decision.token == testCase.tokenId,
                 "case \(index) chose \(decision.token), captured \(testCase.tokenId)")
             if decision.token != fixture.vocabulary - 1 {
-                #expect(abs(decision.probability - testCase.tokenProb) < 1e-3)
+                // Confidence only: FluidAudio carries this out as a token
+                // timing's confidence and nothing reads it back. It inherits
+                // the logits' fp16-against-fp32 gap through the softmax.
+                #expect(abs(decision.probability - testCase.tokenProb)
+                    <= fixture.probabilityTolerance)
             }
         }
+        let emitting = fixture.jointCases.filter { $0.tokenId != fixture.vocabulary - 1 }
+        #expect(
+            emitting.count >= fixture.jointCases.count / 2,
+            "a corpus of blanks would not exercise the argmax or the probability")
     }
 
     /// One encoder frame in the `[1, D, T]` layout the encoder produces.

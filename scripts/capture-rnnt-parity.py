@@ -42,6 +42,10 @@ decode: the decoder output the joint consumes agrees to 0.014 with Core ML's
 state and 0.017 when the native state feeds itself, against cell values that
 reach 9.2. The divergence does not compound. Whether it ever changes a token is
 not decided here — the gold corpus decides that.
+
+The joint agrees on every token it is given. Its softmax probability, which
+FluidAudio carries as per-token confidence and nothing reads back, differs by up
+to 0.015 for the same reason the logits do.
 """
 
 from __future__ import annotations
@@ -236,6 +240,12 @@ def main() -> int:
     )
     parser.add_argument("--seed", type=int, default=20264)
     parser.add_argument(
+        "--probability-tolerance",
+        type=float,
+        default=0.02,
+        help="largest accepted difference in the emitted token's softmax probability",
+    )
+    parser.add_argument(
         "--tolerance",
         type=float,
         default=0.2,
@@ -337,10 +347,28 @@ def main() -> int:
     joint = JointDecision(joint_weights)
     mismatches = 0
     worst_probability = 0.0
+    emitting = 0
     decoder_output = reference_decoder[0]
     joint_cases = []
     for index in range(arguments.steps):
-        encoder_step = fp16(rng.normal(0.0, 1.0, size=encoder_dim).astype(np.float32))
+        # Half the cases are noise, which the joint answers with blank however
+        # it is scaled — the blank logit dominates everything an encoder never
+        # produces. The other half are built to emit: for a target token the
+        # activation that separates it from blank is
+        # `relu(W_out[token] - W_out[blank])`, and the encoder projection is
+        # linear, so least squares gives an encoder step that lands there. The
+        # captured answer is whatever the compiled model then returns, which is
+        # what makes these references rather than expectations.
+        if index % 2 == 0:
+            encoder_step = fp16(rng.normal(0.0, 1.0, size=encoder_dim).astype(np.float32))
+        else:
+            target = int(rng.integers(0, vocabulary - 1))
+            wanted = np.maximum(joint.out_weight[target] - joint.out_weight[blank], 0.0)
+            wanted = wanted / max(np.linalg.norm(wanted), 1e-6) * 8.0
+            residual = wanted - joint.enc_bias - joint.project_decoder(decoder_output)
+            encoder_step = fp16(
+                np.linalg.lstsq(joint.enc_weight, residual, rcond=None)[0].astype(np.float32)
+            )
         prediction = joint_model.predict(
             {
                 "encoder_step": encoder_step.reshape(1, encoder_dim, 1),
@@ -353,6 +381,7 @@ def main() -> int:
             joint.project_encoder(encoder_step), joint.project_decoder(decoder_output)
         )
         mismatches += int(token != reference_token)
+        emitting += int(reference_token != blank)
         worst_probability = max(worst_probability, abs(probability - reference_probability))
         joint_cases.append(
             {
@@ -365,11 +394,43 @@ def main() -> int:
         decoder_output = reference_decoder[(index + 1) % len(reference_decoder)]
 
     print(
-        f"joint decision: {mismatches} argmax mismatches over {arguments.steps} cases, "
+        f"joint decision: {mismatches} argmax mismatches over {arguments.steps} cases "
+        f"({emitting} of them emitting), "
         f"worst probability difference {worst_probability:.3e}"
     )
     if mismatches:
         return 1
+    if worst_probability > arguments.probability_tolerance:
+        print(
+            f"probability differs by {worst_probability:.3e}, over "
+            f"{arguments.probability_tolerance}",
+            file=sys.stderr,
+        )
+        return 1
+    if emitting < arguments.fixture_steps // 2:
+        print(
+            f"only {emitting} cases emit a token; a corpus of blanks would not exercise "
+            "the argmax or the probability",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Frames for the loop-level test: strong enough to emit from the state a
+    # freshly reset decoder is in, whatever the trajectory does to it after the
+    # first token. The joint case corpus above cannot serve here because each of
+    # its constructed steps was aimed at the decoder state of its own step.
+    loop_frames = []
+    start_projection = joint.project_decoder(reference_decoder[0])
+    for _ in range(arguments.fixture_steps):
+        target = int(rng.integers(0, vocabulary - 1))
+        wanted = np.maximum(joint.out_weight[target] - joint.out_weight[blank], 0.0)
+        wanted = wanted / max(np.linalg.norm(wanted), 1e-6) * 40.0
+        residual = wanted - joint.enc_bias - start_projection
+        loop_frames.append(
+            packed(
+                fp16(np.linalg.lstsq(joint.enc_weight, residual, rcond=None)[0].astype(np.float32))
+            )
+        )
 
     if arguments.out:
         fixture = {
@@ -385,8 +446,10 @@ def main() -> int:
             "encoder_dim": encoder_dim,
             "vocabulary": vocabulary,
             "step_tolerance": arguments.tolerance,
+            "probability_tolerance": arguments.probability_tolerance,
             "decoder_steps": fixture_steps[: arguments.fixture_steps],
             "joint_cases": joint_cases[: arguments.fixture_steps],
+            "loop_frames": loop_frames,
         }
         arguments.out.write_text(json.dumps(fixture))
         print(f"wrote {arguments.out} ({arguments.out.stat().st_size} bytes)")
