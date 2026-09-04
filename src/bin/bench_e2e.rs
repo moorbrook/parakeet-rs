@@ -438,12 +438,33 @@ fn run_one(
         .0
         .recv_timeout(timeout)
         .with_context(|| format!("waiting for endpoint on repetition {rep}"))?;
+    let Outcome::Speech {
+        samples,
+        sample_rate,
+        early_transcript,
+        mut timer,
+    } = outcome
+    else {
+        return match outcome {
+            Outcome::Cancelled => bail!("repetition {rep} was cancelled"),
+            Outcome::NoSpeech => bail!("repetition {rep} detected no speech"),
+            Outcome::Error(error) => Err(error).context(format!("repetition {rep}")),
+            Outcome::Speech { .. } => unreachable!("matched above"),
+        };
+    };
+
     // In Tap the acoustic-end marker only exists once playback has rendered
     // the fixture's last audible sample, so its absence *is* the false cut.
     let acoustic_end = match hold_release.map_or_else(|| playback.acoustic_end(), Ok) {
         Ok(end) => end,
         Err(_) if args.tolerate_false_cuts => {
-            log::info!("bench_e2e false_cut rep={rep}");
+            // The provisional transcript is the evidence for *why* it cut:
+            // for a punctuated-commit row it says whether the model ended a
+            // sentence at an intra-utterance pause.
+            log::info!(
+                "bench_e2e false_cut rep={rep} provisional={:?}",
+                early_transcript.unwrap_or_default()
+            );
             drop(session);
             // Let the fixture finish rendering so the next repetition starts
             // from silence rather than mid-utterance.
@@ -459,21 +480,6 @@ fn run_one(
     };
     drop(playback);
     drop(session);
-
-    let Outcome::Speech {
-        samples,
-        sample_rate,
-        early_transcript,
-        mut timer,
-    } = outcome
-    else {
-        return match outcome {
-            Outcome::Cancelled => bail!("repetition {rep} was cancelled"),
-            Outcome::NoSpeech => bail!("repetition {rep} detected no speech"),
-            Outcome::Error(error) => Err(error).context(format!("repetition {rep}")),
-            Outcome::Speech { .. } => unreachable!("matched above"),
-        };
-    };
 
     let transcript = match early_transcript {
         Some(text) => text,

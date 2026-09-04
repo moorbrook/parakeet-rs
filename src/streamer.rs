@@ -348,11 +348,16 @@ fn run_vad(run: VadRun) -> Outcome {
                             }
                         };
                         timer.mark_asr_done();
+                        // `saw_speech` is the confirming detector's 200 ms
+                        // MIN_SPEECH_S gate. Requiring it here keeps the
+                        // shorter window from committing an utterance the
+                        // ordinary authority would have refused to end at all.
+                        //
                         // The decode blocked this loop for tens of ms, so the
                         // punctuated window may already have elapsed; arming
                         // reports that instead of costing another 32 ms frame.
-                        let punctuated =
-                            early_transcript.as_deref().is_some_and(ends_sentence);
+                        let punctuated = saw_speech
+                            && early_transcript.as_deref().is_some_and(ends_sentence);
                         if let Some(EndpointEvent::PunctuatedCommit { speech_end_sample }) =
                             endpoint.arm_punctuated(punctuated)
                         {
@@ -381,7 +386,7 @@ fn run_vad(run: VadRun) -> Outcome {
                 // end the recording at the shorter window. The candidate
                 // detector re-arms on one 32 ms speech frame, so this path is
                 // more resume-sensitive than the confirming state it skips.
-                EndpointEvent::PunctuatedCommit { speech_end_sample } => {
+                EndpointEvent::PunctuatedCommit { speech_end_sample } if saw_speech => {
                     log::debug!(
                         "punctuated commit at {:.3}s",
                         speech_end_sample as f32 / SAMPLE_RATE as f32
@@ -394,7 +399,7 @@ fn run_vad(run: VadRun) -> Outcome {
                 // Local confirmation prevents repeated candidates while the
                 // early detector remains silent. The policy-configured
                 // confirming detector below still owns the ordinary stop.
-                EndpointEvent::Confirmed { .. } => {}
+                EndpointEvent::PunctuatedCommit { .. } | EndpointEvent::Confirmed { .. } => {}
                 EndpointEvent::None => {}
             }
 

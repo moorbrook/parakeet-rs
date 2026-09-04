@@ -26,7 +26,9 @@ CSV="${CSV:-bench/endpoint-sweep.csv}"
 FIVE_S="bench/audio/5s_48000.wav"
 FIVE_S_EXPECTED="The latency benchmark measures end to end speech recognition pipeline performance."
 SINGLE="bench/endpointing/librispeech-single-6930-75918-0000-48000.wav"
+SINGLE_EXPECTED="CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS"
 MULTI="bench/endpointing/librispeech-multi-6930-75918-0001-48000.wav"
+MULTI_EXPECTED="THE ENGLISH FORWARDED TO THE FRENCH BASKETS OF FLOWERS OF WHICH THEY HAD MADE A PLENTIFUL PROVISION TO GREET THE ARRIVAL OF THE YOUNG PRINCESS THE FRENCH IN RETURN INVITED THE ENGLISH TO A SUPPER WHICH WAS TO BE GIVEN THE NEXT DAY"
 
 command -v uv >/dev/null || { echo "missing uv" >&2; exit 1; }
 mkdir -p "$OUT_DIR" "$(dirname "$FIVE_S")"
@@ -50,11 +52,22 @@ cargo build --release --locked --bin bench_e2e
 # label fixture policy confirmation_ms punctuated_ms
 run_row() {
     local label="$1" fixture="$2" policy="$3" confirmation="$4" punctuated="$5"
-    local wav expected=()
+    # Every row carries a reference transcript. The acoustic-end marker fires
+    # at the fixture's last sample above -80 dBFS, and the LibriSpeech room
+    # tone sits above that floor, so a short window can miss the marker with
+    # every word intact. `mismatches` is the oracle for lost speech;
+    # `false_cuts` is the marker, and the two are reported separately.
+    # The LibriSpeech references are the corpus text, not this model's output,
+    # so a row's mismatch count is read against its own control row rather
+    # than against zero.
+    #
+    # bash 3.2 treats an empty array under `set -u` as unbound, so this array
+    # is never allowed to be empty.
+    local wav reference
     case "$fixture" in
-        5s) wav="$FIVE_S"; expected=(--expected "$FIVE_S_EXPECTED") ;;
-        single) wav="$SINGLE" ;;
-        multi) wav="$MULTI" ;;
+        5s) wav="$FIVE_S"; reference="$FIVE_S_EXPECTED" ;;
+        single) wav="$SINGLE"; reference="$SINGLE_EXPECTED" ;;
+        multi) wav="$MULTI"; reference="$MULTI_EXPECTED" ;;
         *) echo "unknown fixture: $fixture" >&2; exit 1 ;;
     esac
     [[ -f "$wav" ]] || { echo "missing fixture: $wav" >&2; exit 1; }
@@ -69,7 +82,7 @@ run_row() {
         --tolerate-false-cuts \
         --device "$DEVICE" \
         --wav "$wav" \
-        "${expected[@]}" \
+        --expected "$reference" \
         --warmup-reps "$WARMUP_REPS" \
         --reps "$REPS" \
         2>"$log"
