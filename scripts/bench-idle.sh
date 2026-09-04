@@ -83,7 +83,10 @@ build() {
 # were not comparable.
 note_load() {
     echo "=== machine load at $(date -u +%FT%TZ) ==="
-    top -l 1 | head -12
+    # `head` closes the pipe and top dies of SIGPIPE, which under
+    # `set -o pipefail` would abort the whole run before a single
+    # repetition. The load note must never be able to fail the bench.
+    top -l 1 2>/dev/null | head -12 || true
     echo "=== end load ==="
 }
 
