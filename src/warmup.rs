@@ -113,8 +113,11 @@ impl EnginePrimer {
     /// cannot cancel the first: a press-release short enough to end while a
     /// prime is still running puts that endpoint decode behind one dispatch on
     /// the worker's single pipe, about 30 to 50 ms. It is bounded at one, and
-    /// it only happens on a press that found the engine cold, which is
-    /// precisely the case that was going to pay a re-wake anyway.
+    /// it can only happen inside a session the press itself started, which is
+    /// the case that was going to pay a re-wake anyway. A press arriving while
+    /// a decode is in flight never reaches here: `App::on_hotkey_press` primes
+    /// only on an FSM outcome that changed state, so a prime cannot queue
+    /// ahead of a final or tail-window decode.
     pub fn prime_in_background(&self, asr: Arc<Asr>) -> bool {
         if self
             .in_flight

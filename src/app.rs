@@ -112,6 +112,11 @@ impl App {
     /// Fire one throwaway dispatch so the Neural Engine is awake by the
     /// endpoint. Spawns; never blocks the caller.
     ///
+    /// Call this only for a hotkey press the FSM acted on — see
+    /// [`TapPressOutcome::primes_engine`]. On a press the FSM ignored there is
+    /// a decode already running, and the Core ML worker's single pipe would
+    /// put this dispatch in front of it.
+    ///
     /// This runs on the main thread from the event-tap callback, which macOS
     /// disables if it takes longer than about 250 ms, so the dispatch itself
     /// must happen on `EnginePrimer`'s thread and not here.
@@ -158,34 +163,46 @@ impl App {
     /// menu bar.
     pub fn on_hotkey_press(self: &Arc<Self>) {
         let mode = effective_trigger_mode(&self.settings.load());
-        // Before the FSM, so the engine starts waking even on the press that
-        // cancels a session: the user who taps twice is usually about to
-        // dictate again.
-        self.prime_engine();
         match mode {
-            TriggerMode::Tap | TriggerMode::TapFast => match self.fsm.on_press_tap() {
-                TapPressOutcome::ClaimedListening => {
-                    self.announce_state(DictationState::Listening);
-                    self.start_session(StreamerMode::VadAutoStop, mode.endpoint_policy());
+            TriggerMode::Tap | TriggerMode::TapFast => {
+                let outcome = self.fsm.on_press_tap();
+                // Gated on the outcome, and dispatched before the session
+                // starter so the wake overlaps the mic open. A press the FSM
+                // ignored lands while a decode is in flight, and the prime
+                // would queue in front of it on the worker's single pipe.
+                if outcome.primes_engine() {
+                    self.prime_engine();
                 }
-                TapPressOutcome::CancelledLive | TapPressOutcome::QueuedCancel => {
-                    // The FSM already routed the cancel; nothing
-                    // further to do. The session-watcher (live case)
-                    // or starter (gap case) will resolve state.
+                match outcome {
+                    TapPressOutcome::ClaimedListening => {
+                        self.announce_state(DictationState::Listening);
+                        self.start_session(StreamerMode::VadAutoStop, mode.endpoint_policy());
+                    }
+                    TapPressOutcome::CancelledLive | TapPressOutcome::QueuedCancel => {
+                        // The FSM already routed the cancel; nothing
+                        // further to do. The session-watcher (live case)
+                        // or starter (gap case) will resolve state.
+                    }
+                    TapPressOutcome::Ignored(state) => {
+                        log::debug!("hotkey press ignored from state {state:?}");
+                    }
                 }
-                TapPressOutcome::Ignored(state) => {
-                    log::debug!("hotkey press ignored from state {state:?}");
+            }
+            TriggerMode::Hold => {
+                let outcome = self.fsm.on_press_hold();
+                if outcome.primes_engine() {
+                    self.prime_engine();
                 }
-            },
-            TriggerMode::Hold => match self.fsm.on_press_hold() {
-                HoldPressOutcome::ClaimedListening => {
-                    self.announce_state(DictationState::Listening);
-                    self.start_session(StreamerMode::Manual, mode.endpoint_policy());
+                match outcome {
+                    HoldPressOutcome::ClaimedListening => {
+                        self.announce_state(DictationState::Listening);
+                        self.start_session(StreamerMode::Manual, mode.endpoint_policy());
+                    }
+                    HoldPressOutcome::Ignored(state) => {
+                        log::debug!("hotkey press ignored from state {state:?}");
+                    }
                 }
-                HoldPressOutcome::Ignored(state) => {
-                    log::debug!("hotkey press ignored from state {state:?}");
-                }
-            },
+            }
         }
     }
 
