@@ -188,7 +188,6 @@ pub fn start_with_strategy(
 
 /// Identical to [`start_with_strategy`], with an explicit capture device for
 /// deterministic loopback benchmarks. Production always passes `None`.
-#[allow(clippy::too_many_arguments)]
 pub fn start_with_strategy_on_device(
     vad_model: &Path,
     mode: Mode,

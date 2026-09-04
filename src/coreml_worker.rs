@@ -285,7 +285,12 @@ impl CoreMlWorkerBackend {
 impl CoreMlWorkerBackend {
     /// One request/response round trip. Both trait entry points share it so the
     /// text a caller gets can never disagree with the spans beside it.
-    fn decode(&self, samples: &[f32], sample_rate: u32) -> Result<(Decoded, Vec<TokenSpan>)> {
+    fn decode(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        require_spans: bool,
+    ) -> Result<(Decoded, Vec<TokenSpan>)> {
         validate_request(samples.len(), sample_rate)?;
         // Production capture already delivers 16 kHz, so this borrows. File-fed
         // callers (the gold corpus is 48 kHz) convert here rather than leaving
@@ -307,15 +312,18 @@ impl CoreMlWorkerBackend {
             .decode_seconds
             .ok_or_else(|| anyhow!("Core ML result omitted decode_seconds"))?
             + response.resample_seconds.unwrap_or(0.0);
-        // `reports_token_spans` promises these, so a worker that answers
-        // without them is a version mismatch, not an empty utterance.
-        let spans = response
-            .token_spans
-            .as_ref()
-            .ok_or_else(|| anyhow!("Core ML result omitted token_spans"))?
-            .iter()
-            .map(TokenSpan::from)
-            .collect();
+        // Only the caller that asked for spans may fail for their absence. The
+        // plain path does not read them, and it is the fallback every Hold
+        // window failure lands on — making it depend on a field it ignores
+        // would defeat the fallback for exactly the worker that needs it.
+        let spans = match (&response.token_spans, require_spans) {
+            (Some(spans), _) => spans.iter().map(TokenSpan::from).collect(),
+            (None, false) => Vec::new(),
+            (None, true) => bail!(
+                "Core ML result omitted token_spans; this worker predates the \
+                 Hold window merge and must be rebuilt"
+            ),
+        };
 
         Ok((
             Decoded {
@@ -334,7 +342,9 @@ impl AsrBackend for CoreMlWorkerBackend {
     }
 
     fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
-        Ok(self.decode(samples, sample_rate)?.0)
+        Ok(self
+            .decode(samples, sample_rate, /* require_spans = */ false)?
+            .0)
     }
 
     fn reports_token_spans(&self) -> bool {
@@ -346,7 +356,7 @@ impl AsrBackend for CoreMlWorkerBackend {
         samples: &[f32],
         sample_rate: u32,
     ) -> Result<(Decoded, Vec<TokenSpan>)> {
-        self.decode(samples, sample_rate)
+        self.decode(samples, sample_rate, /* require_spans = */ true)
     }
 
     fn auxiliary_resident_bytes(&self) -> Result<u64> {
@@ -595,6 +605,16 @@ mod tests {
         assert!((spans[2].end_s - 0.40).abs() < 1e-6);
         let words = crate::windows::words_from_tokens(&spans, 0.0);
         assert_eq!(crate::windows::words_to_text(&words), "Hi there.");
+    }
+
+    #[test]
+    fn a_worker_without_token_spans_still_serves_the_plain_decode() {
+        // The plain decode is where every Hold window failure falls back to,
+        // so it must not depend on a field it never reads. Only the span-aware
+        // entry point may refuse a worker that predates them.
+        let payload = br#"{"kind": "result", "ok": true, "text": "hi", "decode_seconds": 0.04}"#;
+        let response: WorkerResponse = serde_json::from_slice(payload).expect("valid result");
+        assert!(response.token_spans.is_none());
     }
 
     #[test]
