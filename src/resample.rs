@@ -41,17 +41,13 @@ pub struct Resampler {
     /// call. Owning it behind `&mut self` here is what actually makes the
     /// aliasing claim true; never hand this type out by shared reference.
     inner: Option<LinearResampler>,
-    input_rate: u32,
 }
 
 impl Resampler {
     /// Build a converter from `input_rate` to [`TARGET_SAMPLE_RATE`].
     pub fn new(input_rate: u32) -> Result<Self> {
         if input_rate == TARGET_SAMPLE_RATE {
-            return Ok(Self {
-                inner: None,
-                input_rate,
-            });
+            return Ok(Self { inner: None });
         }
         let input = i32::try_from(input_rate)
             .map_err(|_| anyhow!("input sample rate {input_rate} does not fit in i32"))?;
@@ -63,18 +59,13 @@ impl Resampler {
         let inner = LinearResampler::create(input, target).ok_or_else(|| {
             anyhow!("could not build a {input_rate} -> {TARGET_SAMPLE_RATE} Hz resampler")
         })?;
-        Ok(Self {
-            inner: Some(inner),
-            input_rate,
-        })
-    }
-
-    pub fn input_rate(&self) -> u32 {
-        self.input_rate
+        Ok(Self { inner: Some(inner) })
     }
 
     /// True when the input already arrives at the target rate and `push`
-    /// borrows its argument instead of filtering it.
+    /// borrows its argument instead of filtering it. Callers on a hot path
+    /// should branch on this and keep their own buffer rather than calling
+    /// `into_owned` on the borrow, which would copy exactly what it avoided.
     pub fn is_pass_through(&self) -> bool {
         self.inner.is_none()
     }

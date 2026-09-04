@@ -12,9 +12,11 @@
 //! 2. a `mpsc::Sender<Vec<f32>>` "tap" that hands the same 16 kHz chunks to the
 //!    VAD watcher in `streamer.rs` so it can react in real time.
 
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -87,6 +89,7 @@ impl AudioCapture {
                     resampler: Mutex::new(resampler),
                     tap,
                     channels: config.channels(),
+                    callback: CallbackStats::new(),
                 });
                 let stream = match build_stream(&device, config, sinks.clone()) {
                     Ok(v) => v,
@@ -113,6 +116,18 @@ impl AudioCapture {
                     buffer.extend_from_slice(&tail);
                     let samples = std::mem::take(&mut *buffer);
                     drop(buffer);
+                    // Read after the stream is dropped: no callback can be
+                    // running, so the histogram is a consistent snapshot.
+                    let callback = sinks.callback.summary();
+                    log::info!(
+                        "capture_callback device_hz={device_sample_rate} chunks={} \
+                         mean_us={:.1} max_us={} p99_us={}{}",
+                        callback.count,
+                        callback.mean_micros,
+                        callback.max_micros,
+                        callback.p99_micros,
+                        if callback.p99_saturated { "+" } else { "" }
+                    );
                     let _ = reply.send(Ok(Recording {
                         samples,
                         sample_rate: TARGET_SAMPLE_RATE,
@@ -149,6 +164,95 @@ impl AudioCapture {
     }
 }
 
+/// One microsecond per bucket. The last bucket collects everything at or above
+/// its index, so a callback that runs long is counted but not mis-binned.
+const CALLBACK_BUCKETS: usize = 512;
+
+/// Duration histogram for the realtime capture callback.
+///
+/// The callback now folds to mono, filters, and copies twice, and the cost of
+/// that has to be a measurement rather than an estimate: a cpal callback that
+/// overruns its buffer period drops audio. Recording is three relaxed atomic
+/// operations, so it does not add a lock or a syscall to the path it measures.
+struct CallbackStats {
+    buckets: Vec<AtomicU32>,
+    max_micros: AtomicU64,
+    total_micros: AtomicU64,
+    count: AtomicU64,
+}
+
+/// What [`CallbackStats`] reports once capture stops.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CallbackSummary {
+    pub count: u64,
+    pub max_micros: u64,
+    pub mean_micros: f64,
+    pub p99_micros: u64,
+    /// True when p99 fell in the final bucket, so the reported value is a
+    /// lower bound rather than the figure itself.
+    pub p99_saturated: bool,
+}
+
+impl CallbackStats {
+    fn new() -> Self {
+        Self {
+            buckets: (0..CALLBACK_BUCKETS).map(|_| AtomicU32::new(0)).collect(),
+            max_micros: AtomicU64::new(0),
+            total_micros: AtomicU64::new(0),
+            count: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, micros: u64) {
+        let index = usize::try_from(micros).unwrap_or(usize::MAX);
+        let index = index.min(CALLBACK_BUCKETS - 1);
+        self.buckets[index].fetch_add(1, Ordering::Relaxed);
+        self.max_micros.fetch_max(micros, Ordering::Relaxed);
+        self.total_micros.fetch_add(micros, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the histogram after the stream is dropped, so no callback is
+    /// concurrently writing and the counts are a consistent snapshot.
+    fn summary(&self) -> CallbackSummary {
+        let count = self.count.load(Ordering::Relaxed);
+        let max_micros = self.max_micros.load(Ordering::Relaxed);
+        if count == 0 {
+            return CallbackSummary {
+                count: 0,
+                max_micros: 0,
+                mean_micros: 0.0,
+                p99_micros: 0,
+                p99_saturated: false,
+            };
+        }
+        let mean_micros = self.total_micros.load(Ordering::Relaxed) as f64 / count as f64;
+        // Rank of the p99 sample, counting from one: the smallest value with at
+        // least 99% of the samples at or below it.
+        let target = count.saturating_mul(99).div_ceil(100).max(1);
+        let mut seen = 0_u64;
+        for (index, bucket) in self.buckets.iter().enumerate() {
+            seen = seen.saturating_add(u64::from(bucket.load(Ordering::Relaxed)));
+            if seen >= target {
+                return CallbackSummary {
+                    count,
+                    max_micros,
+                    mean_micros,
+                    p99_micros: index as u64,
+                    p99_saturated: index == CALLBACK_BUCKETS - 1,
+                };
+            }
+        }
+        CallbackSummary {
+            count,
+            max_micros,
+            mean_micros,
+            p99_micros: (CALLBACK_BUCKETS - 1) as u64,
+            p99_saturated: true,
+        }
+    }
+}
+
 /// Everything the realtime callback writes into, shared with the capture
 /// thread so it can flush the resampler and take the buffer after `stop()`.
 struct CaptureSinks {
@@ -161,6 +265,7 @@ struct CaptureSinks {
     resampler: Mutex<Resampler>,
     tap: Sender<Vec<f32>>,
     channels: u16,
+    callback: CallbackStats,
 }
 
 /// Fold multi-channel input down to mono so the tap is mono. Keeps the
@@ -187,16 +292,32 @@ fn to_mono(data: &[f32], channels: u16) -> Vec<f32> {
 /// The level meter reads the pre-resample mono chunk so the HUD keeps showing
 /// the device's own peak, independent of the filter.
 fn forward_samples(sinks: &CaptureSinks, floats: &[f32]) {
+    let started = Instant::now();
     let mono = to_mono(floats, sinks.channels);
     crate::hud::set_audio_level(peak_amplitude(&mono));
-    let converted = sinks.resampler.lock().push(&mono).into_owned();
+
+    // A device already at the target rate hands `mono` straight through rather
+    // than copying it, which is what `Resampler::push` borrowing its argument
+    // is for. Taking that branch before the borrow starts is what lets the
+    // owned `mono` move into the tap.
+    let mut resampler = sinks.resampler.lock();
+    let converted = if resampler.is_pass_through() {
+        drop(resampler);
+        mono
+    } else {
+        let out = resampler.push(&mono).into_owned();
+        drop(resampler);
+        out
+    };
     if converted.is_empty() {
         // Normal for a chunk shorter than the filter's window; the samples are
         // held inside the resampler and come out with the next push.
+        sinks.callback.record(started.elapsed().as_micros() as u64);
         return;
     }
     sinks.buffer.lock().extend_from_slice(&converted);
     let _ = sinks.tap.send(converted);
+    sinks.callback.record(started.elapsed().as_micros() as u64);
 }
 
 fn open_device(
@@ -300,6 +421,48 @@ mod tests {
         assert_eq!(to_mono(&samples, 1), samples.to_vec());
     }
 
+    #[test]
+    fn callback_histogram_reports_max_and_p99() {
+        let stats = CallbackStats::new();
+        // 99 samples at 10 µs and one at 300 µs: p99 is the 99th-ranked
+        // sample, which is still 10 µs, while max is the outlier.
+        for _ in 0..99 {
+            stats.record(10);
+        }
+        stats.record(300);
+        let summary = stats.summary();
+        assert_eq!(summary.count, 100);
+        assert_eq!(summary.max_micros, 300);
+        assert!((summary.mean_micros - 12.9).abs() < 0.05, "{}", summary.mean_micros);
+        assert_eq!(summary.p99_micros, 10);
+        assert!(!summary.p99_saturated);
+    }
+
+    #[test]
+    fn callback_histogram_flags_a_saturated_tail() {
+        let stats = CallbackStats::new();
+        for _ in 0..10 {
+            stats.record(u64::from(u32::MAX));
+        }
+        let summary = stats.summary();
+        assert_eq!(summary.max_micros, u64::from(u32::MAX));
+        assert_eq!(summary.p99_micros, (CALLBACK_BUCKETS - 1) as u64);
+        assert!(
+            summary.p99_saturated,
+            "a value past the last bucket must be reported as a lower bound"
+        );
+    }
+
+    #[test]
+    fn callback_histogram_is_empty_before_any_callback() {
+        let summary = CallbackStats::new().summary();
+        assert_eq!(summary.count, 0);
+        assert_eq!(summary.max_micros, 0);
+        assert_eq!(summary.mean_micros, 0.0);
+        assert_eq!(summary.p99_micros, 0);
+        assert!(!summary.p99_saturated);
+    }
+
     /// The capture buffer must contain exactly what a single batch resample of
     /// the whole recording would contain, including the flushed tail. This is
     /// the callback-level version of the property `resample` proves for the
@@ -321,6 +484,7 @@ mod tests {
             resampler: Mutex::new(Resampler::new(device_rate).expect("48k resampler")),
             tap,
             channels: 2,
+            callback: CallbackStats::new(),
         };
 
         let mut offset = 0;

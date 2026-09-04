@@ -1834,12 +1834,33 @@ callback path, covering the mono fold and the short-chunk case where the filter
 returns nothing.
 
 **Consequences.** The worker's resample stage is a rate comparison. The
-conversion cost that remains is spread across capture callbacks, where it is
-roughly 0.1 ms per audio-second against a callback budget of several
-milliseconds, so the endpoint path pays none of it. `bench_asr` converts its
-fixture once at load, outside the measured loop, because that is now what
-production hands `Asr::recognize`; timing it inside the loop would measure a
-step the endpoint path no longer has.
+conversion cost that remains is spread across capture callbacks, and since a
+cpal callback that overruns its buffer period drops audio, that cost is measured
+rather than assumed: `AudioCapture` keeps a lock-free duration histogram and
+logs `capture_callback` when capture stops. On the 48 kHz loopback, 461
+callbacks over 4.917 s of audio measured a mean of 9.8 µs, a p99 of 30 µs, and a
+maximum of 103 µs against the 10.67 ms period of a 512-frame chunk — 0.09%,
+0.28%, and 0.97% of the budget. The maximum is a single-sample tail and varied
+between runs (35 µs and 103 µs across two), so it is the figure to watch if the
+callback grows again.
+
+That is 0.92 ms of callback wall time per audio-second, and it covers the whole
+callback — mono fold, level meter, filter, buffer append, and channel send — not
+the filter alone, which the histogram cannot separate. It replaces an earlier
+draft's asserted 0.1 ms, which was an order of magnitude low. The number that
+matters is unchanged either way: all of it runs during capture and none of it at
+the endpoint.
+
+`bench_asr` converts its fixture once at load, outside the measured loop,
+because that is now what production hands `Asr::recognize`; timing it inside the
+loop would measure a step the endpoint path no longer has.
+
+The sherpa fallback backend changed with it. In production it now receives
+16 kHz from capture instead of device-rate audio, so its own internal Kaldi
+resample became a no-op — the same filter, applied once instead of twice, with
+no expected quality change. `asr_diff` converts the 48 kHz gold corpus through
+`to_target_rate` before either backend sees it, so both arms are gated on the
+audio production actually produces rather than on a rate no user path emits.
 
 The quality risk is real and is gated where it can be seen: the gold corpus is
 48 kHz, so `scripts/bench-gold.sh` runs every fixture through this resampler and

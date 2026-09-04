@@ -419,6 +419,14 @@ Medians of the parts, from the same `phase_timer` lines:
 | 10 s | 8.128 s | 12.5 ms | 0.0 ms | 115.5 ms | 125.0 ms |
 | 20 s | 16.587 s | 14.0 ms | 0.0 ms | 181.0 ms | 192.5 ms |
 
+The capture callback itself is measured, because one that overruns its buffer
+period drops audio. `AudioCapture` keeps a lock-free duration histogram and logs
+`capture_callback` at stop; on the 48 kHz loopback, 461 callbacks over 4.917 s
+measured mean 9.8 µs, p99 30 µs, max 103 µs against the 10.67 ms period of a
+512-frame chunk. That is 0.92 ms per audio-second for the whole callback — mono
+fold, level meter, filter, buffer append, channel send — all of it during
+capture and none at the endpoint.
+
 `run_manual` polls its signal channel every 15 ms, which is the 12 to 14 ms
 median seen in the first column. Capture shutdown now rounds to 0 ms at every
 bucket, where it used to cost about 1 ms: `finish_with_recording` no longer
