@@ -12,10 +12,12 @@
 //! project's own resampler retires that stage instead of duplicating it. See
 //! ADR-0030.
 
-use std::io::{BufReader, Read, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use parking_lot::Mutex;
@@ -132,6 +134,10 @@ pub struct CoreMlWorkerConfig {
     /// when `vocabulary` is non-empty; sherpa's `hotwords_score` is the
     /// reference for what the number means.
     pub vocabulary_score: f32,
+    /// Model download and first compilation can take substantially longer than inference.
+    pub startup_timeout: Duration,
+    /// Total budget for sending a request and receiving its complete response.
+    pub request_timeout: Duration,
 }
 
 /// The two implementations of the transducer decode loop the worker can run.
@@ -231,6 +237,8 @@ impl CoreMlWorkerConfig {
             rnnt_engine: CoreMlRnntEngine::default(),
             vocabulary: Vec::new(),
             vocabulary_score: 0.0,
+            startup_timeout: Duration::from_secs(30 * 60),
+            request_timeout: Duration::from_secs(5 * 60),
         }
     }
 
@@ -248,6 +256,8 @@ impl CoreMlWorkerConfig {
             rnnt_engine: CoreMlRnntEngine::default(),
             vocabulary: Vec::new(),
             vocabulary_score: 0.0,
+            startup_timeout: Duration::from_secs(30 * 60),
+            request_timeout: Duration::from_secs(5 * 60),
         }
     }
 
@@ -393,6 +403,7 @@ pub fn load_coreml_worker(config: &CoreMlWorkerConfig) -> Result<(Asr, f64)> {
 
 struct CoreMlWorkerBackend {
     process: Mutex<WorkerProcess>,
+    config: CoreMlWorkerConfig,
     metadata: AsrBackendMetadata,
     load_seconds: f64,
     /// Stage breakdown from the most recent result, when the worker reports one.
@@ -467,13 +478,11 @@ impl CoreMlWorkerBackend {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("Core ML worker stdout was not piped"))?;
-        let mut process = WorkerProcess {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        };
+        let mut process = WorkerProcess::new(child, stdin, stdout)?;
         let ready = process
-            .read_response()
+            .transaction(config.startup_timeout, |process, deadline| {
+                process.read_response(deadline)
+            })
             .context("waiting for Core ML worker readiness")?;
         ready.require_success("ready")?;
         let load_seconds = ready
@@ -489,7 +498,13 @@ impl CoreMlWorkerBackend {
         } else {
             Some(
                 process
-                    .set_vocabulary(&config.vocabulary, config.vocabulary_score)
+                    .transaction(config.request_timeout, |process, deadline| {
+                        process.set_vocabulary(
+                            &config.vocabulary,
+                            config.vocabulary_score,
+                            deadline,
+                        )
+                    })
                     .context("sending the custom vocabulary to the Core ML worker")?,
             )
         };
@@ -520,6 +535,7 @@ impl CoreMlWorkerBackend {
 
         Ok(Self {
             process: Mutex::new(process),
+            config: config.clone(),
             metadata: AsrBackendMetadata {
                 backend: "fluid-audio-worker".to_string(),
                 model: config.model_variant.model_description().to_string(),
@@ -557,14 +573,25 @@ impl CoreMlWorkerBackend {
         let sample_count = validate_request(model_samples.len(), TARGET_SAMPLE_RATE)?;
 
         let mut process = self.process.lock();
-        process
-            .write_request(&model_samples, TARGET_SAMPLE_RATE, sample_count)
-            .context("sending audio to Core ML worker")?;
-        let response = process
-            .read_response()
-            .context("reading Core ML worker result")?;
+        if process.failed {
+            // Retry on a new request only: replaying audio after an uncertain
+            // response could hide a failure. Spawn also reapplies vocabulary.
+            *process = Self::spawn(&self.config)
+                .context("restarting Core ML worker after an IPC failure")?
+                .process
+                .into_inner();
+        }
+        let response = process.transaction(self.config.request_timeout, |process, deadline| {
+            process
+                .write_request(&model_samples, TARGET_SAMPLE_RATE, sample_count, deadline)
+                .context("sending audio to Core ML worker")?;
+            process
+                .read_response(deadline)
+                .context("reading Core ML worker result")
+        })?;
         response.require_success("result")?;
         *self.last_stages.lock() = response.stages.clone();
+        drop(process);
         let decode_seconds = response
             .decode_seconds
             .ok_or_else(|| anyhow!("Core ML result omitted decode_seconds"))?
@@ -584,7 +611,9 @@ impl CoreMlWorkerBackend {
 
         Ok((
             Decoded {
-                text: response.text.unwrap_or_default(),
+                text: response
+                    .text
+                    .ok_or_else(|| anyhow!("Core ML result omitted text"))?,
                 audio_seconds: samples.len() as f32 / sample_rate as f32,
                 decode_seconds: decode_seconds as f32,
             },
@@ -634,18 +663,53 @@ impl AsrBackend for CoreMlWorkerBackend {
 struct WorkerProcess {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: ChildStdout,
+    failed: bool,
 }
 
 impl WorkerProcess {
+    fn new(child: Child, stdin: ChildStdin, stdout: ChildStdout) -> Result<Self> {
+        let process = Self {
+            child,
+            stdin,
+            stdout,
+            failed: false,
+        };
+        set_nonblocking(process.stdin.as_raw_fd())?;
+        set_nonblocking(process.stdout.as_raw_fd())?;
+        Ok(process)
+    }
+
+    fn transaction<T>(
+        &mut self,
+        timeout: Duration,
+        operation: impl FnOnce(&mut Self, Instant) -> Result<T>,
+    ) -> Result<T> {
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| anyhow!("Core ML IPC timeout is too large"))?;
+        let result = operation(self, deadline);
+        if result.is_err() {
+            self.failed = true;
+            self.terminate();
+        }
+        result
+    }
+
+    fn terminate(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
     fn write_request(
         &mut self,
         samples: &[f32],
         sample_rate: u32,
         sample_count: u32,
+        deadline: Instant,
     ) -> Result<()> {
         let header = encode_header(sample_rate, sample_count);
-        self.stdin.write_all(&header)?;
+        write_before(&mut self.stdin, &header, deadline)?;
 
         // The worker protocol is explicitly little-endian. Encoding without a
         // raw-slice cast keeps this safe and portable; IPC cost is measured by
@@ -654,13 +718,17 @@ impl WorkerProcess {
         for sample in samples {
             payload.extend_from_slice(&sample.to_le_bytes());
         }
-        self.stdin.write_all(&payload)?;
-        self.stdin.flush()?;
+        write_before(&mut self.stdin, &payload, deadline)?;
         Ok(())
     }
 
     /// Send the `PRKV` control frame and read the worker's verdict on it.
-    fn set_vocabulary(&mut self, terms: &[String], score: f32) -> Result<VocabularyStatus> {
+    fn set_vocabulary(
+        &mut self,
+        terms: &[String],
+        score: f32,
+        deadline: Instant,
+    ) -> Result<VocabularyStatus> {
         let payload = serde_json::to_vec(&VocabularyRequest { terms, score })
             .context("encoding the vocabulary request")?;
         if payload.len() > MAX_VOCABULARY_BYTES {
@@ -670,10 +738,9 @@ impl WorkerProcess {
             );
         }
         let length = u32::try_from(payload.len()).context("vocabulary payload exceeds u32")?;
-        self.stdin.write_all(&encode_vocabulary_header(length))?;
-        self.stdin.write_all(&payload)?;
-        self.stdin.flush()?;
-        let response = self.read_response()?;
+        write_before(&mut self.stdin, &encode_vocabulary_header(length), deadline)?;
+        write_before(&mut self.stdin, &payload, deadline)?;
+        let response = self.read_response(deadline)?;
         response.require_success("vocabulary")?;
         Ok(VocabularyStatus {
             accepted: response
@@ -684,25 +751,109 @@ impl WorkerProcess {
         })
     }
 
-    fn read_response(&mut self) -> Result<WorkerResponse> {
+    fn read_response(&mut self, deadline: Instant) -> Result<WorkerResponse> {
         let mut length = [0_u8; 4];
-        self.stdout.read_exact(&mut length)?;
+        read_before(&mut self.stdout, &mut length, deadline)?;
         let length = u32::from_le_bytes(length) as usize;
         if length > MAX_RESPONSE_BYTES {
             bail!("Core ML worker response is too large: {length} bytes");
         }
         let mut payload = vec![0_u8; length];
-        self.stdout.read_exact(&mut payload)?;
+        read_before(&mut self.stdout, &mut payload, deadline)?;
         serde_json::from_slice(&payload).context("decoding Core ML worker response")
     }
 }
 
 impl Drop for WorkerProcess {
     fn drop(&mut self) {
-        let _ = self.stdin.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.terminate();
     }
+}
+
+// These descriptors are exclusively owned by WorkerProcess. Nonblocking mode
+// is essential: poll readiness alone does not bound a large pipe write.
+fn set_nonblocking(fd: RawFd) -> io::Result<()> {
+    // SAFETY: fd is a live pipe descriptor; F_GETFL takes no third argument.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL accepts these flags and does not retain any pointers.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn wait_before(fd: RawFd, events: libc::c_short, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut,
+                "Core ML worker IPC deadline expired; worker stopped; retry dictation to restart it"));
+        }
+        let millis = i32::try_from(remaining.as_millis().saturating_add(1)).unwrap_or(i32::MAX);
+        let mut pollfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        // SAFETY: pollfd is valid for one descriptor and lives across this call.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, millis) };
+        if ready > 0 && Instant::now() < deadline {
+            return Ok(());
+        } // EOF/error is reported by read/write.
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn read_before(pipe: &mut ChildStdout, mut bytes: &mut [u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        wait_before(pipe.as_raw_fd(), libc::POLLIN, deadline)?;
+        match pipe.read(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Core ML worker closed its response pipe",
+                ))
+            }
+            Ok(count) => bytes = &mut bytes[count..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_before(pipe: &mut ChildStdin, mut bytes: &[u8], deadline: Instant) -> io::Result<()> {
+    while !bytes.is_empty() {
+        wait_before(pipe.as_raw_fd(), libc::POLLOUT, deadline)?;
+        match pipe.write(bytes) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "Core ML worker accepted no request bytes",
+                ))
+            }
+            Ok(count) => bytes = &bytes[count..],
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// The `PRKV` frame's JSON body. Borrowed, so a large vocabulary is not cloned
@@ -1129,3 +1280,6 @@ mod tests {
             .is_err());
     }
 }
+
+#[cfg(test)]
+mod ipc_tests;
