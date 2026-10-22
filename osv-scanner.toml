@@ -1,0 +1,4 @@
+[[IgnoredVulns]]
+id = "GHSA-6q48-6c7w-9gw2"
+ignoreUntil = 2027-01-22T00:00:00Z
+reason = "False positive for locked certifi 2026.10.18: the advisory prose confirms this version removes all emSign roots; only its affected-version range requires 10.19. Verified the actual 10.18 CA bundle has zero emSign roots; 2026.7.22 has four and fails the same check. Developer-only Python evaluation locks; not bundled in the app. Keep the three-day release-age guard. Remove this exception once the advisory range is corrected or an aged later certifi is locked."
