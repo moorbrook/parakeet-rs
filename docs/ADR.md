@@ -1096,9 +1096,11 @@ FluidAudio commit `00a9aa771900ea09c485659663be31019e293e47`.
 - Specialized model download/load failure falls back to sherpa. The fallback
   remains downloaded on first launch so the app does not become unusable when
   a hardware-specific plan cannot load.
-- The Core ML weights are a separate ~595 MB on-demand artifact under
-  CC-BY-4.0. FluidAudio is Apache-2.0; attribution is shipped in
-  `THIRD_PARTY_NOTICES.md`.
+- The Core ML weights are a separate ~595 MB on-demand artifact governed by
+  the NVIDIA Open Model License Agreement, as a derivative of
+  `nvidia/parakeet-unified-en-0.6b`; the conversion's own CC-BY-4.0 label
+  does not change that. FluidAudio is Apache-2.0. Attribution and the NVIDIA
+  notice are shipped in `THIRD_PARTY_NOTICES.md`.
 
 **Evidence.** M5 Pro, 24 GB, macOS 26.5.1, release builds, identical 48 kHz
 fixtures, three warmups, 30 measured repetitions per bucket. Both rows include

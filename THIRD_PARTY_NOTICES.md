@@ -3,23 +3,38 @@
 ## FluidAudio
 
 The native Core ML speech-recognition worker links FluidAudio at commit
-`00a9aa771900ea09c485659663be31019e293e47`.
+`00a9aa771900ea09c485659663be31019e293e47`, modified by
+`native/ParakeetCoreMLWorker/patches/fluidaudio.patch` (a configurable offline
+encoder window and a replaceable greedy decode loop).
 
 - Project: <https://github.com/FluidInference/FluidAudio>
 - Copyright: FluidInference contributors
 - License: Apache License 2.0; see `LICENSE-APACHE`
 
-## Parakeet Unified EN 0.6B Core ML model
+## Parakeet Unified EN 0.6B Core ML models
 
-The optimized backend downloads the `FluidInference/parakeet-unified-en-0.6b-coreml`
-model on demand. The weights are not stored in this repository or bundled in the
-application.
+The optimized backend downloads two sets of Core ML models on demand. Neither
+set is stored in this repository or bundled in the application.
 
-- Model (exact revision): <https://huggingface.co/FluidInference/parakeet-unified-en-0.6b-coreml/tree/4252711f6f060f9a2f91e5f081a806d7f45eebd8>
-- Core ML conversion and integration: FluidInference contributors
-- Based on NVIDIA Parakeet
-- Model license: Creative Commons Attribution 4.0 International
-  (<https://creativecommons.org/licenses/by/4.0/>)
+- The `FluidInference/parakeet-unified-en-0.6b-coreml` model at revision
+  <https://huggingface.co/FluidInference/parakeet-unified-en-0.6b-coreml/tree/4252711f6f060f9a2f91e5f081a806d7f45eebd8>.
+  Core ML conversion and integration: FluidInference contributors.
+- Short-window offline encoders at 2, 5 and 8 seconds, published as release
+  assets of this project under the tag `encoder-buckets-v1`. They are converted
+  from `nvidia/parakeet-unified-en-0.6b` with FluidInference's conversion
+  pipeline (<https://github.com/FluidInference/mobius>, Apache License 2.0) by
+  `scripts/build-bucket-encoder.py`, which records the checkpoint digest and
+  converter commit.
+
+- Original model: NVIDIA Parakeet Unified EN 0.6B
+  (<https://huggingface.co/nvidia/parakeet-unified-en-0.6b>)
+- Model license: NVIDIA Open Model License Agreement
+  (<https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/>).
+  The FluidInference conversion's model card labels it CC-BY-4.0; as a
+  derivative of the NVIDIA model it remains governed by the NVIDIA agreement,
+  and so do the short-window encoders.
+
+Notice: Licensed by NVIDIA Corporation under the NVIDIA Open Model License.
 
 ## Parakeet TDT 0.6B v3 int8 fallback model
 
