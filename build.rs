@@ -25,12 +25,19 @@ fn main() {
     // `libonnxruntime.dylib` next to itself at runtime.
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
-        // sherpa-onnx-sys copies the dylibs into the profile directory
-        // (`debug/`, `release/`); test and bench binaries link from its
-        // `deps/` child. With a cargo `build-dir` outside `target/` the
-        // prebuilt-cache rpath below is never found, so this is the path
-        // those binaries load the dylibs through.
-        println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path/..");
+        // sherpa-onnx-sys copies the dylibs into the build directory's
+        // profile folder (`<build-dir>/release`). Test binaries run from its
+        // `deps/` child, and with a cargo `build-dir` outside `target/` the
+        // binaries cargo copies to `target/release` are nowhere near it, so
+        // both load the dylibs through this absolute rpath. OUT_DIR is
+        // `<build-dir>/<profile>/build/<pkg>/out`. scripts/make-app.sh
+        // deletes every rpath from the bundled binary.
+        if let Some(profile_dir) = env::var_os("OUT_DIR")
+            .map(PathBuf::from)
+            .and_then(|out| out.ancestors().nth(3).map(std::path::Path::to_path_buf))
+        {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", profile_dir.display());
+        }
         // Also add the sherpa-onnx-prebuilt cache dir as an rpath so a
         // bare `cargo run` works without first copying dylibs alongside
         // the binary. Used as a fallback only — production .app bundles
