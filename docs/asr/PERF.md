@@ -631,3 +631,111 @@ Reopen only for a conversion that is EN-competitive on this corpus and drops
 the top-K joint outputs. Full tables, the artifact manifest and the replay
 commands are in [`../../bench/README.md`](../../bench/README.md); raw reports
 are under `bench/f0zg/`.
+
+## Hex engine (transcribe.cpp GGUF) comparison — 2026-10-31 (kata mspd)
+
+Hex runs the same Parakeet Unified EN 0.6B as a Q8_0 GGUF through
+transcribe.cpp on Metal. `bench/hex-engine` is a standalone package that copies
+Hex's engine path. The app does not depend on it. Both engines get the same
+audio, the same warm-up and the same release-to-text definition. Run on an M5
+Pro (24 GiB, macOS 26.6.2) at harness commit `10811fd`. The load average was
+2.6–3.3 at the start of each lock group (`bench/hex-engine/results/load.log`).
+
+**Gold corpus**: ten repetitions each. All three arms show zero WER/CER spread
+and no nondeterministic outputs.
+
+| arm | WER | CER | corpus p50 / p95 | peak RSS | gate |
+|---|---:|---:|---:|---:|---|
+| ours, Core ML int8 | 5.434783% | 3.571429% | **0.2396 / 0.2514 s** | **0.10 GiB** | pass |
+| Hex, whole clip (`run`) | 5.434783% | 3.991597% | 0.3598 / 0.3724 s | 0.19 GiB | **fail** (CER) |
+| Hex, live stream, unpaced | **4.347826%** | **3.361345%** | 1.0241 / 1.0505 s | 0.19 GiB | pass |
+
+**Hold loopback**: release-to-text p50 / p95 in ms, 30 repetitions after 2
+warm-ups. The four arms ran back to back for each fixture.
+
+| fixture | ours windowed (shipping) | ours serial | Hex whole clip | Hex live stream |
+|---|---:|---:|---:|---:|
+| 1 s | **45.5** / 56.6 | 46.0 / 49.0 | 52.5 / 56.0 | 47.0 / 55.0 |
+| 3 s | **53.0** / 64.5 | 54.0 / 68.1 | 79.0 / 99.0 | 71.0 / 77.0 |
+| 5 s | 86.5 / 101.1 | 86.0 / 106.7 | 110.0 / 124.1 | **74.5** / 77.5 |
+| 10 s | **65.0** / 72.5 | 100.5 / 114.7 | 128.0 / 143.1 | 79.0 / 83.5 |
+| 20 s | **61.5** / 67.0 | 166.0 / 191.8 | 200.5 / 224.6 | 82.0 / 86.0 |
+| multipause (15.1 s) | **48.5** / 51.5 | 171.5 / 200.6 | 181.5 / 210.8 | 81.0 / 90.1 |
+
+**Peak RSS in Hold**: Hex 0.18–0.20 GiB (whole clip) and 0.19–0.20 GiB
+(stream). `bench_e2e` does not report RSS, so our figure is the gold run's
+0.10 GiB. That figure includes the Core ML worker process. RSS does not
+capture all model weights for either engine: the Q8 GGUF alone is 0.68 GiB. It
+compares host-side overhead, not total memory.
+
+**Energy**: not measured. `powermetrics` needs sudo, and this account has no
+passwordless sudo. To take one sample per arm, run
+`sudo powermetrics --samplers cpu_power,gpu_power,ane_power -i 1000 -n 30` in a
+second terminal during each arm's Hold run.
+
+**Engine against engine.** The serial and Hex whole-clip arms are the
+like-for-like engine comparison: both decode the whole capture once at release
+through our capture path. Core ML is faster at every length, from 6.5 ms at 1 s
+to 34.5 ms at 20 s, and at gold corpus p50 (0.240 s against 0.360 s).
+
+**Product strategy against product strategy.** Each product's own dictation
+path is our 6 s windows against Hex's live stream. Hex's stream finalizes only
+the last 1.04 s context chunk at release, so its release-to-text stays near
+80 ms from 5 s up. Ours is lower at 3, 10 and 20 s and on multipause. At 1 s
+the two are level: ours is 1.5 ms lower at p50 and 1.6 ms higher at p95. Ours
+loses at 5 s (86.5 against 74.5 ms), the one fixture shorter than the 6 s
+window, where release still decodes the whole clip. This bench excludes Hex's
+200 ms post-release tail; Hex's app waits it before finalizing, so in the app
+each stream figure is at least 200 ms higher.
+
+**Quality.** The whole quality difference is one utterance. Hex's stream
+renders "Is IBM up today" exactly, where ours renders "Is IPM up today?". Hex's
+whole-clip run truncates it to "Is IBM up to". That one truncation fails the
+CER regression gate, which allows zero regression from 3.571429%. The stream
+arm drops sentence-final punctuation; the scorer normalizes punctuation, so
+this costs nothing here. On this seven-fixture, 92-word corpus the result
+supports "Hex's stream is not worse", not "it is better".
+
+Unpaced, the stream feeds each clip in 2,560-sample blocks as fast as the
+engine accepts them, so its corpus time measures stream throughput, not
+latency. The Hold table is the latency comparison.
+
+What the harness copies from Hex at commit `46c3c762`:
+
+- the Metal backend
+- one thread on the GPU device
+- word timestamps
+- no vocabulary
+- 1.5 s padding
+- the session recreated after every run and stream
+- chunking at the model's maximum audio length
+- the buffered stream's 5.6 / 1.04 / 1.04 s context, fed in blocks of at
+  least 2,560 samples
+- a prewarm of 8 s of zeros on the stream
+
+It does not copy Hex's 450 ms pre-roll, its 200 ms post-release tail, its
+pause cap (which acts only on pauses over 2.5 s) or its resampler. Both arms
+use our capture and resampler instead.
+
+Artifacts:
+
+- transcribe.cpp at `anomalyco/transcribe.cpp` rev
+  `7045d1c0fe7cee37747b2792977421d435e75fca` (crate `transcribe-cpp` 0.4.1,
+  as Hex patches it)
+- GGUF `handy-computer/parakeet-unified-en-0.6b-gguf` at
+  `7e948f21b7bdbac698d3318db9d350f1096f3b6c`, file
+  `parakeet-unified-en-0.6b-Q8_0.gguf`, 731,357,568 bytes, SHA-256
+  `4b50b6dd862bf6e346929aaf4f5eaacec003bfa3f56462d6c874b41ef2f38795`
+
+Reproduce:
+
+```bash
+# Gold, then Hold: one lock group per fixture, four arms back to back.
+BENCH_LOCK="$HOME/.cache/parakeet-bench.lock" scripts/bench-hex.sh
+# One stage only:
+STAGES=gold scripts/bench-hex.sh
+```
+
+The script fetches the GGUF and checks its hash, then rebuilds the worker,
+`asr_diff`, `bench_e2e` and `bench_hex`. Gold reports, Hold CSVs,
+`identity.txt` and `load.log` are under `bench/hex-engine/results/`.

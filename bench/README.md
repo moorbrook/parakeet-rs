@@ -1372,6 +1372,21 @@ end-to-end measurements above supersede it as the current performance record.
 362 ms ASR + 150 ms VAD ≈ **512 ms** — under the former 700 ms acceptance
 target before the native worker and speculative-decode work landed.
 
+## Hex engine comparison: M5 Pro 24 GB (2026-10-31)
+
+`scripts/bench-hex.sh` runs Hex's engine (transcribe.cpp, Parakeet Unified EN
+0.6B Q8_0 GGUF on Metal) against ours. The gold stage compares `asr_diff
+--gold` with `bench_hex gold`. The Hold stage runs four arms back to back on
+each loopback fixture. `bench_hex` is the standalone package in
+`hex-engine/`, which mirrors Hex's engine path. The app's dependency graph
+does not include it. The tables, the conclusions and the artifact hashes are
+in [`../docs/asr/PERF.md`](../docs/asr/PERF.md#hex-engine-transcribecpp-gguf-comparison--2026-10-31-kata-mspd).
+Raw reports are under `hex-engine/results/`.
+
+```bash
+BENCH_LOCK="$HOME/.cache/parakeet-bench.lock" scripts/bench-hex.sh
+```
+
 ## Files
 
 | Path                         | Purpose                                          |
@@ -1391,6 +1406,7 @@ target before the native worker and speculative-decode work landed.
 | `hold-multipause.{log,csv}`  | Generated Hold-mode runs on the four-clause pause fixture. |
 | `hold-serial*.{log,csv}`     | Generated Hold-mode runs with windowing off (the before arm). |
 | `hold-forced.{log,csv}`      | Generated Hold-mode runs at the shipping forced-cut config. |
+| `hex-engine/`                | Standalone `bench_hex` package for Hex's transcribe.cpp engine; `results/` holds the 2026-10-31 reports. |
 | `asr-quality-windowed-*.json` | Generated gold reports for the windowed decode arms. |
 | `idle-*.{log,csv}`           | Generated ANE idle re-wake A/B runs (sweep, tap, hold, energy). |
 | `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |

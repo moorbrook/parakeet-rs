@@ -24,3 +24,4 @@ endpoint-sweep/
 # bench/README.md and docs/asr/PERF.md.
 !hex-engine/results/
 !hex-engine/results/*.csv
+!hex-engine/results/load.log
