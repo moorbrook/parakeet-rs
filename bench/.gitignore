@@ -20,3 +20,7 @@ asr-quality.json
 !f0zg/
 !f0zg/*.csv
 endpoint-sweep/
+# kata mspd: the Hex engine comparison's raw artifacts, referenced by
+# bench/README.md and docs/asr/PERF.md.
+!hex-engine/results/
+!hex-engine/results/*.csv
