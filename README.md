@@ -5,9 +5,10 @@
 # Parakeet Dictation
 
 Native macOS / Apple Silicon dictation menu-bar app. Press a global
-hotkey, speak, transcript inserts at your cursor. Fully local — no API
-keys, telemetry, or network traffic after the required and optional model
-downloads complete.
+hotkey, speak, transcript inserts at your cursor. Recognition is fully
+local — no API keys, telemetry, or network traffic after the model download
+completes. An optional rewrite step hands the transcript to an OpenCode
+service you already run.
 
 The Cargo package and Rust library crate are `parakeet-dictation` and
 `parakeet_dictation`. The user-facing app remains **Parakeet**, and its existing
@@ -15,7 +16,7 @@ The Cargo package and Rust library crate are `parakeet-dictation` and
 
 - **ASR**: Parakeet Unified EN 0.6B int8 via a resident native Core ML worker
   (sherpa-onnx fallback and contextual-vocabulary backend)
-- **Polish (optional)**: Qwen 3.5 4B Q6_K via llama.cpp + Metal
+- **Rewrite (optional)**: the OpenCode service already running on the Mac
 - **Shell**: AppKit Rust app + resident Swift helper (no Tauri / Electron)
 - **Text injection**: `CGEventKeyboardSetUnicodeString` keystroke
 
@@ -91,13 +92,20 @@ PARAKEET_HUD_PREVIEW=1 cargo run
 The app opens directly into the Listening HUD without starting a dictation
 session.
 
-### Optional polish pass
+### Optional rewrite
 
-Flip Polish to On in Settings; the Qwen GGUF (3.5 GB) downloads
-automatically on first enable and is SHA-256 verified before loading. Polish
-strips fillers, fixes punctuation, and honours inline commands ("new
-paragraph", "scratch that"). It adds wall-clock latency but streams to the
-cursor on word boundaries.
+Set Rewrite to On in Settings to have the OpenCode service that is already
+running on this Mac (`opencode serve`) strip fillers, fix punctuation, and
+honour inline commands ("new paragraph", "scratch that") before the text is
+pasted. Parakeet never starts OpenCode and never reads or stores a provider
+key: it reads OpenCode's owner-only loopback registration
+(`~/.local/state/opencode/service.json`), checks that the registered process
+answers, and posts one stateless generation. Enter the model as
+`provider/model` with an optional variant; a reasoning model needs its `low`
+variant to answer within the 5 s deadline. When OpenCode is not running, is
+slower than 5 s, or answers with an error, the local transcript is pasted
+unchanged. The transcript then leaves the Mac through whatever provider
+OpenCode is configured for; see [`PRIVACY.md`](PRIVACY.md#the-opencode-rewrite).
 
 ### Custom vocabulary
 
@@ -158,7 +166,7 @@ profile removal, and current M5 Pro evidence.
 ### Settings and developer overrides
 
 Settings lets you record a new global shortcut, select Tap, Tap Fast, or Hold,
-toggle Polish, and open the vocabulary file. Changes apply without restarting.
+turn the OpenCode rewrite on or off, and open the vocabulary file. Changes apply without restarting.
 Caps Lock is also supported as a shortcut; because it emits toggle events
 rather than a press/release pair, Parakeet gives it tap-to-start,
 tap-to-finish semantics and locks the trigger selector accordingly.
@@ -195,22 +203,21 @@ Persistent settings, vocabulary, tuning evidence, and model paths are under
   delivery receipt, so an app that accepts the keystroke and discards it
   still looks like success — see [`PRIVACY.md`](PRIVACY.md#clipboard).
 - **Build size**: ~7 MB Rust binary + ~15 MB native worker + ~50 MB bundled
-  dylibs (mostly onnxruntime and llama-cpp). Model weights download separately.
+  dylibs (mostly onnxruntime). Model weights download separately.
 
 ## Layout
 
-App state lives behind two small state machines so the
-session/polish-load races stay localised:
+App state lives behind a small state machine so session races stay
+localised:
 
-`hotkey/menu → capture → VAD + speculative ASR → optional Qwen polish →
-word-boundary streamer → synthetic Unicode keystroke`. Silero remains the sole
+`hotkey/menu → capture → VAD + speculative ASR → optional OpenCode rewrite →
+synthetic Unicode keystroke`. Silero remains the sole
 endpoint authority; speculative recognition is discarded if speech resumes.
 
 - `src/app.rs` — orchestration, supervised worker spawns, panic recovery
 - `src/dictation_fsm.rs` — atomic (state, session, pending_terminate)
-- `src/llm_manager.rs` — polish-LLM lifecycle (Disabled / Loading / Ready)
-- `src/polish.rs` — `PolishBackend` trait + `PromptTemplate` + decode loop
-- `src/paste.rs` — `TextSink` trait + word-boundary `Streamer`
+- `src/rewrite.rs` — OpenCode discovery and the bounded rewrite request
+- `src/paste.rs` — `TextSink` trait + one-shot delivery
 - `src/ax_paste.rs` — `CGEvent` keystroke implementation
 - `src/streamer.rs` — per-session VAD/manual capture
 - `src/vocabulary.rs` — `vocabulary.txt` → sherpa hotwords encoding
@@ -219,8 +226,8 @@ endpoint authority; speculative recognition is discarded if speech resumes.
 - `src/clipboard.rs` — rescue copy when keystroke delivery fails
 - `src/{audio,asr,vad,hud,hotkey,menubar,settings,settings_ui,…}.rs`
 
-Five headless tools live under `src/bin/`: `bench_asr` and `bench_llm` measure
-the individual inference stages; `bench_e2e` replays production capture,
+Four headless tools live under `src/bin/`: `bench_asr` measures the
+recognition stage; `bench_e2e` replays production capture,
 endpointing, and recognition; `asr_diff` gates transcript quality; and
 `tune_asr` selects an evidence-backed runtime plan.
 
@@ -230,7 +237,7 @@ state, recovery behavior, and the clean/revoked QA matrix are in
 [`docs/macos-permissions.md`](docs/macos-permissions.md).
 
 Architectural rationale lives in [`docs/ADR.md`](docs/ADR.md) (decisions
-0001-0029). Reproducible latency and quality evidence lives in
+0001-0036). Reproducible latency and quality evidence lives in
 [`bench/README.md`](bench/README.md); the original, now-archived optimization
 plan is [`docs/latency-plan.md`](docs/latency-plan.md). The deferred
 Developer-ID/notarization shipping procedure is captured in
@@ -277,5 +284,5 @@ at your option (Rust ecosystem convention).
 
 Runtime-downloaded models ship under their own licenses: Parakeet TDT
 0.6B v3 (NVIDIA), Parakeet Unified EN 0.6B Core ML (CC-BY-4.0), Silero
-VAD (MIT), Qwen 3.5 4B Instruct (Apache-2.0). See
+VAD (MIT). See
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

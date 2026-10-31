@@ -1,20 +1,17 @@
 # Latency plan: closing the gap to Wispr Flow
 
 > **Status: archived planning snapshot.** This document records the May 2026
-> route from the former sherpa/`claude -p` pipeline to local in-process polish.
+> route for recognition, endpointing, and paste latency on the sherpa pipeline.
 > It is not the current architecture guide. The authoritative current state is
 > [`ADR.md`](./ADR.md), while commands and measurements are maintained in
 > [`../bench/README.md`](../bench/README.md).
 
-**Current outcome (2026-08-11):** the shipping pipeline is resident Parakeet
-Unified Core ML recognition with speculative decode, optional Qwen 3.5 4B
-Q6_K polish through llama.cpp/Metal, and synthetic Unicode keystroke delivery.
-Tap Fast measured 148.5 ms p50 from acoustic endpoint to transcript-ready after
-ADR-0031 moved its confirmation window from 150 to 90 ms; pause-friendly Tap
-stayed below one second p95 on the endpoint corpus. The
-original Qwen 2B candidate was replaced by the higher-quality 4B model, whose
-standalone polish benchmark measured 1225 ms p50 completion and 29 ms p50
-TTFT. Streaming output keeps first text visible well before completion.
+**Current outcome:** the shipping pipeline is resident Parakeet Unified Core ML
+recognition with speculative decode, an optional rewrite through an
+already-running OpenCode service (ADR-0036), and synthetic Unicode keystroke
+delivery. Tap Fast measured 148.5 ms p50 from acoustic endpoint to
+transcript-ready after ADR-0031 moved its confirmation window from 150 to
+90 ms; pause-friendly Tap stayed below one second p95 on the endpoint corpus.
 
 The body below preserves the dated plan and its assumptions for decision
 history. Statements labelled “original,” “snapshot,” or “historical” are not
@@ -33,7 +30,6 @@ Before the work landed, the load-bearing facts were:
 - **VAD hangover was 150 ms.** At this planning snapshot, `src/vad.rs` used a
   single 150 ms confirmation window. ADR-0025 later split that into a
   pause-friendly 750 ms Tap default and an explicit 150 ms Tap Fast mode.
-- **Current pipeline on main is ASR → `claude -p` subprocess → paste.** Main has `src/polish.rs` tracked since commit `c046668`, switched in `5824e20` to spawn `claude -p` per polish request. Its own source comment puts subprocess startup at ~1–3 s on a warm cache (`src/polish.rs:34-36`), which is a structural latency floor we cannot fit under a <1 s p50 target. This plan **replaces that backend** with in-process Rust inference via `llama-cpp-2` + Metal, running Qwen 3.5 2B-it Q4_K_M (see §6). The `claude -p` path is removed. No Python, no subprocess, no HTTP — pure Rust on the call side.
 - **`src/performance.rs` is CPU topology only**, not per-stage latency tracing. There is nothing measuring the budget today.
 - **CoreML cache is not configured.** `src/asr.rs:72` requests `provider="coreml"` but no `ModelCacheDirectory` is set, so the EP recompiles subgraphs on cold start.
 - **The ADR already publishes the latency story.** ADR.md:250 reports `~840 ms` on a 5 s utterance (150 ms VAD + 640 ms ASR + ~50 ms finalize). Current target is `<1 s p50 with WER ≤ 2%`. ADR-0009 documents that the streaming-Parakeet swap was evaluated and rejected.
@@ -43,13 +39,12 @@ several of them.
 
 ## What "Wispr Flow latency" actually is
 
-Wispr Flow's published <700 ms is cloud, GPU-backed, on a tuned Whisper-class encoder plus a fine-tuned Llama polish served by Baseten + TensorRT-LLM. Their <250 ms polish budget is achievable because they pay for the GPU. Their ASR likely runs on short audio segments via streaming. We are local-first on Apple Silicon. Fair targets on the minimum spec (M5 Pro 24 GB):
+Wispr Flow's published <700 ms is cloud, GPU-backed, on a tuned Whisper-class encoder. Their ASR likely runs on short audio segments via streaming. We are local-first on Apple Silicon. Fair targets on the minimum spec (M5 Pro 24 GB):
 
-- **<700 ms p50 / <1.0 s p95** on 5 s utterances, no polish. Matches Wispr Flow on-device.
-- **<1.0 s p50 / <1.5 s p95** on 5 s utterances, with local LLM polish. Polish is additive, not hidden.
+- **<700 ms p50 / <1.0 s p95** on 5 s utterances. Matches Wispr Flow on-device.
 - **<1.5 s p50** on 10 s utterances. Long-form dictation will lag Wispr Flow because their cloud GPU eats the encoder cost we pay on-device.
 
-Going below the no-polish target requires either a streaming recognizer (already rejected in ADR-0009 — worth re-surveying, not assuming) or moving to cloud ASR.
+Going below the 5 s target requires either a streaming recognizer (already rejected in ADR-0009 — worth re-surveying, not assuming) or moving to cloud ASR.
 
 ## Original latency breakdown (5 s utterance, M5 Pro)
 
@@ -100,8 +95,6 @@ ADR-0009 rejected the streaming-model swap on prior survey. The landscape moves 
 
 The goal of streaming ASR is not just lower endpoint→text time — it's overlapping the ASR work with the user still speaking, so the final-decode tail is short. If the survey turns up a viable option that wasn't viable in ADR-0009, write a new ADR.
 
-**Superseded 2026-09 (Kata 0tpp).** This said speculative polish was impossible until a streaming recognizer shipped, on the grounds that there is no partial transcript to speculate on. ADR-0023's speculative ASR produces one: the endpoint *candidate* decodes a provisional transcript, and the confirmation window is dead time polish can use. `polish::Speculation` implements the polish side.
-
 ### 5. VAD tuning (probably no headroom)
 
 At this planning snapshot, `MIN_SILENCE_S = 0.150`. Going lower would cut at
@@ -112,73 +105,8 @@ the broader long-pause problem by making 750 ms the normal Tap policy, keeping
 
 Files: `src/vad.rs` (only if benchmark says so).
 
-### 6. Original polish tier — in-process Rust inference
+### 6. Things explicitly NOT in this plan (and why)
 
-Polish is **fully local, fully in-process, pure Rust on the call side**. No Python, no subprocess, no HTTP. Architecture:
-
-```
-Rust app
-  └── src/polish.rs ── direct call ──▶  llama-cpp-2 (Metal feature)
-                                            └── Qwen 3.5 2B-it Q4_K_M (1.28 GB on disk)
-```
-
-**Why in-process, not a sidecar:** every layer of indirection costs latency. `claude -p` pays 1–3 s for subprocess startup. A Python sidecar pays HTTP round-trip plus interpreter overhead in the bundle. In-process pays 0 ms for IPC. The ~140 ms gap to Wispr Flow is too tight to spend on transport tax we can avoid.
-
-**Chosen stack — single candidate after constraints:**
-
-Filtering by `<2 GB on disk` + `newest generation` + `Apple Silicon optimized` + `pure-Rust shippable` collapses the candidate space to exactly one:
-
-- **Model: Qwen 3.5 2B-Instruct Q4_K_M** (1.28 GB on disk; Feb 2026 release; beats Gemma 4 E2B on 3/4 size-matched benchmarks).
-- **Runtime: `llama-cpp-2`** (Rust binding on crates.io to upstream llama.cpp, `metal` feature flag for Apple Silicon acceleration).
-
-**Why this and not the alternatives that were explored:**
-
-- **Gemma 4 E2B** — disqualified; no sub-2 GB variant at quality-grade quant. See [gemma4-mlx-implementation.md](./gemma4-mlx-implementation.md) for the disqualification note.
-- **HuggingFace Candle** — doesn't yet ship Qwen 3.5 support (it has Qwen 3, not 3.5 — different generation).
-- **OminiX-MLX** — has no Qwen 3.5 crate; using it would mean writing a `qwen35-mlx` crate from scratch, same architecture-port problem as the Gemma 4 case.
-- **`mlx-rs` direct** — same from-scratch architecture-port problem.
-
-llama.cpp's upstream Qwen 3.5 support landed at release; `llama-cpp-2` wraps it. Zero porting work, working Metal acceleration, available today.
-
-**Total install footprint:**
-
-- Parakeet (today): ~700 MB
-- Qwen 3.5 2B-it Q4_K_M: 1.28 GB
-- **Total: ~2.0 GB** — right at the cap.
-
-**`bench_llm` (validates the chosen stack against the budget):**
-
-Before polish wiring lands in `polish.rs`, build `bench_llm` as a standalone binary that:
-
-- Loads Qwen 3.5 2B-it Q4_K_M via llama-cpp-2 with Metal.
-- Runs the existing `SYSTEM_PROMPT` from `src/polish.rs` on main, plus a 60-token transcript input.
-- Measures: time-to-first-token (TTFT), tokens/sec sustained, peak resident RAM, cold-load time, **p50 / p95 / p99 over 100 polish requests** on M5 Pro 24 GB.
-- Output: `bench/polish-backends.csv` + a short ADR citing the numbers.
-
-If `bench_llm` reports ≤300 ms p50 polish latency, the chosen stack is confirmed and polish wiring follows. If it misses, the CSV tells us what to fix next (faster quant? smaller model? streaming generation? KV-cache reuse across the dictation session?) rather than which library to swap to. No more pivots without real numbers.
-
-**Tiers, in order of latency cost:**
-
-- **Raw mode (default for short utterances): no polish.** Paste raw Parakeet output. Parakeet TDT 0.6B v3 produces capitalised, punctuated output (per NVIDIA model card), though the published WER does not evaluate formatting quality. For short single-sentence dictations the raw output is usable as-is — and it's the only path that hits Wispr Flow's <700 ms.
-- **In-process polish (default for normal dictations):** llama-cpp-2 + Qwen 3.5 2B-it Q4_K_M. Expected polish latency on M5 Pro for a 60-token output: **TBD — established by `bench_llm`.** A defensible upper bound is **≤300 ms p50** to keep total perceived latency under 1.0 s. The benchmark either confirms or refutes this; acceptance numbers use what it produces, not a guess.
-- **No cloud fallback.** Project policy disallows direct Anthropic API. `claude -p` startup cost makes it incompatible with the latency target. If the in-process model fails to load (corrupted weights, OOM on a non-minimum-spec machine) → fall back to raw paste with a one-line user notice. Don't degrade silently to a slow path.
-
-**Crash isolation tradeoff:** `llama-cpp-2` wraps upstream llama.cpp (C++) via FFI. A Rust panic on the call side is catchable with `std::panic::catch_unwind` (failure mode: this dictation pastes raw, app keeps running). A hard segfault inside llama.cpp is not catchable by `catch_unwind` and would crash the whole app. Mitigation: upstream llama.cpp is mature and battle-tested, so hard crashes are rare in practice; `bench_llm` running 100 requests is a smoke test for stability under load. If we ever see segfaults in real use, the escape hatch is a Rust sidecar process talking to the main app over a unix socket (defeats the in-process latency win, but recovers crash isolation).
-
-**Model lifecycle:**
-
-- Load weights at app boot, in a background thread (mirror the existing `src/warmup.rs` pattern for Parakeet).
-- Keep the model resident for the app's lifetime. No unload/reload between dictations.
-- First-launch model download: pull from Hugging Face on first polish-enabled launch, cached in `~/Library/Application Support/com.parakeet.rs/llm/`. Same first-run download pattern as Parakeet today. **(Status 2026-05-17: not implemented. `load_llm_blocking` bails with a clear error when the file is missing; the user fetches it manually per the `bench/README.md` one-liner.)**
-- Warm a dummy 1-token inference before declaring polish ready, so the first real polish doesn't pay the lazy-init cost.
-
-**RAM budget on minimum spec (M5 Pro 24 GB):** Parakeet mmap ~640 MB + ORT arenas + Qwen 3.5 2B Q4 ~1.6 GB resident (weights + KV cache + scratch buffers) + app + OS overhead ≈ 3 GB resident. Comfortably under an eighth of 24 GB. Memory is not the constraint; latency is.
-
-Files: `src/polish.rs` (rewrite — drop `Command::new("claude")`, replace with direct call into `llama-cpp-2`), warmup folded into `App::spawn_llm_setup` in `src/app.rs` (the standalone `src/llm_warmup.rs` was removed during the architecture-review round in favour of a `PolishBackend::warmup` trait method), new `src/bin/bench_llm.rs`, `Cargo.toml` (drop subprocess deps, add `llama-cpp-2` with `metal` feature).
-
-### 7. Things explicitly NOT in this plan (and why)
-
-- **~~Speculative polish on partial transcripts.~~ Superseded 2026-09 (Kata 0tpp).** The original objection — that this requires streaming ASR, and that two consecutive 150 ms frames with identical text is not a stability criterion the streaming-ASR literature supports — was answered by ADR-0023 rather than refuted. Speculation now keys on the VAD endpoint candidate, not on frame-to-frame text stability: if the speaker resumes, the candidate is invalidated and the speculative polish is discarded. `polish::Speculation` holds the polish side; the streamer hook is not wired yet. Note that this hides at most one confirmation window (750 ms LongForm, 150 ms Fast) — it shortens the wait, not the polish.
 - **Draft-paste-then-overwrite.** `src/paste.rs` posts synthetic Unicode keystrokes via `CGEventKeyboardSetUnicodeString` (ADR-0019; this replaces the original "clipboard + enigo ⌘V" plan). It has no idea what the focused app inserted, whether the user typed in between, or how to select and replace text. Reliable selection/replace across terminals, password fields, browser editors, Electron apps, and native rich-text editors is an accessibility-API project, not a paste tweak. Out of scope.
 - **Supporting M1/M2/M3 or 8/16 GB configs.** Minimum spec is M5 Pro 24 GB. Quoting numbers for lower tiers is misleading; benchmark on the target or stay silent.
 - **Generic "M5 Max benchmark" numbers from third-party blog posts.** This app runs on M5 Pro. Benchmark there, not on a one-off M5 Max review.
@@ -189,11 +117,8 @@ For this plan to be considered complete, all numbers measured on the minimum spe
 
 1. `src/performance.rs` emits per-dictation timing logs, and `scripts/bench-latency.sh` produces a CSV of p50/p95/p99 by utterance length.
 2. CoreML model cache directory is configured and a benchmark shows first-dictation cold-start improves measurably.
-3. Warm p50 for a 5 s utterance, **no polish**, is **≤ 700 ms** — matches Wispr Flow's published cloud number, on-device. (Current baseline is ~840 ms; the ~140 ms comes from CoreML cache + verified warmup + any free VAD/finalize trims the benchmark surfaces.)
-4. Warm p50 for a 5 s utterance, **with in-process polish**, is **≤ 1.0 s**. The LLM must be warm (model loaded + dummy inference done) before this measurement.
-5. No regression in `tests/` — settings round-trip and model-fetch URL stability tests pass (commit `70c46c3`).
-6. `bench_llm` runs the existing `SYSTEM_PROMPT` through Qwen 3.5 2B-it Q4_K_M via llama-cpp-2 + Metal over 100 polish requests; outputs TTFT / tokens/sec / p50/p95/p99 in `bench/polish-backends.csv`. The polish-tier ADR cites the numbers.
-7. In-process inference is wrapped in `std::panic::catch_unwind`; a smoke test that injects a panic from the polish call confirms the next dictation pastes raw with a user-visible notice and the app keeps running.
+3. Warm p50 for a 5 s utterance is **≤ 700 ms** — matches Wispr Flow's published cloud number, on-device. (Current baseline is ~840 ms; the ~140 ms comes from CoreML cache + verified warmup + any free VAD/finalize trims the benchmark surfaces.)
+4. No regression in `tests/` — settings round-trip and model-fetch URL stability tests pass (commit `70c46c3`).
 
 ## Outcome rollup (amended through 2026-08-11, M5 Pro 24 GB)
 
@@ -201,11 +126,8 @@ For this plan to be considered complete, all numbers measured on the minimum spe
 |---|---|---|---|
 | 1 | PhaseTimer + bench-latency.sh CSV | ✅ **MET** | `src/performance.rs` `PhaseTimer` emits one `phase_timer …` line per dictation; `scripts/bench-latency.sh` + `scripts/bench-aggregate.py` produce `bench/baseline.csv`. Baseline table in [`bench/README.md`](../bench/README.md). |
 | 2 | CoreML `ModelCacheDirectory` | **SUPERSEDED** | The sherpa binding still lacks this seam ([ADR-0017](./ADR.md#0017--coreml-modelcachedirectory-blocked-at-the-sherpa-onnx-rust-binding)), but the shipping backend moved to a resident native Core ML worker in ADR-0022. Startup warmup and Core ML's compiled plans keep initialization outside dictation. |
-| 3 | 5 s no-polish p50 ≤ 700 ms | ✅ **MEASURED: 182.0 ms** | ADR-0023's matched production-capture replay measures **182.0 ms p50 / 203.0 ms p95** from Core Audio's final non-silent playback instant to transcript-ready, versus 613.0 / 652.5 ms for the serial baseline (**3.37× / 3.21×**). Synthetic Unicode delivery is the only excluded sub-ms step. |
-| 4 | 5 s with-polish p50 ≤ 1.0 s | ✅ **MET (amended 2026-09, Kata 0tpp)** | The 1225 ms previously recorded here was one hardcoded worst-case transcript, not a percentile — 55 output tokens at 43.4 tok/s, the configuration's structural bound. This criterion is about a **5 s utterance**, so it is read against the eval categories that are 5-s-shaped, not against a blend that includes "Yes." and "Sounds good.": **filler-light 446 ms, command 439 ms, filler-heavy 857 ms p50** on the shipping Qwen 3.5 4B Q6_K path. All three are under 1.0 s, so the criterion holds on its own terms. For reference the whole-set blend is 444 ms and the historical transcript alone is 1209 ms in that same run. Note the p95 does **not** clear 1.0 s on the heaviest category (filler-heavy 1219 ms); this row is a p50 criterion. Per-category numbers and the eval set's composition are in [`../bench/README.md`](../bench/README.md). See [ADR-0034](./ADR.md#0034--polish-latency-the-target-was-met-the-measurement-was-not). |
-| 5 | Tests pass | **MET** | The current suite covers settings compatibility, model integrity, endpoint policy, tuning evidence, permission policy, polish panic isolation, and delivery fallback. `cargo test --locked` is the current verification command; this document no longer pins a test count that immediately goes stale. |
-| 6 | Phase-0 bench CSV + polish-tier ADR | **MET, then amended** | The historical CSV records Qwen 2B Phase-0 evidence. ADR-0018 later moved production to **Qwen 3.5 4B Q6_K** for instruction-following quality and records its 30-repetition follow-up. |
-| 7 | catch_unwind + panic smoke test | ✅ **MET** | `app::deliver_cleaned` wraps polish in `std::panic::catch_unwind`. 4 panic-isolation tests in `app::tests` — three for `panic_message` payload extraction (static-str, String, unknown), one for the catch_unwind boundary. Fallback path falls through to `paste::deliver(raw, …)` and sets a menu-bar status string. |
+| 3 | 5 s p50 ≤ 700 ms | ✅ **MEASURED: 182.0 ms** | ADR-0023's matched production-capture replay measures **182.0 ms p50 / 203.0 ms p95** from Core Audio's final non-silent playback instant to transcript-ready, versus 613.0 / 652.5 ms for the serial baseline (**3.37× / 3.21×**). Synthetic Unicode delivery is the only excluded sub-ms step. |
+| 4 | Tests pass | **MET** | The current suite covers settings compatibility, model integrity, endpoint policy, tuning evidence, permission policy, rewrite fallback, and delivery fallback. `cargo test --locked` is the current verification command; this document no longer pins a test count that immediately goes stale. |
 
 ### Current replay and smoke-test commands
 
@@ -217,10 +139,9 @@ scripts/make-app.sh
 open target/release/bundle/osx/Parakeet.app
 log stream --process parakeet-rs --predicate 'eventMessage CONTAINS "phase_timer"'
 
-# Settings → Polish → On downloads and verifies the pinned 3.5 GB Qwen GGUF.
 # Dictate; `dur_post_endpoint_ms` is the full post-endpoint wall clock.
 
-# Reproduce the automated no-polish and endpoint-policy gates:
+# Reproduce the automated end-to-end and endpoint-policy gates:
 REPS=30 WARMUP_REPS=2 scripts/bench-end-to-end.sh
 REPS=30 WARMUP_REPS=2 scripts/bench-endpoint-policy.sh
 ```
@@ -228,10 +149,6 @@ REPS=30 WARMUP_REPS=2 scripts/bench-endpoint-policy.sh
 ## Historical constraints
 
 - Stay on Rust + native AppKit (no Tauri/WebKit additions; the `objc2-app-kit` bindings in `Cargo.toml` are the current direction).
-- **Fully local, fully Rust, in-process.** No cloud transport for polish. No `claude -p`. No Anthropic API. No Python sidecar. No HTTP. No subprocess of any kind for the polish path.
-- `bench_llm` had to validate the chosen stack before polish wiring landed. The
-  later 4B quality amendment intentionally accepted a slower completion time
-  and retained streaming delivery.
 - Minimum hardware is M5 Pro 24 GB; do not add code paths or settings UI for lower tiers.
 - New dependencies need a one-paragraph justification in an ADR.
 - Use `parking_lot::Mutex` (already in tree) for shared state.
@@ -243,11 +160,6 @@ REPS=30 WARMUP_REPS=2 scripts/bench-endpoint-policy.sh
 - `src/coreml_worker.rs` — resident native optimized backend and runtime-plan seam.
 - `src/asr.rs` — common recognizer interface and sherpa fallback.
 - `src/endpointing.rs` — current pause-friendly Tap and Tap Fast policies.
-- `src/app.rs` — capture, speculative ASR, polish, and delivery orchestration.
+- `src/app.rs` — capture, speculative ASR, optional rewrite, and delivery orchestration.
 - `src/performance.rs` — phase timing and Apple Silicon topology metadata.
 - NVIDIA Parakeet TDT 0.6B v3 model card — punctuation/capitalization claim.
-- Google Gemma 4 model card — "E" = effective parameters, not total.
-- [`llama-cpp-2`](https://crates.io/crates/llama-cpp-2) — Rust binding to upstream llama.cpp; `metal` feature flag enables Apple Silicon acceleration. The chosen runtime.
-- Qwen 3.5 4B-Instruct Q6_K GGUF on Hugging Face — the shipping polish model.
-- [gemma4-mlx-implementation.md](./gemma4-mlx-implementation.md) — archived implementation study, not an active backend plan.
-- `src/polish.rs` — current in-process llama.cpp generation and streaming path.

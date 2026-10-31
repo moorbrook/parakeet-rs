@@ -15,12 +15,8 @@ transcripts.json
 asr-quality.json
 *-quality.json
 *.csv
-!cleanup-backends.csv
-!polish/
-!polish/*.csv
 # kata f0zg: the TDT v3 comparison's raw per-arm artifacts, referenced by
 # bench/README.md and docs/asr/PERF.md.
 !f0zg/
 !f0zg/*.csv
-!polish/eval.json
 endpoint-sweep/

@@ -18,11 +18,11 @@ ADRs target. Update whenever the code lands or a measurement is taken.
 |---|---|---|---|
 | End-of-speech → text appears | Resident Parakeet Unified Core ML recognition starts speculatively behind an unchanged Silero stop authority. Tap Fast measured **182.0 ms p50 / 203.0 ms p95** on the representative 5 s production-path replay; pause-friendly Tap measured **637.0 ms p50 / 658.1 ms p95** on the 14.225 s endpoint fixture. | **<1 s p50** with the representative-speech quality gate intact | none — ADR-0022, ADR-0023, and ADR-0025 shipped and measured |
 | Recognition acceleration | A resident native Swift worker owns the int8 Parakeet Unified Core ML graph on CPU+ANE. The sherpa CoreML backend remains the automatic load-failure fallback. An explicit per-chip tuner keeps CPU+ANE unless another bounded plan clears quality, memory, and ≥5% performance gates. | Native Apple Silicon execution with evidence-backed placement | none — ADR-0022 + ADR-0026 shipped; current M5 Pro evidence correctly retains CPU+ANE |
-| Resident set | ~800 MB (640 MB mmap'd ASR model + ORT arenas + audio buffers); +~4 GB when polish is On (Qwen 3.5 4B Q6_K weights + KV cache); ~50 MB bundled dylibs | ≤5 GB steady state with polish On (revised with the 4B bump, ADR-0018 amendment) | none — ADR-0016 + ADR-0018 shipped |
+| Resident set | ~800 MB (640 MB mmap'd ASR model + ORT arenas + audio buffers); ~50 MB bundled dylibs | ≤1.2 GB steady state | none — ADR-0016 + ADR-0022 shipped |
 | Settings window | Native `NSWindow` opened from menubar "Settings…" (`src/settings_ui.rs`); `orderFrontRegardless` so it surfaces above other apps | native, on-demand | none — shipped |
 | Menubar UX | SF Symbols (`mic` / `mic.fill` / `arrow.down.circle`) via `objc2_app_kit::NSImage`; state-reflective menu labels | HIG-conformant template image with state | none — shipped |
 | Paste path | `CGEventKeyboardSetUnicodeString` synthetic keystroke at `AnnotatedSession` tap layer (`src/ax_paste.rs`) | no clipboard mutation; works in terminals, browsers, native, Electron, IDEs | none — [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) shipped, supersedes ADR-0011 |
-| Smart formatting | In-process LLM polish pass: Qwen 3.5 4B Q6_K via llama-cpp-2 + Metal (`src/polish.rs`); opt-in via Settings → Polish → On | optional local polish, streaming output to cursor on word boundaries | none — [ADR-0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) shipped + amended (4B bump) |
+| Smart formatting | Optional rewrite through an already-running OpenCode service (`src/rewrite.rs`), off by default; an absent service, an error, an empty answer, or the 5 s deadline pastes the local transcript unchanged | optional formatting pass that never withholds the local transcript | none — [ADR-0036](#0036--optional-transcript-rewrite-through-the-running-opencode-service) shipped |
 | Custom vocabulary | A plain-text vocabulary is tokenized with the model's own pieces and biased over the native joint output; the sherpa hotword path survives only as the fallback's implementation | explicit specialization without silently changing the generic model | none — ADR-0033 removed the fallback cliff; ADR-0028's bound on a global score change stands |
 | macOS permissions | Contextual Input Monitoring onboarding, just-in-time Microphone/Accessibility requests, a permanent dashboard, settings recovery links, activation-time revocation detection, and a stable self-signed local signing identity so grants survive rebuilds (ADR-0035) | explain before requesting and remain usable when a grant is absent | implementation shipped in ADR-0029; destructive revocation confirmation remains issue #23 |
 
@@ -100,8 +100,12 @@ GPT-Realtime-Whisper ($0.017/min), Microsoft MAI-Transcribe-1 (3.9% FLEURS),
 NVIDIA NIM Nemotron. All produce excellent WER. All require network and
 external trust.
 
-**Decision.** Default and only inference path is local. No API keys, no BYOK
-in the settings UI, no network call after the first-run model download.
+**Decision.** Speech recognition runs only on the Mac. No API keys, no BYOK
+in the settings UI, and no internet call by Parakeet after the first-run
+model download. The optional transcript rewrite
+([ADR-0036](#0036--optional-transcript-rewrite-through-the-running-opencode-service))
+hands the text to a loopback OpenCode service the user already runs, which
+may call its own model provider; audio never leaves the Mac.
 
 **Alternatives.**
 - *Cloud-only* (Wispr Flow's choice): ~$30/mo at our user's usage profile
@@ -258,9 +262,9 @@ never confuse aspiration with engineering:
 | First word in indicator | <500 ms | **n/a — indicator removed in [ADR-0014]** | n/a | retired |
 | Cold start (launch → first hotkey responsive) | ~2 s | native model load **0.130 s**, first-result path **0.278 s** on the measured M5 Pro; full AppKit launch is not separately claimed | **<3 s** with models present | component evidence passes; keep full-launch measurement honest |
 | Representative-speech WER / CER | not published | **5.43% / 3.57%**, zero ten-repeat spread on the seven-file human corpus | frozen product gate **≤8% / ≤5%** with no added baseline error or category regression | met by ADR-0021/0022 |
-| Privacy | cloud | zero network calls after installed model artifacts pass local verification | **zero network calls after required/optional model downloads** | [ADR-0003](#0003--100-local-inference-no-cloud-apis-as-defaults) |
-| Smart formatting | yes, cloud LLM | Qwen 3.5 4B Q6_K, local and streamed | **yes, local LLM post-pass** | met by ADR-0018/0019 |
-| Resident set (steady state) | ~150 MB | ~800 MB asserted without polish; ~4 GB with Qwen loaded | **≤5 GB with polish On** | met after the ADR-0018 4B amendment |
+| Privacy | cloud | zero network calls after installed model artifacts pass local verification | **zero internet calls by Parakeet after the model downloads**; with the opt-in rewrite on, transcripts go through the user's own OpenCode service | [ADR-0003](#0003--100-local-inference-no-cloud-apis-as-defaults) + [ADR-0036](#0036--optional-transcript-rewrite-through-the-running-opencode-service) |
+| Smart formatting | yes, cloud LLM | optional rewrite through an already-running OpenCode service; the local transcript is pasted when it fails | **optional formatting pass** | met by [ADR-0036](#0036--optional-transcript-rewrite-through-the-running-opencode-service)/0019 |
+| Resident set (steady state) | ~150 MB | ~800 MB asserted | **≤1.2 GB** | met by ADR-0016/0022 |
 | Battery cost / 30 min dictation | n/a | unmeasured | **<2% on M5 Pro** | resident CPU+ANE worker and idle QoS policy exist; a controlled energy protocol is still required |
 
 **Honesty notes.**
@@ -349,9 +353,8 @@ the recording window so the finalize cost drops to one chunk + decoder pass.
    test-other. The Parakeet WER difference between 1.9% and ~3% is one extra
    error per 100 words on long-form text — noticeable.
 3. **Native punctuation/capitalization is part of Parakeet TDT v3's value.**
-   Losing it means we'd need [ADR-0010](#0010--local-llm-post-processing-for-smart-formatting)
-   to ship before v1, adding 150–400 ms of LLM warmed-pass latency — which
-   would more than erase the streaming latency savings.
+   Losing it means a post-processing pass would have to ship before v1,
+   adding latency that would more than erase the streaming latency savings.
 
 NVIDIA's flagship `nvidia/nemotron-speech-streaming-en-0.6b` (2.32% test-clean
 at 1.12s chunk, native punctuation, comparable parameter count) is the *only*
@@ -397,57 +400,10 @@ becomes available upstream.
 
 **Consequences.** [ADR-0009] is now narrower than originally drafted:
 it covers the VAD auto-stop UX (shipped) but explicitly does NOT cover a
-recognizer swap. ADR-0010 LLM post-pass became less urgent because Parakeet
-already emitted punctuation. [ADR-0007]'s original sub-200 ms p50 target was
+recognizer swap. [ADR-0007]'s original sub-200 ms p50 target was
 retired in favour of a more honest sub-1 s target. The 150 ms endpoint remains
 available through explicit Tap Fast mode; normal Tap uses ADR-0025's
 pause-friendly policy.
-
----
-
-## 0010 — Local LLM post-processing for smart formatting
-
-**Status:** **Superseded by [ADR-0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m),
-which shipped the local polish pass.** The body below is the original proposal.
-
-**Context.** Wispr Flow's headline feature is *context-aware AI rewriting*:
-dictate casually, output is a polished email; dictate in a code editor,
-output is structured. Parakeet TDT v3 emits punctuation and capitalization
-but not paragraph breaks, code formatting, or tone shifts.
-
-**Decision.** Optional local LLM post-pass between recognizer output and the
-text-injection step. Default off; enable via settings checkbox.
-
-Implementation: spawn a small local LLM (candidates: Qwen2.5-1.5B,
-Llama-3.2-3B, gemma-3-2b, or Apple's local `Foundation Model` on macOS 26+)
-via `llama-cpp-2` or `mlx-rs`-via-FFI. Few-shot prompt with the
-current-app-name (read via `NSWorkspace.frontmostApplication`) injected as
-context: "you are formatting dictation about to be pasted into <app>."
-
-**Alternatives.**
-- *No formatting*: matches raw Parakeet output. Misses the Wispr Flow bar.
-- *Rule-based formatting only* ("um/uh removal, voice commands like
-  'new paragraph')*: easy, helps, but doesn't reach LLM-quality rewriting.
-- *Cloud LLM* (Anthropic/OpenAI): violates [ADR-0003](#0003--100-local-inference-no-cloud-apis-as-defaults).
-
-**Consequences.** Realistic post-pass latency: **150–400 ms warmed**, not
-the 50–150 ms originally quoted. Breakdown for a 1.5B-param model on M5 Pro
-with KV cache warm and the model resident: ~50 ms TTFT, ~30 tokens output
-at ~10 ms/token = ~300 ms generation, plus tokenize/detokenize overhead
-~20–50 ms. Token streaming **does not help** here because we need a single
-final string before injection — partial-rewrite streaming would cause
-flicker in the target app and corrections after paste. If the post-pass
-budget collides with [ADR-0007](#0007--performance-targets-beat-wispr-flow), default it off
-and surface as an opt-in "polish output" toggle in settings.
-
-We're now bundling two models (~640 MB ASR + ~1.5–3 GB LLM). Privacy story
-holds. Default-off respects users who want raw transcription **and** keeps
-the latency target intact for the no-formatting path.
-
-**Open question.** Use Apple's macOS 26+ on-device Foundation Model API
-(free, integrated, ANE-optimized, **closed but on-device**)? Trades zero
-bundle size for OS-version pinning. Worth a separate ADR once we know the
-mac-26 baseline is acceptable for our users.
 
 ---
 
@@ -710,16 +666,13 @@ A SwiftUI rewrite would substitute:
 - **AXUIElement APIs** for objc2-accessibility glue (un-defers
   [ADR-0011](#0011--direct-accessibility-text-injection-deferred)).
 - **NSStatusBar + SwiftUI settings view** for Tauri tray + WebView settings.
-- **Apple Foundation Model API** (macOS 26+) for the
-  [ADR-0010](#0010--local-llm-post-processing-for-smart-formatting) post-pass.
+- **Apple Foundation Model API** (macOS 26+) for an LLM post-pass.
 
 Cost: a Swift rewrite is ~1,000 lines thrown away, several weeks of Swift
 fluency development, and lock-in to a single OS forever.
 
 Benefit: every layer becomes Apple-native, the CoreML / ANE story stops
-being a vendor-and-pray exercise, smaller binary, faster cold start, and
-the "smart formatting" ADR collapses from "bundle a 3 GB LLM" to "call
-Foundation Model API."
+being a vendor-and-pray exercise, smaller binary, and faster cold start.
 
 **Decision (spike-resolved).** **Stay on Tauri+Rust.** The
 [ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage)
@@ -756,7 +709,7 @@ performance targets) and throwing away ~1,500 lines of Rust + TypeScript.
 **Alternatives reconsidered.**
 - *Pivot to SwiftUI now anyway, on principle*: rejected — the original
   motivation for the pivot was the ADR-0012 maintenance tax, which has
-  evaporated. SwiftUI's other advantages (Foundation Model API for the
+  evaporated. SwiftUI's other advantages (Foundation Model API for an
   LLM post-pass, AXUIElement for direct injection) remain real but are
   not load-bearing for v1.
 
@@ -764,199 +717,6 @@ performance targets) and throwing away ~1,500 lines of Rust + TypeScript.
 on the original critical path. The dormant SwiftUI pivot path is kept in
 the ADR record so we know what to do if a future ONNX Runtime regression
 makes CoreML EP unreliable.
-
----
-
-## 0018 — Polish backend: llama.cpp + Qwen 3.5 2B Q4_K_M
-
-**Status:** **Accepted — shipped and measured; amended to Qwen 3.5 4B Q6_K.**
-
-**Context.** [docs/latency-plan.md](./latency-plan.md) §6 calls for a
-Candle vs OminiX-MLX head-to-head on Gemma 4 E2B 4-bit. Research surfaced
-three blockers before any bench could run:
-
-1. **Gemma 4 doesn't exist in Candle 0.10.2.** Candle *main* branch added
-   `pub mod gemma4` recently, but no `quantized-gemma4` example yet —
-   fp16/bf16 weights only (~10 GB for 5.1B-loaded E2B).
-2. **OminiX-MLX ships no Gemma crate.** Adopting it for Gemma 4 means
-   writing a new `gemma4-mlx` crate from scratch (per
-   [docs/gemma4-mlx-implementation.md](./gemma4-mlx-implementation.md)),
-   which catalogues seven architectural divergences from Qwen3. Multi-day
-   port + token-parity validation against Python mlx-lm. Out of scope as
-   the v1 polish backend; gated on a measured Candle/llama.cpp miss.
-3. **Gemma 4 E2B doesn't fit the <2 GB disk budget.** Q4_K_M is ~3 GB
-   ([bartowski/google_gemma-4-E2B-it-GGUF](https://huggingface.co/bartowski/google_gemma-4-E2B-it-GGUF)).
-   Going lower than Q4_K_M (Q3_K_M ~2.4 GB, Q2_K ~1.9 GB) hits the steep
-   small-model quant degradation curve flagged by the [Qwen3
-   quantization study](https://arxiv.org/html/2505.02214v1).
-
-**Decision.** Replace `claude -p` (current `src/polish.rs` path) with
-in-process inference via **llama.cpp + Qwen 3.5 2B-Instruct Q4_K_M**.
-
-- **Model:** [`unsloth/Qwen3.5-2B-GGUF`](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF)
-  → `Qwen3.5-2B-Q4_K_M.gguf` (1.22 GB on disk).
-- **Backend:** [`llama-cpp-2`](https://crates.io/crates/llama-cpp-2)
-  Rust binding (crates.io, default-features off, `metal` feature on).
-  llama.cpp builds llama.cpp's C++ core via cmake at first compile.
-- **Chat template:** ChatML with `/no_think` directive — Qwen 3.5's
-  reasoning mode is on by default and would blow past our output cap
-  inside the `<think>` block. The directive disables thinking; we
-  additionally pre-close an empty `<think></think>` on the assistant
-  side as belt-and-braces.
-
-**Why Qwen 3.5 2B, not the originally-spec'd Gemma 4 E2B.**
-
-Per the size-matched comparison in
-[Maniac](https://www.maniac.ai/blog/qwen-3-5-vs-gemma-4-benchmarks-by-size):
-
-| Benchmark | Gemma 4 E2B | Qwen 3.5 2B | Winner |
-|-----------|-------------|-------------|--------|
-| MMLU-Pro | 60.0 | **66.5** | Qwen (+6.5pp) |
-| TAU2-Bench | 24.5 | **48.8** | Qwen (+24pp) |
-| MMMU-Pro | 44.2 | **50.3** | Qwen (+6.1pp) |
-| MMMLU | **67.4** | 63.1 | Gemma (+4.3pp) |
-
-Qwen 3.5 2B beats Gemma 4 E2B on 3/4 size-class benchmarks, fits the
-<2 GB disk budget at acceptable Q4_K_M quant, is one model generation
-newer (Feb 2026 vs Gemma 4's earlier 2026 release), and works in the
-shipping `llama-cpp-2` Rust binding today. Gemma 4 wins only on
-multilingual MMMLU — not load-bearing for English-language dictation
-polish.
-
-**Why llama.cpp, not Candle.** Candle ships neither Qwen 3.5 (new
-hybrid Gated-DeltaNet architecture, `Qwen3_5ForConditionalGeneration`)
-nor Gemma 4 Q4. llama.cpp picked up both within days of release. The
-"pure Rust" constraint in the latency plan is interpreted as
-"no Python, no subprocess, no HTTP" — FFI to a well-maintained C++
-library (analogous to sherpa-onnx for ASR) satisfies it. The Metal
-backend on Apple Silicon delivers ~100 tok/s on Qwen 3.5 2B Q4_K_M
-(measured below).
-
-**Measured Phase-0 numbers, M5 Pro 24 GB, 100 iterations
-(`bench/polish-backends.csv`):**
-
-| Metric | Mean | p50 | p95 | p99 |
-|---|---|---|---|---|
-| TTFT (ms) | 2.0 | 2.0 | 2.0 | 2.0 |
-| Generation (ms) | 548 | 548 | 558 | 567 |
-| **Total per polish (ms)** | **551** | **550** | **560** | **570** |
-| Decode (tokens/sec) | 100.3 | 100.4 | 101.7 | 101.9 |
-
-Cold model load: 229 ms (incurred once per process; the warmup is
-done as part of `App::spawn_llm_setup` in `src/app.rs`, so polish
-is ready before the user's first hotkey press).
-Output: 55 tokens (one cleaned paragraph) for a 240-character noisy
-input. p99 / p50 = 1.04 — variance is negligible, Metal kernel
-scheduling is steady-state from iteration 1.
-
-**Latency budget consequence.** Projected total post-endpoint latency
-on a 5 s utterance with polish:
-
-```
-   362 ms   ASR (§1 measured)
-+  150 ms   VAD hangover (vad.rs:15)
-+   50 ms   paste finalize (latency-plan estimate)
-+  550 ms   polish (this bench, p50)
-= 1112 ms   total p50
-```
-
-That's **~112 ms over the latency-plan §6 acceptance criterion of
-≤ 1.0 s p50 with polish**. Three mitigations on the table for the
-§4 polish-rewrite work, in order of effort:
-
-1. **Stream the paste**: emit cleaned tokens to NSPasteboard + ⌘V
-   incrementally as the model generates, rather than buffering until
-   end-of-sequence. The user feels latency as "first token visible",
-   not "last token visible". Saves ~300–400 ms perceived; the actual
-   wall clock to last-token is unchanged.
-2. **Trim output cap**: typical polish output for a 30-token input
-   is 20–35 output tokens. Cap at 40 → ~400 ms gen → total ~960 ms p50,
-   under budget. Risk: long dictations get truncated; need fallback to
-   raw paste if the cap hits.
-3. **Ship at ~1.1 s p50, advertise honestly**: still ~5× faster than
-   `claude -p` subprocess (1–3 s startup alone). The §6 acceptance
-   number gets a footnote: "1.0 s p50 was an aspirational target;
-   measured v1 is 1.1 s p50 within budget for streaming-paste v1.1."
-
-Recommend (1) for §4: streaming paste is the lever that buys the most
-perceived-latency improvement and aligns with how cloud dictation
-tools (Wispr Flow, etc.) deliver their <700 ms feel.
-
-**Rejected alternatives revisited.**
-
-- **OminiX-MLX + new `gemma4-mlx` crate.** The implementation doc
-  ([gemma4-mlx-implementation.md](./gemma4-mlx-implementation.md))
-  estimates this as "from-scratch work" with 7 architectural
-  divergences from Qwen3. Plan-faithful but multi-day. Defer; revisit
-  if the measured llama.cpp number ever misses a tightened budget.
-- **Candle main + gemma4 fp16.** ~10 GB on-disk, blows past the <2 GB
-  user constraint, and the loader is not yet quantized.
-- **Direct Anthropic API.** Rejected by project directive (no cloud
-  polish). The in-process llama.cpp path replaces both the API and the
-  prior `claude -p` subprocess approach.
-- **`mlx-rs` direct.** Same multi-day port story as OminiX-MLX without
-  the shared infrastructure crates.
-
-**Open issues (resolved post-§6).**
-
-- ~~The `/no_think` directive leaks into the model's output.~~
-  Resolved — `strip_no_think_tail` in `src/polish.rs` handles all
-  observed variants (`/no_think`, `no_think`, `no think`,
-  `No think`, etc., case-insensitive, ignoring trailing punctuation).
-- ~~Streaming-paste is non-trivial against the clipboard+⌘V shape.~~
-  Resolved — `paste::Streamer` streams to the focused app via
-  `CGEventKeyboardSetUnicodeString` keystrokes (ADR-0019), one
-  word-boundary-batched chunk per LLM emission burst. No clipboard,
-  no AX, no flicker.
-- ~~Open: model file management.~~ Resolved 2026-06-11 alongside the
-  4B bump — `model_fetch::ensure_polish_model` auto-downloads the
-  GGUF on first polish-enable (same `.part`-validate-rename flow as
-  the ASR first-run fetch), wired into `load_llm_blocking` so the
-  boot and Settings-toggle paths share it. A settings-test pins the
-  download URL's filename to `Settings::polish_model_path`.
-
-**References.**
-
-- `bench/polish-backends.csv` — full 100-row Phase-0 data, this M5 Pro.
-- `src/bin/bench_llm.rs` — the bench harness.
-- [Welcome Gemma 4 — Hugging Face](https://huggingface.co/blog/gemma4)
-- [unsloth/Qwen3.5-2B-GGUF](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF)
-- [llama-cpp-2 crate](https://crates.io/crates/llama-cpp-2)
-- [Qwen 3.5 vs Gemma 4 size-matched benchmarks — Maniac](https://www.maniac.ai/blog/qwen-3-5-vs-gemma-4-benchmarks-by-size)
-- [Qwen3 quantization empirical study (arxiv)](https://arxiv.org/html/2505.02214v1)
-
-**Amendment (2026-06-11): model bumped to Qwen 3.5 4B Q6_K.**
-
-The shipped 2B's instruction-following misses were the polish pass's
-dominant quality complaint: paraphrasing, over-deleting legitimate
-"like", fumbling `scratch that`. With the disk budget relaxed from
-<2 GB to ≤5 GB, the swap went to
-[`unsloth/Qwen3.5-4B-GGUF`](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF)
-→ `Qwen3.5-4B-Q6_K.gguf` (3.53 GB). Same family ⇒ the ChatML +
-`/no_think` template, tail-strip, and `PolishBackend` plumbing carry
-over unchanged; only `Settings::polish_model_path` moved.
-
-Why 4B Q6_K and not the alternatives:
-
-- **9B**: every 4-bit quant exceeds 5 GB (Q4_K_S 5.39 GB); only Q3
-  fits, which re-enters the small-model quant-degradation curve this
-  ADR already rejected. Decode would also drop to ~30 tok/s.
-- **4B at Q4_K_M (2.74 GB)**: fits easily, but the relaxed budget
-  buys Q6_K's negligible-loss quant for free.
-- **Other families (Llama 3.3 8B, Phi-4-mini, Mistral)**: nothing
-  at ≤5 GB clearly beats Qwen3.5-4B on instruction following, and
-  all cost chat-template migration + no-think revalidation.
-- **Apple Foundation Models (WWDC26 AFM 3)**: zero-download wildcard;
-  Swift-only API needs an `@objc` shim dylib. Tracked as a possible
-  second `PolishBackend`, not a blocker for this bump.
-
-Measured on the same harness (`bench/README.md` §6 follow-up):
-total p50 550 ms → 1225 ms, decode 100 → 43 tok/s, TTFT 29 ms.
-Streaming paste (ADR-0019) keeps perceived latency at
-time-to-first-words, so the 2.2× wall-clock cost lands after the
-user already sees text flowing. Resident memory with polish On rises
-~1.6 GB → ~4 GB (weights + KV); the steady-state budget row at the
-top of this file is updated accordingly.
 
 ---
 
@@ -1008,11 +768,11 @@ Paths forward, in increasing cost:
 **Why deferring is OK.** The §1 baseline (bench/baseline.csv,
 2026-05-16, M5 Pro 24 GB) puts the 5 s ASR-only p50 at **362 ms**.
 Adding the latency plan's 150 ms VAD hangover + 50 ms paste finalize
-≈ 562 ms total post-endpoint — already inside the §6 acceptance
-criterion of ≤ 700 ms p50 no-polish. The §2 optimization helps
+≈ 562 ms total post-endpoint — already inside the latency plan's
+acceptance criterion of ≤ 700 ms p50. The §2 optimization helps
 *first-launch* cold start only (where the user feels CoreML's MLProgram
 graph compile cost). That's a real win to grab eventually, but it's
-not gating the ship of §6 (polish rewrite + acceptance numbers).
+not gating the plan's acceptance numbers.
 
 **Open question.** Empirically verify whether CoreML's own framework-level
 cache at `~/Library/Caches/com.apple.MLModelCompiler/` already short-
@@ -1035,7 +795,7 @@ path 2 (vendored fork) becomes the right move.
 **Status:** **Accepted — shipped.** Supersedes [ADR-0011](#0011--direct-accessibility-text-injection-deferred)
 (deferred AX path).
 
-**Context.** Delivery of the transcribed (and optionally LLM-cleaned)
+**Context.** Delivery of the transcribed (and optionally rewritten)
 text into the focused app was the source of a long bug tail through
 2026-05-15/16/17. Each round of fixes exposed the next layer:
 
@@ -1090,10 +850,6 @@ posting bypasses some terminals' input pipelines.
 - Native Cocoa: TextEdit, Notes, Mail, Messages
 - Electron: Slack, Discord, VS Code, Cursor
 - IDEs: Xcode, JetBrains family
-- Streaming polish: 3-chunk dictation into Ghostty round-tripped in
-  861 ms `dur_post_endpoint_ms` end-to-end (audio capture stop →
-  ASR → polish polish → keystroke posted → focused-app insertion),
-  with the polish pipeline contributing ~550 ms of that.
 
 **Rejected alternatives:**
 
@@ -1474,7 +1230,7 @@ it again.
 
 Existing artifacts are hashed before their first use by this version. A JSON
 sidecar beside each model records the expected digest plus the file's size,
-mtime, ctime, device, and inode. Later launches may skip the multi-gigabyte hash
+mtime, ctime, device, and inode. Later launches may skip the full hash
 only when all cached identity fields still match. Malformed/unreadable cache
 data is a cache miss, never proof of integrity; cache writes use fsync plus an
 atomic same-directory rename.
@@ -1486,15 +1242,12 @@ atomic same-directory rename.
 | `joiner.int8.onnx` | sherpa `2bda32e` | 6,355,277 | `3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3` |
 | `encoder.int8.onnx` | sherpa `2bda32e` | 652,184,281 | `acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247` |
 | `silero_vad.onnx` | sherpa-onnx `asr-models` release asset | 643,854 | `9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6` |
-| `Qwen3.5-4B-Q6_K.gguf` | Qwen `e87f176` | 3,525,956,768 | `fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66` |
 
-The sherpa and Qwen revisions are the upstream repository commits
-[`2bda32ec70b097a55adaa07d9a7173915b43cc78`](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/commit/2bda32ec70b097a55adaa07d9a7173915b43cc78)
-and
-[`e87f176479d0855a907a41277aca2f8ee7a09523`](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/commit/e87f176479d0855a907a41277aca2f8ee7a09523).
+The sherpa revision is the upstream repository commit
+[`2bda32ec70b097a55adaa07d9a7173915b43cc78`](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/commit/2bda32ec70b097a55adaa07d9a7173915b43cc78).
 Silero's mutable release URL is made byte-immutable by the pinned digest.
 
-**Scope.** This ADR's original table covers six artifacts. ADR-0022 now adds
+**Scope.** This ADR's table covers five artifacts. ADR-0022 now adds
 the separately reviewed 15-file Core ML truth pack and reuses this verifier,
 cache, and atomic-publish path before the Swift worker may load it. Its exact
 manifest is maintained in `model_fetch.rs` and
@@ -1506,9 +1259,8 @@ metadata reads and small sidecar reads. Changing a model now requires an
 intentional code review of revision, size, and digest together.
 
 Measured on the M5 Pro release bundle against the installed artifacts, the
-one-time SHA-256 pass took 1.291 s for the 671 MB sherpa/VAD set and 6.313 s for
-the 3.53 GB polish GGUF. The next launch's metadata-cache checks took 0.738 ms
-and 2.632 ms respectively. This is a launch/first-use gate, not part of
+one-time SHA-256 pass took 1.291 s for the 671 MB sherpa/VAD set. The next
+launch's metadata-cache checks took 0.738 ms. This is a launch/first-use gate, not part of
 recording, endpointing, or inference.
 
 ---
@@ -2313,163 +2065,6 @@ stale code.
 
 ---
 
-## 0034 — Polish latency: the target was met, the measurement was not
-
-**Status:** Accepted. Kata 0tpp.
-
-**Context.** [docs/latency-plan.md](./latency-plan.md) acceptance row 4
-recorded "5 s with-polish p50 ≤ 1.0 s" as **NOT MET**, citing
-**1225 ms p50** for Qwen 3.5 4B Q6_K. That number came from
-`bench_llm` running **one** hardcoded transcript — `SAMPLE_INPUT`, a
-deliberately worst-case 240-character filler-laden string producing 55
-output tokens. At the model's measured 43.4 tok/s that is the
-structural bound of the configuration, and it is arithmetic, not a
-percentile. There was no polish eval set, so neither "p50" nor the
-plan's "no measurable quality regression" had a population to refer to.
-
-**Decision.** Build the eval set first, then re-read the verdict.
-
-`bench/polish/eval.json` holds 26 transcripts with the polished text
-each should produce, across seven categories: clean input, sub-4-word
-utterances, light filler, heavy filler, inline editing commands,
-technical terms, and one long transcript. It retains `SAMPLE_INPUT`
-verbatim as `legacy-bench-sample` so the historical number stays
-anchored. `bench_llm --eval` scores word-level error rate against
-`expected` — casing and punctuation included, because those are two of
-the three things polish exists to fix — and reports latency and quality
-over the same items.
-
-Measured on it (3 reps × 26 items, M5 Pro 24 GB, `bench/README.md`
-§6 follow-up):
-
-Quality columns are schema-1 measurements; see the correction below.
-Latency is unaffected by it.
-
-| Configuration | p50 | p95 | `legacy-bench-sample` | mean WER (schema 1) | exact |
-|---|---|---|---|---|---|
-| **4B Q6_K full-text (shipping)** | **444 ms** | 1219 ms | 1209 ms | **0.139** | 17/26 |
-| 4B + skip < 4 words | 446 ms | 1222 ms | 1221 ms | 0.139 | 17/26 |
-| 4B + context reuse | 424 ms | 1220 ms | 1198 ms | 0.139 | 17/26 |
-| 4B edits-only | 600 ms | 2438 ms | 2421 ms | 0.321 | 9/26 |
-| 2B Q6_K full-text | 230 ms | 572 ms | 571 ms | 0.185 | 13/26 |
-| 0.8B Q6_K full-text | 141 ms | 338 ms | 330 ms | 0.249 | 11/26 |
-
-**The shipping code already meets the target.** A fixed-sample replay in
-the same session reproduces 1202 ms against the 1225 ms on record, so
-the harness measures the same path; the 444 ms and the 1209 ms are the
-same run, described over a population and over one item.
-
-The latency-plan row is amended from **NOT MET** to **MET on the eval
-set, with the single-transcript bound recorded separately**. Both
-numbers are published because both are true, and the composition of the
-eval set — nine of 26 items are zero-change by construction — is a
-judgement I made. Per-category latency and quality are published so the
-blended figure can be re-weighted.
-
-**Polish remains opt-in.** `PolishMode` already defaults to `Off` and
-that does not change. The reason is no longer latency — it is that the
-quality case for turning polish on has not been made on this eval set,
-not that a specific defect has been proven.
-
-> **Correction (2026-09-04, review round 1).** An earlier revision of
-> this ADR justified the default with "the `technical` category scores
-> WER 0.847 on the 4B — spoken version numbers and identifiers are where
-> polish does real damage". That claim was unsupported and backwards.
-> `src/polish.rs` system-prompt rule 7 says "Preserve technical terms,
-> names, and code-like fragments exactly as transcribed", and the model
-> obeys it. Re-run with `--show-output`:
->
-> ```
-> input    : Um, bump serde to one point zero point two one nine in Cargo dot toml.
-> produced : Bump serde to one point zero point two one nine in Cargo dot toml.
-> ```
->
-> Filler removed, casing fixed, identifier preserved. The 0.847 came
-> from two eval items (`technical-01`, `technical-03`) whose `expected`
-> demanded spoken-to-written conversion the prompt forbids — they
-> penalised the model for correct behaviour. `eval.json` schema 2
-> derives their expected text from the prompt rules alone and the
-> category scores **0.091**. Whether polish damages identifiers is
-> **unmeasured**; nothing in this set tests it.
->
-> A second defect was found in the scorer: it split on whitespace, so a
-> model emitting a space where `new paragraph` required a line break
-> scored zero errors. Fixed, and the `command` category moves
-> **0.000 → 0.059** — the 4B ignores the line-break command in two of
-> four items. That one is a real polish defect, and it was hidden.
->
-> Under schema 2 with the corrected scorer the 4B blends to **WER 0.061,
-> 18/26 exact** (from 0.139, 17/26). Inputs never changed, so every
-> latency number in this ADR stands. The 2B, 0.8B, and edits-only rows
-> carry schema-1 quality and are not comparable; re-measuring them needs
-> another bench turn.
-
-**Rejected, with reasons.**
-
-- **Edits-only output** (`OLD ==> NEW` span replacements instead of full
-  text). Worse on both axes: p50 600 ms, WER 0.321. The 4B answers with
-  the corrected transcript rather than an edit list in 17 of 26 items,
-  despite an explicit prohibition and a worked example. The arithmetic
-  never favoured it: full-text averages 18.7 output tokens on this set,
-  an edit line costs 5–8 tokens per fix because the search text must
-  carry enough context to be unique, and the variant measured 26.3. A
-  GBNF grammar (`LlamaSampler::grammar`; the `sampler` feature is on)
-  would force the separator but cannot prevent
-  `<whole input> ==> <corrected>`, which parses cleanly and doubles the
-  tokens. Kept behind `PolishStrategy::EditsOnly`, default off.
-- **Prompt caching the system prompt's KV state.** Architecturally
-  unavailable. Qwen 3.5 is a hybrid Gated-DeltaNet model (ADR-0018);
-  its recurrent state carries no per-token position, so
-  `llama_memory_seq_rm` **refuses** partial sequence removal and leaves
-  the cache untouched. `mean_reused_prompt_tokens=0.0` on every run.
-  Bounded above by the 29 ms TTFT regardless. What survives is context
-  reuse — not re-allocating a `LlamaContext` per call — worth 20 ms.
-- **Draft-model speculative decoding.** Blocked by the same refusal: the
-  verification step needs exactly the partial KV rollback the memory
-  module will not do. llama-cpp-2 also exposes no helper for it.
-- **Smaller polisher as the default.** The 2B is a genuine tail fix —
-  p95 1219 → 572 ms, structural-bound item 1209 → 571 ms — but at WER
-  0.185 vs 0.139 and 13/26 vs 17/26 exact. That is a measurable
-  regression, matching this ADR-0018's original finding about the 2B's
-  instruction following, now with a number. Available as a config
-  option, not a default. The 0.8B is faster and clearly worse.
-
-**Accepted as options, default off.**
-
-- `SkipPolicy { min_words: 4 }` bypasses the model for utterances the
-  system prompt already tells it to return unchanged. Quality identical,
-  fires on 3/26, moves the mean 591 → 556 ms. It does **not** move the
-  p50, because the items it removes were already the fastest — worth
-  having, not worth claiming as a latency win.
-- `polish::Speculation` runs polish on the provisional transcript during
-  the VAD confirmation window and keeps the result only if the confirmed
-  transcript matches. This hides latency rather than reducing it: at
-  most one confirmation window, 750 ms LongForm and 150 ms Fast. Output
-  is buffered, never streamed, because a speculative transcript can
-  still be wrong and pasted text cannot be recalled. The `streamer.rs`
-  hook is not wired; end-to-end measurement is a follow-up. This
-  supersedes the latency plan's claim that speculative polish requires a
-  streaming recognizer — [ADR-0023](#0023--speculative-decode-on-the-endpoint-candidate)'s
-  speculative ASR already produces the provisional transcript.
-
-**Follow-ups filed by this work.**
-
-1. **Inline editing commands are ignored.** The 4B produces
-   `Ship the parts Monday. Invoice follows separately.` where
-   `new paragraph` requires a line break — two of four `command` items.
-   Real, reproducible, and previously invisible because the scorer was
-   newline-blind.
-2. **Re-measure quality for the 2B, 0.8B, and edits-only rows** under
-   `eval.json` schema 2 and the corrected scorer. Needs a bench turn.
-3. **Filler removal misses** — `and, you know,` survives in
-   `technical-03`.
-4. Grammar-constrained edits-only for a long-form mode.
-5. End-to-end measurement of speculative polish once the streamer hook
-   lands, including the hit rate that the byte-identical
-   provisional/confirmed comparison actually achieves.
-
----
-
 ## 0035 — Self-signed local identity so TCC grants survive rebuilds
 
 **Status:** Accepted. Kata 0bb3.
@@ -2551,6 +2146,72 @@ explaining why their grants do not survive rebuilds.
 
 ---
 
+## 0036 — Optional transcript rewrite through the running OpenCode service
+
+**Status:** Accepted (2026-10-31, Kata ahg9).
+
+**Decision.** Transcript cleanup is an optional rewrite done by an agent
+harness that is already running on the Mac, not by a model Parakeet loads.
+The only supported harness is an OpenCode service (`opencode serve`). The
+rewrite is off by default (`rewrite_enabled`), and the model is chosen in
+Settings as `provider/model` plus an optional variant (`rewrite_model`,
+`rewrite_variant`); empty uses the service's default model.
+
+**Contract** (`src/rewrite.rs`, adapted from Hex `src/opencode_service.rs` and
+`src/dictation_processor.rs` at `07e0a05`, MIT):
+
+- Discovery reads `$XDG_STATE_HOME/opencode/service.json` (else
+  `~/.local/state/opencode/service.json`), then `service-<channel>.json`. The
+  file must be a regular file owned by the user with no group or other
+  permissions; its `url` must be loopback `http://`. `GET /api/info` must
+  answer with the registered `pid` (and `version` when registered), otherwise
+  the registration is stale and OpenCode is treated as not running.
+- Requests are HTTP/1.1 over `TcpStream` to that loopback address, with the
+  registration's password as HTTP Basic (`opencode:<password>`). That
+  password is the service's own loopback credential; Parakeet reads no
+  provider key and stores no secret.
+- The rewrite is one `POST /api/experimental/generate` with
+  `{"prompt", "model": {"providerID", "id", "variant"}}`, falling back to
+  `/api/generate` only on HTTP 404. Only HTTP 200 with non-empty `data.text`
+  is pasted. A refused connection, a stale registration, the deadline, any
+  other status, a `{"message"}` error answer, an unparseable body or empty
+  text pastes the local transcript unchanged.
+- Parakeet never runs an OpenCode, Claude Code or Codex executable.
+
+**Deadline: 5 s for discovery, `/api/info` and generation together.** The
+hotkey is ignored while `DictationState::Rewriting` is shown, so this is the
+longest a rewrite can delay the next dictation; it never loses one. Measured
+on the M5 Pro on 2026-10-31 against OpenCode 2.0.32 with this prompt and a
+25-word transcript, ten runs per row, no other benchmark running (load
+average 3.5):
+
+| Model | Variant | Latency |
+|---|---|---|
+| `zai-coding-plan/glm-5.3-flash` | `low` | 0.98–3.38 s, median 1.45 s |
+| `zai-coding-plan/glm-5.3-flash` | default | 6.7–26.6 s, median 9.4 s |
+| `opencode/flint-40b-free` (service default) | — | HTTP 503 "Free usage limit reached" |
+
+A reasoning model therefore needs its low variant to fit; the variant setting
+exists for that reason, and the model setting exists because the service's
+default model on this Mac answers with an error. Hex's 30 s post-processing
+default is sized for long prompts and is not used here.
+
+**Other harnesses.** Claude Code 2.1.316 offers no local server a client can
+call: non-interactive use is `claude -p`, which starts a process, and
+`--remote-control` relays through claude.ai (`claude --help`). Codex 0.166.0
+runs a shared app-server daemon on a unix socket
+(`~/.codex/app-server-control/app-server-control.sock`, `codex app-server
+--help`, marked experimental); its protocol creates persisted agent threads
+and turns rather than answering a one-shot generation, so it is not used.
+
+**Consequences.** With the rewrite on, the transcript and the vocabulary terms
+leave the Mac through whichever provider OpenCode is configured for
+(PRIVACY.md). Local recognition and contextual vocabulary are unchanged. An
+old `settings.json` that still carries `polish_mode` loads normally: the
+settings struct does not deny unknown keys, so the key is ignored.
+
+---
+
 ## Target status index
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -2559,8 +2220,8 @@ explaining why their grants do not survive rebuilds.
 | <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) + [0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) + [0031](#0031--tap-fast-confirms-at-90-ms-punctuation-rejected-as-an-endpoint-signal) | **Shipped + measured** — Tap Fast is 148.5 ms p50 on the representative 5 s bucket, down 33.5 ms, and 46.0 ms faster on the 3.505 s human fixture (13.0 ms measured, offset low by that fixture's marker); pause-friendly Tap remains below 1 s on the endpoint corpus | nothing |
 | Live partial transcripts | [0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) | **Out of scope** — no quality-preserving streaming model won; speculative final decode provides the measured latency win | a new candidate must beat the existing quality/latency/resource gates |
 | CPU+ANE requested and performance-gated | [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans) | **Shipped** — explicit tuner retained CPU+ANE on the M5 Pro after all challengers failed the ≥5%/quality/memory gates | Core ML owns final per-op placement |
-| ≤5 GB resident set with polish On | [0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation) + [0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped** — native tray shell, resident Core ML worker, and Qwen mmap/lifecycle | nothing |
-| Smart formatting parity with Wispr Flow | [0018](#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m) | **Shipped** — optional local Qwen polish streams on word boundaries | strict last-token latency remains above the original target |
+| ≤1.2 GB resident set | [0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped** — native tray shell and resident Core ML worker; ~800 MB asserted | nothing |
+| Optional smart formatting | [ADR-0036](#0036--optional-transcript-rewrite-through-the-running-opencode-service) | **Shipped** — optional rewrite through an already-running OpenCode service; any failure pastes the local transcript | nothing |
 | Clipboard not clobbered | [0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) | **Shipped** on the normal path; clipboard is rescue-only for observable delivery failure | `CGEventPost` has no delivery receipt |
 | Custom vocabulary | [0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list) + [0028](#0028--generic-asr-base-with-evidence-gated-domain-and-user-adaptation) + [0033](#0033--contextual-biasing-on-the-native-core-ml-path) | **Shipped + measured** — the native worker biases over its own joint output: 5.43% to 3.26% WER, custom-vocabulary 27.27% to 9.09%, no category regression, and 2.4% decode cost at five seconds with fifty terms | nothing |
 
@@ -2579,6 +2240,12 @@ explaining why their grants do not survive rebuilds.
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-10-31** — [ADR-0036](#0036--optional-transcript-rewrite-through-the-running-opencode-service)
+  accepted and implemented. The optional formatting pass is a rewrite by the
+  OpenCode service already running on the Mac, bounded by a 5 s deadline,
+  with the local transcript pasted on any failure. Parakeet loads no
+  language model of its own.
 
 - **2026-09-04** — [ADR-0035](#0035--self-signed-local-identity-so-tcc-grants-survive-rebuilds)
   accepted and implemented. Local builds now sign with the keychain's
@@ -2665,7 +2332,7 @@ Anything not on this table is either accepted-and-done or out of scope.
 - **2026-08-10** — [ADR-0024](#0024--immutable-identities-for-rust-managed-model-artifacts)
   added: immutable Hugging Face revisions, pinned length/SHA-256 identities,
   streaming `.part` verification, corrupt-file refetch, and metadata-cached
-  first-use verification for all six Rust-managed model artifacts.
+  first-use verification for all five Rust-managed model artifacts.
 
 - **2026-08-10** — [ADR-0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority)
   added: dual-VAD speculative decode with the original confirmer retained as
@@ -2694,9 +2361,6 @@ Anything not on this table is either accepted-and-done or out of scope.
   - [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected) VAD silence
     threshold tightened from 250 ms to 150 ms; latency budget made
     explicit and shown to require ADR-0012 to hold.
-  - [ADR-0010](#0010--local-llm-post-processing-for-smart-formatting)
-    post-pass latency estimate bumped from "50–150 ms" (hand-waved) to
-    "150–400 ms warmed" (engineered).
   - [ADR-0011](#0011--direct-accessibility-text-injection-deferred) **deferred to
     v2** by user direction.
   - [ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage) **promoted

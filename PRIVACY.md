@@ -6,32 +6,37 @@ synthesizes keystrokes into whatever app is focused. That combination
 deserves a straight answer about what it does with them, not a bullet
 in a README.
 
-Short version: **your audio and transcripts are never transmitted by
-Parakeet, and no audio or transcript is written to disk.** Settings and
-downloaded models are on disk, and there is one failure path that puts
-a transcript on your clipboard — both covered below. The rest of this
+Short version: **your audio is never transmitted, your transcripts are
+transmitted only if you turn on the OpenCode rewrite, and no audio or
+transcript is written to disk.** Settings and downloaded models are on
+disk, the rewrite hands each transcript to an OpenCode service you
+already run, and there is one failure path that puts a transcript on
+your clipboard — all covered below. The rest of this
 document is the detail behind that claim, including the parts that are
 less flattering.
 
 ## Network access
 
-Parakeet makes network requests in exactly two situations, both of them
-model downloads over HTTPS:
+Parakeet makes internet requests in exactly one situation, the model
+downloads over HTTPS:
 
 | When | What | Where from |
 |---|---|---|
 | First launch | Parakeet Unified EN 0.6B int8 Core ML bundle (~595 MB) | `huggingface.co` |
 | First launch | Parakeet TDT 0.6B v3 int8 + tokens (~640 MB) | `huggingface.co` |
 | First launch | Silero VAD (~0.6 MB) | `github.com` |
-| First time you enable Polish | Qwen 3.5 4B Q6_K GGUF (~3.5 GB) | `huggingface.co` |
 
-Once those files are on disk there are no further network calls. There
-is no telemetry, no crash reporting, no analytics, no update check, and
-no license or activation server. There is no account to create and no
-API key to enter, because there is no service to authenticate to.
+Once those files are on disk Parakeet makes no further internet calls.
+There is no telemetry, no crash reporting, no analytics, no update
+check, and no license or activation server. There is no account to
+create and no API key to enter.
 
-You can verify this: `src/model_fetch.rs` contains every URL the app
-knows about, and it is the only module that links the HTTP client.
+The one other connection is the optional OpenCode rewrite, which talks
+only to a loopback address (`127.0.0.1` or `::1`) on this Mac; see
+[The OpenCode rewrite](#the-opencode-rewrite). You can verify this:
+`src/model_fetch.rs` contains every internet URL the app knows about,
+and `src/rewrite.rs` refuses any registered address that is not
+loopback.
 
 ## Your audio
 
@@ -127,14 +132,14 @@ inserted as a synthetic Unicode keystroke, so whatever you had copied
 stays copied.
 
 The exception is delivery failure. If the keystroke can't be
-constructed or posted, or the Polish pass dies part-way through
-streaming, Parakeet writes the transcript to the clipboard and says so
+constructed or posted, Parakeet writes the transcript to the clipboard and says so
 in the menu bar, because losing what you just said is worse than
 overwriting a clipboard entry. Your previous clipboard contents are
 **not** restored afterwards: the transcript has to stay there until you
 paste it.
 
-**This is the one path where a transcript can leave your Mac.** The
+**With the rewrite off, this is the one path where a transcript can
+leave your Mac.** The
 general pasteboard participates in Handoff / Universal Clipboard, so if
 you have that enabled and are signed into iCloud, macOS may sync the
 rescued transcript to your other Apple devices. Parakeet does not
@@ -157,11 +162,10 @@ Everything lives under
 
 | Path | Contents |
 |---|---|
-| `settings.json` | Your hotkey, trigger mode, polish mode, hotword score, and reserved language hint. No secrets — there is no API key to store. |
+| `settings.json` | Your hotkey, trigger mode, rewrite on/off with its OpenCode model and variant, hotword score, and reserved language hint. No secrets — there is no API key to store. |
 | `vocabulary.txt` | Custom terms you added, if any. Parakeet creates it with a commented-out template the first time you click "Edit Vocabulary…", and only reads it after that — it never modifies content you write. |
 | `hotwords.generated.txt` | Machine translation of the above. Regenerated on every model load; safe to delete. |
 | `models/` | Downloaded optimized ASR, fallback ASR, and VAD weights (~1.3 GB total). |
-| `llm/` | Downloaded Polish GGUF (~3.5 GB), only if you enabled Polish. |
 
 No audio, no transcripts. Deleting the whole directory resets Parakeet
 to a fresh install; it will re-download the models on next launch.
@@ -170,13 +174,28 @@ Note that `vocabulary.txt` is unencrypted plain text, and its contents
 are inferable from what Parakeet transcribes well. If the names you
 dictate are themselves sensitive, that file is worth knowing about.
 
-## The Polish pass
+## The OpenCode rewrite
 
-Optional, off by default. When enabled, it runs Qwen 3.5 4B in-process
-via llama.cpp on the Metal GPU — the same process, no subprocess, no
-socket, no server. Your transcript is put in a prompt and the cleaned
-text comes back. Nothing is sent anywhere, and the model has no
-mechanism to persist anything between calls.
+Optional, off by default. When you turn it on, each transcript, with
+the words from `vocabulary.txt`, is sent in one HTTP request to the
+OpenCode service that is already running on this Mac, and the text it
+returns is pasted instead of the local transcript.
+
+- Parakeet never starts OpenCode. It reads OpenCode's registration file
+  (`~/.local/state/opencode/service.json`, or under `$XDG_STATE_HOME`),
+  uses it only if the file belongs to you and nobody else can read it,
+  and only if the registered process answers on a loopback address.
+- The registration holds a password that OpenCode generated for its
+  local server. Parakeet sends it to that loopback address as HTTP
+  Basic authentication and nowhere else. It never reads OpenCode's
+  provider keys or any API key, and stores nothing.
+- **OpenCode then sends the prompt to whichever model provider it is
+  configured for**, under that provider's terms and your account or
+  subscription there. That is where the transcript leaves your Mac.
+  Parakeet does not see or control what the provider keeps.
+- If OpenCode is not running, takes longer than 5 seconds, or answers
+  with an error, Parakeet pastes the local transcript unchanged and
+  nothing else is attempted.
 
 ## What this document does not promise
 

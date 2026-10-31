@@ -172,7 +172,7 @@ M5 Pro 24 GB release results (re-run 2026-09-04):
 
 The unchanged Tap Fast comparison was also re-run for 30 repetitions after
 this policy split. It retained **3.24× p50 / 3.18× p95** speedups (589.5 →
-182.0 ms p50; 644.8 → 203.0 ms p95), so the representative no-polish gate
+182.0 ms p50; 644.8 → 203.0 ms p95), so the representative end-to-end gate
 remains above its accepted 3× target.
 
 The fixture manifest, source revision, hashes, references, and license are in
@@ -1372,222 +1372,6 @@ end-to-end measurements above supersede it as the current performance record.
 362 ms ASR + 150 ms VAD ≈ **512 ms** — under the former 700 ms acceptance
 target before the native worker and speculative-decode work landed.
 
-## §6 Phase-0 polish-backend bench: Qwen 3.5 2B Q4_K_M (2026-05-16, M5 Pro 24 GB)
-
-Driven by `src/bin/bench_llm.rs`. 100 polish iterations of a fixed
-240-char noisy transcript through `llama-cpp-2` (Metal feature)
-loading `unsloth/Qwen3.5-2B-Q4_K_M.gguf`. Output: 55 tokens cleaned.
-
-| Metric | Mean | p50 | p95 | p99 |
-|--------|------|-----|-----|-----|
-| TTFT (ms) | 2.0 | 2.0 | 2.0 | 2.0 |
-| Generation (ms) | 548 | 548 | 558 | 567 |
-| Total per polish (ms) | 551 | **550** | 560 | 570 |
-| Decode (tokens/sec) | 100.3 | 100.4 | 101.7 | 101.9 |
-
-Cold model load: 229 ms. p99/p50 = 1.04 (variance negligible).
-
-Replay:
-
-```bash
-./target/release/bench_llm \
-    --model ~/Library/Application\ Support/com.parakeet.rs/llm/qwen3.5-2b-q4_k_m/Qwen3.5-2B-Q4_K_M.gguf \
-    --reps 100 --warmup-reps 3 2> bench/llm-raw.log
-# then aggregate inline — see ADR-0018 for the one-shot Python snippet
-```
-
-Background and library-selection rationale: [ADR-0018](../docs/ADR.md#0018--polish-backend-llamacpp--qwen-35-2b-q4_k_m).
-
-## §6 follow-up: Qwen 3.5 4B Q6_K (2026-06-11, M5 Pro 24 GB) — shipped
-
-The 2B's instruction-following misses (paraphrasing, over-deleted
-"like", fumbled `scratch that`) motivated a bump to **Qwen3.5-4B at
-Q6_K** (3.53 GB) — same family, so the ChatML + `/no_think` template
-carries over unchanged. See the ADR-0018 amendment.
-
-Enable Polish once in the app to download and SHA-256 verify the pinned GGUF;
-the replay command below uses that standard application path.
-
-30 reps, same 240-char sample transcript, same `bench_llm` harness:
-
-| Metric | Mean | p50 | p95 |
-|--------|------|-----|-----|
-| TTFT (ms) | 40 | 29 | 33 |
-| Generation (ms) | 1200 | 1197 | 1231 |
-| Total per polish (ms) | 1240 | **1225** | 1262 |
-| Decode (tokens/sec) | 43.3 | 43.4 | 43.8 |
-
-vs the 2B: total p50 550 ms → 1225 ms (2.2×), decode 100 → 43 tok/s.
-Streaming paste (ADR-0019) absorbs the difference — perceived latency
-is time-to-first-words (TTFT 29 ms + first chunks), not last-token.
-No truncations at the 768-token output cap across the run.
-
-Replay:
-
-```bash
-./target/release/bench_llm \
-    --model ~/Library/Application\ Support/com.parakeet.rs/llm/qwen3.5-4b-q6_k/Qwen3.5-4B-Q6_K.gguf \
-    --reps 30 --warmup-reps 3 2> bench/llm-4b-raw.log
-```
-
-## §6 follow-up: polish latency and quality on an eval set (2026-09-04, M5 Pro 24 GB)
-
-Kata 0tpp. Everything above measures **one** transcript — the hardcoded
-`SAMPLE_INPUT`, 55 output tokens at the model's decode rate. That is the
-structural bound, not a p50 over anything a user dictates, and it is
-what the "1000 ms NOT MET" verdict was recorded against.
-
-`bench/polish/eval.json` is a 26-item eval set with the polished text
-each item should produce. `bench_llm --eval` runs it, scores word-level
-error rate against `expected` (casing and punctuation included — those
-are two of the three things polish exists to fix), and reports latency
-and quality over the same population.
-
-Machine load before each run: `Load Avg` 1.0–2.3, CPU ≥ 87 % idle.
-3 repetitions × 26 items = 78 measured decodes per row. Repetitions are
-low deliberately: within-item variance is negligible (§6's p99/p50 =
-1.04), so the percentiles are driven by *which item* it is, not by
-run-to-run noise. `p99` over 78 samples is a single item and is not
-quoted below.
-
-**Skipped items enter the percentiles as 0 ms.** The `skip < 4 words`
-row bypasses the model for three items and records them at zero, which
-is the latency the user experiences. It is not a decode time, and that
-row's distribution is therefore not the same shape as the others.
-
-> ### Quality-column correction (2026-09-04)
->
-> The WER column below was first measured against `eval.json` schema 1
-> with a whitespace-splitting scorer. Both had defects, found in review:
->
-> - **`technical` was measured wrong.** `technical-01` and `technical-03`
->   expected spoken-to-written conversion (`one point zero point two one
->   nine` → `1.0.219`, `colon colon` → `::`) that system-prompt rule 7
->   explicitly forbids — "Preserve technical terms, names, and code-like
->   fragments exactly as transcribed". They penalised the model for
->   obeying the prompt. Schema 2 derives their expected text from the
->   prompt rules alone. The category's WER falls **0.847 → 0.091**.
-> - **`command` was scored blind.** The scorer split on whitespace, so a
->   model that emitted a space where `new paragraph` required a line
->   break scored zero errors. It now tokenises breaks. The category's
->   WER rises **0.000 → 0.059**, exposing a real defect: on
->   `command-01` and `command-04` the 4B produced
->   `Ship the parts Monday. Invoice follows separately.` — correct
->   punctuation, no line break.
->
-> Inputs did not change, so **every latency number below is unaffected**.
-> Only the 4B row's quality has been re-measured under schema 2
-> (blended **WER 0.061, 18/26 exact**, recomputed from the unchanged
-> categories plus a deterministic re-run of the two corrected ones).
-> The 2B, 0.8B, and edits-only rows still carry schema-1 quality and are
-> **not comparable to it**; re-measuring them needs another bench turn.
-
-| Variant | p50 | p95 | `legacy-bench-sample` | mean WER | exact | mean out tokens |
-|---|---|---|---|---|---|---|
-| **4B Q6_K full-text (shipping)** | **444 ms** | 1219 ms | 1209 ms | **0.139** | 17/26 | 18.7 |
-| 4B full-text + skip < 4 words | 446 ms | 1222 ms | 1221 ms | 0.139 | 17/26 | 18.3 |
-| 4B full-text + context reuse | 424 ms | 1220 ms | 1198 ms | 0.139 | 17/26 | 18.7 |
-| 4B edits-only | 600 ms | 2438 ms | 2421 ms | 0.321 | 9/26 | 26.3 |
-| 2B Q6_K full-text | 230 ms | 572 ms | 571 ms | 0.185 | 13/26 | 20.5 |
-| 0.8B Q6_K full-text | 141 ms | 338 ms | 330 ms | 0.249 | 11/26 | 21.6 |
-
-**The shipping configuration meets the <1000 ms p50 target on the eval
-set.** The `legacy-bench-sample` column shows why the two verdicts
-differ: that one item costs 1209 ms in the same run whose p50 is 444 ms.
-
-### Composition caveat — read this before quoting the p50
-
-The eval set's composition was a judgement call, and composition
-determines the blended p50. Nine of 26 items are zero-change by
-construction. Per-category numbers are published so the blended figure
-can be re-weighted against a different view of what real dictation looks
-like:
-
-| Category | n | 4B p50 | 4B max | 4B WER | 2B p50 | 2B WER |
-|---|---|---|---|---|---|---|
-| clean | 6 | 429 ms | 514 ms | 0.000 | 197 ms | 0.000 |
-| short | 3 | 299 ms | 326 ms | 0.000 | 147 ms | 0.000 |
-| filler-light | 6 | 446 ms | 492 ms | 0.042 | 212 ms | 0.173 |
-| command | 4 | 439 ms | 503 ms | 0.000 | 251 ms | 0.211 |
-| technical | 3 | 609 ms | 652 ms | 0.847 | 298 ms | 0.681 |
-| filler-heavy | 3 | 857 ms | 1219 ms | 0.257 | 391 ms | 0.258 |
-| long | 1 | 2812 ms | 2812 ms | 0.060 | 1400 ms | 0.103 |
-
-(WER columns here are schema 1; see the correction box above. Latency is
-unaffected.)
-
-Latency tracks output length almost exactly; quality does not.
-
-**Retracted:** an earlier revision of this section claimed the
-`technical` category showed "spoken version numbers and identifiers are
-where polish does real damage". That was wrong, and backwards. Re-run
-with `--show-output`, the 4B **preserves** identifiers exactly as rule 7
-instructs:
-
-```
-input    : Um, bump serde to one point zero point two one nine in Cargo dot toml.
-produced : Bump serde to one point zero point two one nine in Cargo dot toml.
-```
-
-Filler removed, casing fixed, identifier untouched — correct on every
-count. The 0.847 was my eval set demanding a conversion the prompt
-forbids. Whether polish damages identifiers is **unmeasured**: no item
-in this set tests it, because the prompt tells the model not to touch
-them.
-
-The genuine defects the corrected metrics surface are smaller and
-different: the 4B leaves `and, you know,` in `technical-03`, and ignores
-the `new line` / `new paragraph` commands in two of four `command`
-items.
-
-### Findings per avenue
-
-- **Edits-only is worse on both axes.** The model answers with the
-  corrected transcript instead of an edit list in 17 of 26 items, on the
-  4B, with an explicit prohibition and a worked example in the prompt.
-  The arithmetic does not favour it even when it works: full-text
-  averages 18.7 output tokens, an `OLD ==> NEW` line costs 5–8 tokens
-  per fix because `OLD` must carry enough context to be unique, and the
-  variant measured 26.3. A GBNF grammar (`LlamaSampler::grammar`, and
-  the `sampler` feature is already on) would force the `==>` structure
-  but cannot stop `<whole input> ==> <corrected>`, which parses cleanly
-  and doubles the tokens.
-- **Prompt caching is unavailable on this model family.** Qwen 3.5 is a
-  hybrid Gated-DeltaNet architecture (ADR-0018); its recurrent state
-  carries no per-token position, so `llama_memory_seq_rm` refuses
-  partial sequence removal. `mean_reused_prompt_tokens=0.0` on every
-  run. The same refused operation is what draft-model speculative
-  decoding would need for rollback, so that avenue is blocked too. What
-  the `--prompt-cache` row actually measures is **context reuse** — not
-  re-allocating a `LlamaContext` per call — worth 20 ms (444 → 424),
-  consistent with the 29 ms TTFT bounding it.
-- **Skipping short utterances helps the mean, not the p50.** It fires on
-  3/26 items with identical quality, and moves the mean 591 → 556 ms.
-  The p50 is unchanged (444 → 446) because the items it removes were
-  already the fastest ones; taking three items off the bottom does not
-  move the middle.
-- **Neither smaller model is a free swap.** The 2B cuts p95 from 1219 to
-  572 ms and the structural-bound item from 1209 to 571 ms, at WER 0.185
-  vs 0.139 and 13/26 vs 17/26 exact. It is a tail fix bought with
-  quality. The 0.8B is faster still and clearly worse.
-
-Fixed-sample replays for cross-checking against §6 above (15 reps):
-4B Q6_K **p50 1202 ms** (§6 recorded 1225), 2B Q6_K p50 565 ms.
-
-Replay:
-
-```bash
-LLM="$HOME/Library/Application Support/com.parakeet.rs/llm"
-./target/release/bench_llm \
-    --model "$LLM/qwen3.5-4b-q6_k/Qwen3.5-4B-Q6_K.gguf" \
-    --eval bench/polish/eval.json --variant full-text \
-    --reps 3 --tag qwen3.5-4b-q6_k --csv bench/polish/variants.csv \
-    2> bench/llm-4b-fulltext-raw.log
-```
-
-Swap `--variant edits-only`, `--skip-min-words 4`, `--prompt-cache`, or
-`--model` for the other rows.
-
 ## Files
 
 | Path                         | Purpose                                          |
@@ -1598,7 +1382,6 @@ Swap `--variant edits-only`, `--skip-min-words 4`, `--prompt-cache`, or
 | `gold/sources.json`        | Immutable source provenance, licenses, and hashes. |
 | `gold.example.json`        | Historical `say` smoke-example schema. |
 | `asr-quality.json`          | Generated machine-readable quality/latency report (gitignored). |
-| `llm-raw.log`                | All `llm_timer` lines from the last LLM run.     |
 | `baseline.csv`               | Aggregated ASR baseline (pre-CoreML-cache).      |
 | `coreml-unified.csv`         | Generated shipping-backend ASR percentiles.     |
 | `*-boundary.csv`             | Generated Rust/worker boundary measurements.    |
@@ -1613,7 +1396,3 @@ Swap `--variant edits-only`, `--skip-min-words 4`, `--prompt-cache`, or
 | `e2e-*.{log,csv}`            | Generated serial/speculative production-path runs. |
 | `endpoint-*.{log,csv}`       | Generated pause-friendly endpoint gate runs.   |
 | `endpoint-sweep*.{csv,/}`    | Generated confirmation-window sweep rows and logs. |
-| `polish-backends.csv`        | Historical §6 Phase-0 2B polish measurements.  |
-| `polish/eval.json`           | Polish quality eval set: 26 transcripts with expected output. |
-| `polish/variants.csv`        | Generated per-variant polish latency/quality summary. |
-| `llm-*-raw.log`              | Generated `llm_timer` / `llm_eval_*` lines per polish variant run. |

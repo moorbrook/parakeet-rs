@@ -43,16 +43,16 @@ sherpa-onnx ASR model releases. The exact downloaded bytes are pinned in
 - Distributed artifact: <https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models>
 - License: MIT
 
-## Qwen 3.5 4B polish model
+## Hex OpenCode client
 
-The optional Polish feature downloads an Unsloth GGUF conversion of Qwen 3.5
-4B Instruct. The weights are not stored in this repository or bundled in the
-application.
+`src/rewrite.rs` adapts the OpenCode service discovery, loopback HTTP request
+loop and one-shot generation contract from Hex at commit
+`07e0a0558d603831b20da31e0561e0aea2208d09` (`src/opencode_service.rs`,
+`src/dictation_processor.rs`).
 
-- Model (exact revision): <https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/tree/e87f176479d0855a907a41277aca2f8ee7a09523>
-- Original model: Qwen 3.5 4B Instruct
-- Conversion: Unsloth contributors
-- Model license: Apache License 2.0; see `LICENSE-APACHE`
+- Project: <https://github.com/anomalyco/hex>
+- Copyright and full license text: <https://github.com/anomalyco/hex/blob/07e0a0558d603831b20da31e0561e0aea2208d09/LICENSE>
+- License: MIT; see `LICENSE-MIT`
 
 ## LibriSpeech endpoint regression fixtures
 
