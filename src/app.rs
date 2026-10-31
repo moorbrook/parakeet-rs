@@ -45,9 +45,11 @@ pub struct App {
     /// failed or superseded build simply doesn't update this, so the
     /// next check still sees a mismatch and retries.
     loaded_inputs: Mutex<Option<BuildInputs>>,
-    /// Bumped each time a new set of encoder buckets is installed and its
-    /// Core ML plans compiled, which makes the loaded recogniser stale.
-    encoder_bucket_generation: std::sync::atomic::AtomicU64,
+    /// The encoder buckets a recogniser may load. `None` until the boot load,
+    /// which takes whatever verifies on disk; after that it changes only once
+    /// a pre-warm has compiled a new set, so no reload pays a cold plan
+    /// compile for a bucket that landed mid-download.
+    approved_encoder_buckets: Mutex<Option<Vec<u32>>>,
     /// Set when a rebuild was needed but the app was busy. Drained by
     /// `on_session_finished`. Without it a vocabulary edit saved during
     /// a dictation stayed unapplied until the *next* Settings Save.
@@ -70,9 +72,10 @@ struct BuildInputs {
     /// realistic editing workflow produces.
     vocab: Option<(u64, std::time::SystemTime)>,
     score: f32,
-    /// `App::encoder_bucket_generation` when the build started. The build
-    /// itself loads whichever buckets verify on disk.
-    encoder_buckets: u64,
+    /// `App::approved_encoder_buckets` when the build started; the build
+    /// loads those of them that verify on disk. A finished build records
+    /// `Some`, resolving the boot load's `None` to what it loaded.
+    encoder_buckets: Option<Vec<u32>>,
 }
 
 impl BuildInputs {
@@ -83,7 +86,7 @@ impl BuildInputs {
     /// recording the post-build state would mark a newer vocabulary as
     /// loaded when it wasn't — permanently, since the mismatch that
     /// would have triggered a retry is exactly what got erased.
-    fn sample(settings: &SettingsStore, encoder_buckets: u64) -> Self {
+    fn sample(settings: &SettingsStore, encoder_buckets: Option<Vec<u32>>) -> Self {
         let vocab = std::fs::metadata(settings.vocabulary_path())
             .ok()
             .and_then(|m| Some((m.len(), m.modified().ok()?)));
@@ -107,7 +110,7 @@ impl App {
             asr: Mutex::new(None),
             hotkey: Mutex::new(None),
             loaded_inputs: Mutex::new(None),
-            encoder_bucket_generation: std::sync::atomic::AtomicU64::new(0),
+            approved_encoder_buckets: Mutex::new(None),
             reload_pending: std::sync::atomic::AtomicBool::new(false),
             engine_primer: warmup::EnginePrimer::new(),
         }
@@ -550,11 +553,7 @@ impl App {
     }
 
     fn current_build_inputs(&self) -> BuildInputs {
-        BuildInputs::sample(
-            &self.settings,
-            self.encoder_bucket_generation
-                .load(std::sync::atomic::Ordering::SeqCst),
-        )
+        BuildInputs::sample(&self.settings, self.approved_encoder_buckets.lock().clone())
     }
 
     /// Rebuild the recogniser in the background so a vocabulary edit
@@ -644,22 +643,21 @@ impl App {
                     return;
                 }
             };
-            let quiet: model_fetch::ProgressFn = Arc::new(|_| {});
-            let before = runtime.block_on(model_fetch::ensure_encoder_buckets(
-                &directory,
-                model_fetch::BucketFetch::VerifyOnly,
-                quiet,
-            ));
-            if before.len() == model_fetch::ENCODER_BUCKETS.len() {
+            let approved = app
+                .approved_encoder_buckets
+                .lock()
+                .clone()
+                .unwrap_or_default();
+            if approved.len() == model_fetch::ENCODER_BUCKETS.len() {
                 return;
             }
-            let after = runtime.block_on(model_fetch::ensure_encoder_buckets(
+            let installed = runtime.block_on(model_fetch::ensure_encoder_buckets(
                 &directory,
                 model_fetch::BucketFetch::Download,
                 Arc::new(fetch_progress_to_menubar),
             ));
-            if after == before {
-                if after.is_empty() {
+            if installed == approved {
+                if installed.is_empty() {
                     menubar::set_status_text(
                         "Short-utterance encoders unavailable — using 15 s encoder",
                     );
@@ -667,15 +665,14 @@ impl App {
                 return;
             }
             menubar::set_status_text("Preparing short-utterance encoders…");
-            if let Err(error) = prewarm_encoder_buckets(&app.settings, &after) {
+            if let Err(error) = prewarm_encoder_buckets(&app.settings, &installed) {
                 log::warn!("encoder-bucket pre-warm failed; keeping the 15 s encoder: {error:#}");
                 menubar::set_status_text(
                     "Short-utterance encoders failed to load — using 15 s encoder",
                 );
                 return;
             }
-            app.encoder_bucket_generation
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            *app.approved_encoder_buckets.lock() = Some(installed);
             app.reload_asr_if_stale();
         });
     }
@@ -713,6 +710,7 @@ impl App {
                 // recognizer while the lock the press path takes is held.
                 let previous = self.asr.lock().replace(asr);
                 drop(previous);
+                *self.approved_encoder_buckets.lock() = inputs.encoder_buckets.clone();
                 *self.loaded_inputs.lock() = Some(inputs);
                 self.set_state(DictationState::Idle);
                 if optimized {
@@ -768,8 +766,22 @@ fn load_asr_blocking(
 
     let backend_override = configured_asr_backend_override()?;
     if backend_override == AsrBackendOverride::Auto {
-        match load_optimized_asr(settings, &terms, inputs.score) {
-            Ok(asr) => return Ok((Arc::new(asr), inputs)),
+        match load_optimized_asr(
+            settings,
+            &terms,
+            inputs.score,
+            inputs.encoder_buckets.as_deref(),
+        ) {
+            Ok((asr, loaded)) => {
+                let encoder_buckets = Some(inputs.encoder_buckets.clone().unwrap_or(loaded));
+                return Ok((
+                    Arc::new(asr),
+                    BuildInputs {
+                        encoder_buckets,
+                        ..inputs
+                    },
+                ));
+            }
             Err(error) => {
                 log::warn!(
                     "optimized Core ML backend unavailable; falling back to sherpa: {error:#}"
@@ -816,14 +828,25 @@ fn load_asr_blocking(
         menubar::set_status_text("Pre-warming graph…");
         warmup::dummy_decode(&asr)?;
     }
-    Ok((Arc::new(asr), inputs))
+    let encoder_buckets = Some(inputs.encoder_buckets.clone().unwrap_or_default());
+    Ok((
+        Arc::new(asr),
+        BuildInputs {
+            encoder_buckets,
+            ..inputs
+        },
+    ))
 }
 
+/// Returns the recogniser and the encoder buckets it loaded. `allowed`
+/// restricts the buckets to an approved set; `None` takes every bucket that
+/// verifies on disk.
 fn load_optimized_asr(
     settings: &SettingsStore,
     vocabulary: &[String],
     vocabulary_score: f32,
-) -> anyhow::Result<Asr> {
+    allowed: Option<&[u32]>,
+) -> anyhow::Result<(Asr, Vec<u32>)> {
     use anyhow::Context as _;
 
     let app_model_directory = settings.coreml_model_dir();
@@ -845,11 +868,14 @@ fn load_optimized_asr(
         })?;
     // Only what is already on disk: a missing bucket is fetched after the
     // recogniser is up (`App::spawn_encoder_bucket_upgrade`), never before it.
-    let buckets = runtime.block_on(model_fetch::ensure_encoder_buckets(
+    let mut buckets = runtime.block_on(model_fetch::ensure_encoder_buckets(
         &app_model_directory,
         model_fetch::BucketFetch::VerifyOnly,
         on_progress,
     ));
+    if let Some(allowed) = allowed {
+        buckets.retain(|window| allowed.contains(window));
+    }
 
     let (mut config, long_plan_warmup_seconds) =
         optimized_worker_config(settings, &app_model_directory)?;
@@ -889,7 +915,7 @@ fn load_optimized_asr(
     }
     warmup::dummy_decode(&asr)?;
     warmup::warm_encoder_buckets(&asr, &buckets)?;
-    Ok(asr)
+    Ok((asr, buckets))
 }
 
 /// Worker configuration shared by the resident recogniser and the bucket

@@ -57,20 +57,28 @@ pub fn dummy_decode(asr: &Asr) -> Result<()> {
 }
 
 /// Dispatch one silent utterance into each encoder bucket the worker loaded,
-/// so every bucket's Core ML program is compiled and resident before the first
-/// dictation that needs it (kata hrs0). [`dummy_decode`] only reaches the
-/// narrowest bucket.
+/// then one past the widest bucket, so every bucket's Core ML program and the
+/// stock 15 s encoder are compiled and resident before the first dictation
+/// that needs them (kata hrs0). With buckets loaded, [`dummy_decode`] reaches
+/// only the narrowest one.
 ///
 /// The buffer for window `w` is half a second short of `w`: longer than every
 /// narrower window, so the worker routes it to `w`, and well inside the
 /// frame-rounded capacity of `w`'s single encoder window, so it never runs a
-/// second window (kata qgwm).
+/// second window (kata qgwm). The last buffer is half a second past the widest
+/// bucket, which no bucket holds.
 pub fn warm_encoder_buckets(asr: &Asr, windows: &[u32]) -> Result<()> {
+    let Some(&widest) = windows.iter().max() else {
+        return Ok(());
+    };
     for &seconds in windows {
         let samples = vec![0.0_f32; bucket_warmup_samples(seconds)];
         asr.recognize_silent_warmup(&samples, PRIME_SAMPLE_RATE)
             .with_context(|| format!("warming the {seconds} s encoder bucket"))?;
     }
+    let past_buckets = bucket_warmup_samples(widest) + PRIME_SAMPLE_RATE as usize;
+    asr.recognize_silent_warmup(&vec![0.0_f32; past_buckets], PRIME_SAMPLE_RATE)
+        .context("warming the 15 s encoder past the widest bucket")?;
     Ok(())
 }
 
@@ -335,10 +343,19 @@ mod tests {
             lengths: parking_lot::Mutex::new(Vec::new()),
         });
         let asr = Asr::from_backend(Arc::clone(&backend) as Arc<dyn AsrBackend>);
+        warm_encoder_buckets(&asr, &[]).unwrap();
+        assert!(
+            backend.lengths.lock().is_empty(),
+            "dummy_decode warms 15 s alone"
+        );
         warm_encoder_buckets(&asr, &[2, 5, 8]).unwrap();
         // 1.5, 4.5 and 7.5 s: past 2 and 5 s, so they route to 5 and 8 s, and
-        // under each bucket's frame-rounded window (32,000, 79,360, 127,360 samples).
-        assert_eq!(backend.lengths.lock().as_slice(), [24_000, 72_000, 120_000]);
+        // under each bucket's frame-rounded window (32,000, 79,360, 127,360
+        // samples). Then 8.5 s, which no bucket holds: the 15 s encoder.
+        assert_eq!(
+            backend.lengths.lock().as_slice(),
+            [24_000, 72_000, 120_000, 136_000]
+        );
     }
 
     #[test]

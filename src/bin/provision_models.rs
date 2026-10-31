@@ -32,7 +32,10 @@ fn main() -> Result<()> {
         .build()
         .context("building download runtime")?;
     let started = std::time::Instant::now();
-    runtime.block_on(model_fetch::ensure_coreml_model(&model_dir, progress.clone()))?;
+    runtime.block_on(model_fetch::ensure_coreml_model(
+        &model_dir,
+        progress.clone(),
+    ))?;
     let fetch = if verify_only {
         BucketFetch::VerifyOnly
     } else {
