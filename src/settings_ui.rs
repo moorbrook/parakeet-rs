@@ -518,9 +518,8 @@ pub fn open(mtm: MainThreadMarker) {
     add_hint(
         mtm,
         &content,
-        "Sends the transcript to the OpenCode service already running on\n\
-         this Mac. Parakeet never starts it. If it is not running, slow or\n\
-         fails, the local transcript is pasted unchanged.",
+        "Uses the OpenCode service already running on this Mac; never starts it.\n\
+         If it is absent, slow or fails, the local transcript is pasted.",
         PAD,
         hint_y - 32.0,
         WINDOW_W - PAD * 2.0,
