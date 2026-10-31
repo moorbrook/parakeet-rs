@@ -237,7 +237,7 @@ state, recovery behavior, and the clean/revoked QA matrix are in
 [`docs/macos-permissions.md`](docs/macos-permissions.md).
 
 Architectural rationale lives in [`docs/ADR.md`](docs/ADR.md) (decisions
-0001-0036). Reproducible latency and quality evidence lives in
+0001-0037). Reproducible latency and quality evidence lives in
 [`bench/README.md`](bench/README.md); the original, now-archived optimization
 plan is [`docs/latency-plan.md`](docs/latency-plan.md). The deferred
 Developer-ID/notarization shipping procedure is captured in
@@ -283,6 +283,6 @@ Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
 at your option (Rust ecosystem convention).
 
 Runtime-downloaded models ship under their own licenses: Parakeet TDT
-0.6B v3 (NVIDIA), Parakeet Unified EN 0.6B Core ML (CC-BY-4.0), Silero
-VAD (MIT). See
+0.6B v3 (CC-BY-4.0), Parakeet Unified EN 0.6B Core ML and its 2/5/8 s
+encoder buckets (NVIDIA Open Model License), Silero VAD (MIT). See
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
