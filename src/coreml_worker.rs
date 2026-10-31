@@ -1089,7 +1089,10 @@ mod tests {
     #[test]
     fn verified_buckets_go_to_the_worker_as_an_explicit_list() {
         let mut config = CoreMlWorkerConfig::new("/worker", "/models");
-        assert_eq!(config.encoder_buckets, None, "benches keep filename discovery");
+        assert_eq!(
+            config.encoder_buckets, None,
+            "benches keep filename discovery"
+        );
         config.set_encoder_buckets(vec![2, 5, 8]);
         assert_eq!(
             encoder_buckets_argument(config.encoder_buckets.as_deref().unwrap()),

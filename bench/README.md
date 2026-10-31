@@ -533,9 +533,10 @@ REPETITIONS=10 COREML_WORKER=target/release/parakeet-coreml-worker \
     COREML_MODEL_DIR=<dir with bucket encoders> scripts/bench-gold.sh
 ```
 
-Bucket artifacts are not on Hugging Face and the Rust download and verification
-path knows nothing about them, so a stock model directory has no buckets and
-behaves exactly as the tables above describe.
+The app fetches and verifies the 2, 5 and 8 s buckets itself
+([ADR-0037](../docs/ADR.md#0037--short-window-encoder-buckets-258-s-as-verified-release-assets)).
+A model directory without them behaves exactly as the "before" columns
+describe.
 
 ## Native RNNT decode loop: M5 Pro 24 GB (2026-09-04)
 

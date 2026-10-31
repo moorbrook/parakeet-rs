@@ -2214,6 +2214,70 @@ settings struct does not deny unknown keys, so the key is ignored.
 
 ---
 
+## 0037 — Short-window encoder buckets 2/5/8 s as verified release assets
+
+**Status:** Accepted (2026-10-31, Kata htdr; pre-warm from Kata hrs0).
+
+**Context.** The offline encoder is compiled at one fixed 15 s window and
+FluidAudio zero-pads every utterance to it, so a one-second dictation pays
+the whole 26 ms encoder. Kata fgzt built the same NVIDIA checkpoint at
+shorter windows and measured them on the M5 Pro (`bench/README.md`,
+"Bucketed short-window encoders"): 7.7 ms at 2 s, 9.6 ms at 5 s and 12.2 ms
+at 8 s against 26.1 ms at 15 s, with gold-corpus hypotheses byte-identical
+to the 15 s arm. The window is a property of the compiled graph, not of the
+chip, so one build of each bucket serves every Mac, and Core ML's own
+first-load plan compile is the only per-device step.
+
+**Decision.**
+
+- Ship three buckets, 2, 5 and 8 s. 2 and 5 s cover the Hold medians
+  (0.9, 2.9 and 4.9 s); 8 s covers 5 to 8 s for one more archive. 12 s is
+  not shipped: it measured 24.5 ms, inside 2 ms of the 15 s encoder.
+- Host each bucket as one uncompressed tar on this repository's release tag
+  `encoder-buckets-v1` (zstd saves 11% on int8 weights, not worth a
+  decompressor). `src/model_fetch.rs` pins each archive's SHA-256 and size
+  and the SHA-256 and size of every file inside it. A download is hashed
+  while it streams, unpacked into a hidden staging directory, refused if
+  any entry is outside the manifest, verified file by file, and only then
+  renamed into the model directory. A damaged installed bundle is removed.
+- The app hands the worker an explicit `--encoder-buckets` list of the
+  windows that verified, never filename discovery, so an unverified bundle
+  is never loaded. With no bucket the list is `none` and every utterance
+  uses the 15 s encoder, as before. If Core ML refuses a verified bucket the
+  worker is reloaded without buckets rather than falling back to sherpa.
+- Startup only verifies buckets already on disk. Missing buckets are
+  fetched in the background after the recogniser is up, and the first
+  failed download stops the rest of that round, so an unreachable host
+  costs one request per launch.
+- The first load of a bucket compiles a Core ML plan, about 6 s each. A
+  throwaway worker with the resident recogniser's compute units pays that
+  after a download, filling Core ML's on-disk plan cache, and only then is
+  the recogniser marked stale and swapped when idle, so the swap is a warm
+  load. Every load dispatches one silent utterance per bucket (w − 0.5 s,
+  routing to w) before the app reaches Idle.
+- The bucket manifest is not part of `coreml_artifact_digest`, which keys
+  the tuning profile; `tune_asr` runs with `--encoder-buckets none` until
+  Kata 4s2q makes the profile choose buckets.
+
+**Cost.** 1,769,503,176 bytes installed (587,968,514 + 589,810,292 +
+591,724,370) on top of the 569 MB stock encoder, plus one archive (about
+590 MB) of transient space while a bucket unpacks. Resident memory measured
+0.10 to 0.19 GiB in fgzt because Core ML maps the weights.
+
+**Licence.** The buckets are Derivative Models of
+`nvidia/parakeet-unified-en-0.6b` under the NVIDIA Open Model License
+Agreement. The release carries `NOTICE.txt` with the notice line and
+`NVIDIA-Open-Model-License.txt` with the agreement; `THIRD_PARTY_NOTICES.md`
+names both. The conversion pipeline (FluidInference `mobius`) and FluidAudio
+are Apache-2.0.
+
+**Not covered.** `EncoderBuckets.select` routes on `seconds × 16,000`
+samples while a window decodes its frame-rounded part (79,360 samples at
+5 s), so an utterance in that gap runs two windows (Kata qgwm). The window
+patch is still a local FluidAudio override (Kata 3yrc).
+
+---
+
 ## Target status index
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -2242,6 +2306,13 @@ settings struct does not deny unknown keys, so the key is ignored.
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-10-31** — [ADR-0037](#0037--short-window-encoder-buckets-258-s-as-verified-release-assets)
+  accepted and implemented. The app fetches 2, 5 and 8 s offline encoders
+  from release tag `encoder-buckets-v1`, verifies every file by SHA-256
+  before the worker may load it, compiles their Core ML plans in a
+  throwaway worker off the dictation path, and falls back to the 15 s
+  encoder when a bucket is absent. 1.77 GB of disk.
 
 - **2026-10-31** — [ADR-0036](#0036--optional-transcript-rewrite-through-the-running-opencode-service)
   accepted and implemented. The optional formatting pass is a rewrite by the
