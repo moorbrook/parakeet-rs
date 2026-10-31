@@ -7,6 +7,10 @@
 //! fresh install is `HOME=$(mktemp -d) provision_models`. The printed model
 //! directory is what `bench_asr --model-dir` takes to show the bucketed
 //! encoder cost.
+//!
+//! `--verify-only` checks the encoder buckets already on disk and touches
+//! nothing else: no network, and the stock pack is not checked, because its
+//! check repairs by downloading.
 
 use std::sync::Arc;
 
@@ -32,13 +36,13 @@ fn main() -> Result<()> {
         .build()
         .context("building download runtime")?;
     let started = std::time::Instant::now();
-    runtime.block_on(model_fetch::ensure_coreml_model(
-        &model_dir,
-        progress.clone(),
-    ))?;
     let fetch = if verify_only {
         BucketFetch::VerifyOnly
     } else {
+        runtime.block_on(model_fetch::ensure_coreml_model(
+            &model_dir,
+            progress.clone(),
+        ))?;
         BucketFetch::Download
     };
     let windows = runtime.block_on(model_fetch::ensure_encoder_buckets(
