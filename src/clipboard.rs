@@ -13,7 +13,8 @@
 //! entirely*, which is strictly worse than clobbering a clipboard entry.
 //!
 //! So: never on success, always on failure. We do **not** snapshot and
-//! restore the previous pasteboard contents (the qwen-scribe approach) —
+//! restore the previous pasteboard contents (as clipboard-paste dictation
+//! apps do) —
 //! the transcript needs to stay on the clipboard until the user pastes
 //! it, which is exactly the window in which a restore would destroy it.
 //!

@@ -632,7 +632,8 @@ fn run_one(
         }
     };
 
-    // The app's default no-polish delivery is one synchronous CGEvent post.
+    // The app's delivery is one synchronous CGEvent post (after the optional
+    // OpenCode rewrite, which this benchmark does not exercise).
     // The benchmark deliberately does not type into the user's focused app;
     // this marker is transcript-ready and excludes only that sub-ms OS post.
     std::hint::black_box(&transcript);

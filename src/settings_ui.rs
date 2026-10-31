@@ -31,7 +31,7 @@ use objc2_foundation::{
 };
 
 use crate::app::{glyphs_for_shortcut, is_capslock_token, AppHandle};
-use crate::settings::{PolishMode, TriggerMode};
+use crate::settings::TriggerMode;
 
 const WINDOW_W: f64 = 480.0;
 const WINDOW_H: f64 = 560.0;
@@ -46,7 +46,9 @@ struct Ivars {
     recording_token: RefCell<Option<String>>,
     shortcut_button: RefCell<Option<Retained<NSButton>>>,
     mode_popup: RefCell<Option<Retained<NSPopUpButton>>>,
-    polish_popup: RefCell<Option<Retained<NSPopUpButton>>>,
+    rewrite_popup: RefCell<Option<Retained<NSPopUpButton>>>,
+    rewrite_model_field: RefCell<Option<Retained<NSTextField>>>,
+    rewrite_variant_field: RefCell<Option<Retained<NSTextField>>>,
     // No window field. Storing a strong `Retained<NSWindow>` here while
     // the window also held a strong `Retained<SettingsController>` was a
     // textbook retain cycle that prevented either object from ever being
@@ -113,15 +115,6 @@ define_class!(
         #[unsafe(method(save:))]
         fn save(&self, _sender: *mut NSObject) {
             crate::objc_util::selector_guard("save:", || self.save_inner());
-        }
-
-        /// Polish-mode popup changed. Selector kept as a no-op so the
-        /// UI sender wiring stays valid; the actual toggle effect is
-        /// applied on Save (we don't load the 3.5 GB Qwen GGUF on every
-        /// dropdown flip).
-        #[unsafe(method(polishModeChanged:))]
-        fn polish_mode_changed(&self, _sender: *mut NSObject) {
-            crate::objc_util::selector_guard("polishModeChanged:", || {});
         }
 
         /// "Edit Vocabulary…" — hand `vocabulary.txt` to whatever the
@@ -232,11 +225,14 @@ impl SettingsController {
                 _ => TriggerMode::Tap,
             };
         }
-        if let Some(popup) = self.ivars().polish_popup.borrow().as_ref() {
-            new.polish_mode = match popup.indexOfSelectedItem() {
-                1 => PolishMode::On,
-                _ => PolishMode::Off,
-            };
+        if let Some(popup) = self.ivars().rewrite_popup.borrow().as_ref() {
+            new.rewrite_enabled = popup.indexOfSelectedItem() == 1;
+        }
+        if let Some(field) = self.ivars().rewrite_model_field.borrow().as_ref() {
+            new.rewrite_model = field.stringValue().to_string().trim().to_string();
+        }
+        if let Some(field) = self.ivars().rewrite_variant_field.borrow().as_ref() {
+            new.rewrite_variant = field.stringValue().to_string().trim().to_string();
         }
 
         if let Err(e) = app.apply_settings(&new) {
@@ -465,54 +461,74 @@ pub fn open(mtm: MainThreadMarker) {
         76.0,
     );
 
-    // --- Section divider: Polish -----------------------------------------
+    // --- Section divider: Post-processing --------------------------------
     let section_y = row3_y - 80.0;
     add_section_label(mtm, &content, "Post-processing", PAD, section_y);
 
-    // --- Row 4: Polish mode popup ----------------------------------------
+    // --- Row 4: Rewrite popup ---------------------------------------------
     let row4_y = section_y - ROW_H - 10.0;
-    add_label(mtm, &content, "Polish", PAD, row4_y);
-    let polish_popup = make_popup(
+    add_label(mtm, &content, "Rewrite", PAD, row4_y);
+    let rewrite_popup = make_popup(
         mtm,
         &[
-            "Off — paste raw transcript",
-            "On — Qwen 3.5 4B local (≈3.5 GB)",
+            "Off — paste the local transcript",
+            "On — rewrite through running OpenCode",
         ],
-        match settings.as_ref().map(|s| s.polish_mode) {
-            Some(PolishMode::On) => 1,
-            _ => 0,
+        if settings.as_ref().is_some_and(|s| s.rewrite_enabled) {
+            1
+        } else {
+            0
         },
         NSPoint::new(PAD + LABEL_W, row4_y - 4.0),
         NSSize::new(WINDOW_W - PAD * 2.0 - LABEL_W, ROW_H + 4.0),
     );
-    // SAFETY: LIVE_SETTINGS retains `controller` for at least as long as this
-    // popup, and polishModeChanged: is declared on SettingsController with the
-    // target/action ABI expected by AppKit.
-    unsafe {
-        polish_popup.setTarget(Some(controller.as_ref()));
-        polish_popup.setAction(Some(sel!(polishModeChanged:)));
-    }
-    content.addSubview(&polish_popup);
-    *controller.ivars().polish_popup.borrow_mut() = Some(polish_popup);
+    content.addSubview(&rewrite_popup);
+    *controller.ivars().rewrite_popup.borrow_mut() = Some(rewrite_popup);
 
-    // --- Row 5: Polish hint ----------------------------------------------
-    let row5_y = row4_y - 30.0;
+    // --- Row 5: Rewrite model ---------------------------------------------
+    let row5_y = row4_y - ROW_H - 8.0;
+    add_label(mtm, &content, "OpenCode model", PAD, row5_y);
+    let model_field = NSTextField::textFieldWithString(
+        &NSString::from_str(settings.as_ref().map_or("", |s| s.rewrite_model.as_str())),
+        mtm,
+    );
+    model_field.setPlaceholderString(Some(&NSString::from_str("provider/model (empty: default)")));
+    let variant_w = 70.0;
+    let model_w = WINDOW_W - PAD * 2.0 - LABEL_W - variant_w - 8.0;
+    model_field.setFrame(NSRect::new(
+        NSPoint::new(PAD + LABEL_W, row5_y - 4.0),
+        NSSize::new(model_w, ROW_H),
+    ));
+    content.addSubview(&model_field);
+    *controller.ivars().rewrite_model_field.borrow_mut() = Some(model_field);
+    let variant_field = NSTextField::textFieldWithString(
+        &NSString::from_str(settings.as_ref().map_or("", |s| s.rewrite_variant.as_str())),
+        mtm,
+    );
+    variant_field.setPlaceholderString(Some(&NSString::from_str("variant")));
+    variant_field.setFrame(NSRect::new(
+        NSPoint::new(PAD + LABEL_W + model_w + 8.0, row5_y - 4.0),
+        NSSize::new(variant_w, ROW_H),
+    ));
+    content.addSubview(&variant_field);
+    *controller.ivars().rewrite_variant_field.borrow_mut() = Some(variant_field);
+
+    // --- Rewrite hint ----------------------------------------------------
+    let hint_y = row5_y - 28.0;
     add_hint(
         mtm,
         &content,
-        "Polish removes filler words, fixes punctuation, and honours\n\
-         commands like \"new paragraph\" and \"scratch that\". Runs\n\
-         in-process via llama.cpp + Metal on Apple Silicon — no cloud,\n\
-         no API key. Uses the Qwen 3.5 4B Q6_K GGUF (~3.5 GB),\n\
-         downloaded automatically the first time Polish is enabled.",
+        "Sends the transcript to the OpenCode service already running on\n\
+         this Mac. Parakeet never starts it. If it is not running, slow or\n\
+         fails, the local transcript is pasted unchanged.",
         PAD,
-        row5_y - 50.0,
+        hint_y - 32.0,
         WINDOW_W - PAD * 2.0,
-        60.0,
+        44.0,
     );
 
     // --- Section divider: Vocabulary --------------------------------------
-    let vocab_section_y = row5_y - 80.0;
+    let vocab_section_y = hint_y - 48.0;
     add_section_label(mtm, &content, "Vocabulary", PAD, vocab_section_y);
 
     // --- Row 6: Edit-vocabulary button ------------------------------------

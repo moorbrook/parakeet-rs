@@ -74,7 +74,7 @@ define_class!(
                         // to finish (matches the hotkey gate in
                         // App::on_hotkey_press).
                         DictationState::Transcribing
-                        | DictationState::Polishing
+                        | DictationState::Rewriting
                         | DictationState::ModelLoading => {
                             log::debug!(
                                 "toggleDictation: ignored from state {state:?}"
@@ -321,9 +321,9 @@ fn refresh_on_main(
                 "Working…".to_string(),
                 false,
             ),
-            DictationState::Polishing => (
+            DictationState::Rewriting => (
                 "wand.and.stars",
-                "Polishing…".to_string(),
+                "Rewriting…".to_string(),
                 "Working…".to_string(),
                 false,
             ),

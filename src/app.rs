@@ -17,14 +17,12 @@ use crate::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
 use crate::dictation_fsm::{DictationFsm, HoldPressOutcome, TapPressOutcome};
 use crate::hotkey::HotkeyHandle;
 use crate::hud;
-use crate::llm_manager::{FinalizeOutcome, LlmManager, LoadClaim};
 use crate::menubar;
 use crate::model_fetch::{self, Progress};
 use crate::performance::PhaseTimer;
-use crate::polish::{self, LlamaPolish, PolishBackend};
-use crate::settings::{PolishMode, Settings, SettingsStore, TriggerMode};
+use crate::settings::{Settings, SettingsStore, TriggerMode};
 use crate::streamer::{self, Mode as StreamerMode, Outcome, OutcomeRx};
-use crate::{paste, performance, warmup};
+use crate::{paste, performance, rewrite, warmup};
 
 pub use crate::dictation_fsm::DictationState;
 
@@ -36,11 +34,6 @@ pub struct App {
     pub settings: SettingsStore,
     /// Set once the model is downloaded and the recogniser is warm.
     pub asr: Mutex<Option<Arc<Asr>>>,
-    /// Polish-LLM lifecycle: `Disabled` → `Loading` → `Ready` → back
-    /// to `Disabled` on toggle Off or load failure. See
-    /// `crate::llm_manager` for the single-mutex state machine that
-    /// replaced the previous `Mutex<Option<...>>` + `Mutex<bool>` pair.
-    pub llm: LlmManager,
     /// Lives for the program's lifetime; held here so the Settings UI can
     /// rebind it after the user records a new hotkey combo.
     pub hotkey: Mutex<Option<HotkeyHandle>>,
@@ -101,7 +94,6 @@ impl App {
             fsm: DictationFsm::new(),
             settings,
             asr: Mutex::new(None),
-            llm: LlmManager::new(),
             hotkey: Mutex::new(None),
             loaded_biasing: Mutex::new(None),
             reload_pending: std::sync::atomic::AtomicBool::new(false),
@@ -372,9 +364,13 @@ impl App {
             };
 
             let settings = app.settings.load();
-            let result = deliver_cleaned(&app, &raw, &settings);
-            // Marks *last*-chunk paste under streaming; perceived
-            // first-chunk latency is much lower. See ADR-0018.
+            let text = if settings.rewrite_enabled {
+                app.set_state(DictationState::Rewriting);
+                rewrite_transcript(&raw, &settings, &app.settings)
+            } else {
+                raw
+            };
+            let result = paste::deliver(&text).map_err(|e| DeliveryFailure::unsent(e, &text));
             timer.mark_paste_done();
             timer.emit();
             if let Err(failure) = result {
@@ -400,10 +396,9 @@ impl App {
     /// Force-recover after a worker thread panic. The three spawned
     /// worker threads (`session-starter`, `session-watcher`,
     /// `transcribe`) can panic at any FFI boundary (sherpa-onnx, cpal,
-    /// llama.cpp, the `CGEventPost` keystroke synthesis in
-    /// `ax_paste`). Without this recovery, a panic in
-    /// any of them would leave the app stuck in `Listening` /
-    /// `Transcribing` / `Polishing` forever — hotkey presses gated
+    /// the `CGEventPost` keystroke synthesis in `ax_paste`). Without
+    /// this recovery, a panic in any of them would leave the app stuck
+    /// in `Listening` / `Transcribing` / `Rewriting` forever — hotkey presses gated
     /// on `Idle` would be silently ignored and the user would have to
     /// quit.
     ///
@@ -457,21 +452,6 @@ impl App {
     where
         F: FnOnce(Arc<App>) + Send + 'static,
     {
-        self.spawn_supervised_with(name, body, |app, msg| {
-            app.recover_from_panic(name, &msg);
-        });
-    }
-
-    /// Variant of [`spawn_supervised`] with a caller-provided panic
-    /// recovery closure. The default `spawn_supervised` calls
-    /// `recover_from_panic`; the llm-toggle worker uses this to clear
-    /// `llm_loading` instead (a polish-LLM panic shouldn't reset the
-    /// whole dictation FSM).
-    fn spawn_supervised_with<F, P>(self: &Arc<Self>, name: &'static str, body: F, on_panic: P)
-    where
-        F: FnOnce(Arc<App>) + Send + 'static,
-        P: FnOnce(Arc<App>, String) + Send + 'static,
-    {
         let app = Arc::clone(self);
         std::thread::Builder::new()
             .name(name.into())
@@ -481,8 +461,7 @@ impl App {
                     body(app);
                 }));
                 if let Err(payload) = result {
-                    let msg = panic_message(&*payload);
-                    on_panic(app_for_panic, msg);
+                    app_for_panic.recover_from_panic(name, &panic_message(&*payload));
                 }
             })
             .unwrap_or_else(|e| panic!("spawn {name} thread: {e}"));
@@ -519,9 +498,6 @@ impl App {
             if let Some(handle) = self.hotkey.lock().as_ref() {
                 handle.rebind(&new.hotkey)?;
             }
-        }
-        if prev.polish_mode != new.polish_mode {
-            self.handle_polish_mode_change(new.polish_mode);
         }
         // Contextual biasing is baked into the recogniser at
         // construction time, so a changed vocabulary (or boost) only
@@ -658,99 +634,6 @@ impl App {
             Err(e) => {
                 log::error!("setup task panicked: {e}");
                 menubar::set_status_text(&format!("Setup panicked: {e}"));
-            }
-        }
-
-        // Polish LLM loads in a second pass, ONLY if polish is
-        // enabled in settings. Skipping when off means a fresh install
-        // doesn't pay 3.5 GB of resident memory for a feature the user
-        // hasn't turned on. Settings-UI toggle (Off → On) re-triggers
-        // a load via `apply_settings` → `handle_polish_mode_change`.
-        if matches!(self.settings.load().polish_mode, PolishMode::On) {
-            self.clone().spawn_llm_setup().await;
-        }
-    }
-
-    /// Load + warm the polish GGUF off the main thread. Idempotent —
-    /// returns early if `app.llm` is already populated or another load
-    /// is in flight. Called from the boot path
-    /// (`spawn_model_setup`) AND from the Settings-UI toggle
-    /// (`apply_settings` → `handle_polish_mode_change`).
-    ///
-    /// Single-flight via `llm_loading: Mutex<bool>` — without that gate
-    /// a rapid toggle (boot still loading + user flips Off→On) could
-    /// fire two concurrent loads racing to write `llm`, each holding
-    /// 3.5 GB of GGUF weights resident.
-    pub async fn spawn_llm_setup(self: Arc<Self>) {
-        if !matches!(self.llm.try_claim_load(), LoadClaim::Claimed) {
-            return;
-        }
-        let app = Arc::clone(&self);
-        let result = tokio::task::spawn_blocking(move || load_llm_blocking(&app.settings)).await;
-        self.finalize_llm_load(result.unwrap_or_else(|e| Err(anyhow::anyhow!("task panic: {e}"))));
-    }
-
-    /// Apply a completed loader result. Reading `polish_mode` here
-    /// (inside the manager's finalize critical section) is what wins
-    /// the rapid-toggle race: if the user flipped Off while we were
-    /// loading, settings.cache reads `Off` and the manager discards
-    /// the freshly-loaded backend.
-    fn finalize_llm_load(&self, result: anyhow::Result<Arc<dyn PolishBackend>>) {
-        let keep_if_loaded = matches!(self.settings.load().polish_mode, PolishMode::On);
-        let outcome = self.llm.finalize_load(result, keep_if_loaded);
-        let status: Option<String> = match outcome {
-            FinalizeOutcome::Stored => Some("Polish ready".to_string()),
-            FinalizeOutcome::DiscardedDisabled => {
-                log::info!("polish load completed but mode is now Off; discarding loaded model");
-                None
-            }
-            FinalizeOutcome::Failed(e) => {
-                log::error!("polish model setup failed: {e:#}");
-                if keep_if_loaded {
-                    Some(format!("Polish setup failed: {e}"))
-                } else {
-                    None
-                }
-            }
-        };
-        if let Some(text) = status {
-            menubar::set_status_text(&text);
-            self.refresh_menu();
-        }
-    }
-
-    /// Settings-UI polish toggle hook. On→Off drops the loaded model
-    /// (releases the 3.5 GB of weights); Off→On spawns a worker thread
-    /// to load + warm, guarded by `LlmManager::try_claim_load`. Called
-    /// from `apply_settings` when `polish_mode` changes.
-    fn handle_polish_mode_change(self: &Arc<Self>, new_mode: PolishMode) {
-        match new_mode {
-            PolishMode::Off => {
-                // Drop the Arc; if other threads hold clones (e.g. a
-                // polish-in-flight) the model lives until they're done.
-                self.llm.disable();
-                menubar::set_status_text("Polish disabled");
-                self.refresh_menu();
-            }
-            PolishMode::On => {
-                if !matches!(self.llm.try_claim_load(), LoadClaim::Claimed) {
-                    return;
-                }
-                self.spawn_supervised_with(
-                    "llm-toggle-load",
-                    move |app| {
-                        let load_result = load_llm_blocking(&app.settings);
-                        app.finalize_llm_load(load_result);
-                    },
-                    |app, msg| {
-                        log::error!("llm-toggle-load panic: {msg}");
-                        // Reset `Loading` → `Disabled` so a future On
-                        // toggle can retry. Without this the toggle
-                        // would silently no-op forever.
-                        app.llm.clear_loading_after_panic();
-                        menubar::set_status_text("Polish load crashed — try again");
-                    },
-                );
             }
         }
     }
@@ -1002,131 +885,32 @@ fn configured_asr_backend_override() -> anyhow::Result<AsrBackendOverride> {
     }
 }
 
-/// Synchronous polish-LLM load. Used by both the boot path (via
-/// `tokio::spawn_blocking`) and the Settings-toggle path (via
-/// `std::thread::spawn`). Updates the menubar status text as it goes
-/// so the user sees progress through the ~250 ms load + ~150 ms warm.
-fn load_llm_blocking(settings: &SettingsStore) -> anyhow::Result<Arc<dyn PolishBackend>> {
-    let model_path = settings.polish_model_path();
-    // Both first-use download and every later integrity check enter through
-    // this one gate. The caller already runs on a dedicated blocking thread,
-    // and a verified cache hit only reads metadata plus a tiny JSON sidecar.
-    use anyhow::Context as _;
-    let on_progress: model_fetch::ProgressFn = Arc::new(fetch_progress_to_menubar);
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("building polish-download runtime")?
-        .block_on(model_fetch::ensure_polish_model(&model_path, on_progress))
-        .with_context(|| {
-            format!(
-                "verifying or auto-downloading polish model to {}",
-                model_path.display()
-            )
-        })?;
-    menubar::set_status_text("Loading polish model…");
-    let llm = LlamaPolish::load(&model_path)?;
-    menubar::set_status_text("Warming polish model…");
-    llm.warmup()?;
-    Ok(Arc::new(llm))
-}
-
-/// Deliver `raw` to the focused app, optionally piping through the
-/// polish LLM with streaming-paste. Split out of `transcribe_and_paste`
-/// so the streaming-paste choreography (start streamer → push chunks →
-/// finish) stays readable.
-///
-/// Behaviour matrix:
-///
-/// | polish_mode | LLM loaded? | path |
-/// |---|---|---|
-/// | Off | — | one-shot `paste::deliver(raw)` |
-/// | On  | yes | streaming polish → `paste::Streamer` |
-/// | On  | no  | one-shot paste of `raw`, status text explains |
-///
-/// Polish failures fall back to raw paste — the user always sees their
-/// transcript, never nothing.
-fn deliver_cleaned(app: &App, raw: &str, settings: &Settings) -> Result<(), DeliveryFailure> {
-    if matches!(settings.polish_mode, PolishMode::Off) {
-        return paste::deliver(raw).map_err(|e| DeliveryFailure::unsent(e, raw));
-    }
-    let Some(llm) = app.llm.try_get() else {
-        // Polish was enabled but the model isn't loaded — pasting
-        // raw is the right fallback (better than nothing). Status
-        // text already explained the load failure.
-        log::warn!("polish enabled but model unavailable; pasting raw");
-        return paste::deliver(raw).map_err(|e| DeliveryFailure::unsent(e, raw));
+/// The OpenCode rewrite of `raw`, or `raw` unchanged when no service
+/// answers in time or the answer is unusable. Never fails: the dictation is
+/// pasted either way. See `crate::rewrite`.
+fn rewrite_transcript(raw: &str, settings: &Settings, store: &SettingsStore) -> String {
+    let vocabulary = crate::vocabulary::terms(&store.vocabulary_path()).unwrap_or_default();
+    let started = std::time::Instant::now();
+    let model = rewrite::ModelChoice {
+        key: &settings.rewrite_model,
+        variant: &settings.rewrite_variant,
     };
-    app.set_state(DictationState::Polishing);
-
-    let mut streamer = paste::Streamer::start().map_err(|e| DeliveryFailure::unsent(e, raw))?;
-    let outcome = run_polish_isolated(llm.as_ref(), raw, settings, |chunk| {
-        streamer
-            .push(chunk)
-            .map_err(|e| anyhow::anyhow!("streamer push: {e}"))
-    });
-    match outcome {
-        PolishOutcome::Ok => {
-            // Success: flush the unbroken-boundary tail (often the
-            // model's last fragment without a trailing space). If that
-            // last insert fails, only the tail is unsent — everything
-            // up to the previous word boundary already landed, so
-            // rescuing `raw` here would duplicate most of it.
-            streamer
-                .commit()
-                .map_err(|(e, tail)| DeliveryFailure::unsent(e, &tail))
+    let outcome = rewrite::rewrite(raw, model, &vocabulary);
+    let elapsed_ms = started.elapsed().as_millis();
+    match &outcome {
+        rewrite::Outcome::Rewritten(text) => {
+            log::info!(
+                "rewrite: OpenCode rewrote {} chars to {} chars in {elapsed_ms} ms",
+                raw.len(),
+                text.len()
+            );
         }
-        PolishOutcome::Error(e) => {
-            log::error!("polish pipeline failed: {e:#}");
-            // Sample fired-state BEFORE `abort` consumes the streamer.
-            // `abort` deliberately does NOT flush the pending tail, so
-            // this snapshot won't drift under us the way a `commit`-then-
-            // snapshot would.
-            let any_streamed = streamer.has_fired();
-            streamer.abort();
-            if any_streamed {
-                // Partial polished text is on screen and the LLM stopped
-                // producing, so the rest of the transcript is gone from
-                // the visible output. Re-pasting `raw` would duplicate
-                // the part that landed, so put it on the CLIPBOARD
-                // instead: nothing duplicates on screen, and the user
-                // can recover the full transcript if the partial isn't
-                // enough. Before this, the tail plus everything the LLM
-                // hadn't emitted yet was simply lost.
-                rescue_to_clipboard(
-                    &DeliveryFailure::unsent(anyhow::anyhow!("polish failed mid-stream: {e}"), raw),
-                    "Polish failed mid-stream — partial kept, full transcript on clipboard",
-                );
-                Ok(())
-            } else {
-                menubar::set_status_text(&format!("Polish failed — using raw transcript ({e})"));
-                paste::deliver(raw).map_err(|e| DeliveryFailure::unsent(e, raw))
-            }
-        }
-        PolishOutcome::Panicked(msg) => {
-            log::error!("polish panic caught: {msg}");
-            // We leave the model loaded — a single panic doesn't mean
-            // the weights are corrupt, and reloading would cost ~250 ms.
-            let any_streamed = streamer.has_fired();
-            streamer.abort();
-            if any_streamed {
-                // Same reasoning as the error branch above: keep the
-                // partial on screen, put the complete raw transcript on
-                // the clipboard rather than losing it.
-                rescue_to_clipboard(
-                    &DeliveryFailure::unsent(
-                        anyhow::anyhow!("polish panicked mid-stream: {msg}"),
-                        raw,
-                    ),
-                    "Polish panicked mid-stream — partial kept, full transcript on clipboard",
-                );
-                Ok(())
-            } else {
-                menubar::set_status_text("Polish panicked — using raw transcript");
-                paste::deliver(raw).map_err(|e| DeliveryFailure::unsent(e, raw))
-            }
+        rewrite::Outcome::Raw(reason) => {
+            log::warn!("rewrite: pasting the raw transcript after {elapsed_ms} ms: {reason}");
+            menubar::set_status_text("Rewrite unavailable — pasted the local transcript");
         }
     }
+    outcome.text(raw)
 }
 
 /// A delivery attempt that failed, carrying **the text that never
@@ -1177,48 +961,6 @@ fn rescue_to_clipboard(failure: &DeliveryFailure, ok_status: &str) {
             log::error!("clipboard rescue also failed: {e:#}");
             menubar::set_status_text("Paste failed and clipboard write failed — transcript lost");
         }
-    }
-}
-
-/// Outcome of one `polish_streaming` call run inside `catch_unwind`.
-///
-/// Splitting the success / typed-error / panic-payload triplet into a
-/// concrete enum lets us unit-test the panic-isolation seam without
-/// dragging `paste::Streamer` (which talks to the focused app via the
-/// CGEvent keystroke pipeline; see ADR-0019) into the test.
-#[derive(Debug)]
-enum PolishOutcome {
-    Ok,
-    Error(anyhow::Error),
-    Panicked(String),
-}
-
-/// Run the polish backend with a `catch_unwind` boundary. `on_chunk`
-/// is called from inside the unwind boundary — if it panics, the panic
-/// is caught the same way a polish-internal panic would be.
-///
-/// "Panic isolation" here means **Rust panics** from `llama-cpp-2`'s
-/// safe wrapper layer (e.g. an `assert!` inside the binding, a tokenise
-/// failure that the binding maps to `unwrap`). It does NOT catch C++
-/// exceptions, SIGSEGV from the GGML backend, or `abort()` from the
-/// underlying llama.cpp C++ — those bypass Rust's unwinding machinery
-/// entirely. The fallback is best-effort, not bulletproof.
-fn run_polish_isolated<F>(
-    backend: &dyn PolishBackend,
-    text: &str,
-    settings: &Settings,
-    mut on_chunk: F,
-) -> PolishOutcome
-where
-    F: FnMut(&str) -> anyhow::Result<()>,
-{
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        polish::polish_streaming(backend, text, settings, &mut on_chunk)
-    }));
-    match result {
-        Ok(Ok(())) => PolishOutcome::Ok,
-        Ok(Err(e)) => PolishOutcome::Error(e),
-        Err(payload) => PolishOutcome::Panicked(panic_message(&*payload)),
     }
 }
 
@@ -1330,7 +1072,7 @@ pub fn effective_trigger_mode(s: &Settings) -> TriggerMode {
 }
 
 /// Shared download-progress sink: routes `model_fetch::Progress` events
-/// (ASR first-run fetch AND polish first-enable fetch) to the menubar
+/// (the ASR first-run fetch) to the menubar
 /// status text.
 fn fetch_progress_to_menubar(p: Progress) {
     match p {
@@ -1406,12 +1148,12 @@ mod tests {
     fn panic_message_extracts_static_str_payload() {
         // `panic!("literal")` payload comes through as `&'static str`.
         let result: std::thread::Result<()> = std::panic::catch_unwind(|| {
-            panic!("synthetic panic from polish");
+            panic!("synthetic worker panic");
         });
         let payload = result.unwrap_err();
         // `&*payload` derefs the Box so `downcast_ref` sees the inner
         // type (`&'static str`) instead of the Box itself.
-        assert_eq!(panic_message(&*payload), "synthetic panic from polish");
+        assert_eq!(panic_message(&*payload), "synthetic worker panic");
     }
 
     #[test]
@@ -1419,11 +1161,11 @@ mod tests {
         // `panic!("{}", String::from(...))` payload comes through as
         // owned `String`. Both branches of `panic_message` must work.
         let result: std::thread::Result<()> = std::panic::catch_unwind(|| {
-            let dynamic = String::from("dynamic polish error");
+            let dynamic = String::from("dynamic worker error");
             panic!("{}", dynamic);
         });
         let payload = result.unwrap_err();
-        assert_eq!(panic_message(&*payload), "dynamic polish error");
+        assert_eq!(panic_message(&*payload), "dynamic worker error");
     }
 
     #[test]
@@ -1435,137 +1177,6 @@ mod tests {
         });
         let payload = result.unwrap_err();
         assert_eq!(panic_message(&*payload), "non-string panic payload");
-    }
-
-    // Test backends for the §6-7 panic-isolation acceptance criterion.
-    // Real `LlamaPolish` can't be constructed without a GGUF on disk,
-    // so we drive `run_polish_isolated` through fakes that exercise
-    // each `PolishOutcome` arm directly.
-    struct OkBackend;
-    impl crate::polish::PolishBackend for OkBackend {
-        fn polish_into(
-            &self,
-            text: &str,
-            on_chunk: &mut dyn FnMut(&str) -> anyhow::Result<()>,
-        ) -> anyhow::Result<()> {
-            on_chunk(&format!("polished: {text}"))
-        }
-        fn warmup(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct ErroringBackend;
-    impl crate::polish::PolishBackend for ErroringBackend {
-        fn polish_into(
-            &self,
-            _text: &str,
-            _on_chunk: &mut dyn FnMut(&str) -> anyhow::Result<()>,
-        ) -> anyhow::Result<()> {
-            Err(anyhow::anyhow!("simulated polish error"))
-        }
-        fn warmup(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct PanickingBackend;
-    impl crate::polish::PolishBackend for PanickingBackend {
-        fn polish_into(
-            &self,
-            _text: &str,
-            _on_chunk: &mut dyn FnMut(&str) -> anyhow::Result<()>,
-        ) -> anyhow::Result<()> {
-            panic!("simulated llama-cpp safe-wrapper panic");
-        }
-        fn warmup(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn run_polish_isolated_returns_ok_when_backend_succeeds() {
-        let backend = OkBackend;
-        let settings = Settings {
-            polish_mode: PolishMode::On,
-            ..Settings::default()
-        };
-        let mut captured = String::new();
-        let outcome = run_polish_isolated(&backend, "hello", &settings, |c| {
-            captured.push_str(c);
-            Ok(())
-        });
-        assert!(matches!(outcome, PolishOutcome::Ok));
-        assert_eq!(captured, "polished: hello");
-    }
-
-    #[test]
-    fn run_polish_isolated_classifies_typed_error_separately_from_panic() {
-        // An `Err(...)` from the backend should NOT trip catch_unwind —
-        // it's a typed failure, not a panic. The fallback paste is
-        // still raw, but the user-facing message includes the error.
-        let backend = ErroringBackend;
-        let settings = Settings {
-            polish_mode: PolishMode::On,
-            ..Settings::default()
-        };
-        let mut captured = String::new();
-        let outcome = run_polish_isolated(&backend, "hello", &settings, |c| {
-            captured.push_str(c);
-            Ok(())
-        });
-        match outcome {
-            PolishOutcome::Error(e) => {
-                assert!(e.to_string().contains("simulated polish error"));
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn run_polish_isolated_catches_panic_and_recovers_payload() {
-        // The §6-7 acceptance: a panic inside the polish call MUST be
-        // caught here so the dictation pipeline can fall back to raw
-        // paste. This is the load-bearing test for ADR-0018's panic
-        // isolation tradeoff.
-        let backend = PanickingBackend;
-        let settings = Settings {
-            polish_mode: PolishMode::On,
-            ..Settings::default()
-        };
-        let mut captured = String::new();
-        let outcome = run_polish_isolated(&backend, "hello", &settings, |c| {
-            captured.push_str(c);
-            Ok(())
-        });
-        match outcome {
-            PolishOutcome::Panicked(msg) => {
-                assert!(
-                    msg.contains("simulated llama-cpp safe-wrapper panic"),
-                    "expected the panic payload, got: {msg}"
-                );
-            }
-            other => panic!("expected Panicked, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn run_polish_isolated_off_mode_bypasses_backend_panic() {
-        // PolishMode::Off should short-circuit BEFORE reaching the
-        // backend — even a PanickingBackend should never be invoked.
-        // Caller's `on_chunk` sees the raw text exactly once.
-        let backend = PanickingBackend;
-        let settings = Settings {
-            polish_mode: PolishMode::Off,
-            ..Settings::default()
-        };
-        let mut captured = String::new();
-        let outcome = run_polish_isolated(&backend, "raw text", &settings, |c| {
-            captured.push_str(c);
-            Ok(())
-        });
-        assert!(matches!(outcome, PolishOutcome::Ok));
-        assert_eq!(captured, "raw text");
     }
 
     #[test]

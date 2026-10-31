@@ -26,8 +26,8 @@
 //! The FSM owns the state ↔ session ↔ pending-terminate triple. It
 //! does NOT own:
 //!
-//! - The recogniser (`Asr`) or the polish LLM — those have monotonic
-//!   "ready or not" semantics and don't interact with session state.
+//! - The recogniser (`Asr`) — it has monotonic
+//!   "ready or not" semantics and doesn't interact with session state.
 //!   Callers pass `asr_ready: bool` (or a precomputed next state) on
 //!   transitions where it matters.
 //! - UI side-effects (`menubar::refresh`, `hud::show_state`). Callers
@@ -49,8 +49,8 @@ pub enum DictationState {
     Listening,
     /// Capture stopped, ASR running.
     Transcribing,
-    /// ASR done; LLM polish pass running.
-    Polishing,
+    /// ASR done; the OpenCode rewrite is running.
+    Rewriting,
 }
 
 /// Pre-populated stop edge — fired during the gap between the FSM
@@ -170,7 +170,7 @@ impl DictationFsm {
     /// Force-set the state without touching session/pending_terminate.
     /// Used by:
     /// - Boot transition `ModelLoading → Idle` once the ASR is warm.
-    /// - `Transcribing → Polishing` while the LLM pass runs (no
+    /// - `Transcribing → Rewriting` while the OpenCode rewrite runs (no
     ///   session involved at that point).
     /// - `on_session_finished` to return to Idle/ModelLoading after
     ///   the transcribe worker completes.
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn tap_press_from_transcribing_is_ignored() {
-        // Pressing during Transcribing/Polishing must NOT spawn a
+        // Pressing during Transcribing/Rewriting must NOT spawn a
         // second session — the prior session's watcher would later
         // overwrite the new Listening with Idle.
         let fsm = DictationFsm::new();
@@ -457,7 +457,7 @@ mod tests {
             DictationState::Idle,
             DictationState::Listening,
             DictationState::Transcribing,
-            DictationState::Polishing,
+            DictationState::Rewriting,
         ] {
             assert!(
                 !TapPressOutcome::Ignored(state).primes_engine(),

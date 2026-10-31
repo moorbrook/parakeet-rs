@@ -69,10 +69,10 @@ long_description = """
 Press a global hotkey, speak, and Parakeet inserts the transcript at
 your cursor. Powered by Parakeet Unified EN 0.6B int8 running locally
 on the Apple Neural Engine via a resident native Core ML worker, with
-sherpa-onnx as the load-failure fallback. Optional LLM
-polish pass (Qwen 3.5 4B Q6_K, llama.cpp + Metal, in-process)
-removes filler words and fixes punctuation. Fully local — no API
-keys, telemetry, or network calls after required and optional model downloads.
+sherpa-onnx as the load-failure fallback. Recognition is fully local —
+no API keys or telemetry, and no network calls after the model download.
+An optional rewrite step sends the transcript to an OpenCode service
+already running on the Mac and pastes the local transcript if none answers.
 """
 osx_minimum_system_version = "11.0"
 # cargo-bundle's `osx_info_plist_exts` concatenates rather than merges, which
@@ -94,11 +94,11 @@ osx_minimum_system_version = "11.0"
 # - fat LTO + single codegen unit gives the compiler full cross-crate
 #   inlining and dead-code elimination, important since the audio path
 #   crosses several small crates.
-# - panic="unwind" is REQUIRED for the polish-pipeline panic-isolation
-#   acceptance criterion (latency-plan.md §7): a panic from the llama-cpp
-#   safe wrapper must be caught by `catch_unwind` in `run_polish_isolated`
-#   so the next dictation falls back to raw paste. `panic="abort"` would
-#   make that defense dead in release builds.
+# - panic="unwind" is REQUIRED for worker panic isolation: a panic in a
+#   dictation worker or an ObjC selector must be caught by `catch_unwind`
+#   (`App::spawn_supervised`, `objc_util::selector_guard`) so the app
+#   returns to Idle. `panic="abort"` would make that defense dead in
+#   release builds.
 # - strip=symbols removes the debug symbol table.
 [profile.release]
 lto = "fat"
@@ -137,6 +137,9 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",
 ] }
 futures-util = "0.3"
+# Loopback URL checks for the OpenCode rewrite registration (already in the
+# tree through reqwest).
+url = "2"
 sha2 = { version = "0.10.9", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 
@@ -219,20 +222,8 @@ objc2-foundation = { version = "0.3", features = [
     "NSNotification",
 ] }
 
-# llama.cpp via FFI for the polish tier (Qwen 3.5 4B Q6_K GGUF). Metal
-# backend on Apple Silicon — same FFI pattern as sherpa-onnx. Default
-# features (openmp, android-shared-stdcxx) disabled — openmp duplicates
-# work on top of Apple's GCD scheduler; android-shared-stdcxx is
-# irrelevant on macOS.
-llama-cpp-2 = { version = "0.1", default-features = false, features = ["metal", "sampler"] }
-encoding_rs = "0.8"
 
 [dev-dependencies]
 # Isolated per-test data dirs for SettingsStore tests, so parallel
 # `cargo test` runs don't race on a shared `/tmp/parakeet-test` path.
 tempfile = "3"
-# Property tests for the pure text helpers on the polish path
-# (`flush_safe_prefix`, `strip_no_think_tail`) — the char-boundary and
-# tail-strip logic has a history of off-by-one/punctuation bugs that
-# example tests only catch one instance of at a time.
-proptest = "1"

@@ -44,25 +44,6 @@ impl TriggerMode {
     }
 }
 
-/// Optional LLM post-processing pass between ASR output and paste. Used to
-/// strip filler words, fix punctuation, and honour inline editing commands
-/// (e.g. "new paragraph", "scratch that").
-///
-/// Ships a single backend: Qwen 3.5 4B Q6_K via in-process
-/// `llama-cpp-2` (Metal on Apple Silicon). See [ADR-0018](../docs/ADR.md).
-/// No `polish_model` setting — the model is fixed at the backend's
-/// expected path and changing it requires a code change, not a config
-/// change.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PolishMode {
-    /// No post-processing; paste the raw ASR transcript.
-    #[default]
-    Off,
-    /// In-process Qwen 3.5 4B Q6_K via `llama-cpp-2` Metal backend.
-    On,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
     pub hotkey: String,
@@ -70,8 +51,21 @@ pub struct Settings {
     pub trigger_mode: TriggerMode,
     /// Language hint for the recognizer, e.g. "eng_Latn". Empty = autodetect.
     pub language: String,
+    /// Rewrite each transcript through the OpenCode service that is
+    /// already running on this Mac before pasting it. Off by default; when
+    /// on and no service answers within the deadline, the raw transcript is
+    /// pasted unchanged. See [`crate::rewrite`].
     #[serde(default)]
-    pub polish_mode: PolishMode,
+    pub rewrite_enabled: bool,
+    /// OpenCode model for the rewrite as `provider/model`, for example
+    /// `zai-coding-plan/glm-5.3-flash`. Empty uses the service's default
+    /// model.
+    #[serde(default)]
+    pub rewrite_model: String,
+    /// The model's variant, for example `low` reasoning effort. Empty uses
+    /// the model's default variant. Ignored when `rewrite_model` is empty.
+    #[serde(default)]
+    pub rewrite_variant: String,
     /// Contextual-biasing boost applied to every term in
     /// `vocabulary.txt`. Ignored when the vocabulary is empty.
     ///
@@ -153,7 +147,9 @@ impl Default for Settings {
             hotkey: "CmdOrCtrl+Shift+Space".to_string(),
             trigger_mode: TriggerMode::default(),
             language: String::new(),
-            polish_mode: PolishMode::default(),
+            rewrite_enabled: false,
+            rewrite_model: String::new(),
+            rewrite_variant: String::new(),
             hotword_score: default_hotword_score(),
             hold_windows_enabled: default_hold_windows_enabled(),
             hold_window_min_seconds: default_hold_window_min_seconds(),
@@ -173,6 +169,11 @@ pub struct SettingsStore {
 impl SettingsStore {
     pub fn new() -> Result<Self> {
         let data_root = dirs::data_dir().context("locating Application Support dir")?;
+        Self::with_data_root(&data_root)
+    }
+
+    /// The store under `data_root` (Application Support in production).
+    fn with_data_root(data_root: &Path) -> Result<Self> {
         let data_dir = data_root.join(BUNDLE_NAMESPACE);
         // On macOS the conventional split is config under `~/Library/Preferences`
         // and data under `~/Library/Application Support`. We collapse both into
@@ -210,9 +211,8 @@ impl SettingsStore {
         // saves can't truncate each other's tmp file mid-write or race
         // on `rename`.
         //
-        // Pretty-printed so it's grep-friendly when debugging. There is
-        // no secret to special-case — the in-process llama.cpp path has
-        // no API key.
+        // Pretty-printed so it's grep-friendly when debugging. Settings
+        // hold no secret.
         use std::io::Write as _;
         use std::sync::atomic::{AtomicU64, Ordering};
         static SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -325,29 +325,6 @@ impl SettingsStore {
             && self.tokens_path().exists()
             && self.vad_path().exists()
     }
-
-    /// Polish-pass GGUF weights path. Expected to live in the same
-    /// per-bundle data directory as the ASR model. Auto-downloaded by
-    /// `model_fetch::ensure_polish_model` on first polish-enable (the
-    /// `polish_gguf_url_filename_matches_polish_model_path` test pins
-    /// URL ↔ path sync). Exactly one model is supported (Qwen 3.5 4B
-    /// Q6_K, 3.53 GB; chosen over the original 2B Q4_K_M for
-    /// instruction-following quality) — see [ADR-0018](../../docs/ADR.md).
-    /// The directory + filename are fixed; changing them requires a
-    /// model-fetch update, not a settings change.
-    pub fn polish_model_path(&self) -> PathBuf {
-        self.data_dir
-            .join("llm")
-            .join("qwen3.5-4b-q6_k")
-            .join("Qwen3.5-4B-Q6_K.gguf")
-    }
-
-    /// True iff the polish-pass GGUF is on disk. This is an existence-only
-    /// UI/diagnostic helper; the loader calls `ensure_polish_model` and passes
-    /// its integrity gate before llama.cpp can open the file.
-    pub fn polish_model_present(&self) -> bool {
-        self.polish_model_path().exists()
-    }
 }
 
 #[cfg(test)]
@@ -439,77 +416,46 @@ mod tests {
     }
 
     #[test]
-    fn polish_defaults_to_off() {
-        // The polish pass is opt-in: a fresh install doesn't load the
-        // ~3.5 GB Qwen GGUF until the user enables polish explicitly.
-        // Pin the default so an accidental flip doesn't silently start
-        // a download + warmup the user didn't ask for.
-        let s = Settings::default();
-        assert_eq!(s.polish_mode, PolishMode::Off);
-    }
-
-    #[test]
-    fn polish_mode_on_round_trips_lowercase() {
-        let s = Settings {
-            polish_mode: PolishMode::On,
-            ..Settings::default()
-        };
-        let raw = serde_json::to_string(&s).unwrap();
-        // Lowercase enum form, same as TriggerMode.
-        assert!(
-            raw.contains("\"polish_mode\":\"on\""),
-            "expected lowercase polish_mode, got: {raw}"
-        );
-        let back: Settings = serde_json::from_str(&raw).unwrap();
-        assert_eq!(back.polish_mode, PolishMode::On);
+    fn a_settings_file_from_the_polish_era_still_loads() {
+        // settings.json written before the local polish model was removed
+        // carries `polish_mode`. The loader ignores unknown keys, so the
+        // user's other settings survive; a parse failure would silently
+        // reset them all to defaults (`SettingsStore::new` falls back to
+        // `Settings::default()`).
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join(BUNDLE_NAMESPACE);
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("settings.json"),
+            r#"{"hotkey":"Alt+Space","trigger_mode":"hold","language":"eng_Latn","polish_mode":"on","hotword_score":2.5}"#,
+        )
+        .unwrap();
+        let store = SettingsStore::with_data_root(dir.path()).unwrap();
+        let s = store.load();
+        assert_eq!(s.hotkey, "Alt+Space");
+        assert_eq!(s.trigger_mode, TriggerMode::Hold);
+        assert_eq!(s.hotword_score, 2.5);
+        assert!(!s.rewrite_enabled);
+        assert_eq!(s.rewrite_model, "");
+        assert_eq!(s.rewrite_variant, "");
     }
 
     #[test]
     fn settings_json_never_contains_api_key() {
         // The Anthropic-API era wrote an `anthropic_api_key` field into
-        // settings.json. The in-process llama.cpp path has no key. Pin
-        // that the wire shape never leaks any *api_key* field.
+        // settings.json. The OpenCode rewrite reads the service's own
+        // loopback registration and needs no key. Pin that the wire shape
+        // never leaks any *api_key* field.
         let s = Settings {
-            polish_mode: PolishMode::On,
+            rewrite_enabled: true,
+            rewrite_model: "zai-coding-plan/glm-5.3-flash".to_string(),
+            rewrite_variant: "low".to_string(),
             ..Settings::default()
         };
         let raw = serde_json::to_string(&s).unwrap();
         assert!(
             !raw.contains("api_key"),
             "settings.json must not contain any *api_key* field: {raw}"
-        );
-    }
-
-    #[test]
-    fn polish_gguf_url_filename_matches_polish_model_path() {
-        // The auto-downloader (`model_fetch::ensure_polish_model`) writes
-        // to `polish_model_path`; if the URL's trailing filename drifts
-        // from this path's filename, the fetch succeeds but the loader
-        // still reports "model missing" — a 3.5 GB download to nowhere.
-        let url_file = crate::model_fetch::POLISH_GGUF_URL
-            .rsplit('/')
-            .next()
-            .unwrap();
-        let store = synthetic_store(tempfile::tempdir().unwrap().keep());
-        let path = store.polish_model_path();
-        let path_file = path.file_name().unwrap().to_str().unwrap();
-        assert_eq!(url_file, path_file);
-    }
-
-    #[test]
-    fn polish_model_path_lives_under_data_dir() {
-        // The polish GGUF cache layout is a shipped invariant — a
-        // launch that changes this strands existing users' downloads.
-        let store = synthetic_store(tempfile::tempdir().unwrap().keep());
-        let cm = store.polish_model_path();
-        assert!(cm.starts_with(store.data_dir()));
-        assert_eq!(
-            cm,
-            store
-                .data_dir()
-                .join("llm")
-                .join("qwen3.5-4b-q6_k")
-                .join("Qwen3.5-4B-Q6_K.gguf")
         );
     }
 

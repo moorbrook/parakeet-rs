@@ -1,7 +1,7 @@
 //! Floating recording-state HUD.
 //!
 //! A small pill at the bottom of the main display that shows the current
-//! dictation state ("Listening…", "Transcribing…", "Polishing…") so the
+//! dictation state ("Listening…", "Transcribing…", "Rewriting…") so the
 //! user knows the hotkey actually registered. Hides itself on `Idle` /
 //! `ModelLoading` so it's only visible when something is happening.
 //!
@@ -333,12 +333,12 @@ fn show_state_main(state: DictationState) {
         let label = match state {
             DictationState::Listening => Some("●  Listening…"),
             DictationState::Transcribing => Some("Transcribing…"),
-            DictationState::Polishing => Some("✨  Polishing…"),
+            DictationState::Rewriting => Some("✨  Rewriting…"),
             DictationState::Idle | DictationState::ModelLoading => None,
         };
 
         // Bars only animate during Listening. Show them while the
-        // panel is up (Transcribing / Polishing keep them frozen at
+        // panel is up (Transcribing / Rewriting keep them frozen at
         // the minimum height — recording is over, no more audio to
         // visualise). Hide them entirely when the panel hides.
         let want_animation = matches!(state, DictationState::Listening);

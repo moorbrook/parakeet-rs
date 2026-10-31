@@ -3,9 +3,7 @@
 //! Every `#[unsafe(method)]` ObjC selector body is wrapped in
 //! [`selector_guard`] so a Rust panic can't unwind across ObjC frames
 //! (Undefined Behaviour). With `panic = "unwind"` in `[profile.release]`
-//! (required by the polish-pipeline panic-isolation acceptance
-//! criterion in `docs/latency-plan.md` §7), the guard catches the panic
-//! in BOTH debug and release builds — it logs the panic via `log::error!`
+//! the guard catches the panic in BOTH debug and release builds — it logs the panic via `log::error!`
 //! and returns control to AppKit so the menu-bar app keeps running.
 //! `install_panic_hook` adds a backup logging path that fires even when
 //! a panic site is outside any selector wrapper.
@@ -22,8 +20,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 /// having to plaster every selector with bespoke wrappers.
 ///
 /// Works in both debug and release builds — the project's release
-/// profile uses `panic = "unwind"` specifically so this and
-/// `run_polish_isolated` in `app.rs` can actually catch panics.
+/// profile uses `panic = "unwind"` specifically so this and the
+/// worker supervision in `app.rs` can actually catch panics.
 pub fn selector_guard<F: FnOnce()>(name: &'static str, body: F) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(body)) {
         let msg = payload_message(&*payload);

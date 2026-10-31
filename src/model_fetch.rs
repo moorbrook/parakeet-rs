@@ -1,6 +1,6 @@
 //! First-run download and integrity verification for the Rust-managed model
-//! artifacts: Parakeet TDT 0.6B v3 int8, Parakeet Unified Core ML, Silero VAD,
-//! and the optional polish GGUF.
+//! artifacts: Parakeet TDT 0.6B v3 int8, Parakeet Unified Core ML and Silero
+//! VAD.
 //!
 //! Every artifact has an immutable upstream identity (revision where the host
 //! supports one, expected byte length, and SHA-256). Downloads are hashed while
@@ -31,16 +31,6 @@ const HF_REPO: &str = concat!(
 );
 const SILERO_VAD_URL: &str =
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
-#[cfg(test)]
-const POLISH_REVISION: &str = "e87f176479d0855a907a41277aca2f8ee7a09523";
-/// Polish-pass GGUF (ADR-0018, amended to the 4B). MUST stay in sync
-/// with `Settings::polish_model_path` — the filename at the end of
-/// this URL is the filename the loader expects on disk.
-pub(crate) const POLISH_GGUF_URL: &str = concat!(
-    "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/",
-    "e87f176479d0855a907a41277aca2f8ee7a09523/",
-    "Qwen3.5-4B-Q6_K.gguf"
-);
 
 #[derive(Clone, Copy, Debug)]
 struct Artifact {
@@ -98,13 +88,6 @@ const SILERO_VAD: Artifact = Artifact {
     url: SILERO_VAD_URL,
     sha256: "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6",
     size: 643_854,
-};
-
-const POLISH_GGUF: Artifact = Artifact {
-    label: "Qwen3.5-4B-Q6_K.gguf",
-    url: POLISH_GGUF_URL,
-    sha256: "fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66",
-    size: 3_525_956_768,
 };
 
 pub const COREML_REVISION: &str = "4252711f6f060f9a2f91e5f081a806d7f45eebd8";
@@ -320,28 +303,6 @@ pub async fn ensure_model(
         "Model downloaded and verified."
     } else {
         "Model verified."
-    };
-    on_progress(Progress::Status(status.to_string()));
-    Ok(())
-}
-
-/// Verify the optional polish GGUF on every load and download it on first use.
-/// A verified metadata cache keeps later loads cheap; changed files are hashed
-/// again before llama.cpp is allowed to open them.
-pub async fn ensure_polish_model(dest: &Path, on_progress: ProgressFn) -> Result<()> {
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    on_progress(Progress::Status(
-        "Checking polish model integrity…".to_string(),
-    ));
-    let downloaded = ensure_artifact(POLISH_GGUF, dest, &on_progress)
-        .await
-        .context("ensuring polish GGUF")?;
-    let status = if downloaded {
-        "Polish model downloaded and verified."
-    } else {
-        "Polish model verified."
     };
     on_progress(Progress::Status(status.to_string()));
     Ok(())
@@ -862,14 +823,6 @@ mod tests {
         assert_eq!(SILERO_VAD.url, SILERO_VAD_URL);
         assert_eq!(SILERO_VAD.sha256.len(), 64);
         assert_eq!(SILERO_VAD.size, 643_854);
-    }
-
-    #[test]
-    fn polish_gguf_url_is_revision_pinned() {
-        assert!(POLISH_GGUF_URL.contains(POLISH_REVISION));
-        assert_eq!(POLISH_GGUF.sha256.len(), 64);
-        assert_eq!(POLISH_GGUF.size, 3_525_956_768);
-        assert!(POLISH_GGUF_URL.ends_with(POLISH_GGUF.label));
     }
 
     #[test]
