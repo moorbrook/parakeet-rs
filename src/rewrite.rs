@@ -36,7 +36,7 @@ pub const DEADLINE: Duration = Duration::from_secs(5);
 const MAX_REGISTRATION_BYTES: u64 = 64 * 1024;
 const MAX_REGISTRATIONS: usize = 16;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-/// How often a blocked read re-checks the deadline.
+/// How often a blocked read or write re-checks the deadline.
 const READ_SLICE: Duration = Duration::from_millis(50);
 /// Newest one-shot route first; older OpenCode builds serve only the second.
 const GENERATE_ROUTES: [&str; 2] = ["/api/experimental/generate", "/api/generate"];
@@ -375,11 +375,32 @@ impl Service {
         head.push_str("\r\n");
         let mut stream = TcpStream::connect_timeout(&self.address, remaining())
             .map_err(|error| anyhow!("OpenCode isn't running ({error})"))?;
-        stream.set_write_timeout(Some(remaining().max(Duration::from_millis(1))))?;
-        stream
-            .write_all(head.as_bytes())
-            .and_then(|()| stream.write_all(body.unwrap_or_default()))
-            .with_context(|| format!("could not send OpenCode {path}"))?;
+        // One buffer, written in slices that each recheck the shared
+        // deadline: a service that drains the request slowly keeps a single
+        // `write_all` making partial progress past any per-call timeout.
+        let mut request = head.into_bytes();
+        request.extend_from_slice(body.unwrap_or_default());
+        let mut sent = 0;
+        while sent < request.len() {
+            check()?;
+            stream.set_write_timeout(Some(
+                remaining().clamp(Duration::from_millis(1), READ_SLICE),
+            ))?;
+            match stream.write(&request[sent..]) {
+                Ok(0) => bail!("OpenCode closed the connection while receiving {path}"),
+                Ok(written) => sent += written,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("could not send OpenCode {path}"));
+                }
+            }
+        }
         let mut bytes = Vec::new();
         let mut buffer = [0; 16 * 1024];
         loop {
@@ -599,6 +620,46 @@ mod tests {
         assert_eq!(outcome.text(RAW), RAW);
         assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
         assert!(elapsed < Duration::from_millis(1_000), "{elapsed:?}");
+    }
+
+    #[test]
+    fn a_harness_that_reads_slowly_pastes_the_raw_transcript_at_the_deadline() {
+        // The service accepts, then drains the request a few KB at a time and
+        // hangs up after 3 s. The prompt (about 2 MB of vocabulary) is far
+        // larger than the socket buffers, so sending it keeps making partial
+        // progress; the deadline must still bound the whole request.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let opened = Instant::now();
+            let mut buffer = [0; 4096];
+            while opened.elapsed() < Duration::from_secs(3) {
+                if stream.read(&mut buffer).unwrap_or(0) == 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let service = Service {
+            address,
+            password: None,
+        };
+        let vocabulary: Vec<String> = (0..200_000).map(|i| format!("term{i}")).collect();
+        let started = Instant::now();
+        let outcome = rewrite_with(
+            &service,
+            RAW,
+            MODEL,
+            &vocabulary,
+            started,
+            Duration::from_millis(300),
+        );
+        let elapsed = started.elapsed();
+        assert!(matches!(outcome, Outcome::Raw(_)), "{outcome:?}");
+        assert_eq!(outcome.text(RAW), RAW);
+        // The 300 ms deadline plus 200 ms for scheduling.
+        assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
     }
 
     #[test]
