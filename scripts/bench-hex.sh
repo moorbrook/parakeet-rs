@@ -73,6 +73,23 @@ scripts/build-coreml-worker.sh
 cargo build --release --locked --bin asr_diff --bin bench_e2e
 cargo build --release --locked --manifest-path bench/hex-engine/Cargo.toml
 
+# A binary that cannot start (a missing dylib aborts it in dyld, status 134)
+# would otherwise cost every arm it runs in, an hour into the sitting.
+for binary in ./target/release/asr_diff ./target/release/bench_e2e "$HEX"; do
+    status=0
+    "$binary" --help >/dev/null 2>&1 || status=$?
+    if (( status >= 128 )); then
+        "$binary" --help 2>&1 | head -3 >&2 || true
+        echo "bench-hex: $binary cannot start (status $status)" >&2
+        exit 1
+    fi
+done
+
+fail() {
+    echo "bench-hex: $*" >&2
+    exit 1
+}
+failures=0
 held=0
 release_lock() {
     if [[ -n "$BENCH_LOCK" && "$held" == 1 ]]; then
@@ -110,6 +127,9 @@ take_lock() {
 
 if [[ " $STAGES " == *" gold "* ]]; then
     take_lock gold
+    # Both binaries exit 1 for a failed quality gate as well as for an error,
+    # so the report's existence, not the exit status, says the arm ran.
+    rm -f "$OUT/ours-gold.json" "$OUT/hex-offline-gold.json" "$OUT/hex-stream-gold.json"
     "./target/release/asr_diff" --gold bench/gold/manifest.json --audio-dir bench/gold/audio \
         --repetitions "$REPETITIONS" --backend coreml-unified \
         --worker "$WORKER" --model-dir "$MODEL_DIR" \
@@ -120,6 +140,9 @@ if [[ " $STAGES " == *" gold "* ]]; then
             --json-out "$OUT/hex-$path-gold.json" || true
     done
     release_lock
+    for report in ours-gold hex-offline-gold hex-stream-gold; do
+        [[ -f "$OUT/$report.json" ]] || fail "$report.json was not written"
+    done
 fi
 
 if [[ " $STAGES " == *" hold "* ]]; then
@@ -155,20 +178,26 @@ if [[ " $STAGES " == *" hold "* ]]; then
         for arm in "${arms[@]}"; do
             log="$OUT/hold-$arm$suffix.log"
             echo "Hold $arm on $wav…"
+            before=$(grep -c phase_timer "$log" || true)
             case "$arm" in
                 ours-windowed|ours-serial)
                     windows=$([[ "$arm" == ours-windowed ]] && echo 6,6 || echo off)
                     ./target/release/bench_e2e --backend coreml-unified --mode hold \
+                        --worker "$WORKER" --model-dir "$MODEL_DIR" \
                         --wav "$wav" --device "$DEVICE" --hold-windows "$windows" \
-                        --reps "$REPS" --warmup-reps "$WARMUP_REPS" 2>>"$log" \
-                        || echo "  ↑ $arm failed on $wav (see $log)"
+                        --reps "$REPS" --warmup-reps "$WARMUP_REPS" 2>>"$log" || true
                     ;;
                 hex-offline|hex-stream)
                     "$HEX" hold --path "${arm#hex-}" --model "$GGUF" --wav "$wav" \
                         --device "$DEVICE" --reps "$REPS" --warmup-reps "$WARMUP_REPS" \
-                        2>>"$log" || echo "  ↑ $arm failed on $wav (see $log)"
+                        2>>"$log" || true
                     ;;
             esac
+            after=$(grep -c phase_timer "$log" || true)
+            if (( after - before != REPS )); then
+                echo "  ↑ $arm on $wav produced $((after - before)) of $REPS repetitions (see $log)" >&2
+                failures=$((failures + 1))
+            fi
         done
         release_lock
     done
@@ -181,3 +210,5 @@ if [[ " $STAGES " == *" hold "* ]]; then
         cat "$OUT/hold-$arm.csv" "$OUT/hold-$arm-multipause.csv"
     done
 fi
+
+(( failures == 0 )) || fail "$failures Hold arm runs fell short of $REPS repetitions"
