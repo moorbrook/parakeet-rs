@@ -204,6 +204,170 @@ pub fn coreml_artifact_digest() -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Offline encoders compiled at windows shorter than the stock 15 s, which the
+/// worker routes short utterances to (kata fgzt, ADR-0037). Each is converted
+/// once from the same NVIDIA checkpoint by `scripts/build-bucket-encoder.py`
+/// and published as one archive per window, because a Core ML bundle is a
+/// directory and release assets are flat files.
+///
+/// Deliberately not part of [`coreml_artifact_digest`]: that digest keys the
+/// tuning profile, and the profile does not yet select buckets (kata 4s2q).
+#[derive(Clone, Copy, Debug)]
+pub struct EncoderBucket {
+    pub seconds: u32,
+    /// Directory name the worker discovers in the model directory.
+    bundle: &'static str,
+    archive: Artifact,
+    /// Every regular file the archive holds, labelled relative to `bundle`.
+    files: &'static [Artifact],
+}
+
+macro_rules! encoder_bucket {
+    (
+        $seconds:literal, $bundle:literal, $archive_sha256:literal, $archive_size:literal,
+        [$(($path:literal, $sha256:literal, $size:literal)),+ $(,)?]
+    ) => {
+        EncoderBucket {
+            seconds: $seconds,
+            bundle: $bundle,
+            archive: Artifact {
+                label: concat!($bundle, ".tar"),
+                url: concat!(
+                    "https://github.com/moorbrook/parakeet-rs/releases/download/",
+                    "encoder-buckets-v1/",
+                    $bundle,
+                    ".tar"
+                ),
+                sha256: $archive_sha256,
+                size: $archive_size,
+            },
+            files: &[$(Artifact {
+                label: $path,
+                url: concat!(
+                    "https://github.com/moorbrook/parakeet-rs/releases/download/",
+                    "encoder-buckets-v1/",
+                    $bundle,
+                    ".tar"
+                ),
+                sha256: $sha256,
+                size: $size,
+            }),+],
+        }
+    };
+}
+
+pub const ENCODER_BUCKETS: &[EncoderBucket] = &[
+    encoder_bucket!(
+        2,
+        "parakeet_unified_encoder_2s_int8.mlmodelc",
+        "4113921d6e527e98fee315f2fdc12c23aaae917b987bd6309e8e3674790fea78",
+        587_972_608,
+        [
+            (
+                "analytics/coremldata.bin",
+                "33c3b4145f8bdf8c2754cb9a875a3775454fb1a95fa0ec6ea247d44ef93ca631",
+                243
+            ),
+            (
+                "coremldata.bin",
+                "3d0cdc36d3ef05e625fa7da6417bdfdac9bafed38fb4d1a7442bdd44aa00d647",
+                491
+            ),
+            (
+                "metadata.json",
+                "aa09fdec103068ef57292b22c6306081a58f7d2378fc632a63fed93fee3e5342",
+                2_965
+            ),
+            (
+                "model.mil",
+                "ecdb3bc6e24a438acd950249a66c43fddf17e260a040eef3152704361c5ed63f",
+                888_271
+            ),
+            (
+                "weights/weight.bin",
+                "76911797d2d0eb3663f82a04ba532d913785e61e3fa1caf6cc3d727f4ee28a53",
+                587_076_544
+            ),
+        ]
+    ),
+    encoder_bucket!(
+        5,
+        "parakeet_unified_encoder_5s_int8.mlmodelc",
+        "7ffac58a220dae55ea321bbefa161339f84f3f42a64a259d8bf92b99378216de",
+        589_814_784,
+        [
+            (
+                "analytics/coremldata.bin",
+                "ffccf8f64035ede4f95b2d9b89022ccef10adbf63229abce1babc0414f49de02",
+                243
+            ),
+            (
+                "coremldata.bin",
+                "144b14f469f210ab52ab55b9d44d96f34f3710b3f4c6860011c0d0a9d14ca5cd",
+                491
+            ),
+            (
+                "metadata.json",
+                "6ad1d20b9701bd7c9c2e3136e225d4b243577e6680c44bdde87a652e4f1a62e1",
+                2_965
+            ),
+            (
+                "model.mil",
+                "9b69788b1141f7ea747aeefcabe20ce9bf5ac15bfa01310cd73ca302144aad10",
+                911_233
+            ),
+            (
+                "weights/weight.bin",
+                "8208bfa068b9124310625bca7de635f56ebeee3d0a41ef05fa16053a51a8022e",
+                588_895_360
+            ),
+        ]
+    ),
+    encoder_bucket!(
+        8,
+        "parakeet_unified_encoder_8s_int8.mlmodelc",
+        "a093946f242040214c8c8fe0df6e86abd6ad62fde6dbb33567b665b1c4a248aa",
+        591_728_640,
+        [
+            (
+                "analytics/coremldata.bin",
+                "c420c5b321cec4d332eac0a9cad920ea8bf5ea9307456f7c16db1ee817e3a66b",
+                243
+            ),
+            (
+                "coremldata.bin",
+                "bec1d60006b8e5a9b334b7e54a660550fcd260fd3eb075eb2e39bbdb5903e228",
+                491
+            ),
+            (
+                "metadata.json",
+                "bd25da9b3691ed564cd07e87dd5cf6c39203f51cf8339c16b920dc231efa989a",
+                2_967
+            ),
+            (
+                "model.mil",
+                "07c8f63c4382e59f380b3c650ace56745de80d20c070cee58c2438ca550f1f78",
+                952_797
+            ),
+            (
+                "weights/weight.bin",
+                "cf0862b953e4fe0c01588edfc7795c03ff1f34eb5ccae7d1a1c6e291b7e8893b",
+                590_767_872
+            ),
+        ]
+    ),
+];
+
+/// Whether [`ensure_encoder_buckets`] may go to the network.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BucketFetch {
+    /// Only report bundles already present and intact. The startup path uses
+    /// this so a missing bucket never delays the first dictation.
+    VerifyOnly,
+    /// Download and unpack any bucket that is missing or corrupt.
+    Download,
+}
+
 /// Parakeet TDT triplet + tokens, all relative to the per-model dir.
 /// `pub(crate)` so `settings.rs`'s tests can cross-check that this list
 /// stays in sync with the four files `SettingsStore::model_present()`
@@ -329,6 +493,207 @@ pub async fn ensure_coreml_model(model_dir: &Path, on_progress: ProgressFn) -> R
     };
     on_progress(Progress::Status(status.to_string()));
     Ok(())
+}
+
+/// Hidden directory beside the bundles where archives land and unpack. A
+/// bundle reaches the model directory, where the worker looks for it, only by
+/// one rename after every file in it has matched the manifest.
+const BUCKET_STAGING_DIR: &str = ".encoder-buckets-staging";
+
+/// Verify every encoder bucket and, with [`BucketFetch::Download`], fetch the
+/// missing or corrupt ones. Returns the windows whose bundle is intact,
+/// ascending.
+///
+/// Never fails: a bucket that cannot be verified or fetched is left out, and
+/// the worker sends those utterances to the stock 15 s encoder. After the
+/// first failed download no further bucket is fetched in the same call, so an
+/// unreachable host costs one request rather than one per bucket.
+pub async fn ensure_encoder_buckets(
+    model_dir: &Path,
+    fetch: BucketFetch,
+    on_progress: ProgressFn,
+) -> Vec<u32> {
+    ensure_buckets(ENCODER_BUCKETS, model_dir, fetch, &on_progress).await
+}
+
+async fn ensure_buckets(
+    buckets: &[EncoderBucket],
+    model_dir: &Path,
+    fetch: BucketFetch,
+    on_progress: &ProgressFn,
+) -> Vec<u32> {
+    let mut ready = Vec::new();
+    let mut may_download = fetch == BucketFetch::Download;
+    for bucket in buckets {
+        let final_dir = model_dir.join(bucket.bundle);
+        if verify_bundle(*bucket, &final_dir).await {
+            ready.push(bucket.seconds);
+            continue;
+        }
+        if let Err(error) = remove_bundle(&final_dir).await {
+            log::warn!("cannot remove damaged {}: {error:#}", final_dir.display());
+            continue;
+        }
+        if !may_download {
+            continue;
+        }
+        match fetch_bucket(*bucket, model_dir, on_progress).await {
+            Ok(()) => ready.push(bucket.seconds),
+            Err(error) => {
+                log::warn!(
+                    "{} s encoder bucket unavailable, using the 15 s encoder: {error:#}",
+                    bucket.seconds
+                );
+                may_download = false;
+            }
+        }
+    }
+    ready.sort_unstable();
+    ready
+}
+
+async fn fetch_bucket(
+    bucket: EncoderBucket,
+    model_dir: &Path,
+    on_progress: &ProgressFn,
+) -> Result<()> {
+    let staging = model_dir.join(BUCKET_STAGING_DIR);
+    let archive_path = staging.join(bucket.archive.label);
+    ensure_artifact(bucket.archive, &archive_path, on_progress)
+        .await
+        .with_context(|| format!("ensuring {}", bucket.archive.label))?;
+
+    on_progress(Progress::Status(format!(
+        "Unpacking {} s encoder…",
+        bucket.seconds
+    )));
+    let unpack_archive = archive_path.clone();
+    let unpack_staging = staging.clone();
+    let unpacked = tokio::task::spawn_blocking(move || {
+        unpack_bundle(bucket, &unpack_archive, &unpack_staging)
+    })
+    .await
+    .context("bucket unpacker panicked")?;
+    // The archive matched its digest, so an archive that does not unpack to
+    // the manifest is wrong at the source; keeping it would only repeat this.
+    if let Err(error) = unpacked {
+        discard_artifact(&archive_path).await?;
+        return Err(error);
+    }
+    let unpacked_dir = staging.join(bucket.bundle);
+    if !verify_bundle(bucket, &unpacked_dir).await {
+        discard_artifact(&archive_path).await?;
+        remove_bundle(&unpacked_dir).await?;
+        bail!(
+            "{} unpacked to files that do not match the manifest",
+            bucket.archive.label
+        );
+    }
+
+    let final_dir = model_dir.join(bucket.bundle);
+    tokio::fs::rename(&unpacked_dir, &final_dir)
+        .await
+        .with_context(|| format!("moving verified bundle to {}", final_dir.display()))?;
+    sync_parent_directory(&final_dir).await?;
+    discard_artifact(&archive_path).await?;
+    log::info!("{} s encoder bucket installed", bucket.seconds);
+    Ok(())
+}
+
+/// Unpack `archive` under `staging`, refusing any entry that is not a regular
+/// file the manifest names inside the bucket's bundle.
+fn unpack_bundle(bucket: EncoderBucket, archive: &Path, staging: &Path) -> Result<()> {
+    remove_bundle_sync(&staging.join(bucket.bundle))?;
+    let file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
+    let mut tar = tar::Archive::new(BufReader::with_capacity(1024 * 1024, file));
+    tar.set_preserve_permissions(false);
+    for entry in tar.entries().context("reading archive")? {
+        let mut entry = entry.context("reading archive entry")?;
+        let path = entry.path().context("archive entry path")?.into_owned();
+        let label = path
+            .strip_prefix(bucket.bundle)
+            .ok()
+            .and_then(Path::to_str)
+            .ok_or_else(|| {
+                anyhow!(
+                    "archive entry {} is outside {}",
+                    path.display(),
+                    bucket.bundle
+                )
+            })?;
+        match entry.header().entry_type() {
+            tar::EntryType::Directory => {}
+            tar::EntryType::Regular if bucket.files.iter().any(|f| f.label == label) => {}
+            other => bail!("unexpected archive entry {} ({other:?})", path.display()),
+        }
+        if !entry
+            .unpack_in(staging)
+            .with_context(|| format!("unpacking {}", path.display()))?
+        {
+            bail!(
+                "archive entry {} escapes the staging directory",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether every manifest file of `bucket` is present under `dir` and matches
+/// its digest. Any problem, including an I/O error, reads as "not intact": the
+/// caller's only choices are to use the bundle or not.
+async fn verify_bundle(bucket: EncoderBucket, dir: &Path) -> bool {
+    let dir = dir.to_path_buf();
+    let verified = tokio::task::spawn_blocking(move || {
+        if !dir.is_dir() {
+            return false;
+        }
+        bucket.files.iter().all(|file| {
+            let path = dir.join(file.label);
+            match verify_existing_artifact_sync(*file, &path) {
+                Ok(ExistingVerification::CacheHit | ExistingVerification::Hashed) => true,
+                Ok(ExistingVerification::Missing) => {
+                    log::warn!("{} is missing", path.display());
+                    false
+                }
+                Ok(ExistingVerification::DigestMismatch {
+                    actual_sha256,
+                    actual_size,
+                }) => {
+                    log::warn!(
+                        "{} does not match its manifest (size {actual_size}, sha256 {})",
+                        path.display(),
+                        actual_sha256.as_deref().unwrap_or("not computed")
+                    );
+                    false
+                }
+                Err(error) => {
+                    log::warn!("cannot verify {}: {error:#}", path.display());
+                    false
+                }
+            }
+        })
+    })
+    .await;
+    verified.unwrap_or(false)
+}
+
+async fn remove_bundle(dir: &Path) -> Result<()> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || remove_bundle_sync(&dir))
+        .await
+        .context("bundle remover panicked")?
+}
+
+/// Remove a bundle directory, or only the link when it is a symlink to one.
+fn remove_bundle_sync(dir: &Path) -> Result<()> {
+    let result = match fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(dir),
+        Ok(_) => fs::remove_file(dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => Err(error),
+    };
+    result.with_context(|| format!("removing {}", dir.display()))
 }
 
 async fn ensure_artifact(
@@ -873,6 +1238,321 @@ mod tests {
         let len_before = copy.len();
         copy.dedup();
         assert_eq!(len_before, copy.len(), "duplicate entry in ASR_FILES");
+    }
+
+    #[test]
+    fn encoder_buckets_are_the_2_5_8_release_set() {
+        let windows: Vec<u32> = ENCODER_BUCKETS.iter().map(|b| b.seconds).collect();
+        assert_eq!(windows, [2, 5, 8]);
+        for bucket in ENCODER_BUCKETS {
+            assert_eq!(
+                bucket.bundle,
+                format!("parakeet_unified_encoder_{}s_int8.mlmodelc", bucket.seconds)
+            );
+            assert_eq!(
+                bucket.archive.url,
+                format!(
+                    "https://github.com/moorbrook/parakeet-rs/releases/download/\
+                     encoder-buckets-v1/{}.tar",
+                    bucket.bundle
+                )
+            );
+            let mut labels: Vec<&str> = bucket.files.iter().map(|f| f.label).collect();
+            labels.sort_unstable();
+            assert_eq!(
+                labels,
+                [
+                    "analytics/coremldata.bin",
+                    "coremldata.bin",
+                    "metadata.json",
+                    "model.mil",
+                    "weights/weight.bin"
+                ]
+            );
+            let unpacked: u64 = bucket.files.iter().map(|f| f.size).sum();
+            assert!(bucket.archive.size > unpacked, "{}", bucket.bundle);
+            for artifact in bucket.files.iter().chain([&bucket.archive]) {
+                assert_eq!(artifact.sha256.len(), 64);
+                assert!(artifact.sha256.bytes().all(|b| b.is_ascii_hexdigit()));
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_digests_do_not_change_the_tuning_profile_key() {
+        // The tuning profile is keyed by this digest; buckets must not
+        // invalidate a profile until kata 4s2q makes the profile select them.
+        // The value is the one main's manifest produced, and it matches the
+        // `artifact_digest` of the profile already written on the M5 Pro.
+        assert_eq!(
+            coreml_artifact_digest(),
+            "df2587d4ec1a768b78f11235e51298cc3d44c947b6f0a151729b9e94e7da0002"
+        );
+    }
+
+    const BUNDLE: &str = "enc_2s.mlmodelc";
+    const BUNDLE_FILES: &[(&str, &[u8])] = &[
+        ("coremldata.bin", b"plan"),
+        ("weights/weight.bin", b"weights"),
+    ];
+
+    fn tar_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, body) in entries {
+            let mut header = tar::Header::new_ustar();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("{BUNDLE}/{path}"), *body)
+                .unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    fn leaked_artifact(label: &str, url: &str, body: &[u8]) -> Artifact {
+        let (sha256, size) = sha256_reader(Cursor::new(body)).unwrap();
+        Artifact {
+            label: Box::leak(label.to_string().into_boxed_str()),
+            url: Box::leak(url.to_string().into_boxed_str()),
+            sha256: Box::leak(sha256.into_boxed_str()),
+            size,
+        }
+    }
+
+    /// A bucket whose manifest pins `pinned_files` and whose archive pin is
+    /// the digest of `archive`, served at `{base}/{seconds}.tar`.
+    fn test_bucket(
+        seconds: u32,
+        base: &str,
+        archive: &[u8],
+        pinned_files: &[(&str, &[u8])],
+    ) -> EncoderBucket {
+        let url = format!("{base}/{seconds}.tar");
+        let files: Vec<Artifact> = pinned_files
+            .iter()
+            .map(|(path, body)| leaked_artifact(path, &url, body))
+            .collect();
+        EncoderBucket {
+            seconds,
+            bundle: BUNDLE,
+            archive: leaked_artifact(&format!("{BUNDLE}.tar"), &url, archive),
+            files: Box::leak(files.into_boxed_slice()),
+        }
+    }
+
+    /// Serves `routes` (path to body; absent paths get 404) until the test
+    /// process exits, recording every requested path.
+    fn serve(routes: Vec<(String, Vec<u8>)>) -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requested = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = Arc::clone(&requested);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = [0_u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let line = String::from_utf8_lossy(&request[..read]);
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                log.lock().push(path.clone());
+                match routes.iter().find(|(route, _)| *route == path) {
+                    Some((_, body)) => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        stream.write_all(head.as_bytes()).unwrap();
+                        stream.write_all(body).unwrap();
+                    }
+                    None => stream
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .unwrap(),
+                }
+            }
+        });
+        (base, requested)
+    }
+
+    fn no_progress() -> ProgressFn {
+        Arc::new(|_| {})
+    }
+
+    #[tokio::test]
+    async fn a_fetched_bucket_is_installed_only_after_every_file_verifies() {
+        let archive = tar_of(BUNDLE_FILES);
+        let (base, requested) = serve(vec![("/2.tar".to_string(), archive.clone())]);
+        let bucket = test_bucket(2, &base, &archive, BUNDLE_FILES);
+        let dir = tempfile::tempdir().unwrap();
+
+        let ready =
+            ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
+
+        assert_eq!(ready, [2]);
+        assert_eq!(
+            fs::read(dir.path().join(BUNDLE).join("weights/weight.bin")).unwrap(),
+            b"weights"
+        );
+        assert!(!dir
+            .path()
+            .join(BUCKET_STAGING_DIR)
+            .join(bucket.archive.label)
+            .exists());
+        // A second launch verifies from the metadata cache and fetches nothing.
+        let ready =
+            ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
+        assert_eq!(ready, [2]);
+        assert_eq!(requested.lock().as_slice(), ["/2.tar"]);
+    }
+
+    #[tokio::test]
+    async fn an_archive_with_the_wrong_digest_is_refused() {
+        let archive = tar_of(BUNDLE_FILES);
+        let mut tampered = archive.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        let (base, _) = serve(vec![("/2.tar".to_string(), tampered)]);
+        let bucket = test_bucket(2, &base, &archive, BUNDLE_FILES);
+        let dir = tempfile::tempdir().unwrap();
+
+        let ready =
+            ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
+
+        assert!(ready.is_empty());
+        assert!(!dir.path().join(BUNDLE).exists());
+        let staging = dir.path().join(BUCKET_STAGING_DIR);
+        assert!(!staging.join(bucket.archive.label).exists());
+        assert!(!part_path(&staging.join(bucket.archive.label))
+            .unwrap()
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn an_archive_whose_files_differ_from_the_manifest_is_refused() {
+        // The archive matches its own pin, but one file inside it does not
+        // match the per-file manifest.
+        let archive = tar_of(&[
+            ("coremldata.bin", b"plan"),
+            ("weights/weight.bin", b"WEIGHTS"),
+        ]);
+        let (base, _) = serve(vec![("/2.tar".to_string(), archive.clone())]);
+        let bucket = test_bucket(2, &base, &archive, BUNDLE_FILES);
+        let dir = tempfile::tempdir().unwrap();
+
+        let ready =
+            ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
+
+        assert!(ready.is_empty());
+        assert!(!dir.path().join(BUNDLE).exists());
+        let staging = dir.path().join(BUCKET_STAGING_DIR);
+        assert!(!staging.join(BUNDLE).exists());
+        assert!(!staging.join(bucket.archive.label).exists());
+    }
+
+    #[tokio::test]
+    async fn an_archive_entry_outside_the_manifest_is_refused() {
+        let archive = tar_of(&[
+            ("coremldata.bin", b"plan"),
+            ("weights/weight.bin", b"weights"),
+            ("extra.bin", b"x"),
+        ]);
+        let (base, _) = serve(vec![("/2.tar".to_string(), archive.clone())]);
+        let bucket = test_bucket(2, &base, &archive, BUNDLE_FILES);
+        let dir = tempfile::tempdir().unwrap();
+
+        let ready =
+            ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
+
+        assert!(ready.is_empty());
+        assert!(!dir.path().join(BUNDLE).exists());
+    }
+
+    #[tokio::test]
+    async fn a_missing_bucket_is_left_out_and_stops_further_downloads() {
+        let archive = tar_of(BUNDLE_FILES);
+        let (base, requested) = serve(vec![]);
+        let missing = test_bucket(2, &base, &archive, BUNDLE_FILES);
+        let after = EncoderBucket {
+            seconds: 5,
+            bundle: "enc_5s.mlmodelc",
+            ..test_bucket(5, &base, &archive, BUNDLE_FILES)
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let ready = ensure_buckets(
+            &[missing, after],
+            dir.path(),
+            BucketFetch::Download,
+            &no_progress(),
+        )
+        .await;
+
+        assert!(ready.is_empty());
+        assert!(!dir.path().join(BUNDLE).exists());
+        assert_eq!(requested.lock().as_slice(), ["/2.tar"]);
+    }
+
+    #[tokio::test]
+    async fn verify_only_reports_intact_bundles_and_never_downloads() {
+        let archive = tar_of(BUNDLE_FILES);
+        let (base, requested) = serve(vec![("/2.tar".to_string(), archive.clone())]);
+        let bucket = test_bucket(2, &base, &archive, BUNDLE_FILES);
+        let dir = tempfile::tempdir().unwrap();
+
+        let absent = ensure_buckets(
+            &[bucket],
+            dir.path(),
+            BucketFetch::VerifyOnly,
+            &no_progress(),
+        )
+        .await;
+        assert!(absent.is_empty());
+        assert!(requested.lock().is_empty());
+
+        for (path, body) in BUNDLE_FILES {
+            let dest = dir.path().join(BUNDLE).join(path);
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::write(dest, body).unwrap();
+        }
+        let present = ensure_buckets(
+            &[bucket],
+            dir.path(),
+            BucketFetch::VerifyOnly,
+            &no_progress(),
+        )
+        .await;
+        assert_eq!(present, [2]);
+        assert!(requested.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_damaged_installed_bundle_is_removed_so_the_worker_cannot_load_it() {
+        let archive = tar_of(BUNDLE_FILES);
+        let bucket = test_bucket(2, "http://127.0.0.1:9", &archive, BUNDLE_FILES);
+        let dir = tempfile::tempdir().unwrap();
+        for (path, body) in BUNDLE_FILES {
+            let dest = dir.path().join(BUNDLE).join(path);
+            fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            fs::write(dest, body).unwrap();
+        }
+        fs::write(
+            dir.path().join(BUNDLE).join("weights/weight.bin"),
+            b"weightz",
+        )
+        .unwrap();
+
+        let ready = ensure_buckets(
+            &[bucket],
+            dir.path(),
+            BucketFetch::VerifyOnly,
+            &no_progress(),
+        )
+        .await;
+
+        assert!(ready.is_empty());
+        assert!(!dir.path().join(BUNDLE).exists());
     }
 
     fn serve_once_without_content_length(body: &'static [u8]) -> (String, thread::JoinHandle<()>) {

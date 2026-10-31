@@ -134,6 +134,12 @@ pub struct CoreMlWorkerConfig {
     /// when `vocabulary` is non-empty; sherpa's `hotwords_score` is the
     /// reference for what the number means.
     pub vocabulary_score: f32,
+    /// Which short-window encoder buckets the worker loads. `None` lets it
+    /// discover bundles by filename, which benches pointed at a hand-built
+    /// model directory rely on. The app always passes the windows
+    /// `model_fetch::ensure_encoder_buckets` verified, so a bundle nothing
+    /// checked is never loaded; an empty list is `--encoder-buckets none`.
+    pub encoder_buckets: Option<Vec<u32>>,
     /// Model download and first compilation can take substantially longer than inference.
     pub startup_timeout: Duration,
     /// Total budget for sending a request and receiving its complete response.
@@ -237,6 +243,7 @@ impl CoreMlWorkerConfig {
             rnnt_engine: CoreMlRnntEngine::default(),
             vocabulary: Vec::new(),
             vocabulary_score: 0.0,
+            encoder_buckets: None,
             startup_timeout: Duration::from_secs(30 * 60),
             request_timeout: Duration::from_secs(5 * 60),
         }
@@ -256,6 +263,7 @@ impl CoreMlWorkerConfig {
             rnnt_engine: CoreMlRnntEngine::default(),
             vocabulary: Vec::new(),
             vocabulary_score: 0.0,
+            encoder_buckets: None,
             startup_timeout: Duration::from_secs(30 * 60),
             request_timeout: Duration::from_secs(5 * 60),
         }
@@ -315,6 +323,11 @@ impl CoreMlWorkerConfig {
     pub fn set_vocabulary(&mut self, terms: Vec<String>, score: f32) {
         self.vocabulary = terms;
         self.vocabulary_score = score;
+    }
+
+    /// Load exactly these bucket windows, in seconds; empty loads none.
+    pub fn set_encoder_buckets(&mut self, windows: Vec<u32>) {
+        self.encoder_buckets = Some(windows);
     }
 
     pub fn set_compute_units(&mut self, compute_units: CoreMlComputeUnits) {
@@ -463,6 +476,11 @@ impl CoreMlWorkerBackend {
         }
         if config.emit_stage_timings {
             command.arg("--emit-stage-timings");
+        }
+        if let Some(windows) = &config.encoder_buckets {
+            command
+                .arg("--encoder-buckets")
+                .arg(encoder_buckets_argument(windows));
         }
         let mut child = command
             .stdin(Stdio::piped())
@@ -921,6 +939,17 @@ impl WorkerResponse {
     }
 }
 
+fn encoder_buckets_argument(windows: &[u32]) -> String {
+    if windows.is_empty() {
+        return "none".to_string();
+    }
+    windows
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn validate_file(path: &Path, label: &str) -> Result<()> {
     if !path.is_file() {
         bail!("{label} not found at {}", path.display());
@@ -1055,6 +1084,19 @@ mod tests {
         let response: WorkerResponse = serde_json::from_slice(payload).expect("valid result");
         assert!(response.vocabulary_accepted.is_none());
         assert!(response.vocabulary_rejected.is_none());
+    }
+
+    #[test]
+    fn verified_buckets_go_to_the_worker_as_an_explicit_list() {
+        let mut config = CoreMlWorkerConfig::new("/worker", "/models");
+        assert_eq!(config.encoder_buckets, None, "benches keep filename discovery");
+        config.set_encoder_buckets(vec![2, 5, 8]);
+        assert_eq!(
+            encoder_buckets_argument(config.encoder_buckets.as_deref().unwrap()),
+            "2,5,8"
+        );
+        // No verified bucket must not fall back to discovery.
+        assert_eq!(encoder_buckets_argument(&[]), "none");
     }
 
     #[test]

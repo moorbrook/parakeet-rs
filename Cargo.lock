@@ -1420,6 +1420,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sherpa-onnx",
+ "tar",
  "tempfile",
  "tokio",
  "unicode-normalization",
