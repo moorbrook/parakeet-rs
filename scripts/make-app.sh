@@ -66,7 +66,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/target/release/bundle/osx/Parakeet.app"
 BIN_SRC="$ROOT/target/release/parakeet-rs"
 WORKER_SRC="$ROOT/target/release/parakeet-coreml-worker"
-DYLIB_SRC="$ROOT/target/release"
+# sherpa-onnx-sys copies its dylibs into the cargo build directory's profile
+# folder, which is not target/ when a cargo `build-dir` is configured. Ask
+# cargo where it is (equal to target/ when no build-dir is set).
+BUILD_DIR="$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps \
+  | sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p')"
+DYLIB_SRC="${BUILD_DIR:-$ROOT/target}/release"
 
 # --- 0. arm64-only architecture gate -------------------------------------
 # Parakeet Dictation is Apple Silicon only (ADR-0002). sherpa-onnx and the
@@ -132,7 +137,8 @@ add_key LSApplicationCategoryType string "public.app-category.productivity"
 add_key NSHumanReadableCopyright string "Copyright © 2026 Parakeet Dictation contributors"
 
 # --- 3. bundle dylibs ----------------------------------------------------
-# sherpa-onnx-sys copied them to target/release/ during the cargo build.
+# sherpa-onnx-sys copied them to the build directory's release/ folder during
+# the cargo build.
 # Put them in Contents/Frameworks/ where macOS expects bundled libraries.
 
 echo "3. copy worker, notices, and dylibs"
@@ -146,7 +152,9 @@ for lib in libsherpa-onnx-c-api.dylib libsherpa-onnx-cxx-api.dylib \
   if [ -f "$DYLIB_SRC/$lib" ]; then
     cp -f "$DYLIB_SRC/$lib" "$APP/Contents/Frameworks/$lib"
   else
-    echo "  warn: missing $DYLIB_SRC/$lib" >&2
+    # Without these the bundle aborts at launch in dyld.
+    echo "  error: missing $DYLIB_SRC/$lib" >&2
+    exit 1
   fi
 done
 
