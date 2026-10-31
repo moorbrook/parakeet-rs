@@ -2245,16 +2245,20 @@ first-load plan compile is the only per-device step.
   is never loaded. With no bucket the list is `none` and every utterance
   uses the 15 s encoder, as before. If Core ML refuses a verified bucket the
   worker is reloaded without buckets rather than falling back to sherpa.
-- Startup only verifies buckets already on disk. Missing buckets are
-  fetched in the background after the recogniser is up, and the first
-  failed download stops the rest of that round, so an unreachable host
-  costs one request per launch.
-- The first load of a bucket compiles a Core ML plan, about 6 s each. A
-  throwaway worker with the resident recogniser's compute units pays that
-  after a download, filling Core ML's on-disk plan cache, and only then is
-  the recogniser marked stale and swapped when idle, so the swap is a warm
-  load. Every load dispatches one silent utterance per bucket (w − 0.5 s,
-  routing to w) before the app reaches Idle.
+- Startup loads the 15 s encoder alone. Core ML's compiled-plan cache is
+  per worker binary, so the first launch after an update compiles cold: a
+  worker load measured 42.0 s with 2/5/8 against 12.0 s without, then
+  0.81 s and 0.32 s warm (M5 Pro, worker built from this branch). Startup
+  therefore never loads a bucket.
+- After every boot a background task verifies the buckets, fetches missing
+  ones (the first failed download stops that round, so an unreachable host
+  costs one request per launch), and loads them in a throwaway worker with
+  the resident recogniser's compute units. That load is the cold compile
+  after an update and under a second otherwise, and it fills the plan
+  cache. Only then are the buckets approved, the recogniser marked stale,
+  and swapped when idle, so the swap is a warm load. Every load dispatches
+  one silent utterance per bucket (w − 0.5 s, routing to w) and one past
+  the widest bucket before the app reaches Idle.
 - The bucket manifest is not part of `coreml_artifact_digest`, which keys
   the tuning profile; `tune_asr` runs with `--encoder-buckets none` until
   Kata 4s2q makes the profile choose buckets.

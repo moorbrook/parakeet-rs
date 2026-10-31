@@ -538,6 +538,59 @@ The app fetches and verifies the 2, 5 and 8 s buckets itself
 A model directory without them behaves exactly as the "before" columns
 describe.
 
+### Shipped buckets: M5 Pro 24 GB (2026-10-31)
+
+Measured on `work/htdr` at `3492e40`, worker and bench binaries rebuilt
+from that commit. The "before" model directory is the app's stock pack and
+the "after" directory is the same pack plus the 2/5/8 s bundles, whose 15
+files `provision_models --verify-only` checks against the ADR-0037
+manifest. Load averages 2.4 to 3.0 during the bench; Time Machine was
+running.
+
+Hold, 1 s fixture (0.875 s captured), release to transcript-ready, Hold
+windows `3,6`. Two interleaved rounds of 15 measured repetitions per arm,
+two warmups each:
+
+| arm | n | p50 | p95 | mean | ASR p50 | tail decode p50 |
+|---|---:|---:|---:|---:|---:|---:|
+| 15 s only | 30 | 47.5 ms | 54.9 ms | 47.6 ms | 45.5 ms | 46.0 ms |
+| buckets 2/5/8 | 30 | **23.0 ms** | 29.2 ms | 22.4 ms | **18.5 ms** | 18.6 ms |
+
+An earlier sequential pass over 1/3/5/10 s, 30 repetitions each, started
+at load average 5.4 just after a cold compile. Its p50s were 42.0 to
+31.0 ms at 1 s, 57.0 to 36.5 at 3 s, 80.0 to 54.0 at 5 s and 66.0 to
+40.0 at 10 s (8.1 s captured: the 8 s bucket misses it, but its 6 s Hold
+windows fit the 8 s bucket). Its 1 s after arm also carried 16 ms between
+capture end and ASR start that no rerun reproduced, so the interleaved
+rows above replace that one row.
+
+Encoder on a 7.0 s cut of `librispeech-multi` (`bench_asr --stage-timings`,
+five repetitions): 26.2 ms p50 on the 15 s encoder and 13.0 ms on the 8 s
+bucket, with the same 48 decoder and 135 joint steps.
+
+Quality: the gold corpus at ten repetitions scores 5.434783% WER and
+3.571429% CER in both arms, with zero changed outputs, and every hypothesis
+is byte-identical between them. `asr_diff` reports no transcript drift over
+the 1/3/5/10/20 s fixtures and the 7 s cut, recorded without buckets and
+replayed with them.
+
+The plan compile is per worker binary. The first load after a rebuild
+measured 42.0 s with the buckets and 12.0 s without. The next two bucketed
+loads measured 0.81 s and 0.32 s, and the warm stock load 0.15 s. That is
+why the app's boot loads no bucket: a background throwaway worker pays the
+cold compile and the swap is a warm load (ADR-0037).
+
+```bash
+S=<scratch>; BEFORE=<app model dir>; AFTER=<same pack plus bucket bundles>
+./target/release/bench_e2e --backend coreml-unified --mode hold \
+    --wav bench/audio/1s_48000.wav --device "BlackHole 2ch" --hold-windows 3,6 \
+    --reps 15 --warmup-reps 2 --worker target/release/parakeet-coreml-worker \
+    --model-dir "$AFTER" 2>>"$S/after.log"      # alternate with "$BEFORE"
+./target/release/asr_diff --gold bench/gold/manifest.json --audio-dir bench/gold/audio \
+    --repetitions 10 --backend coreml-unified \
+    --worker target/release/parakeet-coreml-worker --model-dir "$AFTER" --json-out "$S/gold.json"
+```
+
 ## Native RNNT decode loop: M5 Pro 24 GB (2026-09-04)
 
 With bucketing and the resample retired, the greedy transducer loop was the
