@@ -559,8 +559,9 @@ two warmups each:
 An earlier sequential pass over 1/3/5/10 s, 30 repetitions each, started
 at load average 5.4 just after a cold compile. Its p50s were 42.0 to
 31.0 ms at 1 s, 57.0 to 36.5 at 3 s, 80.0 to 54.0 at 5 s and 66.0 to
-40.0 at 10 s (8.1 s captured: the 8 s bucket misses it, but its 6 s Hold
-windows fit the 8 s bucket). Its 1 s after arm also carried 16 ms between
+40.0 at 10 s (8.1 s captured, too long for the 8 s bucket, but Hold cuts
+it into two windows, and the 4.0 s tail window the release waits on runs on
+the 5 s bucket). Its 1 s after arm also carried 16 ms between
 capture end and ASR start that no rerun reproduced, so the interleaved
 rows above replace that one row.
 
