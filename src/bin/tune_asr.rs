@@ -189,6 +189,10 @@ fn run(args: &Args) -> Result<()> {
         base_config.worker_path.clone_from(worker);
     }
     base_config.set_existing_model_directory(&model_dir);
+    // The profile's artifact digest covers the 15 s pack only, so tune on it
+    // alone even when the app has installed encoder buckets beside it. Kata
+    // 4s2q makes the profile select buckets.
+    base_config.set_encoder_buckets(Vec::new());
 
     let mut candidates = Vec::with_capacity(CoreMlComputeUnits::CANDIDATES.len());
     for compute_units in CoreMlComputeUnits::CANDIDATES {

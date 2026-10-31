@@ -44,7 +44,10 @@ pub struct App {
     /// Save time) is what makes staleness detection self-correcting: a
     /// failed or superseded build simply doesn't update this, so the
     /// next check still sees a mismatch and retries.
-    loaded_biasing: Mutex<Option<Biasing>>,
+    loaded_inputs: Mutex<Option<BuildInputs>>,
+    /// Bumped each time a new set of encoder buckets is installed and its
+    /// Core ML plans compiled, which makes the loaded recogniser stale.
+    encoder_bucket_generation: std::sync::atomic::AtomicU64,
     /// Set when a rebuild was needed but the app was busy. Drained by
     /// `on_session_finished`. Without it a vocabulary edit saved during
     /// a dictation stayed unapplied until the *next* Settings Save.
@@ -54,11 +57,11 @@ pub struct App {
     engine_primer: warmup::EnginePrimer,
 }
 
-/// The biasing inputs a recogniser was built from. Two recognisers with
-/// equal `Biasing` decode identically, which is the whole point — it's
-/// the comparison that decides whether a rebuild is needed.
+/// The inputs a recogniser was built from. Two recognisers with equal
+/// `BuildInputs` decode identically, which is the whole point — it's the
+/// comparison that decides whether a rebuild is needed.
 #[derive(Clone, Debug, PartialEq)]
-struct Biasing {
+struct BuildInputs {
     /// (len, mtime) of `vocabulary.txt`, or `None` when absent.
     ///
     /// Not a content hash: the file is hand-edited in a text editor, so
@@ -67,9 +70,12 @@ struct Biasing {
     /// realistic editing workflow produces.
     vocab: Option<(u64, std::time::SystemTime)>,
     score: f32,
+    /// `App::encoder_bucket_generation` when the build started. The build
+    /// itself loads whichever buckets verify on disk.
+    encoder_buckets: u64,
 }
 
-impl Biasing {
+impl BuildInputs {
     /// Sample the current on-disk vocabulary + configured score.
     ///
     /// Callers must sample this **before** building, never after: the
@@ -77,14 +83,19 @@ impl Biasing {
     /// recording the post-build state would mark a newer vocabulary as
     /// loaded when it wasn't — permanently, since the mismatch that
     /// would have triggered a retry is exactly what got erased.
-    fn sample(settings: &SettingsStore) -> Self {
+    fn sample(settings: &SettingsStore, encoder_buckets: u64) -> Self {
         let vocab = std::fs::metadata(settings.vocabulary_path())
             .ok()
             .and_then(|m| Some((m.len(), m.modified().ok()?)));
         Self {
             vocab,
             score: settings.load().hotword_score,
+            encoder_buckets,
         }
+    }
+
+    fn same_vocabulary(&self, other: &Self) -> bool {
+        self.vocab == other.vocab && self.score == other.score
     }
 }
 
@@ -95,7 +106,8 @@ impl App {
             settings,
             asr: Mutex::new(None),
             hotkey: Mutex::new(None),
-            loaded_biasing: Mutex::new(None),
+            loaded_inputs: Mutex::new(None),
+            encoder_bucket_generation: std::sync::atomic::AtomicU64::new(0),
             reload_pending: std::sync::atomic::AtomicBool::new(false),
             engine_primer: warmup::EnginePrimer::new(),
         }
@@ -515,19 +527,34 @@ impl App {
         Ok(())
     }
 
-    /// Rebuild the recogniser if the on-disk vocabulary or configured
-    /// score differs from what the loaded one was built against.
+    /// Rebuild the recogniser if the on-disk vocabulary, the configured
+    /// score, or the installed encoder buckets differ from what the loaded
+    /// one was built against.
     fn reload_asr_if_stale(self: &Arc<Self>) {
-        let loaded = self.loaded_biasing.lock().clone();
+        let loaded = self.loaded_inputs.lock().clone();
         let Some(loaded) = loaded else {
             // Boot hasn't produced a recogniser yet; it will read the
             // current vocabulary itself when it builds one.
             return;
         };
-        if loaded == Biasing::sample(&self.settings) {
+        let current = self.current_build_inputs();
+        if loaded == current {
             return;
         }
-        self.reload_asr();
+        let reason = if loaded.same_vocabulary(&current) {
+            ReloadReason::EncoderBuckets
+        } else {
+            ReloadReason::Vocabulary
+        };
+        self.reload_asr(reason);
+    }
+
+    fn current_build_inputs(&self) -> BuildInputs {
+        BuildInputs::sample(
+            &self.settings,
+            self.encoder_bucket_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+        )
     }
 
     /// Rebuild the recogniser in the background so a vocabulary edit
@@ -539,15 +566,20 @@ impl App {
     /// interleave with. `on_session_finished` drains the flag, so the
     /// edit lands as soon as the app is idle rather than waiting for
     /// another Settings Save.
-    fn reload_asr(self: &Arc<Self>) {
+    fn reload_asr(self: &Arc<Self>, reason: ReloadReason) {
         if self.asr.lock().is_none() {
             return;
         }
         if !self.fsm.try_claim_model_reload() {
-            log::info!("biasing changed but app is busy; reload deferred");
+            log::info!(
+                "{} changed but app is busy; reload deferred",
+                reason.subject()
+            );
             self.reload_pending
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            menubar::set_status_text("Vocabulary saved — applies after the current dictation");
+            if reason == ReloadReason::Vocabulary {
+                menubar::set_status_text("Vocabulary saved — applies after the current dictation");
+            }
             return;
         }
         // Claimed: this reload is happening, so any previously deferred
@@ -559,8 +591,9 @@ impl App {
             // `warm = false`: the CoreML graph was compiled by the boot
             // load and is cached per-process, so the dummy decode would
             // cost ~400 ms for nothing here.
-            match load_asr_blocking(&app.settings, /* warm = */ false) {
-                Ok((asr, biasing)) => {
+            let inputs = app.current_build_inputs();
+            match load_asr_blocking(&app.settings, inputs, /* warm = */ false) {
+                Ok((asr, inputs)) => {
                     // Take the old recognizer out under the guard and drop it
                     // after the guard is released. Dropping in place would run
                     // `WorkerProcess::drop` — kill() plus wait() on the Core ML
@@ -573,22 +606,76 @@ impl App {
                     // before it started. An edit that landed mid-build
                     // therefore still compares unequal and gets picked
                     // up by the staleness re-check below.
-                    *app.loaded_biasing.lock() = Some(biasing);
-                    menubar::set_status_text("Vocabulary applied");
+                    *app.loaded_inputs.lock() = Some(inputs);
+                    menubar::set_status_text(reason.applied());
                 }
                 Err(e) => {
                     // The previous recogniser is still in `app.asr` and
                     // still works — we only ever replace it on success,
                     // so a bad vocabulary can't leave the user unable
-                    // to dictate. `loaded_biasing` is deliberately NOT
+                    // to dictate. `loaded_inputs` is deliberately NOT
                     // updated, so the retry path still sees a mismatch.
                     log::error!("recogniser reload failed, keeping the previous one: {e:#}");
-                    menubar::set_status_text("Vocabulary reload failed — previous model kept");
+                    menubar::set_status_text(reason.failed());
                 }
             }
             app.set_state(app.resting_state());
             // The vocabulary may have changed again while we were
             // building. Re-check rather than assuming we're current.
+            app.reload_asr_if_stale();
+        });
+    }
+
+    /// Fetch any missing encoder buckets after the recogniser is up, compile
+    /// their plans in a throwaway worker, then mark the loaded recogniser
+    /// stale so `reload_asr` swaps in one that uses them once the app is
+    /// idle. Dictation runs on the 15 s encoder throughout; a bucket that
+    /// cannot be fetched only means it keeps doing so.
+    fn spawn_encoder_bucket_upgrade(self: &Arc<Self>) {
+        self.spawn_supervised("encoder-buckets", |app| {
+            let directory = app.settings.coreml_model_dir();
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    log::warn!("cannot start the encoder-bucket fetch: {error}");
+                    return;
+                }
+            };
+            let quiet: model_fetch::ProgressFn = Arc::new(|_| {});
+            let before = runtime.block_on(model_fetch::ensure_encoder_buckets(
+                &directory,
+                model_fetch::BucketFetch::VerifyOnly,
+                quiet,
+            ));
+            if before.len() == model_fetch::ENCODER_BUCKETS.len() {
+                return;
+            }
+            let after = runtime.block_on(model_fetch::ensure_encoder_buckets(
+                &directory,
+                model_fetch::BucketFetch::Download,
+                Arc::new(fetch_progress_to_menubar),
+            ));
+            if after == before {
+                if after.is_empty() {
+                    menubar::set_status_text(
+                        "Short-utterance encoders unavailable — using 15 s encoder",
+                    );
+                }
+                return;
+            }
+            menubar::set_status_text("Preparing short-utterance encoders…");
+            if let Err(error) = prewarm_encoder_buckets(&app.settings, &after) {
+                log::warn!("encoder-bucket pre-warm failed; keeping the 15 s encoder: {error:#}");
+                menubar::set_status_text(
+                    "Short-utterance encoders failed to load — using 15 s encoder",
+                );
+                return;
+            }
+            app.encoder_bucket_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             app.reload_asr_if_stale();
         });
     }
@@ -613,19 +700,24 @@ impl App {
         }
 
         let settings = self.settings.clone();
+        let inputs = self.current_build_inputs();
         let result = tokio::task::spawn_blocking(move || {
-            load_asr_blocking(&settings, /* warm = */ true)
+            load_asr_blocking(&settings, inputs, /* warm = */ true)
         })
         .await;
 
         match result {
-            Ok(Ok((asr, biasing))) => {
+            Ok(Ok((asr, inputs))) => {
+                let optimized = asr.backend_metadata().backend != "sherpa-onnx";
                 // Same reason as the reload path: never drop the old
                 // recognizer while the lock the press path takes is held.
                 let previous = self.asr.lock().replace(asr);
                 drop(previous);
-                *self.loaded_biasing.lock() = Some(biasing);
+                *self.loaded_inputs.lock() = Some(inputs);
                 self.set_state(DictationState::Idle);
+                if optimized {
+                    self.spawn_encoder_bucket_upgrade();
+                }
             }
             Ok(Err(e)) => {
                 log::error!("model setup failed: {e:#}");
@@ -648,12 +740,16 @@ impl App {
 /// fall back to unbiased greedy decoding, because a malformed
 /// `vocabulary.txt` should cost the user their custom terms, not their
 /// ability to dictate at all.
-fn load_asr_blocking(settings: &SettingsStore, warm: bool) -> anyhow::Result<(Arc<Asr>, Biasing)> {
+fn load_asr_blocking(
+    settings: &SettingsStore,
+    inputs: BuildInputs,
+    warm: bool,
+) -> anyhow::Result<(Arc<Asr>, BuildInputs)> {
     let encoder_path = settings.encoder_path();
 
-    // Sample BEFORE reading the vocabulary, so the recorded fingerprint
-    // can never be newer than the bytes this build actually consumed.
-    let biasing = Biasing::sample(settings);
+    // `inputs` is sampled by the caller BEFORE the vocabulary is read, so
+    // the recorded fingerprint can never be newer than the bytes this build
+    // actually consumed.
 
     // A vocabulary that can't be read costs the user their custom terms, not
     // their backend: the worker biases toward whatever we hand it, and an empty
@@ -672,8 +768,8 @@ fn load_asr_blocking(settings: &SettingsStore, warm: bool) -> anyhow::Result<(Ar
 
     let backend_override = configured_asr_backend_override()?;
     if backend_override == AsrBackendOverride::Auto {
-        match load_optimized_asr(settings, &terms, biasing.score) {
-            Ok(asr) => return Ok((Arc::new(asr), biasing)),
+        match load_optimized_asr(settings, &terms, inputs.score) {
+            Ok(asr) => return Ok((Arc::new(asr), inputs)),
             Err(error) => {
                 log::warn!(
                     "optimized Core ML backend unavailable; falling back to sherpa: {error:#}"
@@ -713,14 +809,14 @@ fn load_asr_blocking(settings: &SettingsStore, warm: bool) -> anyhow::Result<(Ar
         hotwords: hotwords.as_deref(),
         // The sampled score, not a fresh read — otherwise the recogniser
         // could be built with a score we never record as loaded.
-        hotwords_score: biasing.score,
+        hotwords_score: inputs.score,
     })?;
 
     if warm {
         menubar::set_status_text("Pre-warming graph…");
         warmup::dummy_decode(&asr)?;
     }
-    Ok((Arc::new(asr), biasing))
+    Ok((Arc::new(asr), inputs))
 }
 
 fn load_optimized_asr(
@@ -732,13 +828,14 @@ fn load_optimized_asr(
 
     let app_model_directory = settings.coreml_model_dir();
     let on_progress: model_fetch::ProgressFn = Arc::new(fetch_progress_to_menubar);
-    tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .context("building optimized-model download runtime")?
+        .context("building optimized-model download runtime")?;
+    runtime
         .block_on(model_fetch::ensure_coreml_model(
             &app_model_directory,
-            on_progress,
+            on_progress.clone(),
         ))
         .with_context(|| {
             format!(
@@ -746,16 +843,38 @@ fn load_optimized_asr(
                 app_model_directory.display()
             )
         })?;
+    // Only what is already on disk: a missing bucket is fetched after the
+    // recogniser is up (`App::spawn_encoder_bucket_upgrade`), never before it.
+    let buckets = runtime.block_on(model_fetch::ensure_encoder_buckets(
+        &app_model_directory,
+        model_fetch::BucketFetch::VerifyOnly,
+        on_progress,
+    ));
 
-    let mut config = CoreMlWorkerConfig::discover()?;
-    config.set_existing_model_directory(&app_model_directory);
+    let (mut config, long_plan_warmup_seconds) =
+        optimized_worker_config(settings, &app_model_directory)?;
     config.set_vocabulary(vocabulary.to_vec(), vocabulary_score);
-    let long_plan_warmup_seconds = configure_coreml_runtime_plan(settings, &mut config)?;
+    config.set_encoder_buckets(buckets.clone());
     menubar::set_status_text("Loading optimized recogniser…");
 
-    let (asr, load_seconds) = load_coreml_worker(&config)?;
+    let (asr, load_seconds, buckets) = match load_coreml_worker(&config) {
+        Ok((asr, load_seconds)) => (asr, load_seconds, buckets),
+        // The buckets verified, so this is Core ML refusing them. The 15 s
+        // encoder alone still serves every utterance; falling through to
+        // sherpa over a bucket would cost far more.
+        Err(error) if !buckets.is_empty() => {
+            log::warn!(
+                "worker could not load encoder buckets {buckets:?}; using the 15 s encoder: \
+                 {error:#}"
+            );
+            config.set_encoder_buckets(Vec::new());
+            let (asr, load_seconds) = load_coreml_worker(&config)?;
+            (asr, load_seconds, Vec::new())
+        }
+        Err(error) => return Err(error),
+    };
     log::info!(
-        "optimized ASR ready in {load_seconds:.3}s: {:?}",
+        "optimized ASR ready in {load_seconds:.3}s with encoder buckets {buckets:?}: {:?}",
         asr.backend_metadata()
     );
 
@@ -769,7 +888,74 @@ fn load_optimized_asr(
         let _ = asr.recognize_silent_warmup(&samples, 16_000)?;
     }
     warmup::dummy_decode(&asr)?;
+    warmup::warm_encoder_buckets(&asr, &buckets)?;
     Ok(asr)
+}
+
+/// Worker configuration shared by the resident recogniser and the bucket
+/// pre-warm. They must agree on compute units: Core ML's compiled-plan cache
+/// is keyed by them, so a pre-warm under other units would compile plans the
+/// recogniser never uses.
+fn optimized_worker_config(
+    settings: &SettingsStore,
+    model_directory: &std::path::Path,
+) -> anyhow::Result<(CoreMlWorkerConfig, Option<u32>)> {
+    let mut config = CoreMlWorkerConfig::discover()?;
+    config.set_existing_model_directory(model_directory);
+    let long_plan_warmup_seconds = configure_coreml_runtime_plan(settings, &mut config)?;
+    Ok((config, long_plan_warmup_seconds))
+}
+
+/// Compile the Core ML plans of newly installed encoder buckets in a
+/// throwaway worker, off the dictation path (kata hrs0).
+///
+/// The first load of each bucket compiles a plan, about 6 s each, and Core ML
+/// keeps compiled plans in an on-disk cache shared by every process running
+/// the same worker binary. Paying that here lets the recogniser swapped in
+/// next load the buckets warm, so the swap blocks dictation for a warm load
+/// rather than a cold compile.
+fn prewarm_encoder_buckets(settings: &SettingsStore, windows: &[u32]) -> anyhow::Result<()> {
+    let (mut config, _) = optimized_worker_config(settings, &settings.coreml_model_dir())?;
+    config.set_encoder_buckets(windows.to_vec());
+    let started = std::time::Instant::now();
+    let (asr, load_seconds) = load_coreml_worker(&config)?;
+    warmup::warm_encoder_buckets(&asr, windows)?;
+    log::info!(
+        "compiled encoder buckets {windows:?} in a throwaway worker: load {load_seconds:.3}s, \
+         total {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// Why the recogniser is being rebuilt; only the status text differs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReloadReason {
+    Vocabulary,
+    EncoderBuckets,
+}
+
+impl ReloadReason {
+    fn subject(self) -> &'static str {
+        match self {
+            Self::Vocabulary => "biasing",
+            Self::EncoderBuckets => "encoder bucket set",
+        }
+    }
+
+    fn applied(self) -> &'static str {
+        match self {
+            Self::Vocabulary => "Vocabulary applied",
+            Self::EncoderBuckets => "Short-utterance encoders ready",
+        }
+    }
+
+    fn failed(self) -> &'static str {
+        match self {
+            Self::Vocabulary => "Vocabulary reload failed — previous model kept",
+            Self::EncoderBuckets => "Short-utterance encoders failed to load — previous model kept",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

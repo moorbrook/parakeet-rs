@@ -56,6 +56,28 @@ pub fn dummy_decode(asr: &Asr) -> Result<()> {
     Ok(())
 }
 
+/// Dispatch one silent utterance into each encoder bucket the worker loaded,
+/// so every bucket's Core ML program is compiled and resident before the first
+/// dictation that needs it (kata hrs0). [`dummy_decode`] only reaches the
+/// narrowest bucket.
+///
+/// The buffer for window `w` is half a second short of `w`: longer than every
+/// narrower window, so the worker routes it to `w`, and well inside the
+/// frame-rounded capacity of `w`'s single encoder window, so it never runs a
+/// second window (kata qgwm).
+pub fn warm_encoder_buckets(asr: &Asr, windows: &[u32]) -> Result<()> {
+    for &seconds in windows {
+        let samples = vec![0.0_f32; bucket_warmup_samples(seconds)];
+        asr.recognize_silent_warmup(&samples, PRIME_SAMPLE_RATE)
+            .with_context(|| format!("warming the {seconds} s encoder bucket"))?;
+    }
+    Ok(())
+}
+
+fn bucket_warmup_samples(seconds: u32) -> usize {
+    (seconds as usize * PRIME_SAMPLE_RATE as usize).saturating_sub(PRIME_SAMPLE_RATE as usize / 2)
+}
+
 /// Sample rate the priming buffers are built at. The worker resamples anything
 /// else, so generating at 16 kHz keeps the prime off the resampler.
 const PRIME_SAMPLE_RATE: u32 = 16_000;
@@ -277,6 +299,46 @@ mod tests {
                 decode_seconds: 0.0,
             })
         }
+    }
+
+    /// Records the length of every dispatched buffer.
+    struct LengthRecorder {
+        metadata: AsrBackendMetadata,
+        lengths: parking_lot::Mutex<Vec<usize>>,
+    }
+
+    impl AsrBackend for LengthRecorder {
+        fn metadata(&self) -> &AsrBackendMetadata {
+            &self.metadata
+        }
+
+        fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
+            assert!(samples.iter().all(|s| *s == 0.0));
+            self.lengths.lock().push(samples.len());
+            Ok(Decoded {
+                text: String::new(),
+                audio_seconds: samples.len() as f32 / sample_rate as f32,
+                decode_seconds: 0.0,
+            })
+        }
+    }
+
+    #[test]
+    fn each_bucket_gets_one_silent_dispatch_that_routes_to_it() {
+        let backend = Arc::new(LengthRecorder {
+            metadata: AsrBackendMetadata {
+                backend: "recorder".into(),
+                model: "none".into(),
+                quantization: "none".into(),
+                execution_provider: "test".into(),
+            },
+            lengths: parking_lot::Mutex::new(Vec::new()),
+        });
+        let asr = Asr::from_backend(Arc::clone(&backend) as Arc<dyn AsrBackend>);
+        warm_encoder_buckets(&asr, &[2, 5, 8]).unwrap();
+        // 1.5, 4.5 and 7.5 s: past 2 and 5 s, so they route to 5 and 8 s, and
+        // under each bucket's frame-rounded window (32,000, 79,360, 127,360 samples).
+        assert_eq!(backend.lengths.lock().as_slice(), [24_000, 72_000, 120_000]);
     }
 
     #[test]
