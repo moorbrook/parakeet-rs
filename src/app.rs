@@ -47,8 +47,9 @@ pub struct App {
     loaded_inputs: Mutex<Option<BuildInputs>>,
     /// The encoder buckets a recogniser may load. Empty at boot, so startup
     /// never waits on a bucket's plan compile: Core ML's plan cache is keyed
-    /// to the worker binary, and the first launch after an update compiles
-    /// cold (42.0 s with 2/5/8 against 12.0 s without, M5 Pro). It changes
+    /// by the worker's executable name and the model directory's path, so a
+    /// first install or a moved model directory compiles cold (42.0 s with
+    /// 2/5/8 against 12.0 s without, M5 Pro). It changes
     /// only once a pre-warm has compiled a set, so no load ever pays a cold
     /// compile for a bucket, whether it landed mid-download or was on disk.
     approved_encoder_buckets: Mutex<Vec<u32>>,
@@ -636,8 +637,8 @@ impl App {
     /// compile their plans in a throwaway worker, then mark the loaded
     /// recogniser stale so `reload_asr` swaps in one that uses them once the
     /// app is idle. With a warm plan cache the pre-warm loads in under a
-    /// second; after an app update it is the cold compile, off the dictation
-    /// path. Dictation runs on the 15 s encoder throughout; a bucket that
+    /// second; with a cold one (first install, moved model directory) it is
+    /// the cold compile, off the dictation path. Dictation runs on the 15 s encoder throughout; a bucket that
     /// cannot be fetched only means it keeps doing so.
     fn spawn_encoder_bucket_upgrade(self: &Arc<Self>) {
         self.spawn_supervised("encoder-buckets", |app| {
@@ -944,8 +945,8 @@ fn optimized_worker_config(
 /// throwaway worker, off the dictation path (kata hrs0).
 ///
 /// The first load of each bucket compiles a plan, about 6 s each, and Core ML
-/// keeps compiled plans in an on-disk cache shared by every process running
-/// the same worker binary. Paying that here lets the recogniser swapped in
+/// keeps compiled plans in an on-disk cache keyed by the worker's executable
+/// name and the model directory's path, shared by every process with both. Paying that here lets the recogniser swapped in
 /// next load the buckets warm, so the swap blocks dictation for a warm load
 /// rather than a cold compile.
 fn prewarm_encoder_buckets(settings: &SettingsStore, windows: &[u32]) -> anyhow::Result<()> {

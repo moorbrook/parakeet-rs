@@ -2248,15 +2248,17 @@ first-load plan compile is the only per-device step.
   uses the 15 s encoder, as before. If Core ML refuses a verified bucket the
   worker is reloaded without buckets rather than falling back to sherpa.
 - Startup loads the 15 s encoder alone. Core ML's compiled-plan cache is
-  per worker binary, so the first launch after an update compiles cold: a
-  worker load measured 42.0 s with 2/5/8 against 12.0 s without, then
-  0.81 s and 0.32 s warm (M5 Pro, worker built from this branch). Startup
-  therefore never loads a bucket.
+  keyed by the worker executable's name and the model directory's path, not
+  by the binary's contents, so it is cold after a first install, a moved
+  model directory or a cleared cache, though not after an app update. A cold
+  worker load measured 42.0 s with 2/5/8 against 12.0 s without, and warm
+  loads 0.81 s and 0.32 s (M5 Pro; the cache-key measurements are in
+  `bench/README.md`). Startup therefore never loads a bucket.
 - After every boot a background task verifies the buckets, fetches missing
   ones (the first failed download stops that round, so an unreachable host
   costs one request per launch), and loads them in a throwaway worker with
   the resident recogniser's compute units. That load is the cold compile
-  after an update and under a second otherwise, and it fills the plan
+  when the cache is cold and under a second otherwise, and it fills the plan
   cache. Only then are the buckets approved, the recogniser marked stale,
   and swapped when idle, so the swap is a warm load. Every load dispatches
   one silent utterance per bucket (w − 0.5 s, routing to w) and one past

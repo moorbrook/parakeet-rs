@@ -574,11 +574,24 @@ is byte-identical between them. `asr_diff` reports no transcript drift over
 the 1/3/5/10/20 s fixtures and the 7 s cut, recorded without buckets and
 replayed with them.
 
-The plan compile is per worker binary. The first load after a rebuild
-measured 42.0 s with the buckets and 12.0 s without. The next two bucketed
-loads measured 0.81 s and 0.32 s, and the warm stock load 0.15 s. That is
-why the app's boot loads no bucket: a background throwaway worker pays the
-cold compile and the swap is a warm load (ADR-0037).
+A cold load, one that compiles the Core ML plans, measured 42.0 s with the
+buckets and 12.0 s without. Warm bucketed loads measured 0.81 s and 0.32 s,
+and the warm stock load 0.15 s. The plan cache is keyed by the worker
+executable's name and the model directory's path, not by the binary's
+contents (2026-11-01, worker at dc6e963, IBM fixture, load 3.0–3.9):
+
+| change from a warm load | worker ready |
+|---|---:|
+| none | 0.92 s |
+| rebuilt binary (different SHA-256) at a new path, same name | 0.56 s |
+| same binary renamed | 42.47 s |
+| model directory copied to a new path | 42.30 s |
+| that new path again | 0.74 s |
+
+So an app update stays warm, and the cold compile comes with a first
+install, a moved model directory or a cleared cache. That is why the app's
+boot loads no bucket: when the cache is cold, a background throwaway worker
+pays the compile and the swap is a warm load (ADR-0037).
 
 ```bash
 S=<scratch>; BEFORE=<app model dir>; AFTER=<same pack plus bucket bundles>
