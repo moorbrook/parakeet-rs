@@ -608,7 +608,12 @@ impl App {
             // load and is cached per-process, so the dummy decode would
             // cost ~400 ms for nothing here.
             let inputs = app.current_build_inputs();
-            match load_asr_blocking(&app.settings, inputs, /* warm = */ false) {
+            match load_asr_blocking(
+                &app.settings,
+                &app.window_plan,
+                inputs,
+                /* warm = */ false,
+            ) {
                 Ok((asr, inputs, buckets)) => {
                     // Take the old recognizer out under the guard and drop it
                     // after the guard is released. Dropping in place would run
@@ -680,6 +685,7 @@ impl App {
                 model_fetch::BucketFetch::Download,
                 Arc::new(fetch_progress_to_menubar),
             ));
+            let installed = app.window_plan.usable_buckets(&installed);
             if installed == approved {
                 if installed.is_empty() {
                     menubar::set_status_text(
@@ -721,9 +727,10 @@ impl App {
         }
 
         let settings = self.settings.clone();
+        let plan = self.window_plan.clone();
         let inputs = self.current_build_inputs();
         let result = tokio::task::spawn_blocking(move || {
-            load_asr_blocking(&settings, inputs, /* warm = */ true)
+            load_asr_blocking(&settings, &plan, inputs, /* warm = */ true)
         })
         .await;
 
@@ -764,6 +771,7 @@ impl App {
 /// ability to dictate at all.
 fn load_asr_blocking(
     settings: &SettingsStore,
+    plan: &WindowPlan,
     inputs: BuildInputs,
     warm: bool,
 ) -> anyhow::Result<(Arc<Asr>, BuildInputs, Option<Vec<u32>>)> {
@@ -790,7 +798,13 @@ fn load_asr_blocking(
 
     let backend_override = configured_asr_backend_override()?;
     if backend_override == AsrBackendOverride::Auto {
-        match load_optimized_asr(settings, &terms, inputs.score, &inputs.encoder_buckets) {
+        match load_optimized_asr(
+            settings,
+            plan,
+            &terms,
+            inputs.score,
+            &inputs.encoder_buckets,
+        ) {
             Ok((asr, buckets)) => return Ok((Arc::new(asr), inputs, Some(buckets))),
             Err(error) => {
                 log::warn!(
@@ -845,6 +859,7 @@ fn load_asr_blocking(
 /// returns the recogniser and the buckets it actually loaded.
 fn load_optimized_asr(
     settings: &SettingsStore,
+    plan: &WindowPlan,
     vocabulary: &[String],
     vocabulary_score: f32,
     approved: &[u32],
@@ -875,12 +890,13 @@ fn load_optimized_asr(
     let buckets = if approved.is_empty() {
         Vec::new()
     } else {
-        runtime.block_on(model_fetch::ensure_encoder_buckets(
+        let verified = runtime.block_on(model_fetch::ensure_encoder_buckets(
             &app_model_directory,
             approved,
             model_fetch::BucketFetch::VerifyOnly,
             on_progress,
-        ))
+        ));
+        plan.usable_buckets(&verified)
     };
 
     let (mut config, long_plan_warmup_seconds) =

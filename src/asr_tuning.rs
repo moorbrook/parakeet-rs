@@ -780,6 +780,9 @@ impl WindowTuning {
 pub struct WindowPlan {
     pub encoder_buckets: Vec<u32>,
     pub hold_window_seconds: f32,
+    /// The choice of a valid profile, whose bucket set passed the gold gate
+    /// only as a whole.
+    pub tuned: bool,
 }
 
 impl WindowPlan {
@@ -789,6 +792,7 @@ impl WindowPlan {
         Self {
             encoder_buckets: manifest.iter().map(|bucket| bucket.seconds).collect(),
             hold_window_seconds: BASELINE_HOLD_WINDOW_SECONDS,
+            tuned: false,
         }
     }
 
@@ -799,6 +803,7 @@ impl WindowPlan {
             Ok(Some(selection)) => Self {
                 encoder_buckets: selection.encoder_buckets.clone(),
                 hold_window_seconds: selection.hold_window_seconds,
+                tuned: true,
             },
             Ok(None) => Self::untuned(manifest),
             Err(error) => {
@@ -808,6 +813,19 @@ impl WindowPlan {
                 );
                 Self::untuned(manifest)
             }
+        }
+    }
+
+    /// Which of the `available` (fetched and verified) buckets a recogniser
+    /// may load. Untuned, any of them: each verified bucket matched the 15 s
+    /// encoder in ADR-0037's gold run. Tuned, the chosen set or nothing, since
+    /// a part of it was never gated; nothing leaves the 15 s encoder at 6 s,
+    /// the reference every gate compares against.
+    pub fn usable_buckets(&self, available: &[u32]) -> Vec<u32> {
+        if !self.tuned || available == self.encoder_buckets.as_slice() {
+            available.to_vec()
+        } else {
+            Vec::new()
         }
     }
 
@@ -1469,26 +1487,30 @@ mod tests {
 
     #[test]
     fn measured_costs_survive_a_save_and_reload_exactly() {
-        // Costs as the stage profiler reports them. A profile whose floats came
-        // back one ULP off recomputed a different prediction and was rejected
-        // as inconsistent the first time the app read it.
+        // The costs the M5 Pro profile recorded on 2026-11-01. Its floats came
+        // back one ULP off, so the recomputed prediction differed and the app
+        // rejected the profile as inconsistent the first time it read it.
         let mut evidence = window_evidence(u64::MAX);
-        for (cost, ms) in evidence.encoders.iter_mut().zip([
-            25.678_123_456_789_01,
-            8.117_000_000_000_001,
-            10.02,
-            12.680_000_000_000_007,
-        ]) {
+        for (cost, ms) in evidence
+            .encoders
+            .iter_mut()
+            .zip([25.676_666, 8.121_958, 10.016_334, 12.683_958])
+        {
             cost.encoder_ms_p50 = ms;
         }
-        evidence.decode_ms_per_audio_second = 1.411_666_666_666_666_8;
+        evidence.decode_ms_per_audio_second = 1.405_458_333_333_333;
         gate_everything(&mut evidence, |_, _| CHANGED_SHA);
         let mut profile = TuningProfile::new(
             hardware(),
             "artifact".into(),
             3,
             vec![
-                candidate(BASELINE_COMPUTE_UNITS, 95.312_345_678_9, 198.7, 46.81),
+                candidate(
+                    BASELINE_COMPUTE_UNITS,
+                    95.312_042,
+                    198.689_79,
+                    46.784_625_000_000_005,
+                ),
                 CandidateMeasurement::failed(CoreMlComputeUnits::All, "unsupported"),
                 CandidateMeasurement::failed(CoreMlComputeUnits::CpuAndGpu, "unsupported"),
                 CandidateMeasurement::failed(CoreMlComputeUnits::CpuOnly, "unsupported"),
@@ -1514,6 +1536,7 @@ mod tests {
         let plan = WindowPlan {
             encoder_buckets: vec![5, 8],
             hold_window_seconds: 5.0,
+            tuned: true,
         };
         assert_eq!(plan.hold_windows(Some(&[5, 8]), true).max_seconds, 5.0);
         assert_eq!(plan.hold_windows(Some(&[5, 8]), true).min_seconds, 5.0);
@@ -1524,9 +1547,25 @@ mod tests {
         let stock_only = WindowPlan {
             encoder_buckets: Vec::new(),
             hold_window_seconds: 5.0,
+            tuned: true,
         };
         assert_eq!(stock_only.hold_windows(Some(&[]), true).max_seconds, 5.0);
         assert_eq!(stock_only.hold_windows(None, true).max_seconds, 6.0);
+    }
+
+    #[test]
+    fn a_tuned_plan_loads_its_whole_bucket_set_or_none() {
+        let tuned = WindowPlan {
+            encoder_buckets: vec![5, 8],
+            hold_window_seconds: 5.0,
+            tuned: true,
+        };
+        assert_eq!(tuned.usable_buckets(&[5, 8]), [5, 8]);
+        assert_eq!(tuned.usable_buckets(&[5]), [] as [u32; 0]);
+        assert_eq!(tuned.usable_buckets(&[]), [] as [u32; 0]);
+        let untuned = WindowPlan::untuned(crate::model_fetch::ENCODER_BUCKETS);
+        assert_eq!(untuned.usable_buckets(&[2, 5]), [2, 5]);
+        assert_eq!(untuned.usable_buckets(&[2, 5, 8]), [2, 5, 8]);
     }
 
     #[test]
