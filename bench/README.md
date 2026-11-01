@@ -539,7 +539,7 @@ describe.
 
 ### Shipped buckets: M5 Pro 24 GB (2026-10-31)
 
-Measured on `work/htdr` at `3492e40`, worker and bench binaries rebuilt
+Measured on `work/htdr` at `581b09e`, worker and bench binaries rebuilt
 from that commit. The "before" model directory is the app's stock pack and
 the "after" directory is the same pack plus the 2/5/8 s bundles, whose 15
 files `provision_models --verify-only` checks against the ADR-0037
@@ -578,7 +578,7 @@ A cold load, one that compiles the Core ML plans, measured 42.0 s with the
 buckets and 12.0 s without. Warm bucketed loads measured 0.81 s and 0.32 s,
 and the warm stock load 0.15 s. The plan cache is keyed by the worker
 executable's name and the model directory's path, not by the binary's
-contents (2026-11-01, worker at dc6e963, IBM fixture, load 3.0–3.9):
+contents (2026-11-01, worker at dc6e963, IBM fixture, one run each, load 3.0–3.9):
 
 | change from a warm load | worker ready |
 |---|---:|
