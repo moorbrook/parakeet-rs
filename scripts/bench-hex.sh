@@ -7,8 +7,12 @@
 # it. This script runs both engines on the same audio with the same warm-up
 # and the same release-to-text definition:
 #
-#   gold  `asr_diff --gold` (ours, Core ML) and `bench_hex gold` (Hex, whole
-#         clip and live stream), ten repetitions each, same scorer.
+#   gold  `bench_hex gold` on both engines (ours through the Core ML worker,
+#         Hex whole clip and live stream), ten repetitions each, one scorer
+#         and one caller-side timer around each request. `asr_diff --gold`
+#         runs ours as well, as a transcript cross-check; it times the
+#         worker's own inference, without IPC, so its timings are not
+#         comparable with Hex's.
 #   hold  per loopback fixture, four arms back to back: ours windowed (the
 #         shipping 6 s cap), ours serial, Hex whole clip at release through
 #         our capture path, Hex live stream fed during the hold.
@@ -129,18 +133,22 @@ if [[ " $STAGES " == *" gold "* ]]; then
     take_lock gold
     # Both binaries exit 1 for a failed quality gate as well as for an error,
     # so the report's existence, not the exit status, says the arm ran.
-    rm -f "$OUT/ours-gold.json" "$OUT/hex-offline-gold.json" "$OUT/hex-stream-gold.json"
+    gold_reports=(ours-gold ours-asr-diff-gold hex-offline-gold hex-stream-gold)
+    for report in "${gold_reports[@]}"; do rm -f "$OUT/$report.json"; done
+    "$HEX" gold --path coreml --worker "$WORKER" --model-dir "$MODEL_DIR" \
+        --gold bench/gold/manifest.json --audio-dir bench/gold/audio \
+        --repetitions "$REPETITIONS" --json-out "$OUT/ours-gold.json" || true
     "./target/release/asr_diff" --gold bench/gold/manifest.json --audio-dir bench/gold/audio \
         --repetitions "$REPETITIONS" --backend coreml-unified \
         --worker "$WORKER" --model-dir "$MODEL_DIR" \
-        --json-out "$OUT/ours-gold.json" || true
+        --json-out "$OUT/ours-asr-diff-gold.json" || true
     for path in offline stream; do
         "$HEX" gold --path "$path" --model "$GGUF" --gold bench/gold/manifest.json \
             --audio-dir bench/gold/audio --repetitions "$REPETITIONS" \
             --json-out "$OUT/hex-$path-gold.json" || true
     done
     release_lock
-    for report in ours-gold hex-offline-gold hex-stream-gold; do
+    for report in "${gold_reports[@]}"; do
         [[ -f "$OUT/$report.json" ]] || fail "$report.json was not written"
     done
 fi

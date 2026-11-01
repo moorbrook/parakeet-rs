@@ -7,17 +7,18 @@ mod engine;
 mod gold;
 mod hold;
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{anyhow, bail, Result};
 
-use gold::{DecodePath, GoldArgs};
+use gold::{DecodePath, GoldArgs, GoldEngine};
 use hold::HoldArgs;
 
 const USAGE: &str = "usage:
   bench_hex gold --model GGUF --gold MANIFEST --audio-dir DIR --json-out FILE
                  [--repetitions N] [--path offline|stream]
+  bench_hex gold --path coreml --worker WORKER --model-dir DIR --gold MANIFEST
+                 --audio-dir DIR --json-out FILE [--repetitions N]
   bench_hex hold --model GGUF --wav FILE [--device NAME] [--reps N]
                  [--warmup-reps N] [--path offline|stream]";
 
@@ -71,31 +72,41 @@ fn run() -> Result<bool> {
     }
     let command = argv.remove(0);
     let mut flags = Flags(argv);
-    let path = DecodePath::parse(&flags.take("--path").unwrap_or_else(|| "offline".into()))?;
-    let model = PathBuf::from(flags.required("--model")?);
+    let path_name = flags.take("--path").unwrap_or_else(|| "offline".into());
     match command.as_str() {
         "gold" => {
+            // Our engine, timed by the same loop as Hex's (see gold.rs).
+            let engine = if path_name == "coreml" {
+                GoldEngine::CoreMl {
+                    worker: flags.required("--worker")?.into(),
+                    model_dir: flags.required("--model-dir")?.into(),
+                }
+            } else {
+                GoldEngine::Hex {
+                    path: DecodePath::parse(&path_name)?,
+                    model: flags.required("--model")?.into(),
+                }
+            };
             let args = GoldArgs {
-                model,
+                engine,
                 gold: flags.required("--gold")?.into(),
                 audio_dir: flags.required("--audio-dir")?.into(),
                 json_out: flags.required("--json-out")?.into(),
                 repetitions: flags.number("--repetitions", 10)?,
-                path,
             };
             flags.finish()?;
             gold::run(&args)
         }
         "hold" => {
             let args = HoldArgs {
-                model,
+                path: DecodePath::parse(&path_name)?,
+                model: flags.required("--model")?.into(),
                 wav: flags.required("--wav")?.into(),
                 device: flags
                     .take("--device")
                     .unwrap_or_else(|| "BlackHole 2ch".into()),
                 reps: flags.number("--reps", 30)?,
                 warmup_reps: flags.number("--warmup-reps", 2)?,
-                path,
             };
             flags.finish()?;
             hold::run(&args).map(|()| true)
