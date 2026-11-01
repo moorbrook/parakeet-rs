@@ -141,6 +141,10 @@ struct Inner {
     state: DictationState,
     session: Option<Session>,
     pending_terminate: Option<TerminateKind>,
+    /// A recogniser reload was requested while the app was busy. Set by the
+    /// failed claim under this lock and taken under it at the next `Idle`,
+    /// so no return to `Idle` can run between "busy" and "recorded".
+    reload_deferred: bool,
 }
 
 impl DictationFsm {
@@ -150,6 +154,7 @@ impl DictationFsm {
                 state: DictationState::ModelLoading,
                 session: None,
                 pending_terminate: None,
+                reload_deferred: false,
             }),
         }
     }
@@ -182,18 +187,38 @@ impl DictationFsm {
     /// the recogniser can be swapped (vocabulary change → rebuild with
     /// new contextual biasing).
     ///
-    /// Returns `false` — and changes nothing — from any other state.
+    /// From any other state it returns `false` and records the request,
+    /// in the same critical section that saw the app busy, for
+    /// [`Self::take_deferred_reload`] at the next `Idle`. Recording it
+    /// after the lock was released let a session return to `Idle` and
+    /// drain in between, stranding the reload. A successful claim
+    /// subsumes any earlier deferred request.
+    ///
     /// The claim has to be atomic against `on_press_tap` /
     /// `on_press_hold`, which both gate on `state == Idle`: a
     /// check-then-set would let a hotkey press start a session against
     /// the recogniser we're about to drop.
-    pub fn try_claim_model_reload(&self) -> bool {
+    pub fn claim_model_reload_or_defer(&self) -> bool {
         let mut inner = self.inner.lock();
         if inner.state != DictationState::Idle {
+            inner.reload_deferred = true;
             return false;
         }
         inner.state = DictationState::ModelLoading;
+        inner.reload_deferred = false;
         true
+    }
+
+    /// Take a deferred reload request, only while `Idle`. Returns `true`
+    /// at most once per request; from any other state it leaves the
+    /// request for a later `Idle`.
+    pub fn take_deferred_reload(&self) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.state == DictationState::Idle && inner.reload_deferred {
+            inner.reload_deferred = false;
+            return true;
+        }
+        false
     }
 
     /// Tap-mode press handler. Atomically observes both `session` and
@@ -323,6 +348,33 @@ mod tests {
         let fsm = DictationFsm::new();
         assert_eq!(fsm.state(), DictationState::ModelLoading);
         assert!(!fsm.has_live_session());
+    }
+
+    /// The lost wake-up: the reload's claim sees the app busy, and before
+    /// the reload thread does anything else the session returns to `Idle`
+    /// and drains. The drain must find the request.
+    #[test]
+    fn a_reload_deferred_while_busy_is_found_by_a_drain_right_after_the_claim() {
+        let fsm = DictationFsm::new();
+        fsm.set_state(DictationState::Listening);
+        assert!(!fsm.claim_model_reload_or_defer());
+        assert!(!fsm.take_deferred_reload(), "taken while busy");
+
+        fsm.set_state(DictationState::Idle);
+        assert!(fsm.take_deferred_reload(), "deferred reload lost");
+        assert!(!fsm.take_deferred_reload(), "taken twice");
+    }
+
+    #[test]
+    fn a_reload_claimed_at_idle_runs_now_and_clears_an_older_deferral() {
+        let fsm = DictationFsm::new();
+        fsm.set_state(DictationState::Transcribing);
+        assert!(!fsm.claim_model_reload_or_defer());
+        fsm.set_state(DictationState::Idle);
+        assert!(fsm.claim_model_reload_or_defer());
+        assert_eq!(fsm.state(), DictationState::ModelLoading);
+        fsm.set_state(DictationState::Idle);
+        assert!(!fsm.take_deferred_reload());
     }
 
     #[test]

@@ -969,7 +969,7 @@ any of them wrong produces a feature that silently does nothing.
   no beam search, no behaviour change, byte-identical transcripts.
 - Biasing is baked in at recognizer construction, so a vocabulary edit
   requires a rebuild. Settings-Save rebuilds in the background via
-  `DictationFsm::try_claim_model_reload`, which atomically takes the
+  `DictationFsm::claim_model_reload_or_defer`, which atomically takes the
   app out of `Idle` so a hotkey press can't start a session against a
   recognizer that is about to be dropped. The previous recognizer is
   replaced only on success — a malformed vocabulary costs the user
@@ -995,7 +995,8 @@ stored only on success. Staleness is `loaded != Biasing::sample(...)`.
 Failure leaves the old value, so the mismatch persists and the retry
 happens; a mid-build edit compares unequal to the pre-build sample and
 gets picked up by the re-check the worker runs on completion; and a
-busy app sets `reload_pending`, drained by `on_session_finished`.
+busy app records the request inside the FSM claim's own lock, taken at
+the next return to `Idle` whatever ended the session.
 
 **Consequences.** Verified by `asr_diff` (ADR-0021): the default
 vocabulary + score is transparent on all five fixtures, and the

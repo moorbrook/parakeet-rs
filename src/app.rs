@@ -56,7 +56,6 @@ pub struct App {
     /// Set when a rebuild was needed but the app was busy. Drained by
     /// `on_session_finished`. Without it a vocabulary edit saved during
     /// a dictation stayed unapplied until the *next* Settings Save.
-    reload_pending: std::sync::atomic::AtomicBool,
     /// Wakes the Neural Engine at hotkey-down so the endpoint decode does not
     /// pay its idle re-wake. See `warmup::EnginePrimer`.
     engine_primer: warmup::EnginePrimer,
@@ -113,7 +112,6 @@ impl App {
             hotkey: Mutex::new(None),
             loaded_inputs: Mutex::new(None),
             approved_encoder_buckets: Mutex::new(Vec::new()),
-            reload_pending: std::sync::atomic::AtomicBool::new(false),
             engine_primer: warmup::EnginePrimer::new(),
         }
     }
@@ -448,7 +446,8 @@ impl App {
     /// screen).
     ///
     /// Every return to `Idle` passes through here, so this is also where a
-    /// reload deferred while busy (`reload_pending`) is drained: after a
+    /// reload deferred while busy (`DictationFsm::take_deferred_reload`) is
+    /// drained: after a
     /// transcription, but equally after a cancelled, silent or failed
     /// session, a failed start, or panic recovery. Draining only after a
     /// transcription left a vocabulary edit or an encoder-bucket swap
@@ -456,11 +455,7 @@ impl App {
     fn announce_state(self: &Arc<Self>, state: DictationState) {
         self.refresh_menu();
         hud::show_state(state);
-        if state == DictationState::Idle
-            && self
-                .reload_pending
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
+        if state == DictationState::Idle && self.fsm.take_deferred_reload() {
             self.reload_asr_if_stale();
         }
     }
@@ -569,29 +564,24 @@ impl App {
     /// Deferred (not dropped) when the app is busy: mid-session or
     /// mid-transcribe the in-flight worker holds an `Arc<Asr>` clone,
     /// and swapping the slot would neither help it nor be safe to
-    /// interleave with. `on_session_finished` drains the flag, so the
-    /// edit lands as soon as the app is idle rather than waiting for
-    /// another Settings Save.
+    /// interleave with. The FSM records the deferral under the lock that
+    /// saw the app busy, and the next return to `Idle` takes it
+    /// (`announce_state`), so the edit lands as soon as the app is idle
+    /// rather than waiting for another Settings Save.
     fn reload_asr(self: &Arc<Self>, reason: ReloadReason) {
         if self.asr.lock().is_none() {
             return;
         }
-        if !self.fsm.try_claim_model_reload() {
+        if !self.fsm.claim_model_reload_or_defer() {
             log::info!(
                 "{} changed but app is busy; reload deferred",
                 reason.subject()
             );
-            self.reload_pending
-                .store(true, std::sync::atomic::Ordering::SeqCst);
             if reason == ReloadReason::Vocabulary {
                 menubar::set_status_text("Vocabulary saved — applies after the current dictation");
             }
             return;
         }
-        // Claimed: this reload is happening, so any previously deferred
-        // request is subsumed by it.
-        self.reload_pending
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.announce_state(DictationState::ModelLoading);
         self.spawn_supervised("asr-reload", move |app| {
             // `warm = false`: the CoreML graph was compiled by the boot
@@ -1525,19 +1515,19 @@ mod tests {
     }
 
     #[test]
-    fn a_deferred_reload_is_drained_on_any_return_to_idle_and_not_before() {
-        use std::sync::atomic::Ordering::SeqCst;
+    fn announcing_idle_drains_a_reload_deferred_while_busy() {
         let dir = tempfile::tempdir().unwrap();
         let app = Arc::new(App::new(SettingsStore::with_data_root(dir.path()).unwrap()));
-        app.reload_pending.store(true, SeqCst);
+        app.fsm.set_state(DictationState::Listening);
+        assert!(!app.fsm.claim_model_reload_or_defer());
+        app.announce_state(DictationState::Listening);
 
         // A cancelled or silent session goes Listening -> Idle without
-        // transcribing; only the second announcement may drain.
-        app.announce_state(DictationState::Listening);
-        assert!(app.reload_pending.load(SeqCst), "drained while busy");
+        // transcribing; announcing Idle is where the request is taken.
+        app.fsm.set_state(DictationState::Idle);
         app.announce_state(DictationState::Idle);
         assert!(
-            !app.reload_pending.load(SeqCst),
+            !app.fsm.take_deferred_reload(),
             "deferred reload stranded at Idle"
         );
     }
