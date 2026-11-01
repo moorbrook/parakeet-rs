@@ -46,7 +46,10 @@ fn main() -> Result<()> {
         BucketFetch::Download
     };
     let windows = runtime.block_on(model_fetch::ensure_encoder_buckets(
-        &model_dir, fetch, progress,
+        &model_dir,
+        &model_fetch::all_encoder_bucket_windows(),
+        fetch,
+        progress,
     ));
     println!("model_dir={}", model_dir.display());
     println!("encoder_buckets={windows:?}");

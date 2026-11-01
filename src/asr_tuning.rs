@@ -14,7 +14,10 @@ use sha2::{Digest, Sha256};
 use crate::coreml_worker::{
     CoreMlComputeUnits, DEFAULT_LONG_REGIME_SECONDS, MAX_LONG_REGIME_SECONDS,
 };
+use crate::endpointing::{SAMPLE_RATE, WINDOW_SAMPLES};
+use crate::model_fetch::EncoderBucket;
 use crate::performance;
+use crate::windows::{HoldWindowConfig, WindowPlanner};
 
 pub const PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const TUNER_VERSION: u32 = 1;
@@ -183,6 +186,11 @@ pub struct TuningProfile {
     pub baseline_compute_units: CoreMlComputeUnits,
     pub selection: Selection,
     pub candidates: Vec<CandidateMeasurement>,
+    /// Encoder buckets and Hold window, chosen after the compute units.
+    /// Absent from a profile written before kata 4s2q, which then keeps the
+    /// untuned behaviour: every hosted bucket and the 6 s window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_tuning: Option<WindowTuning>,
 }
 
 impl TuningProfile {
@@ -196,7 +204,7 @@ impl TuningProfile {
             bail!("tuning profile needs at least one measured repetition");
         }
         validate_candidate_inventory(&candidates)?;
-        let cache_key = cache_key(&hardware, &artifact_digest)?;
+        let cache_key = profile_cache_key(&hardware, &artifact_digest, None)?;
         let selection = select(&candidates)?;
         Ok(Self {
             schema_version: PROFILE_SCHEMA_VERSION,
@@ -214,7 +222,54 @@ impl TuningProfile {
             baseline_compute_units: BASELINE_COMPUTE_UNITS,
             selection,
             candidates,
+            window_tuning: None,
         })
+    }
+
+    /// Record the bucket and Hold-window choice, which joins the cache key.
+    pub fn set_window_tuning(&mut self, tuning: WindowTuning) -> Result<()> {
+        if tuning.selection != select_window(&tuning.evidence)? {
+            bail!("window selection does not match its evidence");
+        }
+        self.cache_key = profile_cache_key(&self.hardware, &self.artifact_digest, Some(&tuning))?;
+        self.window_tuning = Some(tuning);
+        Ok(())
+    }
+
+    /// The bucket set and Hold window this profile chose, when it chose them
+    /// and every chosen bucket is still the one `manifest` hosts. Call only on
+    /// a profile [`Self::validate_for`] accepted. `Ok(None)` means the profile
+    /// predates window tuning; an error means its window evidence is stale or
+    /// inconsistent, and the caller keeps the untuned behaviour for windows
+    /// while still using the compute units.
+    pub fn window_selection_for(
+        &self,
+        manifest: &[EncoderBucket],
+    ) -> Result<Option<&WindowSelection>> {
+        let Some(tuning) = &self.window_tuning else {
+            return Ok(None);
+        };
+        if tuning.selection != select_window(&tuning.evidence)? {
+            bail!("window selection does not match its evidence");
+        }
+        for window in &tuning.selection.encoder_buckets {
+            let measured = tuning
+                .evidence
+                .encoders
+                .iter()
+                .find(|cost| cost.window_seconds == *window)
+                .with_context(|| format!("selected {window} s bucket has no measurement"))?;
+            let hosted = manifest
+                .iter()
+                .find(|bucket| bucket.seconds == *window)
+                .with_context(|| format!("selected {window} s bucket is no longer hosted"))?;
+            if measured.archive_sha256.as_deref() != Some(hosted.archive_sha256())
+                || measured.installed_bytes != hosted.installed_bytes()
+            {
+                bail!("the {window} s bucket was re-released after tuning");
+            }
+        }
+        Ok(Some(&tuning.selection))
     }
 
     pub fn validate_for(
@@ -237,7 +292,9 @@ impl TuningProfile {
         if &self.hardware != hardware {
             bail!("tuning profile hardware or macOS fingerprint is stale");
         }
-        if self.cache_key != cache_key(hardware, artifact_digest)? {
+        if self.cache_key
+            != profile_cache_key(hardware, artifact_digest, self.window_tuning.as_ref())?
+        {
             bail!("tuning profile cache key does not match its contents");
         }
         if !(1..=MAX_LONG_REGIME_SECONDS).contains(&self.long_regime_seconds) {
@@ -258,18 +315,55 @@ impl TuningProfile {
 }
 
 pub fn cache_key(hardware: &HardwareFingerprint, artifact_digest: &str) -> Result<String> {
+    profile_cache_key(hardware, artifact_digest, None)
+}
+
+/// The key adds the window choice only when the profile makes one, and then
+/// only the chosen buckets' archive digests and the chosen Hold window. A
+/// profile without window tuning keeps the key it was written with, and one
+/// that chose 5 s alone does not go stale when the 8 s bucket is re-released.
+fn profile_cache_key(
+    hardware: &HardwareFingerprint,
+    artifact_digest: &str,
+    window_tuning: Option<&WindowTuning>,
+) -> Result<String> {
+    #[derive(Serialize)]
+    struct WindowKey<'a> {
+        encoder_buckets: Vec<(u32, Option<&'a str>)>,
+        hold_window_seconds: f32,
+    }
     #[derive(Serialize)]
     struct Key<'a> {
         hardware: &'a HardwareFingerprint,
         backend_id: &'static str,
         artifact_digest: &'a str,
         tuner_version: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        window: Option<WindowKey<'a>>,
     }
+    let window = window_tuning.map(|tuning| WindowKey {
+        encoder_buckets: tuning
+            .selection
+            .encoder_buckets
+            .iter()
+            .map(|window| {
+                let digest = tuning
+                    .evidence
+                    .encoders
+                    .iter()
+                    .find(|cost| cost.window_seconds == *window)
+                    .and_then(|cost| cost.archive_sha256.as_deref());
+                (*window, digest)
+            })
+            .collect(),
+        hold_window_seconds: tuning.selection.hold_window_seconds,
+    });
     let bytes = serde_json::to_vec(&Key {
         hardware,
         backend_id: BACKEND_ID,
         artifact_digest,
         tuner_version: TUNER_VERSION,
+        window,
     })?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
@@ -563,6 +657,428 @@ fn percent_improvement(baseline: f64, candidate: f64) -> f64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Encoder buckets and Hold window (kata 4s2q)
+//
+// The tuner measures each encoder's cost on this chip, predicts the release
+// cost of every bucket subset and Hold window from it, and then runs the gold
+// gate on those configurations fastest first. The first whose output matches
+// the 15 s encoder at the 6 s window byte for byte is chosen; the baseline
+// itself is the fallback and needs no gate.
+
+/// The Hold window the app uses when no profile chooses one (ADR-0032).
+pub const BASELINE_HOLD_WINDOW_SECONDS: f32 = 6.0;
+
+/// Hold windows the tuner may choose. Each runs with pause cutting off
+/// (minimum equal to maximum), the measured setting of ADR-0032.
+pub const HOLD_WINDOW_CANDIDATES: [f32; 5] = [3.0, 4.0, 5.0, 6.0, 8.0];
+
+/// Utterance lengths the predicted release cost averages over, equally
+/// weighted: what bench-hold captures of its 1, 3, 5, 10 and 20 s fixtures
+/// (kata ktfa), so a prediction can be checked against that bench. Fixed in
+/// the tuner, never learned from what the user dictates.
+pub const RELEASE_WORKLOAD_SECONDS: [f32; 5] = [0.875, 2.891, 4.917, 8.128, 16.58];
+
+/// Samples per encoder frame (80 ms). An encoder window decodes only whole
+/// frames, so the 5 s bucket holds 79,360 samples although it is routed
+/// anything up to 80,000, and runs twice for the gap between (kata qgwm).
+pub const ENCODER_FRAME_SAMPLES: u64 = 1_280;
+
+/// Window of the stock encoder, which takes every audio no bucket holds.
+pub const STOCK_ENCODER_WINDOW_SECONDS: u32 = 15;
+
+/// One encoder's measured cost. The encoder pads every input to its window,
+/// so this cost does not depend on how much audio it was given.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncoderCost {
+    pub window_seconds: u32,
+    /// Median of the worker's encoder stage over the probe repetitions.
+    pub encoder_ms_p50: f64,
+    /// The release archive this bucket was measured from. `None` for the
+    /// stock encoder, which the artifact digest already covers.
+    pub archive_sha256: Option<String>,
+    /// Disk the bucket occupies once installed; zero for the stock encoder.
+    pub installed_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum GateOutcome {
+    /// Every repetition produced the same outputs; this is their digest.
+    Output {
+        sha256: String,
+    },
+    /// Repetitions disagreed, so no single output can match the baseline.
+    Nondeterministic,
+    Failed {
+        error: String,
+    },
+}
+
+/// The gold gate's result for one bucket subset at one Hold window.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GateVerdict {
+    pub encoder_buckets: Vec<u32>,
+    pub hold_window_seconds: f32,
+    pub outcome: GateOutcome,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowEvidence {
+    pub disk_budget_bytes: u64,
+    pub hold_window_candidates: Vec<f32>,
+    pub workload_seconds: Vec<f32>,
+    /// Every encoder measured: the stock one and each installed bucket.
+    pub encoders: Vec<EncoderCost>,
+    /// Release cost that grows with the tail's audio (mel and decode), per
+    /// second, from the stock encoder's probes.
+    pub decode_ms_per_audio_second: f64,
+    /// Digest of the gold outputs with no bucket at the baseline Hold window,
+    /// both whole-utterance and Hold-windowed. A configuration is eligible
+    /// only when its digest is this one.
+    pub baseline_output_sha256: String,
+    /// Verdicts in the order they ran: fastest predicted first, stopping at
+    /// the first match.
+    pub gates: Vec<GateVerdict>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowSelection {
+    pub encoder_buckets: Vec<u32>,
+    pub hold_window_seconds: f32,
+    pub installed_bytes: u64,
+    pub predicted_release_ms: f64,
+    pub baseline_predicted_release_ms: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WindowTuning {
+    pub evidence: WindowEvidence,
+    pub selection: WindowSelection,
+}
+
+impl WindowTuning {
+    pub fn new(evidence: WindowEvidence) -> Result<Self> {
+        let selection = select_window(&evidence)?;
+        Ok(Self {
+            evidence,
+            selection,
+        })
+    }
+}
+
+/// The encoder buckets the app keeps and the Hold window it cuts at.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowPlan {
+    pub encoder_buckets: Vec<u32>,
+    pub hold_window_seconds: f32,
+}
+
+impl WindowPlan {
+    /// No profile, or one that predates window tuning: every hosted bucket and
+    /// the 6 s window, the app's behaviour before kata 4s2q.
+    pub fn untuned(manifest: &[EncoderBucket]) -> Self {
+        Self {
+            encoder_buckets: manifest.iter().map(|bucket| bucket.seconds).collect(),
+            hold_window_seconds: BASELINE_HOLD_WINDOW_SECONDS,
+        }
+    }
+
+    /// The plan of a profile [`TuningProfile::validate_for`] accepted. Stale
+    /// window evidence falls back to [`Self::untuned`] and says why.
+    pub fn for_profile(profile: &TuningProfile, manifest: &[EncoderBucket]) -> Self {
+        match profile.window_selection_for(manifest) {
+            Ok(Some(selection)) => Self {
+                encoder_buckets: selection.encoder_buckets.clone(),
+                hold_window_seconds: selection.hold_window_seconds,
+            },
+            Ok(None) => Self::untuned(manifest),
+            Err(error) => {
+                log::warn!(
+                    "ASR tuning profile's bucket and Hold-window choice is stale; using every \
+                     bucket and the {BASELINE_HOLD_WINDOW_SECONDS} s window: {error:#}"
+                );
+                Self::untuned(manifest)
+            }
+        }
+    }
+
+    pub fn hold_windows(&self, enabled: bool) -> HoldWindowConfig {
+        HoldWindowConfig {
+            enabled,
+            min_seconds: self.hold_window_seconds,
+            max_seconds: self.hold_window_seconds,
+        }
+    }
+}
+
+/// A bucket subset at a Hold window, with its predicted release cost.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowCandidate {
+    pub encoder_buckets: Vec<u32>,
+    pub hold_window_seconds: f32,
+    pub installed_bytes: u64,
+    pub predicted_release_ms: f64,
+}
+
+impl WindowCandidate {
+    pub fn is_baseline(&self) -> bool {
+        self.encoder_buckets.is_empty() && self.hold_window_seconds == BASELINE_HOLD_WINDOW_SECONDS
+    }
+}
+
+/// Samples left to decode on release once Hold has cut every window it can,
+/// for continuous speech of `utterance_samples` at `hold_window_seconds`. Runs
+/// the session's own planner on all-speech frames, so a forced cut lands
+/// where `streamer::decode_hold_windowed` would put it.
+pub fn tail_samples(utterance_samples: u64, hold_window_seconds: f32) -> u64 {
+    let config = HoldWindowConfig {
+        enabled: true,
+        min_seconds: hold_window_seconds,
+        max_seconds: hold_window_seconds,
+    };
+    let mut planner = WindowPlanner::new(config, u64::from(WINDOW_SAMPLES));
+    for _ in 0..utterance_samples / u64::from(WINDOW_SAMPLES) {
+        let _ = planner.observe_frame(true);
+    }
+    utterance_samples - planner.open_window_start().min(utterance_samples)
+}
+
+/// The encoder window that takes `samples`: the narrowest bucket that holds
+/// them, else the stock encoder. The worker's `EncoderBuckets.select` rule.
+pub fn routed_window(samples: u64, buckets: &[u32]) -> u32 {
+    let mut sorted = buckets.to_vec();
+    sorted.sort_unstable();
+    sorted
+        .into_iter()
+        .find(|window| samples <= u64::from(*window) * u64::from(SAMPLE_RATE))
+        .unwrap_or(STOCK_ENCODER_WINDOW_SECONDS)
+}
+
+/// Encoder runs `samples` costs on the `window` s encoder: one per whole-frame
+/// capacity it fills.
+pub fn encoder_passes(samples: u64, window: u32) -> u64 {
+    let capacity =
+        u64::from(window) * u64::from(SAMPLE_RATE) / ENCODER_FRAME_SAMPLES * ENCODER_FRAME_SAMPLES;
+    samples.div_ceil(capacity).max(1)
+}
+
+/// Mean release-time ASR cost over [`RELEASE_WORKLOAD_SECONDS`]: the routed
+/// encoder's measured cost plus the per-second cost of the tail's audio. The
+/// fixed per-request overhead is the same for every configuration and left
+/// out.
+pub fn predicted_release_ms(
+    evidence: &WindowEvidence,
+    buckets: &[u32],
+    hold_window_seconds: f32,
+) -> Result<f64> {
+    let mut total = 0.0;
+    for seconds in &evidence.workload_seconds {
+        let samples = (f64::from(*seconds) * f64::from(SAMPLE_RATE)).round() as u64;
+        let tail = tail_samples(samples, hold_window_seconds);
+        let window = routed_window(tail, buckets);
+        let encoder = evidence
+            .encoders
+            .iter()
+            .find(|cost| cost.window_seconds == window)
+            .with_context(|| format!("no measured cost for the {window} s encoder"))?;
+        total += encoder_passes(tail, window) as f64 * encoder.encoder_ms_p50
+            + evidence.decode_ms_per_audio_second * tail as f64 / f64::from(SAMPLE_RATE);
+    }
+    Ok(total / evidence.workload_seconds.len() as f64)
+}
+
+/// Every configuration the gate may try, in the order it tries them, ending
+/// with the baseline: measured buckets only, within the disk budget, and at
+/// least [`MINIMUM_SCORE_IMPROVEMENT_PERCENT`] faster than the baseline, so
+/// noise cannot move the app off it. Ties go to fewer bytes, then the window
+/// nearer the baseline.
+pub fn rank_window_candidates(evidence: &WindowEvidence) -> Result<Vec<WindowCandidate>> {
+    validate_window_evidence(evidence)?;
+    let mut buckets: Vec<&EncoderCost> = evidence
+        .encoders
+        .iter()
+        .filter(|cost| cost.window_seconds != STOCK_ENCODER_WINDOW_SECONDS)
+        .collect();
+    buckets.sort_by_key(|cost| cost.window_seconds);
+    let baseline_ms = predicted_release_ms(evidence, &[], BASELINE_HOLD_WINDOW_SECONDS)?;
+
+    let mut ranked = Vec::new();
+    for mask in 0..1_u32 << buckets.len() {
+        let chosen: Vec<&EncoderCost> = buckets
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask & (1 << index) != 0)
+            .map(|(_, cost)| *cost)
+            .collect();
+        let installed_bytes: u64 = chosen.iter().map(|cost| cost.installed_bytes).sum();
+        if installed_bytes > evidence.disk_budget_bytes {
+            continue;
+        }
+        let windows: Vec<u32> = chosen.iter().map(|cost| cost.window_seconds).collect();
+        for hold_window_seconds in &evidence.hold_window_candidates {
+            let candidate = WindowCandidate {
+                predicted_release_ms: predicted_release_ms(
+                    evidence,
+                    &windows,
+                    *hold_window_seconds,
+                )?,
+                encoder_buckets: windows.clone(),
+                hold_window_seconds: *hold_window_seconds,
+                installed_bytes,
+            };
+            let improvement = percent_improvement(baseline_ms, candidate.predicted_release_ms);
+            if !candidate.is_baseline()
+                && improvement + QUALITY_EPSILON >= MINIMUM_SCORE_IMPROVEMENT_PERCENT
+            {
+                ranked.push(candidate);
+            }
+        }
+    }
+    ranked.sort_by(|a, b| {
+        a.predicted_release_ms
+            .total_cmp(&b.predicted_release_ms)
+            .then(a.installed_bytes.cmp(&b.installed_bytes))
+            .then(
+                (a.hold_window_seconds - BASELINE_HOLD_WINDOW_SECONDS)
+                    .abs()
+                    .total_cmp(&(b.hold_window_seconds - BASELINE_HOLD_WINDOW_SECONDS).abs()),
+            )
+            .then(a.hold_window_seconds.total_cmp(&b.hold_window_seconds))
+            .then(a.encoder_buckets.cmp(&b.encoder_buckets))
+    });
+    ranked.push(WindowCandidate {
+        encoder_buckets: Vec::new(),
+        hold_window_seconds: BASELINE_HOLD_WINDOW_SECONDS,
+        installed_bytes: 0,
+        predicted_release_ms: baseline_ms,
+    });
+    Ok(ranked)
+}
+
+/// The verdict recorded for `candidate`, if the gate ran it.
+pub fn gate_verdict<'a>(
+    evidence: &'a WindowEvidence,
+    candidate: &WindowCandidate,
+) -> Option<&'a GateVerdict> {
+    evidence.gates.iter().find(|verdict| {
+        verdict.encoder_buckets == candidate.encoder_buckets
+            && verdict.hold_window_seconds == candidate.hold_window_seconds
+    })
+}
+
+/// The fastest ranked configuration whose gold output is the baseline's,
+/// byte for byte. Every configuration ranked ahead of the choice must carry a
+/// verdict, so a profile cannot skip a faster configuration it never gated.
+pub fn select_window(evidence: &WindowEvidence) -> Result<WindowSelection> {
+    let ranked = rank_window_candidates(evidence)?;
+    let baseline_ms = ranked
+        .last()
+        .context("ranking always ends with the baseline")?
+        .predicted_release_ms;
+    for candidate in ranked {
+        let passes = candidate.is_baseline()
+            || match gate_verdict(evidence, &candidate) {
+                Some(verdict) => matches!(
+                    &verdict.outcome,
+                    GateOutcome::Output { sha256 } if *sha256 == evidence.baseline_output_sha256
+                ),
+                None => bail!(
+                    "no gold verdict for buckets {:?} at a {} s Hold window, which ranks \
+                     ahead of any passing configuration",
+                    candidate.encoder_buckets,
+                    candidate.hold_window_seconds
+                ),
+            };
+        if passes {
+            return Ok(WindowSelection {
+                encoder_buckets: candidate.encoder_buckets,
+                hold_window_seconds: candidate.hold_window_seconds,
+                installed_bytes: candidate.installed_bytes,
+                predicted_release_ms: candidate.predicted_release_ms,
+                baseline_predicted_release_ms: baseline_ms,
+            });
+        }
+    }
+    unreachable!("the ranking ends with the baseline, which always passes")
+}
+
+fn validate_window_evidence(evidence: &WindowEvidence) -> Result<()> {
+    if evidence.hold_window_candidates != HOLD_WINDOW_CANDIDATES
+        || evidence.workload_seconds != RELEASE_WORKLOAD_SECONDS
+    {
+        bail!("window evidence was gathered over a different candidate set or workload");
+    }
+    for seconds in &evidence.hold_window_candidates {
+        HoldWindowConfig {
+            enabled: true,
+            min_seconds: *seconds,
+            max_seconds: *seconds,
+        }
+        .validate()
+        .map_err(|reason| anyhow::anyhow!(reason))?;
+    }
+    if !evidence
+        .encoders
+        .iter()
+        .any(|cost| cost.window_seconds == STOCK_ENCODER_WINDOW_SECONDS)
+    {
+        bail!("window evidence has no stock-encoder measurement");
+    }
+    for (index, cost) in evidence.encoders.iter().enumerate() {
+        if evidence.encoders[..index]
+            .iter()
+            .any(|other| other.window_seconds == cost.window_seconds)
+        {
+            bail!("the {} s encoder is measured twice", cost.window_seconds);
+        }
+        if !cost.encoder_ms_p50.is_finite() || cost.encoder_ms_p50 < 0.0 {
+            bail!("the {} s encoder has an invalid cost", cost.window_seconds);
+        }
+        let stock = cost.window_seconds == STOCK_ENCODER_WINDOW_SECONDS;
+        let identified = cost
+            .archive_sha256
+            .as_deref()
+            .is_some_and(|digest| digest.len() == 64);
+        if stock != (cost.archive_sha256.is_none() && cost.installed_bytes == 0)
+            || (!stock && (!identified || cost.installed_bytes == 0))
+            || cost.window_seconds == 0
+            || cost.window_seconds > STOCK_ENCODER_WINDOW_SECONDS
+        {
+            bail!(
+                "the {} s encoder has an invalid identity or size",
+                cost.window_seconds
+            );
+        }
+    }
+    if !evidence.decode_ms_per_audio_second.is_finite() || evidence.decode_ms_per_audio_second < 0.0
+    {
+        bail!("window evidence has an invalid per-second decode cost");
+    }
+    if evidence.baseline_output_sha256.len() != 64 {
+        bail!("window evidence has no baseline output digest");
+    }
+    for (index, verdict) in evidence.gates.iter().enumerate() {
+        if evidence.gates[..index].iter().any(|other| {
+            other.encoder_buckets == verdict.encoder_buckets
+                && other.hold_window_seconds == verdict.hold_window_seconds
+        }) {
+            bail!("a configuration was gated twice");
+        }
+        if let GateOutcome::Failed { error } = &verdict.outcome {
+            if error.trim().is_empty() {
+                bail!("a failed gate omitted its error");
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,6 +1229,228 @@ mod tests {
             .is_err());
         assert!(remove(&path).unwrap());
         assert!(!remove(&path).unwrap());
+    }
+
+    const BASELINE_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    const CHANGED_SHA: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+    fn hosted(window: u32) -> &'static EncoderBucket {
+        crate::model_fetch::ENCODER_BUCKETS
+            .iter()
+            .find(|bucket| bucket.seconds == window)
+            .unwrap()
+    }
+
+    /// Encoder costs in ms: the 15 s encoder 26, buckets 2 s 6, 5 s 10, 8 s 13.
+    fn window_evidence(disk_budget_bytes: u64) -> WindowEvidence {
+        let bucket = |window: u32, encoder_ms_p50: f64| EncoderCost {
+            window_seconds: window,
+            encoder_ms_p50,
+            archive_sha256: Some(hosted(window).archive_sha256().to_string()),
+            installed_bytes: hosted(window).installed_bytes(),
+        };
+        WindowEvidence {
+            disk_budget_bytes,
+            hold_window_candidates: HOLD_WINDOW_CANDIDATES.to_vec(),
+            workload_seconds: RELEASE_WORKLOAD_SECONDS.to_vec(),
+            encoders: vec![
+                EncoderCost {
+                    window_seconds: 15,
+                    encoder_ms_p50: 26.0,
+                    archive_sha256: None,
+                    installed_bytes: 0,
+                },
+                bucket(2, 6.0),
+                bucket(5, 10.0),
+                bucket(8, 13.0),
+            ],
+            decode_ms_per_audio_second: 2.0,
+            baseline_output_sha256: BASELINE_SHA.into(),
+            gates: Vec::new(),
+        }
+    }
+
+    /// Record a verdict for every configuration the ranking puts ahead of the
+    /// baseline, as tune_asr would when nothing passes before the end.
+    fn gate_everything(
+        evidence: &mut WindowEvidence,
+        output: impl Fn(&[u32], f32) -> &'static str,
+    ) {
+        for candidate in rank_window_candidates(evidence).unwrap() {
+            if candidate.is_baseline() {
+                break;
+            }
+            evidence.gates.push(GateVerdict {
+                outcome: GateOutcome::Output {
+                    sha256: output(&candidate.encoder_buckets, candidate.hold_window_seconds)
+                        .into(),
+                },
+                encoder_buckets: candidate.encoder_buckets,
+                hold_window_seconds: candidate.hold_window_seconds,
+            });
+        }
+    }
+
+    #[test]
+    fn hold_tail_and_routing_follow_the_planner_and_frame_rounding() {
+        // 8.128 s at 6 s: one forced cut at frame 188 (96,256 samples), the
+        // tail starts 1.5 s before it, at 72,256.
+        assert_eq!(tail_samples(130_048, 6.0), 57_792);
+        assert_eq!(tail_samples(78_672, 6.0), 78_672);
+        assert_eq!(routed_window(80_000, &[8, 2, 5]), 5);
+        assert_eq!(routed_window(80_001, &[2, 5, 8]), 8);
+        assert_eq!(routed_window(14_000, &[]), 15);
+        assert_eq!(encoder_passes(79_360, 5), 1);
+        assert_eq!(encoder_passes(79_361, 5), 2);
+        assert_eq!(encoder_passes(128_000, 8), 1);
+        assert_eq!(
+            BASELINE_HOLD_WINDOW_SECONDS,
+            HoldWindowConfig::default().max_seconds
+        );
+    }
+
+    #[test]
+    fn a_budget_that_fits_one_bucket_takes_the_largest_measured_saving() {
+        // About 588 MB each, so a 600 MB budget holds exactly one. At 6 s every
+        // workload tail fits 5 s: 16 ms saved on all five, against 13 for 8 s
+        // and 20 on the one sub-2 s tail for 2 s.
+        let mut evidence = window_evidence(600_000_000);
+        gate_everything(&mut evidence, |_, hold| {
+            if hold == 6.0 {
+                BASELINE_SHA
+            } else {
+                CHANGED_SHA
+            }
+        });
+        let selection = select_window(&evidence).unwrap();
+        assert_eq!(selection.encoder_buckets, [5]);
+        assert_eq!(selection.hold_window_seconds, 6.0);
+        assert_eq!(selection.installed_bytes, hosted(5).installed_bytes());
+    }
+
+    #[test]
+    fn a_configuration_that_changes_gold_output_is_never_chosen() {
+        let mut evidence = window_evidence(u64::MAX);
+        gate_everything(&mut evidence, |buckets, hold| {
+            if buckets == [8] && hold == 6.0 {
+                BASELINE_SHA
+            } else {
+                CHANGED_SHA
+            }
+        });
+        let selection = select_window(&evidence).unwrap();
+        assert_eq!(selection.encoder_buckets, [8]);
+        assert_eq!(selection.hold_window_seconds, 6.0);
+        let fastest = &rank_window_candidates(&evidence).unwrap()[0];
+        assert!(fastest.predicted_release_ms < selection.predicted_release_ms);
+
+        // Nothing passes: the baseline, which needs no gate.
+        let mut evidence = window_evidence(u64::MAX);
+        gate_everything(&mut evidence, |_, _| CHANGED_SHA);
+        let selection = select_window(&evidence).unwrap();
+        assert!(selection.encoder_buckets.is_empty());
+        assert_eq!(selection.hold_window_seconds, BASELINE_HOLD_WINDOW_SECONDS);
+    }
+
+    #[test]
+    fn a_faster_configuration_without_a_verdict_makes_the_evidence_invalid() {
+        let evidence = window_evidence(u64::MAX);
+        let error = select_window(&evidence).unwrap_err().to_string();
+        assert!(error.contains("no gold verdict"), "{error}");
+    }
+
+    #[test]
+    fn a_profile_written_before_window_tuning_loads_and_keeps_every_bucket_at_6_s() {
+        // The profile tune_asr wrote on the M5 Pro on 2026-08-11, verbatim.
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("bench/tuning/m5-pro-profile-pre-4s2q.json");
+        let profile = load(&path).unwrap().unwrap();
+        assert_eq!(profile.window_tuning, None);
+        assert_eq!(
+            profile.cache_key,
+            "ef53785151eaf33a82c9c14e1eb1c4ca25ece1bec4c5bddafe35fe067c39fe1c"
+        );
+        profile
+            .validate_for(
+                &profile.hardware,
+                "df2587d4ec1a768b78f11235e51298cc3d44c947b6f0a151729b9e94e7da0002",
+            )
+            .unwrap();
+        let plan = WindowPlan::for_profile(&profile, crate::model_fetch::ENCODER_BUCKETS);
+        assert_eq!(plan.encoder_buckets, [2, 5, 8]);
+        assert_eq!(plan.hold_window_seconds, 6.0);
+        assert!(!serde_json::to_string(&profile)
+            .unwrap()
+            .contains("window_tuning"));
+    }
+
+    #[test]
+    fn window_choice_joins_the_key_and_a_re_released_bucket_falls_back() {
+        let mut profile = TuningProfile::new(
+            hardware(),
+            "artifact".into(),
+            3,
+            vec![
+                candidate(BASELINE_COMPUTE_UNITS, 100.0, 50.0, 100.0),
+                CandidateMeasurement::failed(CoreMlComputeUnits::All, "unsupported"),
+                CandidateMeasurement::failed(CoreMlComputeUnits::CpuAndGpu, "unsupported"),
+                CandidateMeasurement::failed(CoreMlComputeUnits::CpuOnly, "unsupported"),
+            ],
+        )
+        .unwrap();
+        let untuned_key = profile.cache_key.clone();
+        let mut evidence = window_evidence(600_000_000);
+        gate_everything(&mut evidence, |buckets, hold| {
+            if buckets == [5] && hold == 6.0 {
+                BASELINE_SHA
+            } else {
+                CHANGED_SHA
+            }
+        });
+        profile
+            .set_window_tuning(WindowTuning::new(evidence).unwrap())
+            .unwrap();
+        assert_ne!(profile.cache_key, untuned_key);
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        save(&path, &profile).unwrap();
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded, profile);
+        loaded.validate_for(&hardware(), "artifact").unwrap();
+        let manifest = crate::model_fetch::ENCODER_BUCKETS;
+        let plan = WindowPlan::for_profile(&loaded, manifest);
+        assert_eq!(plan.encoder_buckets, [5]);
+        assert_eq!(plan.hold_window_seconds, 6.0);
+
+        // The 5 s bucket re-released: compute units stay valid, windows untuned.
+        let mut stale = loaded.clone();
+        let tuning = stale.window_tuning.as_mut().unwrap();
+        let five = tuning
+            .evidence
+            .encoders
+            .iter_mut()
+            .find(|cost| cost.window_seconds == 5)
+            .unwrap();
+        five.archive_sha256 = Some(CHANGED_SHA.into());
+        stale.cache_key =
+            profile_cache_key(&stale.hardware, "artifact", stale.window_tuning.as_ref()).unwrap();
+        stale.validate_for(&hardware(), "artifact").unwrap();
+        assert!(stale.window_selection_for(manifest).is_err());
+        assert_eq!(
+            WindowPlan::for_profile(&stale, manifest),
+            WindowPlan::untuned(manifest)
+        );
+
+        // An edited choice no longer matches the key it was saved under.
+        let mut edited = loaded.clone();
+        edited
+            .window_tuning
+            .as_mut()
+            .unwrap()
+            .selection
+            .hold_window_seconds = 5.0;
+        assert!(edited.validate_for(&hardware(), "artifact").is_err());
     }
 
     #[test]

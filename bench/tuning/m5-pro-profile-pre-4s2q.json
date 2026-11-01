@@ -1,0 +1,252 @@
+{
+  "schema_version": 1,
+  "tuner_version": 1,
+  "cache_key": "ef53785151eaf33a82c9c14e1eb1c4ca25ece1bec4c5bddafe35fe067c39fe1c",
+  "hardware": {
+    "chip": "Apple M5 Pro",
+    "architecture": "aarch64",
+    "memory_bytes": 25769803776,
+    "logical_cpus": 15,
+    "performance_levels": [
+      {
+        "index": 0,
+        "name": "Super",
+        "logical_cpus": 5
+      },
+      {
+        "index": 1,
+        "name": "Performance",
+        "logical_cpus": 10
+      }
+    ],
+    "macos_version": "26.5.1"
+  },
+  "backend_id": "fluid-audio-parakeet-unified-en-0.6b-int8",
+  "artifact_digest": "df2587d4ec1a768b78f11235e51298cc3d44c947b6f0a151729b9e94e7da0002",
+  "created_at_unix_seconds": 1786438725,
+  "repetitions": 10,
+  "long_regime_seconds": 8,
+  "baseline_compute_units": "cpu-and-neural-engine",
+  "selection": {
+    "short": {
+      "compute_units": "cpu-and-neural-engine",
+      "session_score_ms": 1223.4664096666666,
+      "baseline_score_ms": 1223.4664096666666,
+      "score_improvement_percent": 0.0
+    },
+    "long": {
+      "compute_units": "cpu-and-neural-engine",
+      "session_score_ms": 2825.381113,
+      "baseline_score_ms": 2825.381113,
+      "score_improvement_percent": 0.0
+    }
+  },
+  "candidates": [
+    {
+      "compute_units": "cpu-and-neural-engine",
+      "status": {
+        "status": "completed"
+      },
+      "first_observed_load_ms": 147.700792,
+      "load_p50_ms": 90.612584,
+      "warmup_ms": 77.39770899999999,
+      "peak_resident_bytes": 107216896,
+      "quality": {
+        "passed": true,
+        "wer_percent": 5.434782608695652,
+        "cer_percent": 3.5714285714285716,
+        "nondeterministic_outputs": 0,
+        "categories": {
+          "commands": {
+            "wer_percent": 12.195121951219512,
+            "cer_percent": 8.5
+          },
+          "custom-vocabulary": {
+            "wer_percent": 27.272727272727273,
+            "cer_percent": 8.928571428571429
+          },
+          "general": {
+            "wer_percent": 0.0,
+            "cer_percent": 0.0
+          },
+          "long": {
+            "wer_percent": 0.0,
+            "cer_percent": 0.0
+          },
+          "noisy": {
+            "wer_percent": 0.0,
+            "cer_percent": 0.0
+          },
+          "numbers": {
+            "wer_percent": 6.666666666666667,
+            "cer_percent": 8.333333333333334
+          },
+          "proper-nouns": {
+            "wer_percent": 3.5714285714285716,
+            "cer_percent": 1.1363636363636365
+          },
+          "punctuation": {
+            "wer_percent": 5.434782608695652,
+            "cer_percent": 3.5714285714285716
+          }
+        }
+      },
+      "short": {
+        "fixture_count": 6,
+        "audio_seconds": 19.824562500000003,
+        "wall_p50_ms": 316.63683499999996,
+        "wall_p95_ms": 324.624456,
+        "rtfx_p50": 62.60977974972497
+      },
+      "long": {
+        "fixture_count": 1,
+        "audio_seconds": 14.225,
+        "wall_p50_ms": 132.868541,
+        "wall_p95_ms": 135.618666,
+        "rtfx_p50": 107.06070747025062
+      }
+    },
+    {
+      "compute_units": "all",
+      "status": {
+        "status": "completed"
+      },
+      "first_observed_load_ms": 90.519125,
+      "load_p50_ms": 89.770834,
+      "warmup_ms": 72.27275,
+      "peak_resident_bytes": 107708416,
+      "quality": {
+        "passed": true,
+        "wer_percent": 5.434782608695652,
+        "cer_percent": 3.5714285714285716,
+        "nondeterministic_outputs": 0,
+        "categories": {
+          "commands": {
+            "wer_percent": 12.195121951219512,
+            "cer_percent": 8.5
+          },
+          "custom-vocabulary": {
+            "wer_percent": 27.272727272727273,
+            "cer_percent": 8.928571428571429
+          },
+          "general": {
+            "wer_percent": 0.0,
+            "cer_percent": 0.0
+          },
+          "long": {
+            "wer_percent": 0.0,
+            "cer_percent": 0.0
+          },
+          "noisy": {
+            "wer_percent": 0.0,
+            "cer_percent": 0.0
+          },
+          "numbers": {
+            "wer_percent": 6.666666666666667,
+            "cer_percent": 8.333333333333334
+          },
+          "proper-nouns": {
+            "wer_percent": 3.5714285714285716,
+            "cer_percent": 1.1363636363636365
+          },
+          "punctuation": {
+            "wer_percent": 5.434782608695652,
+            "cer_percent": 3.5714285714285716
+          }
+        }
+      },
+      "short": {
+        "fixture_count": 6,
+        "audio_seconds": 19.824562500000003,
+        "wall_p50_ms": 315.52524900000003,
+        "wall_p95_ms": 318.767334,
+        "rtfx_p50": 62.830352128174695
+      },
+      "long": {
+        "fixture_count": 1,
+        "audio_seconds": 14.225,
+        "wall_p50_ms": 132.10037499999999,
+        "wall_p95_ms": 133.472792,
+        "rtfx_p50": 107.68326736392687
+      }
+    },
+    {
+      "compute_units": "cpu-and-gpu",
+      "status": {
+        "status": "failed",
+        "error": "reading Core ML worker result: failed to fill whole buffer"
+      },
+      "first_observed_load_ms": null,
+      "load_p50_ms": null,
+      "warmup_ms": null,
+      "peak_resident_bytes": null,
+      "quality": null,
+      "short": null,
+      "long": null
+    },
+    {
+      "compute_units": "cpu-only",
+      "status": {
+        "status": "completed"
+      },
+      "first_observed_load_ms": 80.240458,
+      "load_p50_ms": 80.37237499999999,
+      "warmup_ms": 262.17320900000004,
+      "peak_resident_bytes": 1353908224,
+      "quality": {
+        "passed": true,
+        "wer_percent": 4.3478260869565215,
+        "cer_percent": 3.361344537815126,
+        "nondeterministic_outputs": 0,
+        "categories": {
+          "commands": {
+            "wer_percent": 9.75609756097561,
+            "cer_percent": 8.0
+          },
+          "custom-vocabulary": {
+            "wer_percent": 18.181818181818183,
+            "cer_percent": 7.142857142857143
+          },
+          "general": {
+            "wer_percent": 0.0,
+            "cer_percent": 0.0
+          },
+          "long": {
+            "wer_percent": 0.0,
+            "cer_percent": 0.0
+          },
+          "noisy": {
+            "wer_percent": 0.0,
+            "cer_percent": 0.0
+          },
+          "numbers": {
+            "wer_percent": 6.666666666666667,
+            "cer_percent": 8.333333333333334
+          },
+          "proper-nouns": {
+            "wer_percent": 2.380952380952381,
+            "cer_percent": 0.9090909090909091
+          },
+          "punctuation": {
+            "wer_percent": 4.3478260869565215,
+            "cer_percent": 3.361344537815126
+          }
+        }
+      },
+      "short": {
+        "fixture_count": 6,
+        "audio_seconds": 19.824562500000003,
+        "wall_p50_ms": 680.3475,
+        "wall_p95_ms": 705.148792,
+        "rtfx_p50": 29.138877558894542
+      },
+      "long": {
+        "fixture_count": 1,
+        "audio_seconds": 14.225,
+        "wall_p50_ms": 194.828041,
+        "wall_p95_ms": 217.130917,
+        "rtfx_p50": 73.0131038991456
+      }
+    }
+  ]
+}

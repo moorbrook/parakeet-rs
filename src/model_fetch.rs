@@ -210,8 +210,10 @@ pub fn coreml_artifact_digest() -> String {
 /// and published as one archive per window, because a Core ML bundle is a
 /// directory and release assets are flat files.
 ///
-/// Deliberately not part of [`coreml_artifact_digest`]: that digest keys the
-/// tuning profile, and the profile does not yet select buckets (kata 4s2q).
+/// Deliberately not part of [`coreml_artifact_digest`]: that digest keys every
+/// tuning profile, and a profile that selects no buckets must not go stale
+/// when one is re-released. A profile that tunes buckets records each one's
+/// [`EncoderBucket::archive_sha256`] instead (kata 4s2q).
 #[derive(Clone, Copy, Debug)]
 pub struct EncoderBucket {
     pub seconds: u32,
@@ -220,6 +222,18 @@ pub struct EncoderBucket {
     archive: Artifact,
     /// Every regular file the archive holds, labelled relative to `bundle`.
     files: &'static [Artifact],
+}
+
+impl EncoderBucket {
+    /// Digest of the release archive, which pins every file inside it.
+    pub fn archive_sha256(&self) -> &'static str {
+        self.archive.sha256
+    }
+
+    /// Disk the unpacked bundle occupies, from the manifest.
+    pub fn installed_bytes(&self) -> u64 {
+        self.files.iter().map(|file| file.size).sum()
+    }
 }
 
 macro_rules! encoder_bucket {
@@ -510,10 +524,47 @@ const BUCKET_STAGING_DIR: &str = ".encoder-buckets-staging";
 /// unreachable host costs one request rather than one per bucket.
 pub async fn ensure_encoder_buckets(
     model_dir: &Path,
+    windows: &[u32],
     fetch: BucketFetch,
     on_progress: ProgressFn,
 ) -> Vec<u32> {
-    ensure_buckets(ENCODER_BUCKETS, model_dir, fetch, &on_progress).await
+    let wanted: Vec<EncoderBucket> = ENCODER_BUCKETS
+        .iter()
+        .filter(|bucket| windows.contains(&bucket.seconds))
+        .copied()
+        .collect();
+    ensure_buckets(&wanted, model_dir, fetch, &on_progress).await
+}
+
+/// Every hosted bucket window, the set the app keeps when no tuning profile
+/// chooses one.
+pub fn all_encoder_bucket_windows() -> Vec<u32> {
+    ENCODER_BUCKETS
+        .iter()
+        .map(|bucket| bucket.seconds)
+        .collect()
+}
+
+/// Remove every hosted bucket's bundle in `model_dir` except `keep`, so a
+/// tuning profile's disk budget holds on disk. A symlinked bundle loses only
+/// its link. Never fails: a bundle that cannot be removed is logged and left.
+pub async fn remove_encoder_buckets_except(model_dir: &Path, keep: &[u32]) {
+    for bucket in ENCODER_BUCKETS {
+        if keep.contains(&bucket.seconds) {
+            continue;
+        }
+        let dir = model_dir.join(bucket.bundle);
+        if fs::symlink_metadata(&dir).is_err() {
+            continue;
+        }
+        match remove_bundle(&dir).await {
+            Ok(()) => log::info!(
+                "removed the {} s encoder bucket, which the tuning profile did not choose",
+                bucket.seconds
+            ),
+            Err(error) => log::warn!("cannot remove {}: {error:#}", dir.display()),
+        }
+    }
 }
 
 async fn ensure_buckets(
@@ -1307,10 +1358,11 @@ mod tests {
 
     #[test]
     fn bucket_digests_do_not_change_the_tuning_profile_key() {
-        // The tuning profile is keyed by this digest; buckets must not
-        // invalidate a profile until kata 4s2q makes the profile select them.
-        // The value is the one main's manifest produced, and it matches the
-        // `artifact_digest` of the profile already written on the M5 Pro.
+        // Every tuning profile is keyed by this digest, so the bucket manifest
+        // stays out of it: a profile that chose buckets carries their archive
+        // digests itself (kata 4s2q). The value is the one main's manifest
+        // produced, and it matches the `artifact_digest` of the profile already
+        // written on the M5 Pro.
         assert_eq!(
             coreml_artifact_digest(),
             "df2587d4ec1a768b78f11235e51298cc3d44c947b6f0a151729b9e94e7da0002"

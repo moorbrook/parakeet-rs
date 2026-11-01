@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::asr::Asr;
+use crate::asr_tuning::WindowPlan;
 use crate::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
 use crate::dictation_fsm::{DictationFsm, HoldPressOutcome, TapPressOutcome};
 use crate::hotkey::HotkeyHandle;
@@ -53,6 +54,9 @@ pub struct App {
     /// only once a pre-warm has compiled a set, so no load ever pays a cold
     /// compile for a bucket, whether it landed mid-download or was on disk.
     approved_encoder_buckets: Mutex<Vec<u32>>,
+    /// The buckets to keep and the Hold window, from the tuning profile read
+    /// at launch, or every bucket and 6 s without one (kata 4s2q).
+    window_plan: WindowPlan,
     /// Set when a rebuild was needed but the app was busy. Drained by
     /// `on_session_finished`. Without it a vocabulary edit saved during
     /// a dictation stayed unapplied until the *next* Settings Save.
@@ -105,8 +109,15 @@ impl BuildInputs {
 
 impl App {
     pub fn new(settings: SettingsStore) -> Self {
+        let window_plan = tuned_window_plan(&settings);
+        log::info!(
+            "encoder buckets {:?}, Hold window {} s",
+            window_plan.encoder_buckets,
+            window_plan.hold_window_seconds
+        );
         Self {
             fsm: DictationFsm::new(),
+            window_plan,
             settings,
             asr: Mutex::new(None),
             hotkey: Mutex::new(None),
@@ -259,7 +270,9 @@ impl App {
             return;
         }
         let vad_path = self.settings.vad_path();
-        let hold_windows = self.settings.load().hold_windows();
+        let hold_windows = self
+            .window_plan
+            .hold_windows(self.settings.load().hold_windows_enabled);
         self.spawn_supervised("session-starter", move |app| {
             app.start_session_blocking(mode, endpoint_policy, vad_path, hold_windows);
         });
@@ -643,12 +656,19 @@ impl App {
                     return;
                 }
             };
+            // Within the profile's disk budget: a bucket it did not choose is
+            // never loaded, so its bundle is removed rather than kept.
+            let wanted = &app.window_plan.encoder_buckets;
+            runtime.block_on(model_fetch::remove_encoder_buckets_except(
+                &directory, wanted,
+            ));
             let approved = app.approved_encoder_buckets.lock().clone();
-            if approved.len() == model_fetch::ENCODER_BUCKETS.len() {
+            if approved == *wanted {
                 return;
             }
             let installed = runtime.block_on(model_fetch::ensure_encoder_buckets(
                 &directory,
+                wanted,
                 model_fetch::BucketFetch::Download,
                 Arc::new(fetch_progress_to_menubar),
             ));
@@ -845,13 +865,12 @@ fn load_optimized_asr(
     let buckets = if approved.is_empty() {
         Vec::new()
     } else {
-        let mut verified = runtime.block_on(model_fetch::ensure_encoder_buckets(
+        runtime.block_on(model_fetch::ensure_encoder_buckets(
             &app_model_directory,
+            approved,
             model_fetch::BucketFetch::VerifyOnly,
             on_progress,
-        ));
-        verified.retain(|window| approved.contains(window));
-        verified
+        ))
     };
 
     let (mut config, long_plan_warmup_seconds) =
@@ -1007,6 +1026,66 @@ fn configured_asr_tuning_override() -> anyhow::Result<AsrTuningOverride> {
     }
 }
 
+/// The tuning profile when its complete cache identity still matches this Mac.
+/// Missing, unreadable, or stale profiles are `None`, with the reason logged;
+/// only an invalid explicit environment override is an error.
+fn validated_tuning_profile(
+    settings: &SettingsStore,
+) -> anyhow::Result<Option<crate::asr_tuning::TuningProfile>> {
+    use crate::asr_tuning::{self, HardwareFingerprint};
+
+    if configured_asr_tuning_override()? == AsrTuningOverride::Off {
+        log::info!("PARAKEET_ASR_TUNING=off; using the untuned baseline");
+        return Ok(None);
+    }
+    let profile_path = settings.asr_tuning_profile_path();
+    let profile = match asr_tuning::load(&profile_path) {
+        Ok(Some(profile)) => profile,
+        Ok(None) => {
+            log::info!(
+                "no ASR tuning profile at {}; using the untuned baseline",
+                profile_path.display()
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            log::warn!("ASR tuning profile is unreadable; using the untuned baseline: {error:#}");
+            return Ok(None);
+        }
+    };
+    let hardware = match HardwareFingerprint::current() {
+        Ok(hardware) => hardware,
+        Err(error) => {
+            log::warn!(
+                "cannot fingerprint this Mac for ASR tuning; using the untuned baseline: \
+                 {error:#}"
+            );
+            return Ok(None);
+        }
+    };
+    let artifact_digest = model_fetch::coreml_artifact_digest();
+    if let Err(error) = profile.validate_for(&hardware, &artifact_digest) {
+        log::warn!("ASR tuning profile is stale or invalid; using the untuned baseline: {error:#}");
+        return Ok(None);
+    }
+    Ok(Some(profile))
+}
+
+/// The bucket set and Hold window the validated profile chose, else every
+/// hosted bucket and the 6 s window. An invalid `PARAKEET_ASR_TUNING` is
+/// reported when the recogniser loads, so here it only means untuned.
+fn tuned_window_plan(settings: &SettingsStore) -> WindowPlan {
+    let manifest = model_fetch::ENCODER_BUCKETS;
+    match validated_tuning_profile(settings) {
+        Ok(Some(profile)) => WindowPlan::for_profile(&profile, manifest),
+        Ok(None) => WindowPlan::untuned(manifest),
+        Err(error) => {
+            log::warn!("{error:#}");
+            WindowPlan::untuned(manifest)
+        }
+    }
+}
+
 /// Apply an evidence-backed runtime plan when its complete cache identity still
 /// matches this Mac. Missing, unreadable, or stale profiles stay on the safe
 /// CPU+ANE baseline; only an invalid explicit environment override is fatal.
@@ -1015,49 +1094,13 @@ fn configure_coreml_runtime_plan(
     settings: &SettingsStore,
     config: &mut CoreMlWorkerConfig,
 ) -> anyhow::Result<Option<u32>> {
-    use crate::asr_tuning::{self, HardwareFingerprint, BASELINE_COMPUTE_UNITS};
+    use crate::asr_tuning::BASELINE_COMPUTE_UNITS;
 
     config.set_compute_units(BASELINE_COMPUTE_UNITS);
-    if configured_asr_tuning_override()? == AsrTuningOverride::Off {
-        log::info!("PARAKEET_ASR_TUNING=off; selecting safe CPU+ANE baseline");
+    let Some(profile) = validated_tuning_profile(settings)? else {
         return Ok(None);
-    }
-
+    };
     let profile_path = settings.asr_tuning_profile_path();
-    let profile = match asr_tuning::load(&profile_path) {
-        Ok(Some(profile)) => profile,
-        Ok(None) => {
-            log::info!(
-                "no ASR tuning profile at {}; selecting safe CPU+ANE baseline",
-                profile_path.display()
-            );
-            return Ok(None);
-        }
-        Err(error) => {
-            log::warn!(
-                "ASR tuning profile is unreadable; selecting safe CPU+ANE baseline: {error:#}"
-            );
-            return Ok(None);
-        }
-    };
-    let hardware = match HardwareFingerprint::current() {
-        Ok(hardware) => hardware,
-        Err(error) => {
-            log::warn!(
-                "cannot fingerprint this Mac for ASR tuning; selecting safe CPU+ANE baseline: \
-                 {error:#}"
-            );
-            return Ok(None);
-        }
-    };
-    let artifact_digest = model_fetch::coreml_artifact_digest();
-    if let Err(error) = profile.validate_for(&hardware, &artifact_digest) {
-        log::warn!(
-            "ASR tuning profile is stale or invalid; selecting safe CPU+ANE baseline: {error:#}"
-        );
-        return Ok(None);
-    }
-
     let short = profile.selection.short.compute_units;
     let long = profile.selection.long.compute_units;
     config.set_regime_compute_units(short, long, profile.long_regime_seconds)?;

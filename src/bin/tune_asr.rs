@@ -10,8 +10,9 @@ use anyhow::{bail, Context, Result};
 use parakeet_dictation::asr::{Asr, Decoded};
 use parakeet_dictation::asr_eval::{self, DecodeMetadata, GoldManifest, RunMetadata};
 use parakeet_dictation::asr_tuning::{
-    self, CandidateMeasurement, CandidateStatus, CategoryQuality, HardwareFingerprint,
-    QualityMeasurement, RegimeMeasurement, TuningProfile,
+    self, CandidateMeasurement, CandidateStatus, CategoryQuality, EncoderCost, GateOutcome,
+    GateVerdict, HardwareFingerprint, QualityMeasurement, RegimeMeasurement, TuningProfile,
+    WindowEvidence, WindowPlan, WindowTuning, STOCK_ENCODER_WINDOW_SECONDS,
 };
 use parakeet_dictation::coreml_worker::{
     load_coreml_worker, CoreMlComputeUnits, CoreMlWorkerConfig, DEFAULT_LONG_REGIME_SECONDS,
@@ -20,13 +21,24 @@ use parakeet_dictation::model_fetch;
 use parakeet_dictation::performance;
 use parakeet_dictation::resample::{to_target_rate, TARGET_SAMPLE_RATE};
 use parakeet_dictation::settings::SettingsStore;
+use parakeet_dictation::streamer::decode_hold_windowed;
 use parakeet_dictation::warmup;
 use parakeet_dictation::wav::read_wav_mono;
+use parakeet_dictation::windows::HoldWindowConfig;
+use sha2::{Digest, Sha256};
 
 const DEFAULT_GOLD: &str = "bench/gold/manifest.json";
 const DEFAULT_AUDIO_DIR: &str = "bench/gold/audio";
 const DEFAULT_REPETITIONS: usize = 5;
 const DEFAULT_LOAD_REPETITIONS: usize = 3;
+const DEFAULT_PROBE_REPETITIONS: usize = 20;
+/// Room for all three hosted buckets (about 1.7 GB installed), so by default
+/// the tuner keeps a bucket only for speed and the budget binds only when set.
+const DEFAULT_BUCKET_BUDGET_MB: u64 = 1_800;
+/// Encoder probes: one short enough for the 2 s bucket, and one longer, run on
+/// the stock encoder only, for the per-second cost of the audio itself.
+const SHORT_PROBE_SECONDS: f64 = 1.5;
+const LONG_PROBE_SECONDS: f64 = 7.5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
@@ -44,6 +56,9 @@ struct Args {
     profile: Option<PathBuf>,
     repetitions: usize,
     load_repetitions: usize,
+    probe_repetitions: usize,
+    bucket_budget_bytes: u64,
+    bucket_fetch: model_fetch::BucketFetch,
 }
 
 struct AudioInput {
@@ -73,6 +88,9 @@ fn parse_args() -> Result<Args> {
     let mut profile = None;
     let mut repetitions = DEFAULT_REPETITIONS;
     let mut load_repetitions = DEFAULT_LOAD_REPETITIONS;
+    let mut probe_repetitions = DEFAULT_PROBE_REPETITIONS;
+    let mut bucket_budget_mb = DEFAULT_BUCKET_BUDGET_MB;
+    let mut bucket_fetch = model_fetch::BucketFetch::Download;
     let mut iterator = std::env::args().skip(1);
     while let Some(argument) = iterator.next() {
         match argument.as_str() {
@@ -87,6 +105,13 @@ fn parse_args() -> Result<Args> {
             "--load-repetitions" => {
                 load_repetitions = next_usize(&mut iterator, "--load-repetitions")?;
             }
+            "--probe-repetitions" => {
+                probe_repetitions = next_usize(&mut iterator, "--probe-repetitions")?;
+            }
+            "--bucket-budget-mb" => {
+                bucket_budget_mb = next_usize(&mut iterator, "--bucket-budget-mb")? as u64;
+            }
+            "--no-bucket-download" => bucket_fetch = model_fetch::BucketFetch::VerifyOnly,
             "--show-profile" => action = exclusive_action(action, Action::Show)?,
             "--remove-profile" => action = exclusive_action(action, Action::Remove)?,
             "-h" | "--help" => {
@@ -96,7 +121,7 @@ fn parse_args() -> Result<Args> {
             other => bail!("unknown argument {other:?}"),
         }
     }
-    if repetitions == 0 || load_repetitions == 0 {
+    if repetitions == 0 || load_repetitions == 0 || probe_repetitions == 0 {
         bail!("repetition counts must be at least one");
     }
     Ok(Args {
@@ -108,6 +133,9 @@ fn parse_args() -> Result<Args> {
         profile,
         repetitions,
         load_repetitions,
+        probe_repetitions,
+        bucket_budget_bytes: bucket_budget_mb * 1_000_000,
+        bucket_fetch,
     })
 }
 
@@ -138,13 +166,20 @@ fn print_usage() {
         "usage: tune_asr [--gold JSON] [--audio-dir DIR] [--worker PATH]\n\
          \x20               [--model-dir DIR] [--profile JSON]\n\
          \x20               [--repetitions N] [--load-repetitions N]\n\
+         \x20               [--probe-repetitions N] [--bucket-budget-mb MB]\n\
+         \x20               [--no-bucket-download]\n\
          \x20      tune_asr [--profile JSON] --show-profile\n\
          \x20      tune_asr [--profile JSON] --remove-profile\n\
          \n\
          Benchmarks every bounded Core ML compute-unit candidate on the\n\
          checked-in human-speech gold corpus, refuses quality/category/memory\n\
-         regressions, selects short and long regimes deterministically, and\n\
-         atomically caches the complete evidence profile."
+         regressions, and selects short and long regimes deterministically.\n\
+         Then, under the chosen units, measures each encoder bucket's cost and\n\
+         picks the bucket set (within the disk budget, default 1800 MB) and\n\
+         Hold window whose gold output is byte-identical to the 15 s encoder\n\
+         at 6 s and whose predicted release cost is lowest. Every hosted\n\
+         bucket must be installed or downloadable. Atomically caches the\n\
+         complete evidence profile."
     );
 }
 
@@ -190,9 +225,9 @@ fn run(args: &Args) -> Result<()> {
         base_config.worker_path.clone_from(worker);
     }
     base_config.set_existing_model_directory(&model_dir);
-    // The profile's artifact digest covers the 15 s pack only, so tune on it
-    // alone even when the app has installed encoder buckets beside it. Kata
-    // 4s2q makes the profile select buckets.
+    // Compute units are tuned on the 15 s encoder alone, which the artifact
+    // digest covers; the buckets are measured afterwards under the chosen
+    // units (`tune_windows`).
     base_config.set_encoder_buckets(Vec::new());
 
     let mut candidates = Vec::with_capacity(CoreMlComputeUnits::CANDIDATES.len());
@@ -217,11 +252,346 @@ fn run(args: &Args) -> Result<()> {
     }
 
     let artifact_digest = model_fetch::coreml_artifact_digest();
-    let profile = TuningProfile::new(hardware, artifact_digest, args.repetitions, candidates)?;
+    let mut profile = TuningProfile::new(hardware, artifact_digest, args.repetitions, candidates)?;
+
+    let window_result = tune_windows(
+        args,
+        &base_config,
+        &profile,
+        &model_dir,
+        &settings.vad_path(),
+        &inputs,
+    )
+    .and_then(|tuning| profile.set_window_tuning(tuning));
     asr_tuning::save(&profile_path, &profile)?;
     println!("{}", serde_json::to_string_pretty(&profile)?);
     eprintln!("saved {}", profile_path.display());
-    Ok(())
+    print_plan(&profile);
+    window_result
+        .context("bucket and Hold-window tuning failed; the profile keeps every bucket at 6 s")
+}
+
+fn print_plan(profile: &TuningProfile) {
+    let plan = WindowPlan::for_profile(profile, model_fetch::ENCODER_BUCKETS);
+    eprintln!(
+        "the app will use compute units short={} long={}, encoder buckets {:?}, Hold window {} s",
+        profile.selection.short.compute_units.as_str(),
+        profile.selection.long.compute_units.as_str(),
+        plan.encoder_buckets,
+        plan.hold_window_seconds
+    );
+    if let Some(tuning) = &profile.window_tuning {
+        eprintln!(
+            "predicted release ASR {:.1} ms against {:.1} ms for the 15 s encoder at 6 s",
+            tuning.selection.predicted_release_ms, tuning.selection.baseline_predicted_release_ms
+        );
+    }
+}
+
+/// Measure every encoder under the profile's compute units, then gate bucket
+/// subsets and Hold windows on the gold corpus, fastest predicted first.
+fn tune_windows(
+    args: &Args,
+    base_config: &CoreMlWorkerConfig,
+    profile: &TuningProfile,
+    model_dir: &Path,
+    vad_path: &Path,
+    inputs: &[AudioInput],
+) -> Result<WindowTuning> {
+    if !vad_path.is_file() {
+        bail!(
+            "Hold windowing needs the Silero model at {}; launch the app once to fetch it",
+            vad_path.display()
+        );
+    }
+    let hosted = model_fetch::all_encoder_bucket_windows();
+    let installed = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(model_fetch::ensure_encoder_buckets(
+            model_dir,
+            &hosted,
+            args.bucket_fetch,
+            Arc::new(|_| {}),
+        ));
+    if installed != hosted {
+        bail!(
+            "every hosted bucket {hosted:?} must be measured, but only {installed:?} verified in {}",
+            model_dir.display()
+        );
+    }
+
+    // The app's own runtime plan, so the costs are the ones it will pay.
+    let mut config = base_config.clone();
+    config.set_regime_compute_units(
+        profile.selection.short.compute_units,
+        profile.selection.long.compute_units,
+        profile.long_regime_seconds,
+    )?;
+    let probe_source = inputs
+        .iter()
+        .max_by(|a, b| a.audio_seconds.total_cmp(&b.audio_seconds))
+        .context("gold corpus is empty")?;
+    if probe_source.audio_seconds < LONG_PROBE_SECONDS {
+        bail!("no gold fixture is long enough for the {LONG_PROBE_SECONDS} s probe");
+    }
+    let short_probe = probe_slice(probe_source, SHORT_PROBE_SECONDS);
+    let long_probe = probe_slice(probe_source, LONG_PROBE_SECONDS);
+
+    let mut encoders = Vec::with_capacity(hosted.len() + 1);
+    eprintln!("measuring the {STOCK_ENCODER_WINDOW_SECONDS} s encoder…");
+    let stock = measure_encoder(
+        &config,
+        &[],
+        &[&short_probe, &long_probe],
+        args.probe_repetitions,
+    )?;
+    let decode_ms_per_audio_second = ((stock[1].other_ms - stock[0].other_ms)
+        / (LONG_PROBE_SECONDS - SHORT_PROBE_SECONDS))
+        .max(0.0);
+    eprintln!(
+        "  encoder p50 {:.2} ms, audio cost {decode_ms_per_audio_second:.2} ms/s",
+        stock[0].encoder_ms
+    );
+    encoders.push(EncoderCost {
+        window_seconds: STOCK_ENCODER_WINDOW_SECONDS,
+        encoder_ms_p50: stock[0].encoder_ms,
+        archive_sha256: None,
+        installed_bytes: 0,
+    });
+    for bucket in model_fetch::ENCODER_BUCKETS {
+        eprintln!("measuring the {} s bucket…", bucket.seconds);
+        let measured = measure_encoder(
+            &config,
+            &[bucket.seconds],
+            &[&short_probe],
+            args.probe_repetitions,
+        )?;
+        eprintln!("  encoder p50 {:.2} ms", measured[0].encoder_ms);
+        encoders.push(EncoderCost {
+            window_seconds: bucket.seconds,
+            encoder_ms_p50: measured[0].encoder_ms,
+            archive_sha256: Some(bucket.archive_sha256().to_string()),
+            installed_bytes: bucket.installed_bytes(),
+        });
+    }
+
+    let mut gate = Gate::new(config, inputs, vad_path, args.repetitions);
+    eprintln!(
+        "gold gate: no bucket at {} s…",
+        asr_tuning::BASELINE_HOLD_WINDOW_SECONDS
+    );
+    let baseline_output_sha256 = match gate.outcome(&[], asr_tuning::BASELINE_HOLD_WINDOW_SECONDS) {
+        GateOutcome::Output { sha256 } => sha256,
+        other => bail!("the baseline itself is not a stable reference: {other:?}"),
+    };
+    let mut evidence = WindowEvidence {
+        disk_budget_bytes: args.bucket_budget_bytes,
+        hold_window_candidates: asr_tuning::HOLD_WINDOW_CANDIDATES.to_vec(),
+        workload_seconds: asr_tuning::RELEASE_WORKLOAD_SECONDS.to_vec(),
+        encoders,
+        decode_ms_per_audio_second,
+        baseline_output_sha256,
+        gates: Vec::new(),
+    };
+    for candidate in asr_tuning::rank_window_candidates(&evidence)? {
+        if candidate.is_baseline() {
+            break;
+        }
+        eprintln!(
+            "gold gate: buckets {:?} at {} s, predicted {:.1} ms…",
+            candidate.encoder_buckets,
+            candidate.hold_window_seconds,
+            candidate.predicted_release_ms
+        );
+        let outcome = gate.outcome(&candidate.encoder_buckets, candidate.hold_window_seconds);
+        let passed = matches!(
+            &outcome,
+            GateOutcome::Output { sha256 } if *sha256 == evidence.baseline_output_sha256
+        );
+        eprintln!(
+            "  {}",
+            if passed {
+                "identical".to_string()
+            } else {
+                format!("{outcome:?}")
+            }
+        );
+        evidence.gates.push(GateVerdict {
+            encoder_buckets: candidate.encoder_buckets,
+            hold_window_seconds: candidate.hold_window_seconds,
+            outcome,
+        });
+        if passed {
+            break;
+        }
+    }
+    WindowTuning::new(evidence)
+}
+
+/// The first `seconds` of a fixture, at the rate the app hands the worker.
+fn probe_slice(input: &AudioInput, seconds: f64) -> Vec<f32> {
+    let length = (seconds * f64::from(TARGET_SAMPLE_RATE)).round() as usize;
+    input.samples[..length.min(input.samples.len())].to_vec()
+}
+
+struct ProbeCost {
+    encoder_ms: f64,
+    /// Wall time outside the encoder: mel, decode and the request itself.
+    other_ms: f64,
+}
+
+/// p50 encoder and non-encoder cost of each probe on a worker loaded with
+/// exactly `buckets`, so a probe the bucket holds runs on it.
+fn measure_encoder(
+    config: &CoreMlWorkerConfig,
+    buckets: &[u32],
+    probes: &[&Vec<f32>],
+    repetitions: usize,
+) -> Result<Vec<ProbeCost>> {
+    let mut config = config.clone();
+    config.set_encoder_buckets(buckets.to_vec());
+    config.set_emit_stage_timings(true);
+    let (asr, _) = load_coreml_worker(&config)?;
+    warmup::dummy_decode(&asr)?;
+    warmup::warm_encoder_buckets(&asr, buckets)?;
+    probes
+        .iter()
+        .map(|probe| {
+            let mut encoder_ms = Vec::with_capacity(repetitions);
+            let mut other_ms = Vec::with_capacity(repetitions);
+            // Two unrecorded runs settle the engine on this shape.
+            for repetition in 0..repetitions + 2 {
+                let started = Instant::now();
+                asr.recognize_with_metrics(probe, TARGET_SAMPLE_RATE)?;
+                let wall_ms = started.elapsed().as_secs_f64() * 1_000.0;
+                let stages = asr
+                    .last_stage_report()
+                    .context("the worker returned no stage timings")?;
+                if stages.encoder_calls != 1 {
+                    bail!(
+                        "a {:.1} s probe ran {} encoder calls; expected one",
+                        probe.len() as f64 / f64::from(TARGET_SAMPLE_RATE),
+                        stages.encoder_calls
+                    );
+                }
+                if repetition >= 2 {
+                    encoder_ms.push(stages.encoder_ms);
+                    other_ms.push(wall_ms - stages.encoder_ms);
+                }
+            }
+            Ok(ProbeCost {
+                encoder_ms: percentile(&mut encoder_ms, 50),
+                other_ms: percentile(&mut other_ms, 50),
+            })
+        })
+        .collect()
+}
+
+/// Each fixture's output, or the outcome when repetitions disagreed.
+type StableOutputs = Result<BTreeMap<String, String>, GateOutcome>;
+
+/// The worker for one bucket set and its whole-utterance outputs, which no
+/// Hold window changes.
+struct LoadedSet {
+    buckets: Vec<u32>,
+    asr: Asr,
+    whole: StableOutputs,
+}
+
+/// Gold outputs per bucket set, keeping one worker loaded at a time.
+struct Gate<'a> {
+    config: CoreMlWorkerConfig,
+    inputs: &'a [AudioInput],
+    vad_path: &'a Path,
+    repetitions: usize,
+    loaded: Option<LoadedSet>,
+}
+
+impl<'a> Gate<'a> {
+    fn new(
+        config: CoreMlWorkerConfig,
+        inputs: &'a [AudioInput],
+        vad_path: &'a Path,
+        repetitions: usize,
+    ) -> Self {
+        Self {
+            config,
+            inputs,
+            vad_path,
+            repetitions,
+            loaded: None,
+        }
+    }
+
+    fn outcome(&mut self, buckets: &[u32], hold_window_seconds: f32) -> GateOutcome {
+        match self.try_outcome(buckets, hold_window_seconds) {
+            Ok(outcome) => outcome,
+            Err(error) => GateOutcome::Failed {
+                error: format!("{error:#}"),
+            },
+        }
+    }
+
+    fn try_outcome(&mut self, buckets: &[u32], hold_window_seconds: f32) -> Result<GateOutcome> {
+        if self.loaded.as_ref().map(|set| set.buckets.as_slice()) != Some(buckets) {
+            self.loaded = None;
+            let mut config = self.config.clone();
+            config.set_encoder_buckets(buckets.to_vec());
+            let (asr, _) = load_coreml_worker(&config)?;
+            warmup::dummy_decode(&asr)?;
+            warmup::warm_encoder_buckets(&asr, buckets)?;
+            let whole = stable_outputs(self.inputs, self.repetitions, |input| {
+                asr.recognize(&input.samples, TARGET_SAMPLE_RATE)
+            })?;
+            self.loaded = Some(LoadedSet {
+                buckets: buckets.to_vec(),
+                asr,
+                whole,
+            });
+        }
+        let LoadedSet { asr, whole, .. } = self.loaded.as_ref().expect("loaded above");
+        let whole = match whole {
+            Ok(outputs) => outputs.clone(),
+            Err(outcome) => return Ok(outcome.clone()),
+        };
+        let config = HoldWindowConfig {
+            enabled: true,
+            min_seconds: hold_window_seconds,
+            max_seconds: hold_window_seconds,
+        };
+        let hold = match stable_outputs(self.inputs, self.repetitions, |input| {
+            decode_hold_windowed(asr, self.vad_path, &input.samples, config)
+        })? {
+            Ok(outputs) => outputs,
+            Err(outcome) => return Ok(outcome),
+        };
+        let bytes = serde_json::to_vec(&BTreeMap::from([("hold", hold), ("whole", whole)]))?;
+        Ok(GateOutcome::Output {
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        })
+    }
+}
+
+/// Each fixture's output when every repetition agrees, else the outcome that
+/// says they did not.
+fn stable_outputs(
+    inputs: &[AudioInput],
+    repetitions: usize,
+    decode: impl Fn(&AudioInput) -> Result<String>,
+) -> Result<StableOutputs> {
+    let mut outputs = BTreeMap::new();
+    for repetition in 0..repetitions {
+        for input in inputs {
+            let text = decode(input)?;
+            if repetition == 0 {
+                outputs.insert(input.file.clone(), text);
+            } else if outputs.get(&input.file) != Some(&text) {
+                return Ok(Err(GateOutcome::Nondeterministic));
+            }
+        }
+    }
+    Ok(Ok(outputs))
 }
 
 fn verify_model(model_dir: &Path) -> Result<()> {
@@ -236,6 +606,7 @@ fn show_profile(path: &Path) -> Result<()> {
     let profile = asr_tuning::load(path)?
         .with_context(|| format!("tuning profile not found at {}", path.display()))?;
     println!("{}", serde_json::to_string_pretty(&profile)?);
+    print_plan(&profile);
     Ok(())
 }
 
