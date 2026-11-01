@@ -616,7 +616,14 @@ fn show_profile(path: &Path) -> Result<()> {
     let profile = asr_tuning::load(path)?
         .with_context(|| format!("tuning profile not found at {}", path.display()))?;
     println!("{}", serde_json::to_string_pretty(&profile)?);
-    print_plan(&profile);
+    // The app's own check, so this says whether the app will use the profile.
+    match profile.validate_for(
+        &HardwareFingerprint::current()?,
+        &model_fetch::coreml_artifact_digest(),
+    ) {
+        Ok(()) => print_plan(&profile),
+        Err(error) => eprintln!("the app will ignore this profile and run untuned: {error:#}"),
+    }
     Ok(())
 }
 
