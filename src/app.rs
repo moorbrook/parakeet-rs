@@ -57,6 +57,11 @@ pub struct App {
     /// The buckets to keep and the Hold window, from the tuning profile read
     /// at launch, or every bucket and 6 s without one (kata 4s2q).
     window_plan: WindowPlan,
+    /// Encoder buckets the resident Core ML recogniser actually loaded, or
+    /// `None` while the recogniser is sherpa or absent. The tuned Hold window
+    /// was gated only together with its bucket set, so it applies only while
+    /// exactly that set is loaded.
+    loaded_encoder_buckets: Mutex<Option<Vec<u32>>>,
     /// Set when a rebuild was needed but the app was busy. Drained by
     /// `on_session_finished`. Without it a vocabulary edit saved during
     /// a dictation stayed unapplied until the *next* Settings Save.
@@ -123,6 +128,7 @@ impl App {
             hotkey: Mutex::new(None),
             loaded_inputs: Mutex::new(None),
             approved_encoder_buckets: Mutex::new(Vec::new()),
+            loaded_encoder_buckets: Mutex::new(None),
             engine_primer: warmup::EnginePrimer::new(),
         }
     }
@@ -270,9 +276,10 @@ impl App {
             return;
         }
         let vad_path = self.settings.vad_path();
-        let hold_windows = self
-            .window_plan
-            .hold_windows(self.settings.load().hold_windows_enabled);
+        let hold_windows = self.window_plan.hold_windows(
+            self.loaded_encoder_buckets.lock().as_deref(),
+            self.settings.load().hold_windows_enabled,
+        );
         self.spawn_supervised("session-starter", move |app| {
             app.start_session_blocking(mode, endpoint_policy, vad_path, hold_windows);
         });
@@ -602,7 +609,7 @@ impl App {
             // cost ~400 ms for nothing here.
             let inputs = app.current_build_inputs();
             match load_asr_blocking(&app.settings, inputs, /* warm = */ false) {
-                Ok((asr, inputs)) => {
+                Ok((asr, inputs, buckets)) => {
                     // Take the old recognizer out under the guard and drop it
                     // after the guard is released. Dropping in place would run
                     // `WorkerProcess::drop` — kill() plus wait() on the Core ML
@@ -611,6 +618,7 @@ impl App {
                     // AppKit run loop on a child reap.
                     let previous = app.asr.lock().replace(asr);
                     drop(previous);
+                    *app.loaded_encoder_buckets.lock() = buckets;
                     // Record what this build actually read, sampled
                     // before it started. An edit that landed mid-build
                     // therefore still compares unequal and gets picked
@@ -720,12 +728,13 @@ impl App {
         .await;
 
         match result {
-            Ok(Ok((asr, inputs))) => {
+            Ok(Ok((asr, inputs, buckets))) => {
                 let optimized = asr.backend_metadata().backend != "sherpa-onnx";
                 // Same reason as the reload path: never drop the old
                 // recognizer while the lock the press path takes is held.
                 let previous = self.asr.lock().replace(asr);
                 drop(previous);
+                *self.loaded_encoder_buckets.lock() = buckets;
                 *self.loaded_inputs.lock() = Some(inputs);
                 self.set_state(DictationState::Idle);
                 if optimized {
@@ -757,7 +766,7 @@ fn load_asr_blocking(
     settings: &SettingsStore,
     inputs: BuildInputs,
     warm: bool,
-) -> anyhow::Result<(Arc<Asr>, BuildInputs)> {
+) -> anyhow::Result<(Arc<Asr>, BuildInputs, Option<Vec<u32>>)> {
     let encoder_path = settings.encoder_path();
 
     // `inputs` is sampled by the caller BEFORE the vocabulary is read, so
@@ -782,7 +791,7 @@ fn load_asr_blocking(
     let backend_override = configured_asr_backend_override()?;
     if backend_override == AsrBackendOverride::Auto {
         match load_optimized_asr(settings, &terms, inputs.score, &inputs.encoder_buckets) {
-            Ok(asr) => return Ok((Arc::new(asr), inputs)),
+            Ok((asr, buckets)) => return Ok((Arc::new(asr), inputs, Some(buckets))),
             Err(error) => {
                 log::warn!(
                     "optimized Core ML backend unavailable; falling back to sherpa: {error:#}"
@@ -829,16 +838,17 @@ fn load_asr_blocking(
         menubar::set_status_text("Pre-warming graph…");
         warmup::dummy_decode(&asr)?;
     }
-    Ok((Arc::new(asr), inputs))
+    Ok((Arc::new(asr), inputs, None))
 }
 
-/// The worker loads those `approved` encoder buckets that verify on disk.
+/// The worker loads those `approved` encoder buckets that verify on disk;
+/// returns the recogniser and the buckets it actually loaded.
 fn load_optimized_asr(
     settings: &SettingsStore,
     vocabulary: &[String],
     vocabulary_score: f32,
     approved: &[u32],
-) -> anyhow::Result<Asr> {
+) -> anyhow::Result<(Asr, Vec<u32>)> {
     use anyhow::Context as _;
 
     let app_model_directory = settings.coreml_model_dir();
@@ -877,7 +887,7 @@ fn load_optimized_asr(
         optimized_worker_config(settings, &app_model_directory)?;
     config.set_vocabulary(vocabulary.to_vec(), vocabulary_score);
 
-    let (asr, _) = start_resident(
+    start_resident(
         buckets,
         |buckets| {
             config.set_encoder_buckets(buckets.to_vec());
@@ -903,8 +913,7 @@ fn load_optimized_asr(
             warmup::dummy_decode(asr)?;
             warmup::warm_encoder_buckets(asr, buckets)
         },
-    )?;
-    Ok(asr)
+    )
 }
 
 /// Start the resident worker with `buckets` and warm it, as one attempt. If

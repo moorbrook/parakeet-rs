@@ -674,10 +674,13 @@ pub const BASELINE_HOLD_WINDOW_SECONDS: f32 = 6.0;
 pub const HOLD_WINDOW_CANDIDATES: [f32; 5] = [3.0, 4.0, 5.0, 6.0, 8.0];
 
 /// Utterance lengths the predicted release cost averages over, equally
-/// weighted: what bench-hold captures of its 1, 3, 5, 10 and 20 s fixtures
-/// (kata ktfa), so a prediction can be checked against that bench. Fixed in
+/// weighted: every quarter second from 0.5 s to 20 s. A grid rather than a
+/// few fixtures, so every routing band counts; five bench lengths left no
+/// tail between 5 and 6 s and so priced the 8 s bucket at nothing. Fixed in
 /// the tuner, never learned from what the user dictates.
-pub const RELEASE_WORKLOAD_SECONDS: [f32; 5] = [0.875, 2.891, 4.917, 8.128, 16.58];
+pub fn release_workload_seconds() -> Vec<f32> {
+    (2..=80).map(|quarter| quarter as f32 * 0.25).collect()
+}
 
 /// Samples per encoder frame (80 ms). An encoder window decodes only whole
 /// frames, so the 5 s bucket holds 79,360 samples although it is routed
@@ -808,11 +811,21 @@ impl WindowPlan {
         }
     }
 
-    pub fn hold_windows(&self, enabled: bool) -> HoldWindowConfig {
+    /// The Hold windowing for a session on a recogniser that loaded
+    /// `loaded_buckets` (`None` for one that is not Core ML). The tuned window
+    /// passed the gold gate only with the tuned bucket set, so with any other
+    /// set, such as boot before the buckets are approved or a bucket that
+    /// failed to fetch, the session uses the 6 s baseline.
+    pub fn hold_windows(&self, loaded_buckets: Option<&[u32]>, enabled: bool) -> HoldWindowConfig {
+        let seconds = if loaded_buckets == Some(self.encoder_buckets.as_slice()) {
+            self.hold_window_seconds
+        } else {
+            BASELINE_HOLD_WINDOW_SECONDS
+        };
         HoldWindowConfig {
             enabled,
-            min_seconds: self.hold_window_seconds,
-            max_seconds: self.hold_window_seconds,
+            min_seconds: seconds,
+            max_seconds: seconds,
         }
     }
 }
@@ -868,7 +881,7 @@ pub fn encoder_passes(samples: u64, window: u32) -> u64 {
     samples.div_ceil(capacity).max(1)
 }
 
-/// Mean release-time ASR cost over [`RELEASE_WORKLOAD_SECONDS`]: the routed
+/// Mean release-time ASR cost over [`release_workload_seconds`]: the routed
 /// encoder's measured cost plus the per-second cost of the tail's audio. The
 /// fixed per-request overhead is the same for every configuration and left
 /// out.
@@ -1010,7 +1023,7 @@ pub fn select_window(evidence: &WindowEvidence) -> Result<WindowSelection> {
 
 fn validate_window_evidence(evidence: &WindowEvidence) -> Result<()> {
     if evidence.hold_window_candidates != HOLD_WINDOW_CANDIDATES
-        || evidence.workload_seconds != RELEASE_WORKLOAD_SECONDS
+        || evidence.workload_seconds != release_workload_seconds()
     {
         bail!("window evidence was gathered over a different candidate set or workload");
     }
@@ -1241,7 +1254,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Encoder costs in ms: the 15 s encoder 26, buckets 2 s 6, 5 s 10, 8 s 13.
+    /// Encoder costs in ms: the 15 s encoder 26, buckets 2 s 6, 5 s 10, 8 s 20.
     fn window_evidence(disk_budget_bytes: u64) -> WindowEvidence {
         let bucket = |window: u32, encoder_ms_p50: f64| EncoderCost {
             window_seconds: window,
@@ -1252,7 +1265,7 @@ mod tests {
         WindowEvidence {
             disk_budget_bytes,
             hold_window_candidates: HOLD_WINDOW_CANDIDATES.to_vec(),
-            workload_seconds: RELEASE_WORKLOAD_SECONDS.to_vec(),
+            workload_seconds: release_workload_seconds(),
             encoders: vec![
                 EncoderCost {
                     window_seconds: 15,
@@ -1262,7 +1275,7 @@ mod tests {
                 },
                 bucket(2, 6.0),
                 bucket(5, 10.0),
-                bucket(8, 13.0),
+                bucket(8, 20.0),
             ],
             decode_ms_per_audio_second: 2.0,
             baseline_output_sha256: BASELINE_SHA.into(),
@@ -1311,9 +1324,10 @@ mod tests {
 
     #[test]
     fn a_budget_that_fits_one_bucket_takes_the_largest_measured_saving() {
-        // About 588 MB each, so a 600 MB budget holds exactly one. At 6 s every
-        // workload tail fits 5 s: 16 ms saved on all five, against 13 for 8 s
-        // and 20 on the one sub-2 s tail for 2 s.
+        // About 588 MB each, so a 600 MB budget holds exactly one. At 6 s the
+        // 5 s bucket saves 16 ms on 60 of the 79 workload tails and 6 ms on 3
+        // in its frame-rounding gap (12.4 ms mean); 8 s takes all 79 but saves
+        // only 6, and 2 s saves 20 on the 15 tails of 2 s or less (3.8 ms).
         let mut evidence = window_evidence(600_000_000);
         gate_everything(&mut evidence, |_, hold| {
             if hold == 6.0 {
@@ -1451,6 +1465,26 @@ mod tests {
             .selection
             .hold_window_seconds = 5.0;
         assert!(edited.validate_for(&hardware(), "artifact").is_err());
+    }
+
+    #[test]
+    fn the_tuned_hold_window_applies_only_with_the_tuned_bucket_set() {
+        let plan = WindowPlan {
+            encoder_buckets: vec![5, 8],
+            hold_window_seconds: 5.0,
+        };
+        assert_eq!(plan.hold_windows(Some(&[5, 8]), true).max_seconds, 5.0);
+        assert_eq!(plan.hold_windows(Some(&[5, 8]), true).min_seconds, 5.0);
+        assert_eq!(plan.hold_windows(Some(&[]), true).max_seconds, 6.0);
+        assert_eq!(plan.hold_windows(Some(&[5]), true).max_seconds, 6.0);
+        assert_eq!(plan.hold_windows(None, true).max_seconds, 6.0);
+        assert!(!plan.hold_windows(Some(&[5, 8]), false).enabled);
+        let stock_only = WindowPlan {
+            encoder_buckets: Vec::new(),
+            hold_window_seconds: 5.0,
+        };
+        assert_eq!(stock_only.hold_windows(Some(&[]), true).max_seconds, 5.0);
+        assert_eq!(stock_only.hold_windows(None, true).max_seconds, 6.0);
     }
 
     #[test]

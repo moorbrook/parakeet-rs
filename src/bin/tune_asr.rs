@@ -177,7 +177,8 @@ fn print_usage() {
          Then, under the chosen units, measures each encoder bucket's cost and\n\
          picks the bucket set (within the disk budget, default 1800 MB) and\n\
          Hold window whose gold output is byte-identical to the 15 s encoder\n\
-         at 6 s and whose predicted release cost is lowest. Every hosted\n\
+         at 6 s and whose predicted release cost, averaged over utterances\n\
+         of 0.5-20 s, is lowest. Every hosted\n\
          bucket must be installed or downloadable. Atomically caches the\n\
          complete evidence profile."
     );
@@ -388,7 +389,7 @@ fn tune_windows(
     let mut evidence = WindowEvidence {
         disk_budget_bytes: args.bucket_budget_bytes,
         hold_window_candidates: asr_tuning::HOLD_WINDOW_CANDIDATES.to_vec(),
-        workload_seconds: asr_tuning::RELEASE_WORKLOAD_SECONDS.to_vec(),
+        workload_seconds: asr_tuning::release_workload_seconds(),
         encoders,
         decode_ms_per_audio_second,
         baseline_output_sha256,
@@ -566,11 +567,20 @@ impl<'a> Gate<'a> {
             Ok(outputs) => outputs,
             Err(outcome) => return Ok(outcome),
         };
-        let bytes = serde_json::to_vec(&BTreeMap::from([("hold", hold), ("whole", whole)]))?;
         Ok(GateOutcome::Output {
-            sha256: format!("{:x}", Sha256::digest(bytes)),
+            sha256: output_digest(whole, hold)?,
         })
     }
+}
+
+/// SHA-256 of one configuration's gold outputs, whole-utterance and
+/// Hold-windowed, as canonical JSON.
+fn output_digest(
+    whole: BTreeMap<String, String>,
+    hold: BTreeMap<String, String>,
+) -> Result<String> {
+    let bytes = serde_json::to_vec(&BTreeMap::from([("hold", hold), ("whole", whole)]))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 /// Each fixture's output when every repetition agrees, else the outcome that
@@ -804,4 +814,78 @@ fn percentile(values: &mut [f64], percentile: usize) -> f64 {
 fn process_tree_resident_bytes(asr: &Asr) -> Result<u64> {
     let parent = performance::resident_bytes(std::process::id())?;
     Ok(parent + asr.auxiliary_resident_bytes()?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn fixture(file: &str) -> AudioInput {
+        AudioInput {
+            file: file.into(),
+            samples: Vec::new(),
+            sample_rate: TARGET_SAMPLE_RATE,
+            audio_seconds: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_change_on_a_later_repetition_is_nondeterministic() {
+        let inputs = [fixture("a.wav"), fixture("b.wav")];
+        let calls = Cell::new(0);
+        let outputs = stable_outputs(&inputs, 3, |input| {
+            calls.set(calls.get() + 1);
+            // The fifth decode is b.wav on the third repetition.
+            Ok(if calls.get() == 5 {
+                "drift".into()
+            } else {
+                input.file.clone()
+            })
+        })
+        .unwrap();
+        assert_eq!(outputs, Err(GateOutcome::Nondeterministic));
+
+        let outputs = stable_outputs(&inputs, 3, |input| Ok(input.file.clone())).unwrap();
+        assert_eq!(
+            outputs,
+            Ok(BTreeMap::from([
+                ("a.wav".to_string(), "a.wav".to_string()),
+                ("b.wav".to_string(), "b.wav".to_string()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_decode_failure_is_an_error_not_an_output() {
+        let inputs = [fixture("a.wav")];
+        let calls = Cell::new(0);
+        let result = stable_outputs(&inputs, 2, |_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                bail!("worker exited")
+            }
+            Ok("text".into())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn the_digest_covers_both_whole_and_hold_outputs() {
+        let map = |text: &str| BTreeMap::from([("a.wav".to_string(), text.to_string())]);
+        // printf '%s' '{"hold":{"a.wav":"hold text"},"whole":{"a.wav":"whole text"}}' | shasum -a 256
+        assert_eq!(
+            output_digest(map("whole text"), map("hold text")).unwrap(),
+            "cbfac7369418b7afa95d671b2c7367f949fb8b2bc18d8947552258e90f5cfc8b"
+        );
+        let reference = output_digest(map("whole text"), map("hold text")).unwrap();
+        assert_ne!(
+            output_digest(map("whole text!"), map("hold text")).unwrap(),
+            reference
+        );
+        assert_ne!(
+            output_digest(map("whole text"), map("hold text!")).unwrap(),
+            reference
+        );
+    }
 }
