@@ -861,42 +861,64 @@ fn load_optimized_asr(
     let (mut config, long_plan_warmup_seconds) =
         optimized_worker_config(settings, &app_model_directory)?;
     config.set_vocabulary(vocabulary.to_vec(), vocabulary_score);
-    config.set_encoder_buckets(buckets.clone());
-    menubar::set_status_text("Loading optimized recogniser…");
 
-    let (asr, load_seconds, buckets) = match load_coreml_worker(&config) {
-        Ok((asr, load_seconds)) => (asr, load_seconds, buckets),
-        // The buckets verified, so this is Core ML refusing them. The 15 s
-        // encoder alone still serves every utterance; falling through to
-        // sherpa over a bucket would cost far more.
+    let (asr, _) = start_resident(
+        buckets,
+        |buckets| {
+            config.set_encoder_buckets(buckets.to_vec());
+            menubar::set_status_text("Loading optimized recogniser…");
+            let (asr, load_seconds) = load_coreml_worker(&config)?;
+            log::info!(
+                "optimized ASR ready in {load_seconds:.3}s with encoder buckets {buckets:?}: {:?}",
+                asr.backend_metadata()
+            );
+            Ok(asr)
+        },
+        |asr, buckets| {
+            // Every backend load starts a fresh resident worker process. Its
+            // first prediction compiles the ANE plan, so even a
+            // vocabulary-triggered reload needs this cheap warmup; Core ML's
+            // cache is not shared with the old worker that will be dropped
+            // after the swap.
+            menubar::set_status_text("Pre-warming optimized graph…");
+            if let Some(seconds) = long_plan_warmup_seconds {
+                let samples = vec![0.0_f32; seconds as usize * 16_000];
+                let _ = asr.recognize_silent_warmup(&samples, 16_000)?;
+            }
+            warmup::dummy_decode(asr)?;
+            warmup::warm_encoder_buckets(asr, buckets)
+        },
+    )?;
+    Ok(asr)
+}
+
+/// Start the resident worker with `buckets` and warm it, as one attempt. If
+/// either step fails with buckets loaded, start and warm again without them:
+/// the buckets verified, so this is Core ML refusing one at load or at its
+/// first prediction, and the 15 s encoder alone still serves every
+/// utterance. Falling through to sherpa over a bucket would cost far more.
+/// Returns the warmed worker and the buckets it actually has.
+fn start_resident<W>(
+    buckets: Vec<u32>,
+    mut start: impl FnMut(&[u32]) -> anyhow::Result<W>,
+    mut warm: impl FnMut(&W, &[u32]) -> anyhow::Result<()>,
+) -> anyhow::Result<(W, Vec<u32>)> {
+    let mut attempt = |buckets: &[u32]| -> anyhow::Result<W> {
+        let worker = start(buckets)?;
+        warm(&worker, buckets)?;
+        Ok(worker)
+    };
+    match attempt(&buckets) {
+        Ok(worker) => Ok((worker, buckets)),
         Err(error) if !buckets.is_empty() => {
             log::warn!(
-                "worker could not load encoder buckets {buckets:?}; using the 15 s encoder: \
+                "worker could not use encoder buckets {buckets:?}; using the 15 s encoder: \
                  {error:#}"
             );
-            config.set_encoder_buckets(Vec::new());
-            let (asr, load_seconds) = load_coreml_worker(&config)?;
-            (asr, load_seconds, Vec::new())
+            Ok((attempt(&[])?, Vec::new()))
         }
-        Err(error) => return Err(error),
-    };
-    log::info!(
-        "optimized ASR ready in {load_seconds:.3}s with encoder buckets {buckets:?}: {:?}",
-        asr.backend_metadata()
-    );
-
-    // Every backend load starts a fresh resident worker process. Its first
-    // prediction compiles the ANE plan, so even a vocabulary-triggered reload
-    // needs this cheap warmup; Core ML's cache is not shared with the old
-    // worker that will be dropped after the swap.
-    menubar::set_status_text("Pre-warming optimized graph…");
-    if let Some(seconds) = long_plan_warmup_seconds {
-        let samples = vec![0.0_f32; seconds as usize * 16_000];
-        let _ = asr.recognize_silent_warmup(&samples, 16_000)?;
+        Err(error) => Err(error),
     }
-    warmup::dummy_decode(&asr)?;
-    warmup::warm_encoder_buckets(&asr, &buckets)?;
-    Ok(asr)
 }
 
 /// Worker configuration shared by the resident recogniser and the bucket
@@ -1445,5 +1467,54 @@ mod tests {
         assert_eq!(effective_trigger_mode(&s), TriggerMode::Tap);
         s.trigger_mode = TriggerMode::TapFast;
         assert_eq!(effective_trigger_mode(&s), TriggerMode::TapFast);
+    }
+
+    /// A worker that starts with buckets but fails their warm-up must end up
+    /// as a warmed 15 s-only worker, not an error the caller turns into the
+    /// sherpa fallback.
+    #[test]
+    fn a_bucket_failing_its_warm_up_falls_back_to_the_15_s_encoder() {
+        let mut started = Vec::new();
+        let mut warmed = Vec::new();
+        let (worker, buckets) = start_resident(
+            vec![2, 5, 8],
+            |buckets| {
+                started.push(buckets.to_vec());
+                Ok(started.len())
+            },
+            |worker, buckets| {
+                warmed.push((*worker, buckets.to_vec()));
+                if buckets.is_empty() {
+                    Ok(())
+                } else {
+                    anyhow::bail!("prediction failed on the 5 s bucket")
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!((worker, buckets), (2, vec![]));
+        assert_eq!(started, [vec![2, 5, 8], vec![]]);
+        assert_eq!(warmed, [(1, vec![2, 5, 8]), (2, vec![])]);
+    }
+
+    #[test]
+    fn a_worker_that_warms_keeps_its_buckets_and_a_15_s_failure_is_an_error() {
+        let (worker, buckets) =
+            start_resident(vec![2, 5, 8], |_| Ok("worker"), |_, _| Ok(())).unwrap();
+        assert_eq!((worker, buckets), ("worker", vec![2, 5, 8]));
+
+        let mut attempts = 0;
+        let error = start_resident(
+            Vec::new(),
+            |_| {
+                attempts += 1;
+                Ok(())
+            },
+            |(), _| anyhow::bail!("15 s encoder failed"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "15 s encoder failed");
+        assert_eq!(attempts, 1);
     }
 }
