@@ -1468,6 +1468,48 @@ mod tests {
     }
 
     #[test]
+    fn measured_costs_survive_a_save_and_reload_exactly() {
+        // Costs as the stage profiler reports them. A profile whose floats came
+        // back one ULP off recomputed a different prediction and was rejected
+        // as inconsistent the first time the app read it.
+        let mut evidence = window_evidence(u64::MAX);
+        for (cost, ms) in evidence.encoders.iter_mut().zip([
+            25.678_123_456_789_01,
+            8.117_000_000_000_001,
+            10.02,
+            12.680_000_000_000_007,
+        ]) {
+            cost.encoder_ms_p50 = ms;
+        }
+        evidence.decode_ms_per_audio_second = 1.411_666_666_666_666_8;
+        gate_everything(&mut evidence, |_, _| CHANGED_SHA);
+        let mut profile = TuningProfile::new(
+            hardware(),
+            "artifact".into(),
+            3,
+            vec![
+                candidate(BASELINE_COMPUTE_UNITS, 95.312_345_678_9, 198.7, 46.81),
+                CandidateMeasurement::failed(CoreMlComputeUnits::All, "unsupported"),
+                CandidateMeasurement::failed(CoreMlComputeUnits::CpuAndGpu, "unsupported"),
+                CandidateMeasurement::failed(CoreMlComputeUnits::CpuOnly, "unsupported"),
+            ],
+        )
+        .unwrap();
+        profile
+            .set_window_tuning(WindowTuning::new(evidence).unwrap())
+            .unwrap();
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        save(&path, &profile).unwrap();
+        let loaded = load(&path).unwrap().unwrap();
+        loaded.validate_for(&hardware(), "artifact").unwrap();
+        loaded
+            .window_selection_for(crate::model_fetch::ENCODER_BUCKETS)
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
     fn the_tuned_hold_window_applies_only_with_the_tuned_bucket_set() {
         let plan = WindowPlan {
             encoder_buckets: vec![5, 8],
