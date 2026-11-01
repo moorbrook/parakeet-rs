@@ -660,8 +660,9 @@ zero WER/CER spread and no nondeterministic outputs.
 
 `asr_diff --gold` ran ours in the same lock group and produced identical
 transcripts (`ours-asr-diff-gold.json`). It reports the worker's own inference
-time, 0.2479 s at corpus p50. The IPC therefore costs about 1 ms per request
-(9 ms over the seven fixtures). `asr_diff` timings are not comparable with
+time, 0.2479 s at corpus p50. The two runs' corpus medians differ by 9.1 ms.
+They are separate runs, so that gap mixes the IPC with run-to-run variation
+and does not measure the IPC. `asr_diff` timings are not comparable with
 Hex's, because they leave the IPC out.
 
 **Hold loopback**: release-to-text p50 / p95 in ms, 30 repetitions after 2
