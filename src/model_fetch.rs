@@ -558,6 +558,10 @@ async fn fetch_bucket(
     on_progress: &ProgressFn,
 ) -> Result<()> {
     let staging = model_dir.join(BUCKET_STAGING_DIR);
+    let prepare = staging.clone();
+    tokio::task::spawn_blocking(move || prepare_staging(&prepare))
+        .await
+        .context("staging preparer panicked")??;
     let archive_path = staging.join(bucket.archive.label);
     ensure_artifact(bucket.archive, &archive_path, on_progress)
         .await
@@ -598,6 +602,29 @@ async fn fetch_bucket(
     discard_artifact(&archive_path).await?;
     log::info!("{} s encoder bucket installed", bucket.seconds);
     Ok(())
+}
+
+/// Make `staging` a real directory that only this user can enter. Unpacking
+/// deletes and writes under it, so a symlink or file in its place is removed
+/// (the link itself, never its target) rather than followed.
+fn prepare_staging(staging: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    match fs::symlink_metadata(staging) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => fs::remove_file(staging)
+            .with_context(|| format!("removing non-directory {}", staging.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting {}", staging.display()))
+        }
+    }
+    match fs::DirBuilder::new().mode(0o700).create(staging) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).with_context(|| format!("creating {}", staging.display())),
+    }
+    fs::set_permissions(staging, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restricting {}", staging.display()))
 }
 
 /// Unpack `archive` under `staging`, refusing any entry that is not a regular
@@ -1405,6 +1432,30 @@ mod tests {
             ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
         assert_eq!(ready, [2]);
         assert_eq!(requested.lock().as_slice(), ["/2.tar"]);
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_staging_directory_is_replaced_and_its_target_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let archive = tar_of(BUNDLE_FILES);
+        let (base, _) = serve(vec![("/2.tar".to_string(), archive.clone())]);
+        let bucket = test_bucket(2, &base, &archive, BUNDLE_FILES);
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let foreign = elsewhere.path().join(BUNDLE).join("keep.txt");
+        fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        fs::write(&foreign, b"not ours").unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(BUCKET_STAGING_DIR)).unwrap();
+
+        let ready =
+            ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
+
+        assert_eq!(ready, [2]);
+        assert_eq!(fs::read(&foreign).unwrap(), b"not ours");
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 1);
+        let staging = fs::symlink_metadata(dir.path().join(BUCKET_STAGING_DIR)).unwrap();
+        assert!(staging.is_dir(), "staging is still a symlink");
+        assert_eq!(staging.permissions().mode() & 0o777, 0o700);
     }
 
     #[tokio::test]
