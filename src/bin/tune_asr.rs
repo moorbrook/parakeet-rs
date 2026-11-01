@@ -18,6 +18,7 @@ use parakeet_dictation::coreml_worker::{
 };
 use parakeet_dictation::model_fetch;
 use parakeet_dictation::performance;
+use parakeet_dictation::resample::{to_target_rate, TARGET_SAMPLE_RATE};
 use parakeet_dictation::settings::SettingsStore;
 use parakeet_dictation::warmup;
 use parakeet_dictation::wav::read_wav_mono;
@@ -252,7 +253,11 @@ fn read_inputs(manifest: &GoldManifest, audio_dir: &Path) -> Result<Vec<AudioInp
         .iter()
         .map(|fixture| {
             let path = audio_dir.join(&fixture.file);
-            let (samples, sample_rate) = read_wav_mono(&path)?;
+            let (fixture_samples, fixture_rate) = read_wav_mono(&path)?;
+            // What production hands the recogniser: 16 kHz mono from the
+            // project's resampler (ADR-0030), not the corpus's 48 kHz.
+            let samples = to_target_rate(&fixture_samples, fixture_rate)?.into_owned();
+            let sample_rate = TARGET_SAMPLE_RATE;
             let audio_seconds = samples.len() as f64 / f64::from(sample_rate);
             Ok(AudioInput {
                 file: fixture.file.clone(),
