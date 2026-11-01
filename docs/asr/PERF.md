@@ -637,21 +637,38 @@ are under `bench/f0zg/`.
 Hex runs the same Parakeet Unified EN 0.6B as a Q8_0 GGUF through
 transcribe.cpp on Metal. `bench/hex-engine` is a standalone package that copies
 Hex's engine path. The app does not depend on it. Both engines get the same
-audio, the same warm-up and the same release-to-text definition. Run on an M5
-Pro (24 GiB, macOS 26.6.2) at harness commit `10811fd`. The load average was
-2.6–3.3 at the start of each lock group (`bench/hex-engine/results/load.log`).
+audio, the same warm-up and the same timing boundaries. Run on an M5 Pro
+(24 GiB, macOS 26.6.2). The Hold tables come from harness commit `90d5408`,
+with a load average of 2.6–3.3 at the start of each lock group. The gold table
+comes from `f9dd2ff`, with a load average of 3.69 / 3.97 / 3.40 when the gold
+lock was taken, and two other agents were working on the machine
+(`bench/hex-engine/results/load.log`).
 
-**Gold corpus**: ten repetitions each. All three arms show zero WER/CER spread
-and no nondeterministic outputs.
+**Gold corpus**: ten repetitions each through `bench_hex gold`, which runs both
+engines in one loop. Every arm is timed by the same wall clock on the caller's
+side of one request: from handing over 16 kHz audio to holding the text. That
+is what the app waits for. For ours it includes the worker IPC and its JSON.
+For Hex it includes the 1.5 s padding, the copies and the session rotation,
+which Hex's own `run` performs before it returns the text. All three arms show
+zero WER/CER spread and no nondeterministic outputs.
 
 | arm | WER | CER | corpus p50 / p95 | peak RSS | gate |
 |---|---:|---:|---:|---:|---|
-| ours, Core ML int8 | 5.434783% | 3.571429% | **0.2396 / 0.2514 s** | **0.10 GiB** | pass |
-| Hex, whole clip (`run`) | 5.434783% | 3.991597% | 0.3598 / 0.3724 s | 0.19 GiB | **fail** (CER) |
-| Hex, live stream, unpaced | **4.347826%** | **3.361345%** | 1.0241 / 1.0505 s | 0.19 GiB | pass |
+| ours, Core ML int8 | 5.434783% | 3.571429% | **0.2570 / 0.2593 s** | **0.10 GiB** | pass |
+| Hex, whole clip (`run`) | 5.434783% | 3.991597% | 0.3708 / 0.3809 s | 0.19 GiB | **fail** (CER) |
+| Hex, live stream, unpaced | **4.347826%** | **3.361345%** | 1.0619 / 1.0887 s | 0.19 GiB | pass |
+
+`asr_diff --gold` ran ours in the same lock group and produced identical
+transcripts (`ours-asr-diff-gold.json`). It reports the worker's own inference
+time, 0.2479 s at corpus p50. The IPC therefore costs about 1 ms per request
+(9 ms over the seven fixtures). `asr_diff` timings are not comparable with
+Hex's, because they leave the IPC out.
 
 **Hold loopback**: release-to-text p50 / p95 in ms, 30 repetitions after 2
-warm-ups. The four arms ran back to back for each fixture.
+warm-ups. The four arms ran back to back for each fixture. Every arm uses the
+same boundary: the clock starts at the release instant and stops when the
+caller holds the transcript (`PhaseTimer`, aggregated by `bench-aggregate.py
+--metric end-to-end`). Ours runs through `bench_e2e`, so the IPC is inside it.
 
 | fixture | ours windowed (shipping) | ours serial | Hex whole clip | Hex live stream |
 |---|---:|---:|---:|---:|
@@ -676,7 +693,8 @@ second terminal during each arm's Hold run.
 **Engine against engine.** The serial and Hex whole-clip arms are the
 like-for-like engine comparison: both decode the whole capture once at release
 through our capture path. Core ML is faster at every length, from 6.5 ms at 1 s
-to 34.5 ms at 20 s, and at gold corpus p50 (0.240 s against 0.360 s).
+to 34.5 ms at 20 s. It is also faster at gold corpus p50, 0.257 s against
+0.371 s, with both timed on the caller's side.
 
 **Product strategy against product strategy.** Each product's own dictation
 path is our 6 s windows against Hex's live stream. Hex's stream finalizes only
@@ -738,4 +756,5 @@ STAGES=gold scripts/bench-hex.sh
 
 The script fetches the GGUF and checks its hash, then rebuilds the worker,
 `asr_diff`, `bench_e2e` and `bench_hex`. Gold reports, Hold CSVs,
-`identity.txt` and `load.log` are under `bench/hex-engine/results/`.
+`identity.txt` (for the latest stage run) and `load.log` are under
+`bench/hex-engine/results/`.

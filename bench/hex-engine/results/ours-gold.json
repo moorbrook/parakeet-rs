@@ -32,10 +32,10 @@
     "chip": "Apple M5 Pro",
     "memory_bytes": 25769803776,
     "logical_cpus": 15,
-    "model_load_seconds": 0.571302833,
-    "warmup_seconds": 0.070374042,
-    "first_result_seconds": 0.683890208,
-    "peak_resident_bytes": 107954176
+    "model_load_seconds": 0.41133575,
+    "warmup_seconds": 0.074367625,
+    "first_result_seconds": 0.531040167,
+    "peak_resident_bytes": 103596032
   },
   "overall": {
     "fixtures": 7,
@@ -56,8 +56,8 @@
     "char_substitutions": 3,
     "cer_percent": 3.5714285714285716,
     "audio_seconds": 34.04956293106079,
-    "decode_seconds": 0.24584096111357212,
-    "rtfx": 138.50239918046358
+    "decode_seconds": 0.2579231634736061,
+    "rtfx": 132.01436611002626
   },
   "repeatability": {
     "repetitions": 10,
@@ -69,10 +69,10 @@
     "cer_percent_min": 3.5714285714285716,
     "cer_percent_max": 3.5714285714285716,
     "cer_spread_percent": 0.0,
-    "corpus_decode_seconds_p50": 0.23960770852863789,
-    "corpus_decode_seconds_p95": 0.2514207102358341,
-    "corpus_rtfx_p50": 142.105457041217,
-    "corpus_rtfx_p95": 135.42863234743908
+    "corpus_decode_seconds_p50": 0.25702786818146706,
+    "corpus_decode_seconds_p95": 0.25927482917904854,
+    "corpus_rtfx_p50": 132.4742066763791,
+    "corpus_rtfx_p95": 131.32614160376917
   },
   "categories": {
     "commands": {
@@ -94,8 +94,8 @@
       "char_substitutions": 3,
       "cer_percent": 8.5,
       "audio_seconds": 16.319562435150146,
-      "decode_seconds": 0.16357329301536083,
-      "rtfx": 99.76911349224723
+      "decode_seconds": 0.17272837087512016,
+      "rtfx": 94.4810765739748
     },
     "custom-vocabulary": {
       "fixtures": 2,
@@ -116,8 +116,8 @@
       "char_substitutions": 3,
       "cer_percent": 8.928571428571429,
       "audio_seconds": 5.69599986076355,
-      "decode_seconds": 0.06347991712391376,
-      "rtfx": 89.72916347141523
+      "decode_seconds": 0.06710566580295563,
+      "rtfx": 84.88105724915813
     },
     "general": {
       "fixtures": 2,
@@ -138,8 +138,8 @@
       "char_substitutions": 0,
       "cer_percent": 0.0,
       "audio_seconds": 17.730000495910645,
-      "decode_seconds": 0.08226766809821129,
-      "rtfx": 215.51602112684827
+      "decode_seconds": 0.08519479259848595,
+      "rtfx": 208.11131707861844
     },
     "long": {
       "fixtures": 1,
@@ -160,8 +160,8 @@
       "char_substitutions": 0,
       "cer_percent": 0.0,
       "audio_seconds": 14.225000381469727,
-      "decode_seconds": 0.04870566725730896,
-      "rtfx": 292.0604763778299
+      "decode_seconds": 0.049817707389593124,
+      "rtfx": 285.54104809008766
     },
     "noisy": {
       "fixtures": 1,
@@ -182,8 +182,8 @@
       "char_substitutions": 0,
       "cer_percent": 0.0,
       "audio_seconds": 3.3275625705718994,
-      "decode_seconds": 0.0330994576215744,
-      "rtfx": 100.5322385827548
+      "decode_seconds": 0.03521179035305977,
+      "rtfx": 94.50137403430118
     },
     "numbers": {
       "fixtures": 3,
@@ -204,8 +204,8 @@
       "char_substitutions": 0,
       "cer_percent": 8.333333333333334,
       "audio_seconds": 10.623562574386597,
-      "decode_seconds": 0.10009337589144707,
-      "rtfx": 106.13651982233097
+      "decode_seconds": 0.10562270507216454,
+      "rtfx": 100.58029253396101
     },
     "proper-nouns": {
       "fixtures": 6,
@@ -226,8 +226,8 @@
       "char_substitutions": 3,
       "cer_percent": 1.1363636363636365,
       "audio_seconds": 30.081562995910645,
-      "decode_seconds": 0.21323654241859913,
-      "rtfx": 141.07133165223766
+      "decode_seconds": 0.22301483154296875,
+      "rtfx": 134.88593017686702
     },
     "punctuation": {
       "fixtures": 7,
@@ -248,8 +248,8 @@
       "char_substitutions": 3,
       "cer_percent": 3.5714285714285716,
       "audio_seconds": 34.04956293106079,
-      "decode_seconds": 0.24584096111357212,
-      "rtfx": 138.50239918046358
+      "decode_seconds": 0.2579231634736061,
+      "rtfx": 132.01436611002626
     }
   },
   "fixtures": [
@@ -279,12 +279,12 @@
       "char_substitutions": 0,
       "cer_percent": 0.0,
       "audio_seconds": 3.505,
-      "decode_seconds": 0.033562,
-      "rtfx": 104.433586,
+      "decode_seconds": 0.035377085,
+      "rtfx": 99.07543,
       "repetitions": 10,
       "unique_hypotheses": 1,
-      "decode_seconds_p50": 0.03251075,
-      "decode_seconds_p95": 0.03472179
+      "decode_seconds_p50": 0.034027874,
+      "decode_seconds_p95": 0.035377085
     },
     {
       "file": "librispeech-multi-6930-75918-0001-48000.wav",
@@ -313,12 +313,12 @@
       "char_substitutions": 0,
       "cer_percent": 0.0,
       "audio_seconds": 14.225,
-      "decode_seconds": 0.048705667,
-      "rtfx": 292.0605,
+      "decode_seconds": 0.049817707,
+      "rtfx": 285.54105,
       "repetitions": 10,
       "unique_hypotheses": 1,
-      "decode_seconds_p50": 0.04471646,
-      "decode_seconds_p95": 0.048705667
+      "decode_seconds_p50": 0.049518418,
+      "decode_seconds_p95": 0.056465544
     },
     {
       "file": "slurp-calendar-amy-close-1490262086-48000.wav",
@@ -347,12 +347,12 @@
       "char_substitutions": 0,
       "cer_percent": 0.0,
       "audio_seconds": 3.328,
-      "decode_seconds": 0.0343895,
-      "rtfx": 96.77373,
+      "decode_seconds": 0.035502583,
+      "rtfx": 93.73966,
       "repetitions": 10,
       "unique_hypotheses": 1,
-      "decode_seconds_p50": 0.03307975,
-      "decode_seconds_p95": 0.035064377
+      "decode_seconds_p50": 0.035032917,
+      "decode_seconds_p95": 0.03554546
     },
     {
       "file": "slurp-calendar-amy-distant-1490262086-48000.wav",
@@ -382,12 +382,12 @@
       "char_substitutions": 0,
       "cer_percent": 0.0,
       "audio_seconds": 3.3275626,
-      "decode_seconds": 0.033099458,
-      "rtfx": 100.53224,
+      "decode_seconds": 0.03521179,
+      "rtfx": 94.50137,
       "repetitions": 10,
       "unique_hypotheses": 1,
-      "decode_seconds_p50": 0.03293925,
-      "decode_seconds_p95": 0.035218917
+      "decode_seconds_p50": 0.03467104,
+      "decode_seconds_p95": 0.035741832
     },
     {
       "file": "slurp-alarm-seven-thirty-close-1497886326-48000.wav",
@@ -415,12 +415,12 @@
       "char_substitutions": 0,
       "cer_percent": 33.333333333333336,
       "audio_seconds": 3.968,
-      "decode_seconds": 0.03260442,
-      "rtfx": 121.701294,
+      "decode_seconds": 0.034908332,
+      "rtfx": 113.669136,
       "repetitions": 10,
       "unique_hypotheses": 1,
-      "decode_seconds_p50": 0.032655958,
-      "decode_seconds_p95": 0.0342295
+      "decode_seconds_p50": 0.034701332,
+      "decode_seconds_p95": 0.03704704
     },
     {
       "file": "slurp-stock-ibm-close-1502199029-48000.wav",
@@ -449,12 +449,12 @@
       "char_substitutions": 1,
       "cer_percent": 6.666666666666667,
       "audio_seconds": 1.984,
-      "decode_seconds": 0.030703126,
-      "rtfx": 64.61883,
+      "decode_seconds": 0.03231875,
+      "rtfx": 61.388515,
       "repetitions": 10,
       "unique_hypotheses": 1,
-      "decode_seconds_p50": 0.030644832,
-      "decode_seconds_p95": 0.033188958
+      "decode_seconds_p50": 0.03229533,
+      "decode_seconds_p95": 0.032690916
     },
     {
       "file": "slurp-music-olly-tactics-close-1490194280-48000.wav",
@@ -483,12 +483,12 @@
       "char_substitutions": 2,
       "cer_percent": 9.75609756097561,
       "audio_seconds": 3.712,
-      "decode_seconds": 0.03277679,
-      "rtfx": 113.25086,
+      "decode_seconds": 0.034786917,
+      "rtfx": 106.70678,
       "repetitions": 10,
       "unique_hypotheses": 1,
-      "decode_seconds_p50": 0.032642085,
-      "decode_seconds_p95": 0.03493796
+      "decode_seconds_p50": 0.034702584,
+      "decode_seconds_p95": 0.035913084
     }
   ]
 }
