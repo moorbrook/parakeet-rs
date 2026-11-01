@@ -5,7 +5,10 @@ graph set published by FluidInference. The shipping worker and graph pack have
 independent, immutable identities:
 
 - FluidAudio runtime commit:
+  [`94702495056e0fd0ed61c16af31d42d20fccd7b7`](https://github.com/moorbrook/FluidAudio/tree/94702495056e0fd0ed61c16af31d42d20fccd7b7)
+  on the moorbrook fork, which is upstream
   [`00a9aa771900ea09c485659663be31019e293e47`](https://github.com/FluidInference/FluidAudio/tree/00a9aa771900ea09c485659663be31019e293e47)
+  plus the window and decode-loop change (ADR-0038)
 - Core ML model revision:
   [`4252711f6f060f9a2f91e5f081a806d7f45eebd8`](https://huggingface.co/FluidInference/parakeet-unified-en-0.6b-coreml/tree/4252711f6f060f9a2f91e5f081a806d7f45eebd8)
 - Source checkpoint ID: `nvidia/parakeet-unified-en-0.6b`

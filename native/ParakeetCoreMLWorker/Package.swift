@@ -22,18 +22,17 @@ let package = Package(
         ),
     ],
     dependencies: [
-        // A local override, not a vendored copy. Two things in FluidAudio have
-        // to change here: the offline encoder window is hardcoded at 15 s,
-        // which bucketed short-window encoders need parameterized (kata fgzt),
-        // and the greedy RNNT decode loop is fixed to its two CoreML models,
-        // which `NativeRnntDecoder` replaces (kata 2564). So
-        // `scripts/build-coreml-worker.sh` clones
-        // https://github.com/FluidInference/FluidAudio.git at revision
-        // 00a9aa771900ea09c485659663be31019e293e47 into `.fluidaudio-local` and
-        // applies `patches/fluidaudio.patch`. Run that script before building
-        // this package. Restore the plain SCM dependency and delete both the
-        // patch and the clone if the changes land upstream.
-        .package(name: "FluidAudio", path: ".fluidaudio-local"),
+        // The moorbrook fork, branch `parakeet-rs-window`: upstream
+        // FluidInference/FluidAudio at 00a9aa771900ea09c485659663be31019e293e47
+        // plus one commit with the two changes this worker needs. The offline
+        // encoder window is a parameter instead of a hardcoded 15 s, for the
+        // short-window encoder buckets (kata fgzt), and the greedy RNNT decode
+        // loop is a protocol with a factory, which `NativeRnntDecoder`
+        // implements (kata 2564). Pinned by revision; see ADR-0038.
+        .package(
+            url: "https://github.com/moorbrook/FluidAudio.git",
+            revision: "94702495056e0fd0ed61c16af31d42d20fccd7b7"
+        ),
     ],
     targets: [
         .executableTarget(

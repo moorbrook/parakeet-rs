@@ -2,13 +2,15 @@
 
 ## FluidAudio
 
-The native Core ML speech-recognition worker links FluidAudio at commit
-`00a9aa771900ea09c485659663be31019e293e47`, modified by
-`native/ParakeetCoreMLWorker/patches/fluidaudio.patch` (a configurable offline
-encoder window and a replaceable greedy decode loop).
+The native Core ML speech-recognition worker links FluidAudio from the
+moorbrook fork at commit `94702495056e0fd0ed61c16af31d42d20fccd7b7`: upstream
+commit `00a9aa771900ea09c485659663be31019e293e47` plus modifications by
+parakeet-rs (a configurable offline encoder window and a replaceable greedy
+decode loop).
 
 - Project: <https://github.com/FluidInference/FluidAudio>
-- Copyright: FluidInference contributors
+- Fork: <https://github.com/moorbrook/FluidAudio/tree/parakeet-rs-window>
+- Copyright: FluidInference contributors; modifications by parakeet-rs
 - License: Apache License 2.0; see `LICENSE-APACHE`
 
 ## Parakeet Unified EN 0.6B Core ML models

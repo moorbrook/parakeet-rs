@@ -1081,7 +1081,9 @@ layer; `AsrBackend` is the stable seam. Rust owns the pinned download and
 integrity gate. The worker owns model load, native mel extraction, Core ML
 CPU+ANE execution, and greedy RNNT decode, then accepts framed little-endian
 Float32 audio over stdin and returns framed JSON over stdout. It is pinned to
-FluidAudio commit `00a9aa771900ea09c485659663be31019e293e47`.
+FluidAudio commit `00a9aa771900ea09c485659663be31019e293e47`, taken since
+[ADR-0038](#0038--fluidaudio-from-a-revision-pinned-moorbrook-fork) from the
+moorbrook fork commit that adds the window and decode-loop change to it.
 
 - Model load and ANE plan compilation happen once per worker, not once per
   utterance.
@@ -2278,7 +2280,35 @@ are Apache-2.0.
 **Not covered.** `EncoderBuckets.select` routes on `seconds × 16,000`
 samples while a window decodes its frame-rounded part (79,360 samples at
 5 s), so an utterance in that gap runs two windows (Kata qgwm). The window
-patch is still a local FluidAudio override (Kata 3yrc).
+patch is FluidAudio from the moorbrook fork, pinned by revision
+([ADR-0038](#0038--fluidaudio-from-a-revision-pinned-moorbrook-fork)).
+
+---
+
+## 0038 — FluidAudio from a revision-pinned moorbrook fork
+
+**Status:** Accepted (2026-11-01, Kata 3yrc).
+
+**Context.** The worker needs two changes to FluidAudio: the offline encoder
+window as a parameter instead of a hardcoded 15 s (the encoder buckets of
+[ADR-0037](#0037--short-window-encoder-buckets-258-s-as-verified-release-assets)),
+and the greedy RNNT decode loop behind a protocol and factory, which
+`NativeRnntDecoder` implements. Neither is upstream. Until now every build
+cloned upstream at `00a9aa771900ea09c485659663be31019e293e47` into a local
+path dependency and applied a checked-in patch, so bare `swift build` and
+`swift test` failed on a clean clone.
+
+**Decision.** `native/ParakeetCoreMLWorker/Package.swift` depends on
+<https://github.com/moorbrook/FluidAudio>, branch `parakeet-rs-window`,
+pinned by revision `94702495056e0fd0ed61c16af31d42d20fccd7b7`. That commit's
+parent is upstream `00a9aa77`, and its diff is exactly the former patch (four
+files, +112/−40). The fetch-and-patch script, the patch and the local
+checkout are gone; SwiftPM resolves the fork like any other dependency.
+
+- Moving the pin, to a rebased fork commit or back to upstream if the change
+  lands there, takes a new ADR.
+- Licence: Apache-2.0, unchanged. `THIRD_PARTY_NOTICES.md` names the fork and
+  the modifications by parakeet-rs.
 
 ---
 
@@ -2310,6 +2340,11 @@ patch is still a local FluidAudio override (Kata 3yrc).
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-11-01** — [ADR-0038](#0038--fluidaudio-from-a-revision-pinned-moorbrook-fork)
+  accepted and implemented. The worker takes FluidAudio from the moorbrook
+  fork at a pinned revision, upstream `00a9aa77` plus the window and
+  decode-loop change, so a clean checkout builds without a local override.
 
 - **2026-10-31** — [ADR-0037](#0037--short-window-encoder-buckets-258-s-as-verified-release-assets)
   accepted and implemented. The app fetches 2, 5 and 8 s offline encoders

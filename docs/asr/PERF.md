@@ -189,11 +189,9 @@ assignments for all three models, are in [`COMPUTE_PLAN.md`](COMPUTE_PLAN.md);
 the full tables are in [`bench/README.md`](../../bench/README.md).
 
 This needed a three-file change to FluidAudio, which hardcodes the 15 s window.
-The package is a local path override reconstituted by
-`scripts/reconstitute-fluidaudio.sh` from the pinned upstream revision plus
-`native/ParakeetCoreMLWorker/patches/fluidaudio.patch`; nothing
-of FluidAudio is checked in but the patch, and the change is written to be
-offered upstream.
+It lives in the moorbrook fork the worker pins by revision (ADR-0038); nothing
+of FluidAudio is checked in here, and the change is written to be offered
+upstream.
 
 ## Mel and resample cost — 2026-09-04
 
@@ -377,7 +375,7 @@ The inner matrix-vector product is in C. Swift compiles
 around it, which measured 356 ms against 15 ms for the same loop written with
 NEON intrinsics.
 
-This needed a second change to FluidAudio, in the same checked-in patch as the
+This needed a second change to FluidAudio, in the same fork commit as the
 encoder window: a protocol for the decode loop and a factory the manager takes
 it from. `--rnnt-engine coreml` keeps the original path, which is how the two
 arms above were measured on one build.

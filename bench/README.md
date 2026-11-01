@@ -229,10 +229,9 @@ passes the flag automatically for `BACKEND=coreml-unified` and reduces the
 `asr_stages` log lines into `*-stages.csv` through `scripts/bench-stages.py`.
 
 The decode pipeline lives in FluidAudio's `UnifiedAsrManager` and
-`UnifiedRnntDecoder`, a pinned dependency this project depends on and patches
-rather than vendors (`native/ParakeetCoreMLWorker/patches/fluidaudio.patch`, two
-changes: the offline encoder window, and the hook the native decode loop is
-injected through). The worker measures from outside all the same: at startup it
+`UnifiedRnntDecoder`, a dependency pinned to the moorbrook fork rather than
+vendored (ADR-0038; the fork's one commit makes two changes: the offline
+encoder window, and the hook the native decode loop is injected through). The worker measures from outside all the same: at startup it
 replaces the prediction implementations of `MLModel` and its registered
 subclasses with timing wrappers that call straight through, and attributes each
 dispatch to a stage by the input feature names FluidAudio's providers declare

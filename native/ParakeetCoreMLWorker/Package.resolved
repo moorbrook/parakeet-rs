@@ -1,0 +1,14 @@
+{
+  "originHash" : "3b59c4e8ebba19533682ed988d8937bb3cfffbbb0609c3b1019412e98c17fbd6",
+  "pins" : [
+    {
+      "identity" : "fluidaudio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/moorbrook/FluidAudio.git",
+      "state" : {
+        "revision" : "94702495056e0fd0ed61c16af31d42d20fccd7b7"
+      }
+    }
+  ],
+  "version" : 3
+}

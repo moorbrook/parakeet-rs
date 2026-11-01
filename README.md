@@ -237,7 +237,7 @@ state, recovery behavior, and the clean/revoked QA matrix are in
 [`docs/macos-permissions.md`](docs/macos-permissions.md).
 
 Architectural rationale lives in [`docs/ADR.md`](docs/ADR.md) (decisions
-0001-0037). Reproducible latency and quality evidence lives in
+0001-0038). Reproducible latency and quality evidence lives in
 [`bench/README.md`](bench/README.md); the original, now-archived optimization
 plan is [`docs/latency-plan.md`](docs/latency-plan.md). The deferred
 Developer-ID/notarization shipping procedure is captured in

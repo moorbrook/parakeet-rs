@@ -47,8 +47,6 @@ that are not derivable from the code.
   other load first and record it with the numbers.
 - Rebuild `bench_asr` and the worker before measuring. A stale binary reports
   retired stages as alive.
-- The worker build and the worker tests cannot overlap in one checkout;
-  `scripts/reconstitute-fluidaudio.sh` rewrites `.fluidaudio-local`.
 - Measured numbers in docs carry the fixture, the commit, and the load
   conditions. Do not round a single run into a claim.
 
@@ -57,8 +55,9 @@ that are not derivable from the code.
 - This repository is public. No real names, email addresses, or home
   directory paths in tracked files, commit messages, or scripts. Keychain
   identity names are fine; the "Apple Development" identity is not.
-- FluidAudio is a pinned revision plus checked-in patches reconstituted at
-  build time. Do not vendor it and do not bump it without an ADR.
+- FluidAudio is the moorbrook fork pinned by revision in
+  `native/ParakeetCoreMLWorker/Package.swift` (ADR-0038). Do not vendor it,
+  and do not move the pin without an ADR.
 - Single-user app: no backwards-compatibility shims, serde aliases, or
   migration paths. Rename freely.
 - Python runs through `uv run` with PEP 723 inline metadata.
