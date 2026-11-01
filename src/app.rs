@@ -607,6 +607,7 @@ impl App {
                     // therefore still compares unequal and gets picked
                     // up by the staleness re-check below.
                     *app.loaded_inputs.lock() = Some(inputs);
+                    log::info!("recogniser reloaded: {}", reason.applied());
                     menubar::set_status_text(reason.applied());
                 }
                 Err(e) => {
