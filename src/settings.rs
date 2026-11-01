@@ -173,7 +173,7 @@ impl SettingsStore {
     }
 
     /// The store under `data_root` (Application Support in production).
-    fn with_data_root(data_root: &Path) -> Result<Self> {
+    pub(crate) fn with_data_root(data_root: &Path) -> Result<Self> {
         let data_dir = data_root.join(BUNDLE_NAMESPACE);
         // On macOS the conventional split is config under `~/Library/Preferences`
         // and data under `~/Library/Application Support`. We collapse both into

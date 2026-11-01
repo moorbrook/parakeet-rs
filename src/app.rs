@@ -398,15 +398,6 @@ impl App {
 
     fn on_session_finished(self: &Arc<Self>) {
         self.set_state(self.resting_state());
-        // Drain a rebuild that arrived while we were busy. Without this
-        // a vocabulary edit saved mid-dictation stayed unapplied until
-        // the user happened to open Settings and Save again.
-        if self
-            .reload_pending
-            .swap(false, std::sync::atomic::Ordering::SeqCst)
-        {
-            self.reload_asr_if_stale();
-        }
     }
 
     /// Force-recover after a worker thread panic. The three spawned
@@ -430,7 +421,7 @@ impl App {
         menubar::set_status_text(&format!("{source} crashed — try again"));
     }
 
-    pub fn set_state(&self, new_state: DictationState) {
+    pub fn set_state(self: &Arc<Self>, new_state: DictationState) {
         self.fsm.set_state(new_state);
         self.announce_state(new_state);
     }
@@ -454,9 +445,23 @@ impl App {
     /// pre-refactor code had a real bug where panic recovery refreshed
     /// the menu but not the HUD, leaving the listening waveform on
     /// screen).
-    fn announce_state(&self, state: DictationState) {
+    ///
+    /// Every return to `Idle` passes through here, so this is also where a
+    /// reload deferred while busy (`reload_pending`) is drained: after a
+    /// transcription, but equally after a cancelled, silent or failed
+    /// session, a failed start, or panic recovery. Draining only after a
+    /// transcription left a vocabulary edit or an encoder-bucket swap
+    /// unapplied until some later dictation finished.
+    fn announce_state(self: &Arc<Self>, state: DictationState) {
         self.refresh_menu();
         hud::show_state(state);
+        if state == DictationState::Idle
+            && self
+                .reload_pending
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.reload_asr_if_stale();
+        }
     }
 
     /// Spawn a named worker thread whose body runs inside a
@@ -1516,5 +1521,23 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "15 s encoder failed");
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn a_deferred_reload_is_drained_on_any_return_to_idle_and_not_before() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let dir = tempfile::tempdir().unwrap();
+        let app = Arc::new(App::new(SettingsStore::with_data_root(dir.path()).unwrap()));
+        app.reload_pending.store(true, SeqCst);
+
+        // A cancelled or silent session goes Listening -> Idle without
+        // transcribing; only the second announcement may drain.
+        app.announce_state(DictationState::Listening);
+        assert!(app.reload_pending.load(SeqCst), "drained while busy");
+        app.announce_state(DictationState::Idle);
+        assert!(
+            !app.reload_pending.load(SeqCst),
+            "deferred reload stranded at Idle"
+        );
     }
 }
