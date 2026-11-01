@@ -975,7 +975,7 @@ any of them wrong produces a feature that silently does nothing.
   replaced only on success — a malformed vocabulary costs the user
   their custom terms, never their ability to dictate.
 
-**Staleness tracking (`App::loaded_biasing`).** Three bugs here were
+**Staleness tracking (`App::loaded_inputs`).** Three bugs here were
 caught in adversarial review, and all three share one root cause:
 comparing against *what settings said* rather than *what was loaded*.
 
@@ -989,9 +989,10 @@ comparing against *what settings said* rather than *what was loaded*.
   3. A rebuild requested while the app was busy printed "applies after
      the current dictation" and was then dropped — nothing drained it.
 
-The fix is one type: `Biasing { vocab: Option<(len, mtime)>, score }`,
-sampled **before** the build, returned by `load_asr_blocking`, and
-stored only on success. Staleness is `loaded != Biasing::sample(...)`.
+The fix is one type, `BuildInputs { vocab: Option<(len, mtime)>, score,
+encoder_buckets }`, sampled **before** the build, returned by
+`load_asr_blocking`, and stored only on success. Staleness is
+`loaded != BuildInputs::sample(...)`.
 Failure leaves the old value, so the mismatch persists and the retry
 happens; a mid-build edit compares unequal to the pre-build sample and
 gets picked up by the re-check the worker runs on completion; and a

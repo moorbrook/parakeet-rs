@@ -102,7 +102,7 @@ impl CoreMlModelVariant {
 /// Paths needed to start the native Core ML worker.
 ///
 /// Not `Eq`: `vocabulary_score` is an `f32`, and the app compares configured
-/// biasing through `Biasing`, which owns that comparison deliberately.
+/// biasing through `BuildInputs`, which owns that comparison deliberately.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CoreMlWorkerConfig {
     pub worker_path: PathBuf,
