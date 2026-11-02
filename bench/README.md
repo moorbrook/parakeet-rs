@@ -634,8 +634,9 @@ Gold for the choice, 10 repetitions: WER 5.43%, CER 3.57%, 0 changed outputs,
 whole and Hold-windowed at 6 s. The Hold-windowed hypotheses are
 byte-identical to the 15 s encoder's.
 
-Release to text, Hold at 6 s, `--arm prime --idle-gap-ms 10000` (keydown
-primer, then 10 s idle before each rep, as in the app). 10 measured reps after
+Release to text, Hold at 6 s, `--arm prime --idle-gap-ms 10000` (each rep
+idles 10 s, fires the keydown primer at the press edge, then plays the
+fixture, as in the app). 10 measured reps after
 2 warmups per cell, one run per arm, arm order rotated per fixture. Build
 `71be519`. Load average 2.83 at the start and 5.15 at the end; 25% memory
 free at the start, 6.1 of 7.2 GB swap used.
