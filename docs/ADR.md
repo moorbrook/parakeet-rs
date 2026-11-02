@@ -2370,9 +2370,11 @@ keyed by chip, memory, macOS and the artifact digest.
   profile written before this ADR keeps its key and means what it meant:
   every hosted bucket at 6 s. A chosen bucket that has since been
   re-released drops only the window choice; the compute units stay.
-- The app reads the plan at launch. It removes bundles of buckets the plan
-  did not choose, fetches and pre-warms the chosen ones, and loads a tuned
-  set whole or not at all. Hold sessions use the tuned window only while
+- The app reads the profile once, at launch, and takes the compute units,
+  buckets and window from that one read, because they passed the gate
+  together; a profile written while the app runs applies at its next
+  launch. It removes bundles of buckets the plan did not choose, fetches
+  and pre-warms the chosen ones, and loads a tuned set whole or not at all. Hold sessions use the tuned window only while
   exactly the tuned set is loaded; otherwise they use 6 s, the configuration
   every gate compares against. `hold_window_min_seconds` and
   `hold_window_max_seconds` leave `settings.json`; the profile, else 6 s, is

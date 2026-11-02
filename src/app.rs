@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use parking_lot::Mutex;
 
 use crate::asr::Asr;
-use crate::asr_tuning::WindowPlan;
+use crate::asr_tuning::{TuningProfile, WindowPlan};
 use crate::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
 use crate::dictation_fsm::{DictationFsm, HoldPressOutcome, TapPressOutcome};
 use crate::hotkey::HotkeyHandle;
@@ -54,9 +54,9 @@ pub struct App {
     /// only once a pre-warm has compiled a set, so no load ever pays a cold
     /// compile for a bucket, whether it landed mid-download or was on disk.
     approved_encoder_buckets: Mutex<Vec<u32>>,
-    /// The buckets to keep and the Hold window, from the tuning profile read
-    /// at launch, or every bucket and 6 s without one (kata 4s2q).
-    window_plan: WindowPlan,
+    /// The tuning profile read at launch, and the buckets to keep and the
+    /// Hold window it chose (every bucket and 6 s without one; kata 4s2q).
+    tuning: RuntimeTuning,
     /// Encoder buckets the resident Core ML recogniser actually loaded, or
     /// `None` while the recogniser is sherpa or absent. The tuned Hold window
     /// was gated only together with its bucket set, so it applies only while
@@ -114,15 +114,15 @@ impl BuildInputs {
 
 impl App {
     pub fn new(settings: SettingsStore) -> Self {
-        let window_plan = tuned_window_plan(&settings);
+        let tuning = RuntimeTuning::read(&settings);
         log::info!(
             "encoder buckets {:?}, Hold window {} s",
-            window_plan.encoder_buckets,
-            window_plan.hold_window_seconds
+            tuning.window_plan.encoder_buckets,
+            tuning.window_plan.hold_window_seconds
         );
         Self {
             fsm: DictationFsm::new(),
-            window_plan,
+            tuning,
             settings,
             asr: Mutex::new(None),
             hotkey: Mutex::new(None),
@@ -276,7 +276,7 @@ impl App {
             return;
         }
         let vad_path = self.settings.vad_path();
-        let hold_windows = self.window_plan.hold_windows(
+        let hold_windows = self.tuning.window_plan.hold_windows(
             self.loaded_encoder_buckets.lock().as_deref(),
             self.settings.load().hold_windows_enabled,
         );
@@ -608,12 +608,7 @@ impl App {
             // load and is cached per-process, so the dummy decode would
             // cost ~400 ms for nothing here.
             let inputs = app.current_build_inputs();
-            match load_asr_blocking(
-                &app.settings,
-                &app.window_plan,
-                inputs,
-                /* warm = */ false,
-            ) {
+            match load_asr_blocking(&app.settings, &app.tuning, inputs, /* warm = */ false) {
                 Ok((asr, inputs, buckets)) => {
                     // Take the old recognizer out under the guard and drop it
                     // after the guard is released. Dropping in place would run
@@ -671,7 +666,7 @@ impl App {
             };
             // Within the profile's disk budget: a bucket it did not choose is
             // never loaded, so its bundle is removed rather than kept.
-            let wanted = &app.window_plan.encoder_buckets;
+            let wanted = &app.tuning.window_plan.encoder_buckets;
             runtime.block_on(model_fetch::remove_encoder_buckets_except(
                 &directory, wanted,
             ));
@@ -685,7 +680,7 @@ impl App {
                 model_fetch::BucketFetch::Download,
                 Arc::new(fetch_progress_to_menubar),
             ));
-            let installed = app.window_plan.usable_buckets(&installed);
+            let installed = app.tuning.window_plan.usable_buckets(&installed);
             if installed == approved {
                 if installed.is_empty() {
                     menubar::set_status_text(
@@ -695,7 +690,7 @@ impl App {
                 return;
             }
             menubar::set_status_text("Preparing short-utterance encoders…");
-            if let Err(error) = prewarm_encoder_buckets(&app.settings, &installed) {
+            if let Err(error) = prewarm_encoder_buckets(&app.settings, &app.tuning, &installed) {
                 log::warn!("encoder-bucket pre-warm failed; keeping the 15 s encoder: {error:#}");
                 menubar::set_status_text(
                     "Short-utterance encoders failed to load — using 15 s encoder",
@@ -727,10 +722,10 @@ impl App {
         }
 
         let settings = self.settings.clone();
-        let plan = self.window_plan.clone();
+        let tuning = self.tuning.clone();
         let inputs = self.current_build_inputs();
         let result = tokio::task::spawn_blocking(move || {
-            load_asr_blocking(&settings, &plan, inputs, /* warm = */ true)
+            load_asr_blocking(&settings, &tuning, inputs, /* warm = */ true)
         })
         .await;
 
@@ -771,7 +766,7 @@ impl App {
 /// ability to dictate at all.
 fn load_asr_blocking(
     settings: &SettingsStore,
-    plan: &WindowPlan,
+    tuning: &RuntimeTuning,
     inputs: BuildInputs,
     warm: bool,
 ) -> anyhow::Result<(Arc<Asr>, BuildInputs, Option<Vec<u32>>)> {
@@ -800,7 +795,7 @@ fn load_asr_blocking(
     if backend_override == AsrBackendOverride::Auto {
         match load_optimized_asr(
             settings,
-            plan,
+            tuning,
             &terms,
             inputs.score,
             &inputs.encoder_buckets,
@@ -859,7 +854,7 @@ fn load_asr_blocking(
 /// returns the recogniser and the buckets it actually loaded.
 fn load_optimized_asr(
     settings: &SettingsStore,
-    plan: &WindowPlan,
+    tuning: &RuntimeTuning,
     vocabulary: &[String],
     vocabulary_score: f32,
     approved: &[u32],
@@ -896,11 +891,11 @@ fn load_optimized_asr(
             model_fetch::BucketFetch::VerifyOnly,
             on_progress,
         ));
-        plan.usable_buckets(&verified)
+        tuning.window_plan.usable_buckets(&verified)
     };
 
     let (mut config, long_plan_warmup_seconds) =
-        optimized_worker_config(settings, &app_model_directory)?;
+        optimized_worker_config(tuning, &app_model_directory)?;
     config.set_vocabulary(vocabulary.to_vec(), vocabulary_score);
 
     start_resident(
@@ -966,12 +961,12 @@ fn start_resident<W>(
 /// is keyed by them, so a pre-warm under other units would compile plans the
 /// recogniser never uses.
 fn optimized_worker_config(
-    settings: &SettingsStore,
+    tuning: &RuntimeTuning,
     model_directory: &std::path::Path,
 ) -> anyhow::Result<(CoreMlWorkerConfig, Option<u32>)> {
     let mut config = CoreMlWorkerConfig::discover()?;
     config.set_existing_model_directory(model_directory);
-    let long_plan_warmup_seconds = configure_coreml_runtime_plan(settings, &mut config)?;
+    let long_plan_warmup_seconds = configure_coreml_runtime_plan(tuning, &mut config)?;
     Ok((config, long_plan_warmup_seconds))
 }
 
@@ -983,8 +978,12 @@ fn optimized_worker_config(
 /// name and the model directory's path, shared by every process with both. Paying that here lets the recogniser swapped in
 /// next load the buckets warm, so the swap blocks dictation for a warm load
 /// rather than a cold compile.
-fn prewarm_encoder_buckets(settings: &SettingsStore, windows: &[u32]) -> anyhow::Result<()> {
-    let (mut config, _) = optimized_worker_config(settings, &settings.coreml_model_dir())?;
+fn prewarm_encoder_buckets(
+    settings: &SettingsStore,
+    tuning: &RuntimeTuning,
+    windows: &[u32],
+) -> anyhow::Result<()> {
+    let (mut config, _) = optimized_worker_config(tuning, &settings.coreml_model_dir())?;
     config.set_encoder_buckets(windows.to_vec());
     let started = std::time::Instant::now();
     let (asr, load_seconds) = load_coreml_worker(&config)?;
@@ -1054,9 +1053,7 @@ fn configured_asr_tuning_override() -> anyhow::Result<AsrTuningOverride> {
 /// The tuning profile when its complete cache identity still matches this Mac.
 /// Missing, unreadable, or stale profiles are `None`, with the reason logged;
 /// only an invalid explicit environment override is an error.
-fn validated_tuning_profile(
-    settings: &SettingsStore,
-) -> anyhow::Result<Option<crate::asr_tuning::TuningProfile>> {
+fn validated_tuning_profile(settings: &SettingsStore) -> anyhow::Result<Option<TuningProfile>> {
     use crate::asr_tuning::{self, HardwareFingerprint};
 
     if configured_asr_tuning_override()? == AsrTuningOverride::Off {
@@ -1096,17 +1093,35 @@ fn validated_tuning_profile(
     Ok(Some(profile))
 }
 
-/// The bucket set and Hold window the validated profile chose, else every
-/// hosted bucket and the 6 s window. An invalid `PARAKEET_ASR_TUNING` is
-/// reported when the recogniser loads, so here it only means untuned.
-fn tuned_window_plan(settings: &SettingsStore) -> WindowPlan {
-    let manifest = model_fetch::ENCODER_BUCKETS;
-    match validated_tuning_profile(settings) {
-        Ok(Some(profile)) => WindowPlan::for_profile(&profile, manifest),
-        Ok(None) => WindowPlan::untuned(manifest),
-        Err(error) => {
-            log::warn!("{error:#}");
-            WindowPlan::untuned(manifest)
+/// The tuning profile as read once at launch, and the bucket set and Hold
+/// window it chose. Every recogniser the app builds, the bucket pre-warm and
+/// every Hold session take their choices from this one read: a profile's
+/// compute units, buckets and window passed the gold gate together, so a
+/// profile replaced or removed while the app runs must not mix with them. A
+/// new profile applies at the next launch.
+#[derive(Clone, Debug)]
+struct RuntimeTuning {
+    /// `Err` is an invalid `PARAKEET_ASR_TUNING`, which fails every optimized
+    /// load as it did before the read moved to launch.
+    profile: Result<Option<TuningProfile>, String>,
+    window_plan: WindowPlan,
+}
+
+impl RuntimeTuning {
+    fn read(settings: &SettingsStore) -> Self {
+        let profile = validated_tuning_profile(settings).map_err(|error| format!("{error:#}"));
+        let manifest = model_fetch::ENCODER_BUCKETS;
+        let window_plan = match &profile {
+            Ok(Some(profile)) => WindowPlan::for_profile(profile, manifest),
+            Ok(None) => WindowPlan::untuned(manifest),
+            Err(error) => {
+                log::warn!("{error}");
+                WindowPlan::untuned(manifest)
+            }
+        };
+        Self {
+            profile,
+            window_plan,
         }
     }
 }
@@ -1116,22 +1131,23 @@ fn tuned_window_plan(settings: &SettingsStore) -> WindowPlan {
 /// CPU+ANE baseline; only an invalid explicit environment override is fatal.
 /// The returned duration requests one long-regime warmup when two plans load.
 fn configure_coreml_runtime_plan(
-    settings: &SettingsStore,
+    tuning: &RuntimeTuning,
     config: &mut CoreMlWorkerConfig,
 ) -> anyhow::Result<Option<u32>> {
     use crate::asr_tuning::BASELINE_COMPUTE_UNITS;
 
     config.set_compute_units(BASELINE_COMPUTE_UNITS);
-    let Some(profile) = validated_tuning_profile(settings)? else {
-        return Ok(None);
+    let profile = match &tuning.profile {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return Ok(None),
+        Err(error) => anyhow::bail!("{error}"),
     };
-    let profile_path = settings.asr_tuning_profile_path();
     let short = profile.selection.short.compute_units;
     let long = profile.selection.long.compute_units;
     config.set_regime_compute_units(short, long, profile.long_regime_seconds)?;
     log::info!(
-        "using ASR tuning profile {}: short={}, long={}, threshold={}s, cache_key={}",
-        profile_path.display(),
+        "using the ASR tuning profile read at launch: short={}, long={}, threshold={}s, \
+         cache_key={}",
         short.as_str(),
         long.as_str(),
         profile.long_regime_seconds,
@@ -1580,6 +1596,32 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "15 s encoder failed");
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn a_reload_after_the_profile_is_removed_keeps_every_launch_tuning_choice() {
+        use crate::asr_tuning::{self, HardwareFingerprint};
+        use crate::coreml_worker::CoreMlComputeUnits;
+
+        let dir = tempfile::tempdir().unwrap();
+        let settings = SettingsStore::with_data_root(dir.path()).unwrap();
+        let profile = asr_tuning::tests::tuned_profile(
+            HardwareFingerprint::current().unwrap(),
+            &model_fetch::coreml_artifact_digest(),
+        );
+        let path = settings.asr_tuning_profile_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        asr_tuning::save(&path, &profile).unwrap();
+
+        let app = App::new(settings);
+        assert!(app.tuning.window_plan.tuned);
+        assert_ne!(app.tuning.window_plan.hold_window_seconds, 6.0);
+
+        // Removed while the app runs, then a vocabulary edit rebuilds the worker.
+        std::fs::remove_file(&path).unwrap();
+        let (config, _) = optimized_worker_config(&app.tuning, dir.path()).unwrap();
+        assert_eq!(config.short_compute_units, CoreMlComputeUnits::CpuAndGpu);
+        assert_eq!(config.long_compute_units, CoreMlComputeUnits::CpuAndGpu);
     }
 
     #[test]

@@ -282,7 +282,8 @@ fn run(args: &Args) -> Result<()> {
 fn print_plan(profile: &TuningProfile) {
     let plan = WindowPlan::for_profile(profile, model_fetch::ENCODER_BUCKETS);
     eprintln!(
-        "the app will use compute units short={} long={}, encoder buckets {:?}, Hold window {} s",
+        "from its next launch the app will use compute units short={} long={}, encoder buckets \
+         {:?}, Hold window {} s",
         profile.selection.short.compute_units.as_str(),
         profile.selection.long.compute_units.as_str(),
         plan.encoder_buckets,

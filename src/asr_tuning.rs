@@ -1203,7 +1203,7 @@ fn validate_window_evidence(evidence: &WindowEvidence) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tempfile::tempdir;
 
@@ -1432,6 +1432,41 @@ mod tests {
                 hold_window_seconds: candidate.hold_window_seconds,
             });
         }
+    }
+
+    /// A profile that validates for `hardware` and `artifact`, chooses CPU+GPU
+    /// in both regimes, and chooses the fastest-ranked bucket set at a Hold
+    /// window other than 6 s: every tuning choice differs from the baseline.
+    pub(crate) fn tuned_profile(hardware: HardwareFingerprint, artifact: &str) -> TuningProfile {
+        let mut profile = TuningProfile::new(
+            hardware,
+            artifact.into(),
+            3,
+            vec![
+                candidate(BASELINE_COMPUTE_UNITS, 100.0, 50.0, 100.0),
+                candidate(CoreMlComputeUnits::CpuAndGpu, 100.0, 30.0, 60.0),
+                CandidateMeasurement::failed(CoreMlComputeUnits::All, "unsupported"),
+                CandidateMeasurement::failed(CoreMlComputeUnits::CpuOnly, "unsupported"),
+            ],
+        )
+        .unwrap();
+        let mut evidence = window_evidence(u64::MAX);
+        let chosen = rank_window_candidates(&evidence)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.hold_window_seconds != BASELINE_HOLD_WINDOW_SECONDS)
+            .unwrap();
+        gate_everything(&mut evidence, |buckets, hold| {
+            if buckets == chosen.encoder_buckets.as_slice() && hold == chosen.hold_window_seconds {
+                BASELINE_SHA
+            } else {
+                CHANGED_SHA
+            }
+        });
+        profile
+            .set_window_tuning(WindowTuning::new(evidence).unwrap())
+            .unwrap();
+        profile
     }
 
     #[test]
