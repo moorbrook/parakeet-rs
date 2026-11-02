@@ -329,19 +329,48 @@ fn tune_windows(
         );
     }
 
-    // The app's own runtime plan, so the costs are the ones it will pay.
+    // The gate runs the app's own runtime plan, so its outputs are the ones
+    // the app will produce.
     let mut config = base_config.clone();
     config.set_regime_compute_units(
         profile.selection.short.compute_units,
         profile.selection.long.compute_units,
         profile.long_regime_seconds,
     )?;
+    // Costs are measured under the short-regime units alone, which every Hold
+    // request at every candidate window runs under (checked here). Under a
+    // split plan the 9 s stock switch probe would otherwise reach the
+    // long-regime manager, which no Hold request uses.
+    if !asr_tuning::hold_requests_use_short_units(
+        profile.selection.short.compute_units,
+        profile.selection.long.compute_units,
+        profile.long_regime_seconds,
+    ) {
+        bail!(
+            "compute units short={} long={} with a {} s long regime would run some Hold \
+             windows on the long-regime units, which the window tuner does not measure",
+            profile.selection.short.compute_units.as_str(),
+            profile.selection.long.compute_units.as_str(),
+            profile.long_regime_seconds
+        );
+    }
+    let mut measure_config = base_config.clone();
+    measure_config.set_compute_units(profile.selection.short.compute_units);
     let probe_source = inputs
         .iter()
         .max_by(|a, b| a.audio_seconds.total_cmp(&b.audio_seconds))
         .context("gold corpus is empty")?;
-    if probe_source.audio_seconds < LONG_PROBE_SECONDS {
-        bail!("no gold fixture is long enough for the {LONG_PROBE_SECONDS} s probe");
+    // The stock switch probe must outlast the widest bucket, or it would run
+    // on that bucket and be recorded as the stock encoder.
+    let widest_probe_seconds = hosted
+        .iter()
+        .map(|window| f64::from(*window) + 1.0)
+        .fold(LONG_PROBE_SECONDS, f64::max);
+    if probe_source.audio_seconds < widest_probe_seconds {
+        bail!(
+            "the longest gold fixture is {:.2} s; the encoder probes need {widest_probe_seconds} s",
+            probe_source.audio_seconds
+        );
     }
     let short_probe = probe_slice(probe_source, SHORT_PROBE_SECONDS);
     let long_probe = probe_slice(probe_source, LONG_PROBE_SECONDS);
@@ -349,7 +378,7 @@ fn tune_windows(
     let mut encoders = Vec::with_capacity(hosted.len() + 1);
     eprintln!("measuring the {STOCK_ENCODER_WINDOW_SECONDS} s encoder…");
     let stock = measure_encoder(
-        &config,
+        &measure_config,
         &[],
         &[&short_probe, &long_probe],
         args.probe_repetitions,
@@ -370,7 +399,7 @@ fn tune_windows(
     for bucket in model_fetch::ENCODER_BUCKETS {
         eprintln!("measuring the {} s bucket…", bucket.seconds);
         let measured = measure_encoder(
-            &config,
+            &measure_config,
             &[bucket.seconds],
             &[&short_probe],
             args.probe_repetitions,
@@ -385,7 +414,8 @@ fn tune_windows(
     }
 
     eprintln!("measuring encoder switches…");
-    let switch_costs = measure_switches(&config, &hosted, probe_source, SWITCH_REPETITIONS)?;
+    let switch_costs =
+        measure_switches(&measure_config, &hosted, probe_source, SWITCH_REPETITIONS)?;
     for cost in &switch_costs {
         eprintln!(
             "  {} s -> {} s: +{:.2} ms",

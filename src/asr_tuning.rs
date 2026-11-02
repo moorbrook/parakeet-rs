@@ -673,6 +673,20 @@ pub const BASELINE_HOLD_WINDOW_SECONDS: f32 = 6.0;
 /// (minimum equal to maximum), the measured setting of ADR-0032.
 pub const HOLD_WINDOW_CANDIDATES: [f32; 5] = [3.0, 4.0, 5.0, 6.0, 8.0];
 
+/// Whether every Hold request at every candidate window runs under the
+/// short-regime compute units, the only units the window tuner measures. A
+/// Hold request is at most one window long; the worker sends a request of
+/// `long_regime_seconds` or longer to the long-regime units and, when those
+/// differ, never to a bucket.
+pub fn hold_requests_use_short_units(
+    short: CoreMlComputeUnits,
+    long: CoreMlComputeUnits,
+    long_regime_seconds: u32,
+) -> bool {
+    let widest = HOLD_WINDOW_CANDIDATES.iter().copied().fold(0.0, f32::max);
+    short == long || widest < long_regime_seconds as f32
+}
+
 /// Utterance lengths the predicted release cost averages over, equally
 /// weighted: every quarter second from 0.5 s to 20 s. A grid rather than a
 /// few fixtures, so every routing band counts; five bench lengths left no
@@ -1687,6 +1701,26 @@ mod tests {
         };
         assert_eq!(stock_only.hold_windows(Some(&[]), true).max_seconds, 5.0);
         assert_eq!(stock_only.hold_windows(None, true).max_seconds, 6.0);
+    }
+
+    #[test]
+    fn split_units_that_send_a_candidate_window_to_the_long_regime_cannot_be_priced() {
+        use CoreMlComputeUnits::{CpuAndGpu, CpuAndNeuralEngine};
+        assert!(hold_requests_use_short_units(
+            CpuAndNeuralEngine,
+            CpuAndNeuralEngine,
+            8
+        ));
+        assert!(!hold_requests_use_short_units(
+            CpuAndNeuralEngine,
+            CpuAndGpu,
+            8
+        ));
+        assert!(hold_requests_use_short_units(
+            CpuAndNeuralEngine,
+            CpuAndGpu,
+            9
+        ));
     }
 
     #[test]
