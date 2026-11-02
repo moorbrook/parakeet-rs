@@ -2316,6 +2316,94 @@ checkout are gone; SwiftPM resolves the fork like any other dependency.
 
 ---
 
+## 0039 — Per-Mac choice of encoder buckets and Hold window on the gold gate
+
+**Status:** Accepted (2026-11-01, Kata 4s2q).
+
+**Context.** [ADR-0037](#0037--short-window-encoder-buckets-258-s-as-verified-release-assets)
+ships 2, 5 and 8 s encoder buckets, and
+[ADR-0032](#0032--hold-decodes-6-s-windows-during-the-hold-joined-on-word-agreement)
+fixes the Hold window at 6 s. Whether a bucket pays for its disk, and which
+window is fastest, depends on the chip's cost for each encoder window and
+for switching between them. The window is also a quality choice, because it
+decides where Hold cuts and merges. `tune_asr` already chooses compute units
+per Mac ([ADR-0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans)),
+keyed by chip, memory, macOS and the artifact digest.
+
+**Decision.**
+
+- After the compute-unit pass, `tune_asr` measures every hosted bucket and
+  the 15 s encoder under the short-regime units, which every Hold request
+  runs on. Each encoder is loaded alone with the stage profiler and given a
+  1.5 s probe; its encoder-stage p50 is its cost, which does not depend on
+  audio length because the encoder pads to its window. The 15 s encoder also
+  runs a 7.5 s probe, which gives the per-second cost of mel and decode. A
+  plan whose regimes use different units, with a long-regime threshold that
+  a candidate window reaches, is refused: those windows would run on units
+  the tuner does not measure.
+- It also measures, for every ordered pair of encoders, the extra cost of a
+  request on one after 8 s of the other, against a control that idled on
+  itself. On the ANE an encoder left idle while another runs is slower on
+  its next request.
+- From those numbers it predicts the release-time ASR cost of every bucket
+  subset that fits the disk budget (`--bucket-budget-mb`, default 1800, room
+  for all three) at every Hold window in {3, 4, 5, 6, 8} s, pause cutting
+  off. The prediction averages, with equal weight, over utterances from
+  0.5 to 20 s in 0.25 s steps. The tail and the last background window come
+  from the session's own `WindowPlanner` and the encoder from the worker's
+  routing rule. A tail in the 5 s bucket's frame-rounding gap is charged two
+  passes (Kata qgwm), and a tail whose encoder differs from the previous
+  one (the last background window's, else the 0.5 s keydown primer's) is
+  charged the measured switch. The workload is fixed in the tuner and never
+  learned from the user's dictations.
+- The gold gate then runs those configurations, fastest predicted first.
+  A configuration passes only when the SHA-256 of its gold outputs equals
+  the baseline's, over every repetition: whole-utterance and Hold-windowed,
+  against the 15 s encoder alone at 6 s. The first that passes is chosen.
+  A configuration less than 5% faster than the baseline is never tried, and
+  the baseline needs no gate.
+- The profile gains an optional `window_tuning` section: the measured costs
+  and switch costs, each bucket's archive digest and size, the budget, every
+  gate verdict and the selection. Loading recomputes the selection from the
+  evidence, as for compute units. The cache key adds the chosen buckets'
+  archive digests and the chosen window only when the section exists, so a
+  profile written before this ADR keeps its key and means what it meant:
+  every hosted bucket at 6 s. A chosen bucket that has since been
+  re-released drops only the window choice; the compute units stay.
+- The app reads the plan at launch. It removes bundles of buckets the plan
+  did not choose, fetches and pre-warms the chosen ones, and loads a tuned
+  set whole or not at all. Hold sessions use the tuned window only while
+  exactly the tuned set is loaded; otherwise they use 6 s, the configuration
+  every gate compares against. `hold_window_min_seconds` and
+  `hold_window_max_seconds` leave `settings.json`; the profile, else 6 s, is
+  the only source.
+- Profiles are read with serde_json's `float_roundtrip`. Without it a
+  measured float could parse one ULP off, the recomputed selection would
+  differ, and the app ignored the profile.
+
+**Result on the M5 Pro (24 GB, macOS 26.6.2, 2026-11-01).** CPU+ANE for both
+regimes, buckets 5 and 8 s (1.18 GB), Hold window 6 s: predicted release ASR
+16.6 ms against 31.3 ms. Every faster configuration tried, all at 3, 4 or
+5 s, changed the gold output.
+The 2 s bucket loses because the keydown primer runs on it and every longer
+tail then pays 12 to 25 ms to switch. Gold for the choice: 10 repetitions,
+WER 5.43%, CER 3.57%, 0 changed outputs, Hold-windowed output byte-identical
+to the 15 s encoder. Release to text in the app's primed Hold, 5+8 against the
+15 s encoder alone: 36 against 53 ms p50 at 0.9 s of speech, 48 against
+64 ms at 8.2 s, 67 against 65 ms at 16.6 s. Costs and the full table are in
+`bench/README.md`, "Tuned buckets and Hold window".
+
+**Not covered.**
+
+- The gold corpus has one fixture longer than 6 s, so the window half of the
+  gate rests on that file. A window other than 6 s can win only with
+  byte-identical output; a WER-no-worse gate like the compute units' would
+  admit more and is a separate decision.
+- The primer warms only the 2 s bucket. Priming the encoder the tail will
+  use is not tried here.
+
+---
+
 ## Target status index
 
 | ADR-0007 target | Owner ADR | Status | Blocked by |
@@ -2344,6 +2432,12 @@ checkout are gone; SwiftPM resolves the fork like any other dependency.
 Anything not on this table is either accepted-and-done or out of scope.
 
 ## Change log
+
+- **2026-11-01** — [ADR-0039](#0039--per-mac-choice-of-encoder-buckets-and-hold-window-on-the-gold-gate)
+  accepted and implemented. `tune_asr` measures each encoder bucket and the
+  cost of switching between them, then chooses the bucket set and Hold window
+  that the gold gate leaves byte-identical. The app installs only the chosen
+  buckets. On the M5 Pro: buckets 5 and 8 s at 6 s.
 
 - **2026-11-01** — [ADR-0038](#0038--fluidaudio-from-a-revision-pinned-moorbrook-fork)
   accepted and implemented. The worker takes FluidAudio from the moorbrook

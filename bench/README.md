@@ -604,6 +604,74 @@ S=<scratch>; BEFORE=<app model dir>; AFTER=<same pack plus bucket bundles>
     --worker target/release/parakeet-coreml-worker --model-dir "$AFTER" --json-out "$S/gold.json"
 ```
 
+## Tuned buckets and Hold window: M5 Pro 24 GB (2026-11-01)
+
+`tune_asr` chooses which encoder buckets to install and the Hold window
+(ADR-0039). On this Mac it chose CPU+ANE for both regimes, buckets 5 and 8 s
+(1.18 GB), and a 6 s Hold window. Tuner build `71be519`, macOS 26.6.2.
+
+Measured by the tuner, each encoder loaded alone, 20 predictions:
+
+| encoder | encoder p50 |
+|---:|---:|
+| 2 s | 7.71 ms |
+| 5 s | 10.20 ms |
+| 8 s | 12.29 ms |
+| 15 s | 26.34 ms |
+
+Mel and decode cost 1.36 ms per audio second beyond the encoder. An encoder
+that has sat idle for 8 s while another ran costs more on its next request
+(p50 of 3): from 2 s to 5 s +12.0 ms, 2 s to 8 s +25.0 ms, 2 s to 15 s
++17.2 ms, 5 s to 8 s +13.3 ms, 5 s to 15 s +6.9 ms, 15 s to 8 s +5.7 ms,
+15 s to 5 s +2.3 ms; every other pair 0. The 0.5 s keydown primer runs on the
+2 s bucket when it is loaded, so with 2/5/8 every tail longer than 2 s pays
+one of the first three. The fifteen configurations predicted faster than the
+choice, all at 3, 4 or 5 s, changed the gold output; buckets 5 and 8 at 6 s
+matched it. Predicted release ASR: 16.6 ms against 31.3 ms for the 15 s
+encoder alone.
+
+Gold for the choice, 10 repetitions: WER 5.43%, CER 3.57%, 0 changed outputs,
+whole and Hold-windowed at 6 s. The Hold-windowed hypotheses are
+byte-identical to the 15 s encoder's.
+
+Release to text, Hold at 6 s, `--arm prime --idle-gap-ms 10000` (keydown
+primer, then 10 s idle before each rep, as in the app). 10 measured reps after
+2 warmups per cell, one run per arm, arm order rotated per fixture. Build
+`71be519`. Load average 2.83 at the start and 5.15 at the end; 25% memory
+free at the start, 6.1 of 7.2 GB swap used.
+
+| fixture | speech | 15 s only p50 / p95 | 5+8 p50 / p95 | 2/5/8 p50 / p95 |
+|---|---:|---:|---:|---:|
+| `1s_48000.wav` | 0.9 s | 53 / 59 ms | 36 / 39 ms | **28 / 31 ms** |
+| `3s_48000.wav` | 2.9 s | 64 / 70 ms | **42 / 49 ms** | 49 / 60 ms |
+| `5s_48000.wav` | 5.0 s | 64 / 79 ms | **50 / 67 ms** | 66 / 81 ms |
+| `5p6s_48000.wav` | 5.7 s | 97 / 108 ms | 90 / 121 ms | 94 / 133 ms |
+| `10s_48000.wav` | 8.2 s | 64 / 72 ms | **48 / 58 ms** | 58 / 106 ms |
+| `20s_48000.wav` | 16.6 s | 65 / 74 ms | 67 / 95 ms | 68 / 78 ms |
+
+No false cuts and no transcript mismatches in any cell. Buckets 5 and 8 cut
+the p50 by 14 to 22 ms on 0.9, 2.9, 5.0 and 8.2 s of speech and stay within
+7 ms of the 15 s encoder at 5.7 and 16.6 s. Adding the 2 s bucket is 8 ms
+faster at 0.9 s and 7 to 16 ms slower from 2.9 to 8.2 s, the primer's switch
+cost. `5p6s_48000.wav` is the first 5.6 s of `10s_48000.wav` (gitignored, cut
+locally); its tail decode is about 90 ms on every arm, so that cost is not
+the encoder's and is unexplained. With no idle and no primer (`--arm warm`,
+same day, load 5.06), 2/5/8 beat the 15 s encoder by 9 to 43 ms up to 8.2 s
+of speech; that arm does not price the switch.
+
+```bash
+S=<scratch>; APP_MODEL_DIR=<app model dir>; D58=<model dir with buckets 5 and 8>
+./target/release/tune_asr --worker target/release/parakeet-coreml-worker \
+    --model-dir "$APP_MODEL_DIR"            # writes the app's profile
+./target/release/bench_e2e --backend coreml-unified --mode hold \
+    --wav bench/audio/5s_48000.wav --device "BlackHole 2ch" --hold-windows 6,6 \
+    --arm prime --idle-gap-ms 10000 --reps 10 --warmup-reps 2 \
+    --worker target/release/parakeet-coreml-worker --model-dir "$D58" 2>"$S/b58-5s.log"
+./target/release/asr_diff --gold bench/gold/manifest.json --audio-dir bench/gold/audio \
+    --repetitions 10 --backend coreml-unified --hold-windows 6,6 \
+    --worker target/release/parakeet-coreml-worker --model-dir "$D58" --json-out "$S/gold.json"
+```
+
 ## Native RNNT decode loop: M5 Pro 24 GB (2026-09-04)
 
 With bucketing and the resample retired, the greedy transducer loop was the
