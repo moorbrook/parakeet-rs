@@ -705,6 +705,17 @@ pub struct EncoderCost {
     pub installed_bytes: u64,
 }
 
+/// Measured extra wall time of a request on the `to_window` encoder when the
+/// worker's previous request ran on `from_window`, over two in a row on
+/// `to_window`. Floored at zero.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwitchCost {
+    pub from_window: u32,
+    pub to_window: u32,
+    pub extra_ms_p50: f64,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "status")]
 pub enum GateOutcome {
@@ -739,6 +750,13 @@ pub struct WindowEvidence {
     /// Release cost that grows with the tail's audio (mel and decode), per
     /// second, from the stock encoder's probes.
     pub decode_ms_per_audio_second: f64,
+    /// Extra cost of a request whose encoder differs from the previous
+    /// request's, for every ordered pair of measured encoders. A Hold tail
+    /// follows either the last background window or, for a recording too
+    /// short to cut, the keydown primer.
+    pub switch_costs: Vec<SwitchCost>,
+    /// Length of the keydown primer's dispatch, which decides its encoder.
+    pub prime_seconds: f32,
     /// Digest of the gold outputs with no bucket at the baseline Hold window,
     /// both whole-utterance and Hold-windowed. A configuration is eligible
     /// only when its digest is this one.
@@ -868,16 +886,27 @@ impl WindowCandidate {
 /// the session's own planner on all-speech frames, so a forced cut lands
 /// where `streamer::decode_hold_windowed` would put it.
 pub fn tail_samples(utterance_samples: u64, hold_window_seconds: f32) -> u64 {
+    hold_split(utterance_samples, hold_window_seconds).0
+}
+
+/// The release tail in samples, and the length of the last window Hold cut
+/// in the background before it, if it cut any.
+pub fn hold_split(utterance_samples: u64, hold_window_seconds: f32) -> (u64, Option<u64>) {
     let config = HoldWindowConfig {
         enabled: true,
         min_seconds: hold_window_seconds,
         max_seconds: hold_window_seconds,
     };
     let mut planner = WindowPlanner::new(config, u64::from(WINDOW_SAMPLES));
+    let mut last_window = None;
     for _ in 0..utterance_samples / u64::from(WINDOW_SAMPLES) {
-        let _ = planner.observe_frame(true);
+        if let Some(cut) = planner.observe_frame(true) {
+            let end = cut.end.min(utterance_samples);
+            last_window = Some(end.saturating_sub(cut.start));
+        }
     }
-    utterance_samples - planner.open_window_start().min(utterance_samples)
+    let tail = utterance_samples - planner.open_window_start().min(utterance_samples);
+    (tail, last_window)
 }
 
 /// The encoder window that takes `samples`: the narrowest bucket that holds
@@ -900,9 +929,10 @@ pub fn encoder_passes(samples: u64, window: u32) -> u64 {
 }
 
 /// Mean release-time ASR cost over [`release_workload_seconds`]: the routed
-/// encoder's measured cost plus the per-second cost of the tail's audio. The
-/// fixed per-request overhead is the same for every configuration and left
-/// out.
+/// encoder's measured cost, the per-second cost of the tail's audio, and the
+/// switch cost when the encoder that ran just before the tail (the last
+/// background window, else the keydown primer) is a different one. The fixed
+/// per-request overhead is the same for every configuration and left out.
 pub fn predicted_release_ms(
     evidence: &WindowEvidence,
     buckets: &[u32],
@@ -911,15 +941,31 @@ pub fn predicted_release_ms(
     let mut total = 0.0;
     for seconds in &evidence.workload_seconds {
         let samples = (f64::from(*seconds) * f64::from(SAMPLE_RATE)).round() as u64;
-        let tail = tail_samples(samples, hold_window_seconds);
+        let (tail, last_window) = hold_split(samples, hold_window_seconds);
         let window = routed_window(tail, buckets);
         let encoder = evidence
             .encoders
             .iter()
             .find(|cost| cost.window_seconds == window)
             .with_context(|| format!("no measured cost for the {window} s encoder"))?;
+        let prime_samples =
+            (f64::from(evidence.prime_seconds) * f64::from(SAMPLE_RATE)).round() as u64;
+        let previous = routed_window(last_window.unwrap_or(prime_samples), buckets);
+        let switch_ms = if previous == window {
+            0.0
+        } else {
+            evidence
+                .switch_costs
+                .iter()
+                .find(|cost| cost.from_window == previous && cost.to_window == window)
+                .with_context(|| {
+                    format!("no measured switch from the {previous} s to the {window} s encoder")
+                })?
+                .extra_ms_p50
+        };
         total += encoder_passes(tail, window) as f64 * encoder.encoder_ms_p50
-            + evidence.decode_ms_per_audio_second * tail as f64 / f64::from(SAMPLE_RATE);
+            + evidence.decode_ms_per_audio_second * tail as f64 / f64::from(SAMPLE_RATE)
+            + switch_ms;
     }
     Ok(total / evidence.workload_seconds.len() as f64)
 }
@@ -1090,6 +1136,37 @@ fn validate_window_evidence(evidence: &WindowEvidence) -> Result<()> {
     if !evidence.decode_ms_per_audio_second.is_finite() || evidence.decode_ms_per_audio_second < 0.0
     {
         bail!("window evidence has an invalid per-second decode cost");
+    }
+    if evidence.prime_seconds != crate::warmup::PRIME_SECONDS {
+        bail!("window evidence assumed a different keydown primer");
+    }
+    for from in &evidence.encoders {
+        for to in &evidence.encoders {
+            if from.window_seconds == to.window_seconds {
+                continue;
+            }
+            let matching: Vec<&SwitchCost> = evidence
+                .switch_costs
+                .iter()
+                .filter(|cost| {
+                    cost.from_window == from.window_seconds && cost.to_window == to.window_seconds
+                })
+                .collect();
+            if matching.len() != 1
+                || !matching[0].extra_ms_p50.is_finite()
+                || matching[0].extra_ms_p50 < 0.0
+            {
+                bail!(
+                    "window evidence needs one valid switch cost from the {} s to the {} s \
+                     encoder",
+                    from.window_seconds,
+                    to.window_seconds
+                );
+            }
+        }
+    }
+    if evidence.switch_costs.len() != evidence.encoders.len() * (evidence.encoders.len() - 1) {
+        bail!("window evidence has switch costs for encoders it did not measure");
     }
     if evidence.baseline_output_sha256.len() != 64 {
         bail!("window evidence has no baseline output digest");
@@ -1296,9 +1373,29 @@ mod tests {
                 bucket(8, 20.0),
             ],
             decode_ms_per_audio_second: 2.0,
+            switch_costs: switch_costs(0.0),
+            prime_seconds: crate::warmup::PRIME_SECONDS,
             baseline_output_sha256: BASELINE_SHA.into(),
             gates: Vec::new(),
         }
+    }
+
+    /// The same extra cost for every ordered pair of the four encoders.
+    fn switch_costs(extra_ms_p50: f64) -> Vec<SwitchCost> {
+        let windows = [15, 2, 5, 8];
+        windows
+            .iter()
+            .flat_map(|from| {
+                windows
+                    .iter()
+                    .filter(move |to| *to != from)
+                    .map(move |to| SwitchCost {
+                        from_window: *from,
+                        to_window: *to,
+                        extra_ms_p50,
+                    })
+            })
+            .collect()
     }
 
     /// Record a verdict for every configuration the ranking puts ahead of the
@@ -1358,6 +1455,44 @@ mod tests {
         assert_eq!(selection.encoder_buckets, [5]);
         assert_eq!(selection.hold_window_seconds, 6.0);
         assert_eq!(selection.installed_bytes, hosted(5).installed_bytes());
+    }
+
+    #[test]
+    fn a_measured_switch_cost_favours_one_encoder_for_every_release() {
+        // Without switching, 2/5/8 at 6 s is fastest. With 20 ms per switch, a
+        // 2 s primer then a 5 s tail, or an 8 s background window then a 5 s
+        // tail, each pay it, while the 8 s bucket alone takes the primer, every
+        // background window and every tail: 20 ms each at 8 s against 26 for
+        // the 15 s encoder, and no switch.
+        let mut evidence = window_evidence(u64::MAX);
+        gate_everything(&mut evidence, |_, hold| {
+            if hold == 6.0 {
+                BASELINE_SHA
+            } else {
+                CHANGED_SHA
+            }
+        });
+        assert_eq!(select_window(&evidence).unwrap().encoder_buckets, [2, 5, 8]);
+
+        let mut evidence = window_evidence(u64::MAX);
+        evidence.switch_costs = switch_costs(20.0);
+        gate_everything(&mut evidence, |_, hold| {
+            if hold == 6.0 {
+                BASELINE_SHA
+            } else {
+                CHANGED_SHA
+            }
+        });
+        let selection = select_window(&evidence).unwrap();
+        assert_eq!(selection.encoder_buckets, [8]);
+        assert_eq!(selection.hold_window_seconds, 6.0);
+    }
+
+    #[test]
+    fn hold_split_reports_the_last_background_window() {
+        // 8.128 s at 6 s: one cut of frames 0..188 (96,256 samples).
+        assert_eq!(hold_split(130_048, 6.0), (57_792, Some(96_256)));
+        assert_eq!(hold_split(78_672, 6.0), (78_672, None));
     }
 
     #[test]

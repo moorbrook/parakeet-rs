@@ -11,8 +11,8 @@ use parakeet_dictation::asr::{Asr, Decoded};
 use parakeet_dictation::asr_eval::{self, DecodeMetadata, GoldManifest, RunMetadata};
 use parakeet_dictation::asr_tuning::{
     self, CandidateMeasurement, CandidateStatus, CategoryQuality, EncoderCost, GateOutcome,
-    GateVerdict, HardwareFingerprint, QualityMeasurement, RegimeMeasurement, TuningProfile,
-    WindowEvidence, WindowPlan, WindowTuning, STOCK_ENCODER_WINDOW_SECONDS,
+    GateVerdict, HardwareFingerprint, QualityMeasurement, RegimeMeasurement, SwitchCost,
+    TuningProfile, WindowEvidence, WindowPlan, WindowTuning, STOCK_ENCODER_WINDOW_SECONDS,
 };
 use parakeet_dictation::coreml_worker::{
     load_coreml_worker, CoreMlComputeUnits, CoreMlWorkerConfig, DEFAULT_LONG_REGIME_SECONDS,
@@ -377,6 +377,15 @@ fn tune_windows(
         });
     }
 
+    eprintln!("measuring encoder switches…");
+    let switch_costs = measure_switches(&config, &hosted, probe_source, args.probe_repetitions)?;
+    for cost in &switch_costs {
+        eprintln!(
+            "  {} s -> {} s: +{:.2} ms",
+            cost.from_window, cost.to_window, cost.extra_ms_p50
+        );
+    }
+
     let mut gate = Gate::new(config, inputs, vad_path, args.repetitions);
     eprintln!(
         "gold gate: no bucket at {} s…",
@@ -392,6 +401,8 @@ fn tune_windows(
         workload_seconds: asr_tuning::release_workload_seconds(),
         encoders,
         decode_ms_per_audio_second,
+        switch_costs,
+        prime_seconds: warmup::PRIME_SECONDS,
         baseline_output_sha256,
         gates: Vec::new(),
     };
@@ -440,6 +451,69 @@ struct ProbeCost {
     encoder_ms: f64,
     /// Wall time outside the encoder: mel, decode and the request itself.
     other_ms: f64,
+}
+
+/// Extra wall time of a request when the worker's previous request ran on a
+/// different encoder, for every ordered pair of the stock encoder and the
+/// hosted buckets, all loaded together in one worker as the app loads them.
+/// Each request is a probe the target encoder is the narrowest to hold.
+fn measure_switches(
+    config: &CoreMlWorkerConfig,
+    buckets: &[u32],
+    source: &AudioInput,
+    repetitions: usize,
+) -> Result<Vec<SwitchCost>> {
+    let widest = buckets.iter().copied().max().unwrap_or(0);
+    let mut windows = buckets.to_vec();
+    windows.push(STOCK_ENCODER_WINDOW_SECONDS);
+    let probes: Vec<(u32, Vec<f32>)> = windows
+        .iter()
+        .map(|&window| {
+            // Half a second inside a bucket; a second past the widest bucket
+            // for the stock encoder, as the warm-up does.
+            let seconds = if window == STOCK_ENCODER_WINDOW_SECONDS {
+                f64::from(widest) + 1.0
+            } else {
+                f64::from(window) - 0.5
+            };
+            (window, probe_slice(source, seconds))
+        })
+        .collect();
+    let mut config = config.clone();
+    config.set_encoder_buckets(buckets.to_vec());
+    let (asr, _) = load_coreml_worker(&config)?;
+    warmup::dummy_decode(&asr)?;
+    warmup::warm_encoder_buckets(&asr, buckets)?;
+    let timed = |probe: &[f32]| -> Result<f64> {
+        let started = Instant::now();
+        asr.recognize_with_metrics(probe, TARGET_SAMPLE_RATE)?;
+        Ok(started.elapsed().as_secs_f64() * 1_000.0)
+    };
+    let mut costs = Vec::new();
+    for (to_window, to_probe) in &probes {
+        let mut same = Vec::with_capacity(repetitions);
+        for _ in 0..repetitions {
+            timed(to_probe)?;
+            same.push(timed(to_probe)?);
+        }
+        let same_ms = percentile(&mut same, 50);
+        for (from_window, from_probe) in &probes {
+            if from_window == to_window {
+                continue;
+            }
+            let mut switched = Vec::with_capacity(repetitions);
+            for _ in 0..repetitions {
+                timed(from_probe)?;
+                switched.push(timed(to_probe)?);
+            }
+            costs.push(SwitchCost {
+                from_window: *from_window,
+                to_window: *to_window,
+                extra_ms_p50: (percentile(&mut switched, 50) - same_ms).max(0.0),
+            });
+        }
+    }
+    Ok(costs)
 }
 
 /// p50 encoder and non-encoder cost of each probe on a worker loaded with
