@@ -705,9 +705,10 @@ pub struct EncoderCost {
     pub installed_bytes: u64,
 }
 
-/// Measured extra wall time of a request on the `to_window` encoder when the
-/// worker's previous request ran on `from_window`, over two in a row on
-/// `to_window`. Floored at zero.
+/// Measured extra wall time of a request on the `to_window` encoder after the
+/// engine spent several seconds on `from_window` alone, over the same time
+/// spent on `to_window`. The engine stays awake, but an encoder's own program
+/// goes cold when another one runs instead. Floored at zero.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SwitchCost {
@@ -750,10 +751,10 @@ pub struct WindowEvidence {
     /// Release cost that grows with the tail's audio (mel and decode), per
     /// second, from the stock encoder's probes.
     pub decode_ms_per_audio_second: f64,
-    /// Extra cost of a request whose encoder differs from the previous
-    /// request's, for every ordered pair of measured encoders. A Hold tail
-    /// follows either the last background window or, for a recording too
-    /// short to cut, the keydown primer.
+    /// Extra cost of a request whose encoder sat idle while another ran, for
+    /// every ordered pair of measured encoders. A Hold tail follows either the
+    /// last background window or, for a recording too short to cut, the
+    /// keydown primer; its encoder is cold when it is not that one.
     pub switch_costs: Vec<SwitchCost>,
     /// Length of the keydown primer's dispatch, which decides its encoder.
     pub prime_seconds: f32,

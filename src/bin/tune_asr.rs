@@ -39,6 +39,13 @@ const DEFAULT_BUCKET_BUDGET_MB: u64 = 1_800;
 /// the stock encoder only, for the per-second cost of the audio itself.
 const SHORT_PROBE_SECONDS: f64 = 1.5;
 const LONG_PROBE_SECONDS: f64 = 7.5;
+/// How long an encoder sits idle, with the engine kept busy on another, before
+/// its switch cost is timed: past the knee of the idle re-wake sweep
+/// (`bench/README.md`, "Cool-down knee"), as for an encoder last used a
+/// recording ago.
+const SWITCH_IDLE: std::time::Duration = std::time::Duration::from_secs(8);
+/// Repetitions of each switch timing; each costs `SWITCH_IDLE`.
+const SWITCH_REPETITIONS: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Action {
@@ -378,7 +385,7 @@ fn tune_windows(
     }
 
     eprintln!("measuring encoder switches…");
-    let switch_costs = measure_switches(&config, &hosted, probe_source, args.probe_repetitions)?;
+    let switch_costs = measure_switches(&config, &hosted, probe_source, SWITCH_REPETITIONS)?;
     for cost in &switch_costs {
         eprintln!(
             "  {} s -> {} s: +{:.2} ms",
@@ -453,10 +460,14 @@ struct ProbeCost {
     other_ms: f64,
 }
 
-/// Extra wall time of a request when the worker's previous request ran on a
-/// different encoder, for every ordered pair of the stock encoder and the
-/// hosted buckets, all loaded together in one worker as the app loads them.
-/// Each request is a probe the target encoder is the narrowest to hold.
+/// Extra wall time of a request on an encoder that sat idle while the engine
+/// kept running another, for every ordered pair of the stock encoder and the
+/// hosted buckets, all loaded together as the app loads them. That is a Hold
+/// tail whose encoder is not the one the keydown primer or the background
+/// windows ran: the engine is awake, but this encoder's program last ran a
+/// recording ago. Measured as the target after `SWITCH_IDLE` of the other
+/// encoder every half second, against the target after the same of itself.
+/// Back to back, with no idle time, a switch measured within 1 ms.
 fn measure_switches(
     config: &CoreMlWorkerConfig,
     buckets: &[u32],
@@ -484,17 +495,23 @@ fn measure_switches(
     let (asr, _) = load_coreml_worker(&config)?;
     warmup::dummy_decode(&asr)?;
     warmup::warm_encoder_buckets(&asr, buckets)?;
-    let timed = |probe: &[f32]| -> Result<f64> {
+    // The target after SWITCH_IDLE of `keeper` every half second.
+    let after = |keeper: &[f32], target: &[f32]| -> Result<f64> {
+        asr.recognize_with_metrics(target, TARGET_SAMPLE_RATE)?;
+        let idle_started = Instant::now();
+        while idle_started.elapsed() < SWITCH_IDLE {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            asr.recognize_with_metrics(keeper, TARGET_SAMPLE_RATE)?;
+        }
         let started = Instant::now();
-        asr.recognize_with_metrics(probe, TARGET_SAMPLE_RATE)?;
+        asr.recognize_with_metrics(target, TARGET_SAMPLE_RATE)?;
         Ok(started.elapsed().as_secs_f64() * 1_000.0)
     };
     let mut costs = Vec::new();
     for (to_window, to_probe) in &probes {
         let mut same = Vec::with_capacity(repetitions);
         for _ in 0..repetitions {
-            timed(to_probe)?;
-            same.push(timed(to_probe)?);
+            same.push(after(to_probe, to_probe)?);
         }
         let same_ms = percentile(&mut same, 50);
         for (from_window, from_probe) in &probes {
@@ -503,8 +520,7 @@ fn measure_switches(
             }
             let mut switched = Vec::with_capacity(repetitions);
             for _ in 0..repetitions {
-                timed(from_probe)?;
-                switched.push(timed(to_probe)?);
+                switched.push(after(from_probe, to_probe)?);
             }
             costs.push(SwitchCost {
                 from_window: *from_window,
