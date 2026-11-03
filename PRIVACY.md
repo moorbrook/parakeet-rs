@@ -164,8 +164,7 @@ Everything lives under
 |---|---|
 | `settings.json` | Your hotkey, trigger mode, rewrite on/off with its OpenCode model and variant, hotword score, and reserved language hint. No secrets — there is no API key to store. |
 | `vocabulary.txt` | Custom terms you added, if any. Parakeet creates it with a commented-out template the first time you click "Edit Vocabulary…", and only reads it after that — it never modifies content you write. |
-| `hotwords.generated.txt` | Machine translation of the above. Regenerated on every model load; safe to delete. |
-| `models/` | Downloaded optimized ASR, fallback ASR, and VAD weights (~1.3 GB total). |
+| `models/` | Downloaded Core ML ASR, encoder buckets, and Silero VAD weights. |
 
 No audio, no transcripts. Deleting the whole directory resets Parakeet
 to a fresh install; it will re-download the models on next launch.

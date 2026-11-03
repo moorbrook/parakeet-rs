@@ -23,7 +23,7 @@ use crate::model_fetch::{self, Progress};
 use crate::performance::PhaseTimer;
 use crate::settings::{Settings, SettingsStore, TriggerMode};
 use crate::streamer::{self, Mode as StreamerMode, Outcome, OutcomeRx};
-use crate::{paste, performance, rewrite, warmup};
+use crate::{paste, rewrite, warmup};
 
 pub use crate::dictation_fsm::DictationState;
 
@@ -58,7 +58,7 @@ pub struct App {
     /// Hold window it chose (every bucket and 6 s without one; kata 4s2q).
     tuning: RuntimeTuning,
     /// Encoder buckets the resident Core ML recogniser actually loaded, or
-    /// `None` while the recogniser is sherpa or absent. The tuned Hold window
+    /// `None` while the recogniser is absent. The tuned Hold window
     /// was gated only together with its bucket set, so it applies only while
     /// exactly that set is loaded.
     loaded_encoder_buckets: Mutex<Option<Vec<u32>>>,
@@ -421,7 +421,7 @@ impl App {
 
     /// Force-recover after a worker thread panic. The three spawned
     /// worker threads (`session-starter`, `session-watcher`,
-    /// `transcribe`) can panic at any FFI boundary (sherpa-onnx, cpal,
+    /// `transcribe`) can panic at any FFI boundary (Core ML, cpal,
     /// the `CGEventPost` keystroke synthesis in `ax_paste`). Without
     /// this recovery, a panic in any of them would leave the app stuck
     /// in `Listening` / `Transcribing` / `Rewriting` forever — hotkey presses gated
@@ -608,7 +608,7 @@ impl App {
             // load and is cached per-process, so the dummy decode would
             // cost ~400 ms for nothing here.
             let inputs = app.current_build_inputs();
-            match load_asr_blocking(&app.settings, &app.tuning, inputs, /* warm = */ false) {
+            match load_asr_blocking(&app.settings, &app.tuning, inputs) {
                 Ok((asr, inputs, buckets)) => {
                     // Take the old recognizer out under the guard and drop it
                     // after the guard is released. Dropping in place would run
@@ -702,36 +702,28 @@ impl App {
         });
     }
 
-    /// Run the first-run model download + page-touch + recogniser load +
+    /// Run the first-run model download, recogniser load, and
     /// dummy warmup decode on the tokio runtime. Transitions state from
     /// ModelLoading → Idle on success.
     pub async fn spawn_model_setup(self: Arc<Self>) {
-        let model_dir = self.settings.model_dir();
-        let vad_path = self.settings.vad_path();
-
         let on_progress: model_fetch::ProgressFn = Arc::new(fetch_progress_to_menubar);
-
-        // `ensure_model` is also the integrity gate for already-present
-        // artifacts. Its verified-metadata cache makes unchanged launches
-        // cheap; skipping it here would trust any stale or replaced file.
-        if let Err(e) = model_fetch::ensure_model(&model_dir, &vad_path, on_progress.clone()).await
+        if let Err(error) =
+            model_fetch::ensure_vad_model(&self.settings.data_dir().join("models"), on_progress)
+                .await
         {
-            log::error!("model fetch failed: {e:#}");
-            menubar::set_status_text(&format!("Model download failed: {e}"));
+            menubar::set_status_text(&format!("VAD setup failed: {error}"));
+            log::error!("VAD setup failed: {error:#}");
             return;
         }
-
         let settings = self.settings.clone();
         let tuning = self.tuning.clone();
         let inputs = self.current_build_inputs();
-        let result = tokio::task::spawn_blocking(move || {
-            load_asr_blocking(&settings, &tuning, inputs, /* warm = */ true)
-        })
-        .await;
+        let result =
+            tokio::task::spawn_blocking(move || load_asr_blocking(&settings, &tuning, inputs))
+                .await;
 
         match result {
             Ok(Ok((asr, inputs, buckets))) => {
-                let optimized = asr.backend_metadata().backend != "sherpa-onnx";
                 // Same reason as the reload path: never drop the old
                 // recognizer while the lock the press path takes is held.
                 let previous = self.asr.lock().replace(asr);
@@ -739,9 +731,7 @@ impl App {
                 *self.loaded_encoder_buckets.lock() = buckets;
                 *self.loaded_inputs.lock() = Some(inputs);
                 self.set_state(DictationState::Idle);
-                if optimized {
-                    self.spawn_encoder_bucket_upgrade();
-                }
+                self.spawn_encoder_bucket_upgrade();
             }
             Ok(Err(e)) => {
                 log::error!("model setup failed: {e:#}");
@@ -768,10 +758,7 @@ fn load_asr_blocking(
     settings: &SettingsStore,
     tuning: &RuntimeTuning,
     inputs: BuildInputs,
-    warm: bool,
 ) -> anyhow::Result<(Arc<Asr>, BuildInputs, Option<Vec<u32>>)> {
-    let encoder_path = settings.encoder_path();
-
     // `inputs` is sampled by the caller BEFORE the vocabulary is read, so
     // the recorded fingerprint can never be newer than the bytes this build
     // actually consumed.
@@ -791,63 +778,15 @@ fn load_asr_blocking(
         }
     };
 
-    let backend_override = configured_asr_backend_override()?;
-    if backend_override == AsrBackendOverride::Auto {
-        match load_optimized_asr(
-            settings,
-            tuning,
-            &terms,
-            inputs.score,
-            &inputs.encoder_buckets,
-        ) {
-            Ok((asr, buckets)) => return Ok((Arc::new(asr), inputs, Some(buckets))),
-            Err(error) => {
-                log::warn!(
-                    "optimized Core ML backend unavailable; falling back to sherpa: {error:#}"
-                );
-                menubar::set_status_text("Optimized model unavailable — loading fallback…");
-            }
-        }
-    } else {
-        log::info!("PARAKEET_ASR_BACKEND=sherpa; selecting explicit fallback backend");
-    }
-
-    menubar::set_status_text("Warming page cache…");
-    let _ = warmup::page_touch(&encoder_path)?;
-
-    let hotwords = match crate::vocabulary::prepare(
-        &settings.vocabulary_path(),
-        &settings.hotwords_path(),
-        Some(&settings.tokens_path()),
-    ) {
-        Ok(path) => path,
-        Err(e) => {
-            log::error!("vocabulary unusable, decoding without biasing: {e:#}");
-            menubar::set_status_text("Vocabulary unreadable — biasing off");
-            None
-        }
-    };
-
-    menubar::set_status_text("Loading recogniser (CoreML)…");
-    let threads = performance::performance_core_count();
-    log::info!("OfflineRecognizer: {threads} threads, provider=coreml");
-    let asr = Asr::load(&crate::asr::AsrConfig {
-        encoder: &encoder_path,
-        decoder: &settings.decoder_path(),
-        joiner: &settings.joiner_path(),
-        tokens: &settings.tokens_path(),
-        num_threads: threads,
-        hotwords: hotwords.as_deref(),
-        // The sampled score, not a fresh read — otherwise the recogniser
-        // could be built with a score we never record as loaded.
-        hotwords_score: inputs.score,
-    })?;
-
-    if warm {
-        menubar::set_status_text("Pre-warming graph…");
-        warmup::dummy_decode(&asr)?;
-    }
-    Ok((Arc::new(asr), inputs, None))
+    let (asr, buckets) = load_optimized_asr(
+        settings,
+        tuning,
+        &terms,
+        inputs.score,
+        &inputs.encoder_buckets,
+    )
+    .map_err(|error| anyhow::anyhow!("Core ML setup failed: {error:#}"))?;
+    Ok((Arc::new(asr), inputs, Some(buckets)))
 }
 
 /// The worker loads those `approved` encoder buckets that verify on disk;
@@ -931,7 +870,7 @@ fn load_optimized_asr(
 /// either step fails with buckets loaded, start and warm again without them:
 /// the buckets verified, so this is Core ML refusing one at load or at its
 /// first prediction, and the 15 s encoder alone still serves every
-/// utterance. Falling through to sherpa over a bucket would cost far more.
+/// utterance. A bucket failure must not disable the stock encoder.
 /// Returns the warmed worker and the buckets it actually has.
 fn start_resident<W>(
     buckets: Vec<u32>,
@@ -1154,30 +1093,6 @@ fn configure_coreml_runtime_plan(
         profile.cache_key
     );
     Ok((short != long).then_some(profile.long_regime_seconds + 1))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AsrBackendOverride {
-    Auto,
-    Sherpa,
-}
-
-fn parse_asr_backend_override(value: Option<&str>) -> anyhow::Result<AsrBackendOverride> {
-    match value {
-        None | Some("") | Some("auto") => Ok(AsrBackendOverride::Auto),
-        Some("sherpa") => Ok(AsrBackendOverride::Sherpa),
-        Some(other) => {
-            anyhow::bail!("invalid PARAKEET_ASR_BACKEND={other:?}; expected auto or sherpa")
-        }
-    }
-}
-
-fn configured_asr_backend_override() -> anyhow::Result<AsrBackendOverride> {
-    match std::env::var("PARAKEET_ASR_BACKEND") {
-        Ok(value) => parse_asr_backend_override(Some(&value)),
-        Err(std::env::VarError::NotPresent) => parse_asr_backend_override(None),
-        Err(error) => Err(error.into()),
-    }
 }
 
 /// The OpenCode rewrite of `raw`, or `raw` unchanged when no service
@@ -1406,23 +1321,6 @@ mod tests {
     use crate::settings::TriggerMode;
 
     #[test]
-    fn asr_backend_override_keeps_sherpa_one_setting_away() {
-        assert_eq!(
-            parse_asr_backend_override(None).unwrap(),
-            AsrBackendOverride::Auto
-        );
-        assert_eq!(
-            parse_asr_backend_override(Some("auto")).unwrap(),
-            AsrBackendOverride::Auto
-        );
-        assert_eq!(
-            parse_asr_backend_override(Some("sherpa")).unwrap(),
-            AsrBackendOverride::Sherpa
-        );
-        assert!(parse_asr_backend_override(Some("coreml")).is_err());
-    }
-
-    #[test]
     fn asr_tuning_override_keeps_safe_baseline_one_setting_away() {
         assert_eq!(
             parse_asr_tuning_override(None).unwrap(),
@@ -1551,7 +1449,7 @@ mod tests {
 
     /// A worker that starts with buckets but fails their warm-up must end up
     /// as a warmed 15 s-only worker, not an error the caller turns into the
-    /// sherpa fallback.
+    /// setup error.
     #[test]
     fn a_bucket_failing_its_warm_up_falls_back_to_the_15_s_encoder() {
         let mut started = Vec::new();

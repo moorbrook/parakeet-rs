@@ -18,7 +18,7 @@ use crate::windows::HoldWindowConfig;
 /// Bundle-id-style namespace for our on-disk state. Matches what the previous
 /// Tauri build wrote (`tauri.conf.json` `identifier`), so the model files
 /// downloaded under that name still resolve.
-const BUNDLE_NAMESPACE: &str = "com.parakeet.rs";
+pub(crate) const BUNDLE_NAMESPACE: &str = "com.parakeet.rs";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -69,12 +69,10 @@ pub struct Settings {
     /// Contextual-biasing boost applied to every term in
     /// `vocabulary.txt`. Ignored when the vocabulary is empty.
     ///
-    /// Measured against `parakeet-tdt-0.6b-v3-int8` on the bench
-    /// fixtures: 1.0–6.0 leaves clean speech untouched, 10.0 starts
-    /// injecting hotwords into audio that doesn't contain them, and
-    /// 50.0 replaces the transcript with them outright. 2.0 is the
-    /// conservative default; raise it only if a term is still being
-    /// missed, and re-check with `asr_diff` that nothing else moved.
+    /// The native greedy decoder applies a per-token log-probability boost.
+    /// Keep 2.0 unless the gold corpus shows a safe improvement in every
+    /// category. Scores from other decoder/tokenizer combinations do not
+    /// transfer to this model.
     #[serde(default = "default_hotword_score")]
     pub hotword_score: f32,
     /// Turn off to restore the original Hold behaviour: nothing is decoded
@@ -221,12 +219,6 @@ impl SettingsStore {
         &self.data_dir
     }
 
-    pub fn model_dir(&self) -> PathBuf {
-        self.data_dir
-            .join("models")
-            .join("parakeet-tdt-0.6b-v3-int8")
-    }
-
     /// Root passed to the native worker's model hub. The worker appends the
     /// pinned Parakeet Unified repository folder beneath it.
     pub fn coreml_model_root(&self) -> PathBuf {
@@ -243,26 +235,9 @@ impl SettingsStore {
         self.data_dir.join("asr-tuning-profile.json")
     }
 
-    pub fn encoder_path(&self) -> PathBuf {
-        self.model_dir().join("encoder.int8.onnx")
-    }
-
-    pub fn decoder_path(&self) -> PathBuf {
-        self.model_dir().join("decoder.int8.onnx")
-    }
-
-    pub fn joiner_path(&self) -> PathBuf {
-        self.model_dir().join("joiner.int8.onnx")
-    }
-
-    pub fn tokens_path(&self) -> PathBuf {
-        self.model_dir().join("tokens.txt")
-    }
-
     /// User-editable vocabulary list — one term or phrase per line,
     /// written naturally. Opened by the Settings UI's "Edit
-    /// Vocabulary…" button and translated into sherpa's hotwords
-    /// format by `crate::vocabulary`.
+    /// Vocabulary…" button and sent to the native worker.
     ///
     /// Lives directly in the data dir (not under `models/`) because
     /// it's user content, not a downloaded artefact — a user clearing
@@ -271,24 +246,11 @@ impl SettingsStore {
         self.data_dir.join("vocabulary.txt")
     }
 
-    /// Machine-generated sherpa hotwords file, derived from
-    /// [`Self::vocabulary_path`] at recogniser-load time. Regenerated
-    /// from scratch on every load, so it's safe to delete.
-    pub fn hotwords_path(&self) -> PathBuf {
-        self.data_dir.join("hotwords.generated.txt")
-    }
-
-    /// Silero VAD ONNX model — drives the press-once / auto-stop flow.
+    /// Pinned Silero Core ML bundle for endpointing.
     pub fn vad_path(&self) -> PathBuf {
-        self.data_dir.join("models").join("silero_vad.onnx")
-    }
-
-    pub fn model_present(&self) -> bool {
-        self.encoder_path().exists()
-            && self.decoder_path().exists()
-            && self.joiner_path().exists()
-            && self.tokens_path().exists()
-            && self.vad_path().exists()
+        self.data_dir
+            .join("models")
+            .join(crate::model_fetch::VAD_MODEL_FOLDER)
     }
 }
 
@@ -300,19 +262,6 @@ mod tests {
     //! breakage: renamed fields, removed defaults, or model-path layout
     //! drift that would silently invalidate an existing user's install.
     use super::*;
-    use std::path::PathBuf;
-
-    fn synthetic_store(data_dir: PathBuf) -> SettingsStore {
-        // Build a store without touching `dirs::data_dir()` so the test
-        // doesn't depend on a real `$HOME`. The path layout helpers
-        // (`encoder_path`, `vad_path`, …) read `data_dir` only.
-        SettingsStore {
-            settings_path: data_dir.join("settings.json"),
-            data_dir,
-            cache: Arc::new(Mutex::new(Settings::default())),
-        }
-    }
-
     #[test]
     fn an_existing_settings_file_keeps_the_engine_prime_on() {
         // The field was added after users already had a settings.json. Without
@@ -425,40 +374,6 @@ mod tests {
     }
 
     #[test]
-    fn model_paths_share_a_single_root() {
-        // The downloader (model_fetch.rs) writes the four ASR files into
-        // `model_dir()` and the VAD into `data_dir/models/`. If anyone
-        // renames the model subdirectory, every existing user has to
-        // re-download 640 MB. Pin the layout.
-        let store = synthetic_store(tempfile::tempdir().unwrap().keep());
-        let model_dir = store.model_dir();
-        assert!(model_dir.starts_with(store.data_dir()));
-        assert_eq!(
-            model_dir,
-            store
-                .data_dir()
-                .join("models")
-                .join("parakeet-tdt-0.6b-v3-int8"),
-        );
-        assert_eq!(store.encoder_path(), model_dir.join("encoder.int8.onnx"));
-        assert_eq!(store.decoder_path(), model_dir.join("decoder.int8.onnx"));
-        assert_eq!(store.joiner_path(), model_dir.join("joiner.int8.onnx"));
-        assert_eq!(store.tokens_path(), model_dir.join("tokens.txt"));
-        assert_eq!(
-            store.vad_path(),
-            store.data_dir().join("models").join("silero_vad.onnx"),
-        );
-        assert_eq!(
-            store.coreml_model_dir(),
-            store
-                .data_dir()
-                .join("models")
-                .join("coreml")
-                .join("parakeet-unified-en-0.6b")
-        );
-    }
-
-    #[test]
     fn bundle_namespace_is_stable() {
         // The on-disk path is derived from this constant. Changing it
         // strands every existing user's downloaded model + settings.
@@ -466,32 +381,16 @@ mod tests {
     }
 
     #[test]
-    fn download_set_matches_presence_check() {
-        // The downloader fetches `model_fetch::ASR_FILES` into
-        // `model_dir()`. Benchmark/evaluation binaries use the existence-only
-        // `model_present()` preflight, while app startup performs the stronger
-        // downloader integrity gate. If these lists drift, those entry points
-        // disagree about whether the fallback model is installed.
-        let store = synthetic_store(tempfile::tempdir().unwrap().keep());
-        let model_dir = store.model_dir();
-
-        let mut gated: Vec<PathBuf> = vec![
-            store.encoder_path(),
-            store.decoder_path(),
-            store.joiner_path(),
-            store.tokens_path(),
-        ];
-        gated.sort();
-
-        let mut fetched: Vec<PathBuf> = crate::model_fetch::ASR_FILES
-            .iter()
-            .map(|name| model_dir.join(name))
-            .collect();
-        fetched.sort();
-
+    fn model_paths_share_a_single_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SettingsStore::with_data_root(directory.path()).unwrap();
         assert_eq!(
-            gated, fetched,
-            "model_fetch::ASR_FILES and SettingsStore presence accessors have drifted"
+            store.coreml_model_dir(),
+            store
+                .data_dir()
+                .join("models")
+                .join("coreml")
+                .join("parakeet-unified-en-0.6b")
         );
     }
 }

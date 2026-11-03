@@ -68,13 +68,12 @@ short_description = "Voice-to-text dictation, fully local, Apple Silicon."
 long_description = """
 Press a global hotkey, speak, and Parakeet inserts the transcript at
 your cursor. Powered by Parakeet Unified EN 0.6B int8 running locally
-on the Apple Neural Engine via a resident native Core ML worker, with
-sherpa-onnx as the load-failure fallback. Recognition is fully local —
+on the Apple Neural Engine via a resident native Core ML worker. Recognition is fully local —
 no API keys or telemetry, and no network calls after the model download.
 An optional rewrite step sends the transcript to an OpenCode service
 already running on the Mac and pastes the local transcript if none answers.
 """
-osx_minimum_system_version = "11.0"
+osx_minimum_system_version = "14.0"
 # cargo-bundle's `osx_info_plist_exts` concatenates rather than merges, which
 # produces a malformed plist with two `<plist>` roots. Custom Info.plist
 # keys (NSMicrophoneUsageDescription, NSAppleEventsUsageDescription,
@@ -88,7 +87,7 @@ version = "0.1.0"
 copyright = "Copyright (c) 2026 Parakeet Dictation contributors"
 category = "Productivity"
 short_description = "Voice-to-text dictation, fully local, Apple Silicon."
-osx_minimum_system_version = "11.0"
+osx_minimum_system_version = "14.0"
 
 # Release profile tuned for shipping:
 # - fat LTO + single codegen unit gives the compiler full cross-crate
@@ -121,16 +120,6 @@ dirs = "5"
 # Audio capture
 cpal = "0.15"
 
-# Local Parakeet ASR via sherpa-onnx Rust bindings.
-#
-# Linkage = shared (dylib), not static. The upstream static onnxruntime
-# build for osx-arm64 is compiled WITHOUT the CoreML EP (sherpa-onnx
-# defines SHERPA_ONNX_DISABLE_COREML in its static-onnxruntime cmake path).
-# The shared-lib release uses Microsoft's official `libonnxruntime.dylib`,
-# which DOES export `_OrtSessionOptionsAppendExecutionProvider_CoreML`.
-# Verified by inspecting the released archive — see ADR-0012 + ADR-0015.
-sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"] }
-
 # HTTP for first-run model download from Hugging Face.
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
@@ -141,12 +130,9 @@ futures-util = "0.3"
 # tree through reqwest).
 url = "2"
 sha2 = { version = "0.10.9", default-features = false }
-# Unpacks the encoder-bucket archives (already in the tree through sherpa-onnx).
+# Unpacks the encoder-bucket archives.
 tar = { version = "0.4.46", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
-
-# Memory-map the model file for ds4-style page-touch warmup.
-memmap2 = "0.9"
 
 # Apple-specific: thread QoS, P-core scheduling.
 libc = "0.2"
@@ -229,3 +215,6 @@ objc2-foundation = { version = "0.3", features = [
 # Isolated per-test data dirs for SettingsStore tests, so parallel
 # `cargo test` runs don't race on a shared `/tmp/parakeet-test` path.
 tempfile = "3"
+
+[build-dependencies]
+cc = "1"

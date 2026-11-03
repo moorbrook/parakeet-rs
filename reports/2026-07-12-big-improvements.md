@@ -1,3 +1,6 @@
+> Archived research snapshot. Runtime and dependency claims below apply to its date.
+> Current architecture and commands are in README.md and docs/ADR.md.
+
 # Parakeet Dictation — Big-Improvement Review (2026-07-12)
 
 > Historical point-in-time review. Several recommendations were implemented or superseded after publication. See the project [README](../README.md) and [ADR](../docs/ADR.md) for current behavior and decisions.

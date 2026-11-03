@@ -204,12 +204,12 @@ pub fn start_with_strategy_on_device(
         // Silero is a small RNN; two single-threaded states cost far less than
         // the ASR pass they allow us to hide behind endpoint confirmation.
         Some(VadSet {
-            confirming: Vad::load_confirming(vad_model, 1, confirmation_ms)
+            confirming: Vad::load_confirming(vad_model, confirmation_ms)
                 .context("loading confirming Silero VAD")?,
             // Also run the early detector in serial benchmark mode so old and
             // new measurements share the exact same acoustic-end anchor. Only
             // the speculative production path acts on its candidate early.
-            candidate: Vad::load_candidate(vad_model, 1).context("loading candidate Silero VAD")?,
+            candidate: Vad::load_candidate(vad_model).context("loading candidate Silero VAD")?,
         })
     } else {
         None
@@ -290,7 +290,7 @@ pub fn decode_hold_windowed(
     if !asr.reports_token_spans() {
         bail!("this recognizer reports no word boundaries, so windows cannot be joined");
     }
-    let vad = Vad::load_candidate(vad_model, 1).context("loading Silero for windowed decode")?;
+    let mut vad = Vad::load_candidate(vad_model).context("loading Silero for windowed decode")?;
     let mut planner = WindowPlanner::new(config, u64::from(WINDOW_SAMPLES));
     let mut merged: Vec<Word> = Vec::new();
 
@@ -298,8 +298,7 @@ pub fn decode_hold_windowed(
     for index in 0..frames {
         let frame =
             &samples[index * WINDOW_SAMPLES as usize..(index + 1) * WINDOW_SAMPLES as usize];
-        vad.accept_waveform(frame);
-        vad.drain_segments();
+        vad.accept_waveform(frame)?;
         let Some(cut) = planner.observe_frame(vad.detected()) else {
             continue;
         };
@@ -344,7 +343,7 @@ fn build_hold_windowing(
         log::warn!("hold windowing off: {reason}");
         return None;
     }
-    let vad = match Vad::load_candidate(vad_model, 1) {
+    let vad = match Vad::load_candidate(vad_model) {
         Ok(vad) => vad,
         Err(error) => {
             log::warn!("hold windowing off: loading Silero failed: {error:#}");
@@ -368,7 +367,7 @@ fn build_hold_windowing(
 fn run_vad(run: VadRun) -> Outcome {
     let VadRun {
         capture,
-        vad,
+        mut vad,
         asr,
         endpoint_strategy,
         confirmation_ms,
@@ -425,13 +424,15 @@ fn run_vad(run: VadRun) -> Outcome {
         while window_buf.len() >= WINDOW_SAMPLES as usize {
             window.clear();
             window.extend(window_buf.drain(..WINDOW_SAMPLES as usize));
-            vad.confirming.accept_waveform(&window);
-            vad.confirming.drain_segments();
+            if let Err(error) = vad.confirming.accept_waveform(&window) {
+                return Outcome::Error(error.context("Core ML VAD inference failed"));
+            }
             processed_vad_samples = processed_vad_samples.saturating_add(u64::from(WINDOW_SAMPLES));
 
             let detected_now = vad.confirming.detected();
-            vad.candidate.accept_waveform(&window);
-            vad.candidate.drain_segments();
+            if let Err(error) = vad.candidate.accept_waveform(&window) {
+                return Outcome::Error(error.context("Core ML VAD inference failed"));
+            }
             let candidate_detected = vad.candidate.detected();
             if detected_now && !saw_speech {
                 saw_speech = true;
@@ -692,14 +693,17 @@ fn run_manual(
             }
         };
         while let Some(samples) = chunk {
+            let mut vad_failure = None;
             if let Some(state) = &mut windowing {
                 window_buf.extend_from_slice(&samples);
                 cut_audio.extend_from_slice(&samples);
                 while window_buf.len() >= WINDOW_SAMPLES as usize {
                     frame.clear();
                     frame.extend(window_buf.drain(..WINDOW_SAMPLES as usize));
-                    state.vad.accept_waveform(&frame);
-                    state.vad.drain_segments();
+                    if let Err(error) = state.vad.accept_waveform(&frame) {
+                        vad_failure = Some(error);
+                        break;
+                    }
                     let Some(cut) = state.planner.observe_frame(state.vad.detected()) else {
                         continue;
                     };
@@ -729,6 +733,16 @@ fn run_manual(
                     cut_audio.drain(..keep.min(cut_audio.len()));
                     cut_audio_start = cut.next_start;
                 }
+            }
+            if let Some(error) = vad_failure {
+                log::warn!(
+                    "hold windowing off: VAD inference failed: {error:#}; decoding the recording in one pass"
+                );
+                if let Some(disabled) = windowing.take() {
+                    let _ = disabled.decoder.finish();
+                }
+                window_buf.clear();
+                cut_audio.clear();
             }
             chunk = tap_rx.try_recv().ok();
         }
@@ -773,7 +787,9 @@ fn finish_manual(
     timer.mark_capture_end(audio_s);
 
     let Some(HoldWindowing {
-        planner, decoder, ..
+        mut vad,
+        planner,
+        decoder,
     }) = windowing
     else {
         return Outcome::Speech {
@@ -783,6 +799,9 @@ fn finish_manual(
             timer,
         };
     };
+
+    // Reap after ASR instead of blocking release-to-text on process exit.
+    vad.request_shutdown();
 
     // The planner counts on the VAD's 16 kHz timeline. Since ADR-0030 capture
     // delivers exactly that, but check rather than slice on an assumption.

@@ -4,20 +4,9 @@
 
 Do not train, distill, or quantization-aware-train a new model from the current
 evidence. Keep the generic int8 Parakeet Unified Core ML model as the shipping
-default. Do not change the global sherpa `hotword_score` from 2.0.
-
-The smallest measured intervention was already in the product: sherpa
-contextual vocabulary. A 27-point exploratory score sweep followed by six
-ten-repeat measurements found no score that improves a repeated vocabulary
-class without worsening another category or CER. Because the existing corpus
-contains only seven fixtures and the remaining errors are heterogeneous,
-neural training would be fitting anecdotes rather than a demonstrated error
-distribution.
-
-The next intervention, if new data shows the same class repeatedly, should be
-a constrained vocabulary/lexical-rescoring layer on the native Core ML path.
-It is smaller, removable, and easier to gate than an adapter. Learned weights
-come only after that route fails on a newly separated development set.
+default. Contextual vocabulary runs inside the native worker with score 2.0.
+Before changing that score, run the gold corpus with and without vocabulary.
+The small diagnostic corpus does not justify training or a global score change.
 
 ## What the generic model gets wrong
 
@@ -34,50 +23,6 @@ lexical failures are:
 The noisy `Amy` fixture and both general-speech fixtures are lexically exact on
 the shipping backend. That matters: an intervention cannot trade those wins
 away to repair a name.
-
-## Contextual-vocabulary sweep
-
-All rows use the int8 sherpa fallback, which at the time owned the only
-implementation of contextual decoding. ADR-0033 later moved biasing onto the
-native Core ML path, so these rows are the sherpa reference rather than the
-shipping configuration; their conclusion about a global score change stands,
-and the per-token scores do not transfer, because sherpa tokenized each term
-per character and the native path uses the model's own BPE pieces. Each checked row is a release build, one
-warmup, and ten corpus repetitions, run serially on an M5 Pro. All produced one
-unique transcript per fixture. The complete per-category rows and provenance
-are in `bench/domain-adaptation/raw/`.
-
-| decoder | WER | CER | custom-vocabulary WER / CER | p50 / p95 | p50 cost vs greedy | result |
-|---|---:|---:|---:|---:|---:|---|
-| greedy | 10.87% | 5.46% | 54.55% / 12.50% | 2.843 / 2.923 s | — | fallback baseline; fails shipping gate |
-| modified beam, score 0 | 10.87% | 5.46% | 54.55% / 12.50% | 3.219 / 3.249 s | +13.2% | search cost with no lexical effect |
-| modified beam, score 2 | 10.87% | 5.46% | 54.55% / 12.50% | 3.237 / 3.287 s | +13.9% | current default; no lexical effect |
-| modified beam, score 2.75 | 8.70% | 6.09% | 27.27% / 12.50% | 3.245 / 3.314 s | +14.2% | first effect; WER improves, CER/categories regress |
-| modified beam, score 4.5 | 11.96% | 8.40% | 36.36% / 23.21% | 3.261 / 3.309 s | +14.7% | first `Olly`; also injects `IBM` elsewhere |
-| modified beam, score 6 | 42.39% | 33.82% | 45.45% / 28.57% | 3.324 / 3.387 s | +16.9% | broad vocabulary injection |
-
-The first-effect score changes `It's I B M up today` to `IBM up today`, but
-also changes the noisy phrase ending `with Amy` to `with 80`. Its per-category
-delta against greedy makes the trade explicit; negative is better:
-
-| category | Δ WER points | Δ CER points | gate |
-|---|---:|---:|---|
-| commands | -4.88 | +1.50 | fail |
-| custom vocabulary | -27.27 | 0.00 | WER win only |
-| general | 0.00 | 0.00 | tie |
-| long | 0.00 | 0.00 | tie |
-| noisy | +9.09 | +5.56 | fail |
-| numbers | +3.33 | +2.08 | fail |
-| proper nouns | -2.38 | +0.68 | fail |
-| punctuation-tagged corpus | -2.17 | +0.63 | fail |
-
-The exploratory sweep covered scores 0, 0.5, 1, 2, every 0.25 from 2.25
-through 5.75, then 6, 8, 10, 12, 15, 20, 30, and 50. Scores through 2.5 were
-identical to greedy. Scores 2.75–4.25 shared the same `IBM` win/`Amy` loss.
-Scores 8–50 measured 96.74–119.57% WER. There is no missing safe interval
-among the sampled points; the two transition regions are bracketed to 0.25,
-which is sufficient to reject a global change on this already-tuned diagnostic
-set, not to claim every real-valued score has been exhaustively evaluated.
 
 ## Locked gate before any new collection
 
@@ -141,14 +86,7 @@ a speaker's vocabulary is an M5-specific weight.
 
 ## Reproduction
 
-The compact summary, raw reports, source/input digests, and verifier live in
-`bench/domain-adaptation/`:
-
-```bash
-uv run scripts/verify-domain-adaptation-evidence.py
-```
-
-`asr_diff` report schema v3 makes each result self-describing: decoder method,
-whether contextual vocabulary was requested and active, score, term count,
-source vocabulary SHA-256, and generated hotword SHA-256 are embedded with the
-existing model, hardware, quality, latency, and memory metadata.
+`COREML_WORKER=target/release/parakeet-coreml-worker scripts/bench-gold.sh`
+records the native baseline and vocabulary rows. Reports include decoder
+method, requested and accepted vocabulary counts, score, source digest, model
+identity, hardware, quality, latency, and memory.

@@ -5,15 +5,7 @@
 #   2. Merge our Info.plist keys          — LSUIElement, mic + apple-events
 #                                           usage strings (cargo-bundle
 #                                           can't merge plists cleanly)
-#   3. Bundle dylibs                      — sherpa-onnx + onnxruntime into
-#                                           Contents/Frameworks/
-#   4. Rewrite rpath                      — point at @executable_path/../
-#                                           Frameworks instead of the
-#                                           dev-machine @loader_path
-#   5. Code-sign                          — self-signed "Parakeet Local Dev"
-#                                           identity when present (stable TCC
-#                                           identity across rebuilds), else
-#                                           ad-hoc `-` with a loud warning
+#   3. Copy the native worker and notices
 #
 # Output: target/release/bundle/osx/Parakeet.app — drop into /Applications.
 #
@@ -66,18 +58,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP="$ROOT/target/release/bundle/osx/Parakeet.app"
 BIN_SRC="$ROOT/target/release/parakeet-rs"
 WORKER_SRC="$ROOT/target/release/parakeet-coreml-worker"
-# sherpa-onnx-sys copies its dylibs into the cargo build directory's profile
-# folder, which is not target/ when a cargo `build-dir` is configured. Ask
-# cargo where it is (equal to target/ when no build-dir is set).
-BUILD_DIR="$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps \
-  | sed -n 's/.*"build_directory":"\([^"]*\)".*/\1/p')"
-DYLIB_SRC="${BUILD_DIR:-$ROOT/target}/release"
-
 # --- 0. arm64-only architecture gate -------------------------------------
-# Parakeet Dictation is Apple Silicon only (ADR-0002). sherpa-onnx and the
-# onnxruntime dylibs we bundle are arm64-only — silently producing a
-# fat / Intel binary would yield a .app that crashes on launch. Pin the
-# expected arch here so a wrong CI matrix entry fails loudly instead.
 if [ -f "$BIN_SRC" ]; then
   if ! lipo -archs "$BIN_SRC" | grep -qx arm64; then
     echo "ERROR: $BIN_SRC is not arm64-only (got: $(lipo -archs "$BIN_SRC"))" >&2
@@ -136,55 +117,15 @@ add_key LSApplicationCategoryType string "public.app-category.productivity"
 # Required for notarization + nice-to-have for the Get Info pane.
 add_key NSHumanReadableCopyright string "Copyright © 2026 Parakeet Dictation contributors"
 
-# --- 3. bundle dylibs ----------------------------------------------------
-# sherpa-onnx-sys copied them to the build directory's release/ folder during
-# the cargo build.
-# Put them in Contents/Frameworks/ where macOS expects bundled libraries.
-
-echo "3. copy worker, notices, and dylibs"
-mkdir -p "$APP/Contents/Frameworks"
+# Copy only the two executable products and license resources. Rebuilding an
+# existing bundle must not keep libraries from an earlier runtime.
+echo "3. copy worker and notices"
+rm -rf "$APP/Contents/Frameworks"
 cp -f "$WORKER_SRC" "$APP/Contents/MacOS/parakeet-coreml-worker"
 mkdir -p "$APP/Contents/Resources/Licenses"
 cp -f "$ROOT/LICENSE-APACHE" "$APP/Contents/Resources/Licenses/LICENSE-APACHE"
 cp -f "$ROOT/THIRD_PARTY_NOTICES.md" "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
-for lib in libsherpa-onnx-c-api.dylib libsherpa-onnx-cxx-api.dylib \
-           libonnxruntime.dylib libonnxruntime.1.24.4.dylib; do
-  if [ -f "$DYLIB_SRC/$lib" ]; then
-    cp -f "$DYLIB_SRC/$lib" "$APP/Contents/Frameworks/$lib"
-  else
-    # Without these the bundle aborts at launch in dyld.
-    echo "  error: missing $DYLIB_SRC/$lib" >&2
-    exit 1
-  fi
-done
-
-# --- 4. fix the binary's rpath -------------------------------------------
-# The binary was linked with `-Wl,-rpath,@loader_path` (which in a .app
-# resolves to Contents/MacOS/, no dylibs there) and a dev-machine absolute
-# path to target/sherpa-onnx-prebuilt/.../lib (also gone in the bundle).
-# Add an rpath that resolves correctly inside the .app, drop the stale ones.
-
-echo "4. rewrite rpath"
 EXE="$APP/Contents/MacOS/parakeet-rs"
-# Drop any existing rpaths that won't resolve inside the .app.
-for old in $(otool -l "$EXE" | awk '/cmd LC_RPATH/{getline;getline;print $2}'); do
-  install_name_tool -delete_rpath "$old" "$EXE" 2>/dev/null || true
-done
-install_name_tool -add_rpath '@executable_path/../Frameworks' "$EXE"
-
-# Verify the rpath actually took. `install_name_tool -add_rpath` can
-# silently no-op if the binary's signature blocks it (e.g. some macOS
-# versions reject load-command edits on previously-signed binaries);
-# without an rpath the .app aborts at launch with
-# "Library not loaded: @rpath/libsherpa-onnx-c-api.dylib ... no
-# LC_RPATH's found", which we'd otherwise only learn about from a
-# user crash report.
-if ! otool -l "$EXE" | awk '/cmd LC_RPATH/{getline;getline;print $2}' \
-     | grep -qx '@executable_path/../Frameworks'; then
-  echo "ERROR: install_name_tool -add_rpath silently failed on $EXE" >&2
-  echo "       Bundle would abort at launch with 'no LC_RPATH found'." >&2
-  exit 1
-fi
 
 # --- 5. ad-hoc code-sign -------------------------------------------------
 # Gatekeeper on macOS 14+ rejects unsigned binaries by default. We sign
@@ -262,9 +203,6 @@ sign_one() {
 }
 
 # Leaves first: every dylib in Contents/Frameworks/.
-for lib in "$APP"/Contents/Frameworks/*.dylib; do
-  [ -f "$lib" ] && sign_one "$lib"
-done
 # Then the main executable.
 sign_one "$APP/Contents/MacOS/parakeet-coreml-worker"
 sign_one "$APP/Contents/MacOS/parakeet-rs"

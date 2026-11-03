@@ -38,27 +38,36 @@ set is stored in this repository or bundled in the application.
 
 Notice: Licensed by NVIDIA Corporation under the NVIDIA Open Model License.
 
-## Parakeet TDT 0.6B v3 int8 fallback model
+## Parakeet TDT 0.6B v3 Core ML evaluation model
 
-The fallback and contextual-vocabulary backend downloads the sherpa-onnx ONNX
-conversion of NVIDIA Parakeet TDT 0.6B v3. The weights are not stored in this
-repository or bundled in the application.
+The developer-only TDT v3 evaluation path accepts an explicitly installed
+Core ML bundle. App startup does not download it.
 
-- Model (exact revision): <https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/tree/2bda32ec70b097a55adaa07d9a7173915b43cc78>
-- Original model: NVIDIA Parakeet TDT 0.6B v3
-- Conversion: sherpa-onnx contributors
+- Original model: <https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3>
+- Core ML conversion: <https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml>
 - Model license: Creative Commons Attribution 4.0 International
   (<https://creativecommons.org/licenses/by/4.0/>)
 
-## Silero VAD
+## Silero Core ML VAD
 
-Parakeet downloads the Silero voice-activity detector distributed with the
-sherpa-onnx ASR model releases. The exact downloaded bytes are pinned in
-`src/model_fetch.rs` by length and SHA-256.
+Parakeet downloads FluidInference's Silero v6.0.0 32 ms Core ML bundle at
+revision `b419383c55c110e2c9271fa6ee0ea83d03c70d96`. Every file's length and
+SHA-256 are pinned in `src/model_fetch.rs`.
 
-- Upstream project: <https://github.com/snakers4/silero-vad>
-- Distributed artifact: <https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models>
+- Upstream: <https://github.com/snakers4/silero-vad>
+- Conversion: <https://huggingface.co/FluidInference/silero-vad-coreml/tree/b419383c55c110e2c9271fa6ee0ea83d03c70d96/silero-vad-unified-v6.0.0.mlmodelc>
 - License: MIT
+
+## Kaldi linear resampler
+
+`native/resample/resample.{cc,h}` contains the Kaldi windowed-sinc resampler,
+adapted from the k2-fsa/sherpa-onnx v1.13.2 distribution. Parakeet owns its
+streaming state and static linkage. Source copyright notices are retained.
+The ordered dot product preserves the distributed kernel's floating-point
+rounding.
+
+- Source: <https://github.com/k2-fsa/sherpa-onnx/blob/v1.13.2/sherpa-onnx/csrc/resample.cc>
+- License: Apache License 2.0; see `LICENSE-APACHE`
 
 ## Hex OpenCode client
 

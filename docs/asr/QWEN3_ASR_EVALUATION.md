@@ -3,7 +3,7 @@
 ## Decision
 
 **No-go for the production backend.** Keep native Core ML Parakeet Unified as
-the default and sherpa-onnx as the load-failure fallback.
+the production backend.
 Qwen3-ASR q8 is an interesting offline multilingual model, but it does not
 clear this app's streaming-quality, latency, memory, packaging, or native-build
 gates on the target Mac. No Qwen or Python dependency enters Parakeet.app.
@@ -236,7 +236,7 @@ source/conversion attribution. The recorded composite artifact digest already
 pins every file used by this evaluation.
 
 If reconsidered, the only acceptable integration is a dedicated native worker
-behind the existing ASR backend seam, with sherpa fallback, immutable
+behind the existing ASR backend seam, with explicit load errors, immutable
 first-use download, atomic activation, offline startup after installation, and
 no Python. It must pass the current transcript/category, signed-package,
 user-perceived latency, memory, and fallback gates before it can become a

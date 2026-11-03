@@ -131,8 +131,7 @@ pub struct CoreMlWorkerConfig {
     /// is the default and costs the decode loop one nil check per window.
     pub vocabulary: Vec<String>,
     /// Per-token log-probability boost applied to the biased tokens. Read only
-    /// when `vocabulary` is non-empty; sherpa's `hotwords_score` is the
-    /// reference for what the number means.
+    /// when `vocabulary` is non-empty.
     pub vocabulary_score: f32,
     /// Which short-window encoder buckets the worker loads. `None` lets it
     /// discover bundles by filename, which benches pointed at a hand-built
@@ -353,7 +352,7 @@ impl CoreMlWorkerConfig {
         Ok(())
     }
 
-    /// Discover the bundled worker and the standard FluidAudio model cache.
+    /// Discover the bundled worker and the app's verified model cache.
     ///
     /// Environment overrides keep benchmarks and development builds explicit;
     /// a bundled app finds the worker beside its own executable.
@@ -380,8 +379,9 @@ impl CoreMlWorkerConfig {
                 Some(path) => PathBuf::from(path),
                 None => dirs::data_dir()
                     .ok_or_else(|| anyhow!("macOS application-support directory is unavailable"))?
-                    .join("FluidAudio")
-                    .join("Models")
+                    .join(crate::settings::BUNDLE_NAMESPACE)
+                    .join("models")
+                    .join("coreml")
                     .join(model_variant.folder_name()),
             };
         let mut config = Self::new(worker_path, model_directory);
@@ -409,7 +409,8 @@ fn discover_worker_path() -> Result<PathBuf> {
 
 /// Start a worker and return it behind the stable app-facing ASR facade.
 pub fn load_coreml_worker(config: &CoreMlWorkerConfig) -> Result<(Asr, f64)> {
-    let backend = CoreMlWorkerBackend::spawn(config)?;
+    let backend = CoreMlWorkerBackend::spawn(config)
+        .map_err(|error| anyhow!("Core ML recognizer could not load: {error:#}"))?;
     let load_seconds = backend.load_seconds;
     Ok((Asr::from_backend(Arc::new(backend)), load_seconds))
 }
@@ -678,7 +679,7 @@ impl AsrBackend for CoreMlWorkerBackend {
     }
 }
 
-struct WorkerProcess {
+pub(crate) struct WorkerProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
@@ -686,7 +687,7 @@ struct WorkerProcess {
 }
 
 impl WorkerProcess {
-    fn new(child: Child, stdin: ChildStdin, stdout: ChildStdout) -> Result<Self> {
+    pub(crate) fn new(child: Child, stdin: ChildStdin, stdout: ChildStdout) -> Result<Self> {
         let process = Self {
             child,
             stdin,
@@ -698,7 +699,7 @@ impl WorkerProcess {
         Ok(process)
     }
 
-    fn transaction<T>(
+    pub(crate) fn transaction<T>(
         &mut self,
         timeout: Duration,
         operation: impl FnOnce(&mut Self, Instant) -> Result<T>,
@@ -717,6 +718,27 @@ impl WorkerProcess {
     fn terminate(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    pub(crate) fn request_shutdown(&mut self) {
+        let _ = self.child.kill();
+    }
+
+    pub(crate) fn read_ready(&mut self, deadline: Instant) -> Result<()> {
+        self.read_response(deadline)?.require_success("ready")
+    }
+
+    pub(crate) fn vad_probability(&mut self, samples: &[f32], deadline: Instant) -> Result<f32> {
+        self.write_request(samples, 16_000, samples.len() as u32, deadline)?;
+        let response = self.read_response(deadline)?;
+        response.require_success("vad")?;
+        let probability = response
+            .probability
+            .ok_or_else(|| anyhow!("Core ML VAD omitted its probability"))?;
+        if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+            bail!("Core ML VAD returned an invalid probability");
+        }
+        Ok(probability)
     }
 
     fn write_request(
@@ -899,6 +921,7 @@ struct WorkerResponse {
     /// `ready` and failure frames, and from any worker built before the Hold
     /// window merge needed them.
     token_spans: Option<Vec<WireTokenSpan>>,
+    probability: Option<f32>,
 }
 
 /// Wire form of one emission. Separate from [`TokenSpan`] so the worker's
@@ -1004,6 +1027,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn worker_load_failure_explains_that_coreml_is_required() {
+        let directory = tempfile::tempdir().unwrap();
+        let config =
+            CoreMlWorkerConfig::new(directory.path().join("missing-worker"), directory.path());
+        let error = match load_coreml_worker(&config) {
+            Ok(_) => panic!("a missing worker must fail setup"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.starts_with("Core ML recognizer could not load:"),
+            "{error}"
+        );
+        assert!(error.contains("missing-worker"), "{error}");
+    }
+
+    #[test]
     fn request_header_is_versioned_little_endian() {
         let header = encode_header(48_000, 240_000);
         assert_eq!(&header[..4], b"PRKT");
@@ -1038,7 +1077,7 @@ mod tests {
     #[test]
     fn vocabulary_request_sends_the_terms_verbatim() {
         // The worker tokenizes them against the model bundle, so anything this
-        // side does to a term (case folding, the sherpa word-start marker)
+        // side does to a term (case folding, the word-start marker)
         // would bias a word the user did not write.
         let terms = vec!["IBM".to_string(), "New York".to_string()];
         let payload = serde_json::to_string(&VocabularyRequest {
@@ -1051,7 +1090,7 @@ mod tests {
 
     #[test]
     fn vocabulary_response_reports_accepted_and_rejected_terms() {
-        // Rejected terms are the diagnostic the sherpa path gets from its own
+        // Rejected terms must be reported by the native worker.
         // token validation. Losing them means a user's word silently boosts
         // nothing with nothing anywhere to explain it.
         let payload = br#"{
@@ -1126,6 +1165,7 @@ mod tests {
             vocabulary_rejected: None,
             vocabulary_encoded: None,
             token_spans: None,
+            probability: None,
         };
         let error = response
             .require_success("result")

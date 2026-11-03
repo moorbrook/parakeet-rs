@@ -14,11 +14,10 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
-use parakeet_dictation::asr::{Asr, AsrConfig};
+use parakeet_dictation::asr::Asr;
 use parakeet_dictation::asr_eval::normalize_lexical;
 use parakeet_dictation::coreml_worker::{load_coreml_worker, CoreMlWorkerConfig};
 use parakeet_dictation::endpointing::EndpointPolicy;
-use parakeet_dictation::performance;
 use parakeet_dictation::settings::SettingsStore;
 use parakeet_dictation::streamer::{self, EndpointStrategy, Mode, Outcome};
 use parakeet_dictation::warmup;
@@ -114,16 +113,14 @@ fn parse_mode(value: &str) -> anyhow::Result<BenchMode> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Backend {
-    Sherpa,
     CoreMlUnified,
 }
 
 impl Backend {
     fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
-            "sherpa" => Ok(Self::Sherpa),
             "coreml-unified" => Ok(Self::CoreMlUnified),
-            _ => bail!("unknown backend {value:?}; expected sherpa or coreml-unified"),
+            _ => bail!("unknown backend {value:?}; expected coreml-unified"),
         }
     }
 }
@@ -169,7 +166,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut wav = None;
     let mut reps = DEFAULT_REPS;
     let mut warmup_reps = DEFAULT_WARMUP_REPS;
-    let mut backend = Backend::Sherpa;
+    let mut backend = Backend::CoreMlUnified;
     let mut strategy = EndpointStrategy::Serial;
     let mut endpoint_policy = EndpointPolicy::LongForm;
     let mut hold_windows = HoldWindowConfig::default();
@@ -311,7 +308,7 @@ fn parse_args() -> anyhow::Result<Args> {
 fn print_usage() {
     eprintln!(
         "usage: bench_e2e --wav PATH [--reps N] [--warmup-reps N]\n\
-         \x20                [--backend sherpa|coreml-unified]\n\
+         \x20                [--backend coreml-unified]\n\
          \x20                [--strategy serial|speculative]\n\
          \x20                [--endpoint-policy fast|long-form]\n\
          \x20                [--confirmation-ms N]\n\
@@ -384,11 +381,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
         bail!("--arm cadence is only defined for --mode hold");
     }
     let store = SettingsStore::new()?;
-    let asr = Arc::new(load_backend(args, &store)?);
+    let asr = Arc::new(load_backend(args)?);
 
-    if args.backend == Backend::Sherpa {
-        warmup::page_touch(&store.encoder_path())?;
-    }
     warmup::dummy_decode(asr.as_ref())?;
 
     let (samples, sample_rate) = read_wav_mono(&args.wav)?;
@@ -455,25 +449,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_backend(args: &Args, store: &SettingsStore) -> anyhow::Result<Asr> {
+fn load_backend(args: &Args) -> anyhow::Result<Asr> {
     match args.backend {
-        Backend::Sherpa => {
-            if !store.model_present() {
-                bail!(
-                    "ASR model not present at {}",
-                    store.encoder_path().display()
-                );
-            }
-            Asr::load(&AsrConfig {
-                encoder: &store.encoder_path(),
-                decoder: &store.decoder_path(),
-                joiner: &store.joiner_path(),
-                tokens: &store.tokens_path(),
-                num_threads: performance::performance_core_count(),
-                hotwords: None,
-                hotwords_score: 0.0,
-            })
-        }
         Backend::CoreMlUnified => {
             let mut config = CoreMlWorkerConfig::discover()?;
             if let Some(worker) = &args.worker {

@@ -26,15 +26,8 @@ The optimized row uses FluidAudio commit
 | backend | decoding | WER | CER | load | first result | decode p50 | decode p95 | p50 RTFx | peak RSS | gate |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | FluidAudio Core ML | greedy, int8 CPU+ANE | **5.43%** | **3.57%** | **0.168 s** | **0.321 s** | **0.452 s** | **0.470 s** | **75.4×** | **0.10 GiB** | pass |
-| sherpa-onnx | greedy, int8, Core ML requested | 10.87% | 5.46% | 3.647 s | 4.582 s | 2.764 s | 2.949 s | 12.3× | 4.25 GiB | fail |
-| sherpa-onnx | vocabulary, modified beam, score 2 | 10.87% | 5.46% | 3.717 s | 4.716 s | 3.126 s | 3.148 s | 10.9× | 4.26 GiB | fail |
 
-Core ML is 6.12× faster at corpus-decode p50 and 6.28× at p95 than the unbiased
-sherpa baseline. It reduces model load by 21.8×, first result by 14.3×, and
-observed peak RSS by about 41.5×. The vocabulary row did not change any gold
-transcript and was 13.1% slower than sherpa greedy at p50.
-
-All three configurations produced one unique transcript per fixture across ten
+The native configuration produced one unique transcript per fixture across ten
 runs: WER spread 0.00 points, CER spread 0.00 points, and zero changed outputs.
 That measured floor sets both regression tolerances to 0.00 points. The checked
 baseline is 5/92 word edits (5.4347826%) and 17/476 character edits (3.5714286%);
@@ -43,28 +36,12 @@ any increase fails even while the independent absolute product limits remain
 95% character accuracy on this corpus and permit at most seven word edits and
 23 character edits.
 
-## Domain-adaptation decision — 2026-08-11
+## Domain adaptation
 
-A 27-point `hotword_score` exploration was narrowed to six authoritative
-ten-repeat rows. The first transcript effect appears at score 2.75: overall WER
-falls from 10.87% to 8.70% and custom-vocabulary WER from 54.55% to 27.27%, but
-CER rises from 5.46% to 6.09%, noisy WER doubles from 9.09% to 18.18%, numbers
-WER rises from 13.33% to 16.67%, and corpus p50 is 14.2% slower than greedy.
-At score 4.5 the decoder begins producing `Olly` while injecting `IBM` into an
-unrelated noisy command; score 6 reaches 42.39% WER.
-
-No score clears the frozen shipping Core ML overall or per-category baseline,
-and all six repeated rows are deterministic. Training, distillation, QAT, and
-a global score change are therefore rejected on current evidence. The generic
-Core ML model remains default. See [`DOMAIN_ADAPTATION.md`](DOMAIN_ADAPTATION.md)
-for every category delta, data-separation rules, adapter ownership, and reopen
-gates; machine-verifiable evidence is under `bench/domain-adaptation/`.
-
-Replay:
-
-```bash
-REPETITIONS=10 scripts/bench-gold.sh
-```
+The native context trie applies vocabulary boosts before greedy selection.
+Run the vocabulary row in `scripts/bench-gold.sh` and retain per-category
+quality limits when changing its score or tokenization. See
+[DOMAIN_ADAPTATION.md](DOMAIN_ADAPTATION.md).
 
 ## Core ML worker boundary — 2026-08-11
 

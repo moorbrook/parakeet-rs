@@ -15,16 +15,14 @@ The Cargo package and Rust library crate are `parakeet-dictation` and
 `parakeet-rs` executable target is retained for bundle and permission stability.
 
 - **ASR**: Parakeet Unified EN 0.6B int8 via a resident native Core ML worker
-  (sherpa-onnx fallback and contextual-vocabulary backend)
+  with native contextual vocabulary
 - **Rewrite (optional)**: the OpenCode service already running on the Mac
 - **Shell**: AppKit Rust app + resident Swift helper (no Tauri / Electron)
 - **Text injection**: `CGEventKeyboardSetUnicodeString` keystroke
 
 ## Install from source
 
-No prebuilt releases — build it yourself. Apple Silicon Mac, macOS 11.0+.
-The optimized Parakeet Unified worker requires macOS 14+; macOS 11–13 use the
-bundled sherpa-onnx fallback.
+No prebuilt releases — build it yourself. Apple Silicon Mac, macOS 14+.
 
 1. **Install prerequisites** (skip what you already have):
    ```bash
@@ -63,7 +61,7 @@ rebuilds. Details in
    the app's signature), **Grant** opens System Settings → Privacy &
    Security → Input Monitoring and logs what happened instead of failing
    silently.
-2. The int8 Core ML model (~595 MB) and sherpa fallback/VAD bundle (~640 MB)
+2. The int8 Core ML model (~595 MB) and Silero Core ML VAD (~1 MB)
    download on first launch. They live under
    `~/Library/Application Support/com.parakeet.rs/models/`. All model downloads,
    including every file in the Core ML bundle, are pinned to immutable
@@ -123,26 +121,11 @@ jargon, and product names Parakeet mishears. Click Save in Settings
 afterwards — the recogniser rebuilds in the background (or as soon as
 the current dictation finishes).
 
-A non-empty vocabulary selects the sherpa contextual-biasing backend. An empty
-vocabulary uses the faster Parakeet Unified Core ML backend. This makes the
-backend change explicit instead of silently dropping custom terms.
-
-For diagnosis or emergency rollback, `PARAKEET_ASR_BACKEND=sherpa` forces the
-fallback without changing vocabulary. Unset it or use `auto` to restore normal
-selection.
-
-Terms are validated against the model's token inventory, so a word the model
-can't represent (emoji, unusual scripts) is reported in the log and skipped
-rather than silently doing nothing.
-
-An empty list costs nothing. A non-empty one switches the decoder from greedy
-to beam search, measured at **+13%** decode time
-([ADR-0020](docs/ADR.md#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list)).
-The boost strength is `hotword_score` in `settings.json`, default 2.0; the
-measured sweep saw the first unrelated-term injection at 4.5 and broad
-corruption at 6, so re-check with `asr_diff` if you raise it. No safe global
-increase was found; see
-[`docs/asr/DOMAIN_ADAPTATION.md`](docs/asr/DOMAIN_ADAPTATION.md).
+The native worker tokenizes terms with the model's piece inventory and boosts
+matching paths in its greedy decoder. It reports rejected terms in the log.
+An empty list adds no biasing. The boost is `hotword_score` in settings,
+default 2.0. Recheck the gold corpus before changing it. See
+[domain adaptation](docs/asr/DOMAIN_ADAPTATION.md).
 
 ### Apple Silicon runtime tuning
 
@@ -175,11 +158,9 @@ Runtime and diagnostic overrides are intentionally narrow:
 
 | Variable | Effect |
 |---|---|
-| `PARAKEET_ASR_BACKEND=sherpa` | Force the fallback recognizer. |
 | `PARAKEET_ASR_TUNING=off` | Ignore a valid per-chip tuning profile without deleting it. |
 | `PARAKEET_COREML_WORKER=/path/to/worker` | Use a specific native worker in development or benchmarks. |
 | `PARAKEET_COREML_MODEL_DIR=/path/to/model` | Use an existing Core ML model directory. |
-| `PARAKEET_REQUIRE_COREML=1` | Make the build fail when the sherpa ONNX Runtime library lacks its Core ML symbol. |
 | `PARAKEET_HUD_PREVIEW=1` | Open the Listening HUD without recording. |
 | `PARAKEET_PERMISSIONS_PREVIEW=startup\|dictation\|all` | Open a permission-dashboard scope using real permission state. |
 
@@ -191,10 +172,9 @@ Persistent settings, vocabulary, tuning evidence, and model paths are under
 
 - **Apple Silicon only.** No plans for a universal binary
   ([ADR-0002](docs/ADR.md#0002--macos-only)).
-- **Optimized ASR requires macOS 14+.** On macOS 11–13, or whenever the native
-  worker/model cannot load, Parakeet automatically uses sherpa-onnx. A custom
-  vocabulary stays on the fast path: the native worker biases toward it
-  directly ([ADR-0033](docs/ADR.md#0033--contextual-biasing-on-the-native-core-ml-path)).
+- **ASR requires macOS 14+.** Worker or model load failures produce a clear
+  setup error. Recognition uses the native Core ML worker for all vocabulary
+  settings.
 - **Text injection** works in terminals (Ghostty, iTerm2, Terminal.app),
   browsers, native Cocoa, Electron (Slack/VS Code/etc.), JetBrains,
   Xcode. Doesn't reach password fields or apps with aggressive input
@@ -202,8 +182,8 @@ Persistent settings, vocabulary, tuning evidence, and model paths are under
   the clipboard and the menu bar says so. `CGEventPost` gives no
   delivery receipt, so an app that accepts the keystroke and discards it
   still looks like success — see [`PRIVACY.md`](PRIVACY.md#clipboard).
-- **Build size**: ~7 MB Rust binary + ~15 MB native worker + ~50 MB bundled
-  dylibs (mostly onnxruntime). Model weights download separately.
+- **Bundle contents**: Rust executable, native worker, and notices. Model
+  weights download separately. No inference-runtime dylibs are bundled.
 
 ## Layout
 
@@ -220,8 +200,8 @@ endpoint authority; speculative recognition is discarded if speech resumes.
 - `src/paste.rs` — `TextSink` trait + one-shot delivery
 - `src/ax_paste.rs` — `CGEvent` keystroke implementation
 - `src/streamer.rs` — per-session VAD/manual capture
-- `src/vocabulary.rs` — `vocabulary.txt` → sherpa hotwords encoding
-- `src/coreml_worker.rs` — framed IPC backend + specialized-model fallback seam
+- `src/vocabulary.rs` — `vocabulary.txt` parsing for native contextual biasing
+- `src/coreml_worker.rs` — framed IPC, native model loading, and inference metrics
 - `native/ParakeetCoreMLWorker/` — pinned FluidAudio/Core ML deployment worker
 - `src/clipboard.rs` — rescue copy when keystroke delivery fails
 - `src/{audio,asr,vad,hud,hotkey,menubar,settings,settings_ui,…}.rs`
@@ -237,7 +217,7 @@ state, recovery behavior, and the clean/revoked QA matrix are in
 [`docs/macos-permissions.md`](docs/macos-permissions.md).
 
 Architectural rationale lives in [`docs/ADR.md`](docs/ADR.md) (decisions
-0001-0038). Reproducible latency and quality evidence lives in
+0001-0040). Reproducible latency and quality evidence lives in
 [`bench/README.md`](bench/README.md); the original, now-archived optimization
 plan is [`docs/latency-plan.md`](docs/latency-plan.md). The deferred
 Developer-ID/notarization shipping procedure is captured in
@@ -250,6 +230,15 @@ scripts/make-app.sh
 cargo run --release --locked --bin bench_asr -- --help
 cargo test --locked
 cargo clippy --locked --all-targets --no-deps
+```
+
+With the `BlackHole 2ch` loopback available, verify endpointing against recorded
+human speech. The Hold failure check uses the three-second fixture generated
+by `scripts/bench-latency.sh` and asserts every spoken word survives a VAD crash:
+
+```bash
+scripts/bench-endpoint-policy.sh
+scripts/check-vad-failure.sh
 ```
 
 Anything that could change what the recogniser *says* — model weights,
@@ -282,7 +271,6 @@ punctuation-only regression remains visible without inflating WER.
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE)
 at your option (Rust ecosystem convention).
 
-Runtime-downloaded models ship under their own licenses: Parakeet TDT
-0.6B v3 (CC-BY-4.0), Parakeet Unified EN 0.6B Core ML and its 2/5/8 s
+Runtime-downloaded models ship under their own licenses: Parakeet Unified EN 0.6B Core ML and its 2/5/8 s
 encoder buckets (NVIDIA Open Model License), Silero VAD (MIT). See
 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

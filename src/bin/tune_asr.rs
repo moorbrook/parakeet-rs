@@ -307,7 +307,7 @@ fn tune_windows(
     vad_path: &Path,
     inputs: &[AudioInput],
 ) -> Result<WindowTuning> {
-    if !vad_path.is_file() {
+    if !vad_path.is_dir() {
         bail!(
             "Hold windowing needs the Silero model at {}; launch the app once to fetch it",
             vad_path.display()
@@ -861,7 +861,6 @@ fn tune_candidate(
                 hotword_score: None,
                 vocabulary_terms_requested: 0,
                 vocabulary_sha256: None,
-                generated_hotwords_sha256: None,
             },
             operating_system: format!("macOS {}", hardware.macos_version),
             architecture: hardware.architecture.clone(),

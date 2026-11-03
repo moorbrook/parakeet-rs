@@ -375,21 +375,51 @@ private struct EncodedTerm: Encodable {
 /// The `PRKV` control frame's JSON body.
 private struct VocabularyRequest: Decodable {
     let terms: [String]
-    /// Per-token log-probability boost; sherpa's `hotwords_score` is the
-    /// reference for what the number means.
+    /// Per-token log-probability boost.
     let score: Float
+}
+
+private struct VadResponse: Encodable {
+    let kind = "vad"
+    let ok = true
+    let probability: Float
 }
 
 @main
 private struct ParakeetCoreMLWorker {
     static func main() async {
         do {
-            let options = try WorkerOptions.parse(Array(CommandLine.arguments.dropFirst()))
+            let arguments = Array(CommandLine.arguments.dropFirst())
+            if arguments.count == 2, arguments[0] == "--vad-model" {
+                try await runVad(modelURL: URL(fileURLWithPath: arguments[1]))
+                return
+            }
+            let options = try WorkerOptions.parse(arguments)
             try await run(options: options)
         } catch {
-            try? writeResponse(.failure(kind: "fatal", error: error))
+            try? writeResponse(WorkerResponse.failure(kind: "fatal", error: error))
             FileHandle.standardError.write(Data("parakeet-coreml-worker: \(error)\n".utf8))
             Foundation.exit(1)
+        }
+    }
+
+    /// A dedicated process keeps endpoint inference independent of an ASR
+    /// decode in flight. Each session starts with zero recurrent state.
+    private static func runVad(modelURL: URL) async throws {
+        let loadStart = ContinuousClock.now
+        let vad = try CoreMlVad(modelURL: modelURL)
+        try writeResponse(WorkerResponse.ready(loadSeconds: seconds(since: loadStart)))
+        let input = FileHandle.standardInput
+        while let header = try readExactly(requestHeaderBytes, from: input) {
+            let request = try parseHeader(header)
+            guard request.sampleRate == 16_000, request.sampleCount == 512 else {
+                throw WorkerError.invalidArgument("VAD requires 512 samples at 16000 Hz")
+            }
+            guard let payload = try readExactly(512 * MemoryLayout<Float>.size, from: input) else {
+                throw WorkerError.truncatedRequest
+            }
+            let probability = try vad.probability(decodeSamples(payload, count: 512))
+            try writeResponse(VadResponse(probability: probability))
         }
     }
 
@@ -468,7 +498,7 @@ private struct ParakeetCoreMLWorker {
                         .utf8)
             )
         }
-        try writeResponse(.ready(loadSeconds: loadSeconds))
+        try writeResponse(WorkerResponse.ready(loadSeconds: loadSeconds))
 
         let input = FileHandle.standardInput
         let converter = AudioConverter()
@@ -491,9 +521,9 @@ private struct ParakeetCoreMLWorker {
                             "parakeet-coreml-worker: vocabulary \(entry.term) -> \(pieces)\n"
                         FileHandle.standardError.write(Data(line.utf8))
                     }
-                    try writeResponse(.vocabulary(report))
+                    try writeResponse(WorkerResponse.vocabulary(report))
                 } catch {
-                    try writeResponse(.failure(kind: "vocabulary", error: error))
+                    try writeResponse(WorkerResponse.failure(kind: "vocabulary", error: error))
                 }
                 continue
             }
@@ -541,7 +571,7 @@ private struct ParakeetCoreMLWorker {
                 stages?.resampleMs = resampleSeconds * 1_000
                 let decodeSeconds = seconds(since: decodeStart)
                 try writeResponse(
-                    .result(
+                    WorkerResponse.result(
                         text: text,
                         decodeSeconds: decodeSeconds,
                         resampleSeconds: resampleSeconds,
@@ -552,7 +582,7 @@ private struct ParakeetCoreMLWorker {
                     )
                 )
             } catch {
-                try writeResponse(.failure(kind: "result", error: error))
+                try writeResponse(WorkerResponse.failure(kind: "result", error: error))
             }
         }
     }
@@ -746,7 +776,7 @@ private func decodeSamples(_ data: Data, count: Int) -> [Float] {
     return samples
 }
 
-private func writeResponse(_ response: WorkerResponse) throws {
+private func writeResponse<Response: Encodable>(_ response: Response) throws {
     let encoder = JSONEncoder()
     encoder.keyEncodingStrategy = .convertToSnakeCase
     encoder.outputFormatting = [.sortedKeys]

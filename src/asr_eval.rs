@@ -144,7 +144,6 @@ pub struct DecodeMetadata {
     pub hotword_score: Option<f32>,
     pub vocabulary_terms_requested: usize,
     pub vocabulary_sha256: Option<String>,
-    pub generated_hotwords_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -721,7 +720,6 @@ mod tests {
                 hotword_score: None,
                 vocabulary_terms_requested: 0,
                 vocabulary_sha256: None,
-                generated_hotwords_sha256: None,
             },
             operating_system: "test".to_string(),
             architecture: "test".to_string(),

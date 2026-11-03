@@ -204,7 +204,12 @@ impl TuningProfile {
             bail!("tuning profile needs at least one measured repetition");
         }
         validate_candidate_inventory(&candidates)?;
-        let cache_key = profile_cache_key(&hardware, &artifact_digest, None)?;
+        let cache_key = profile_cache_key(
+            &hardware,
+            &artifact_digest,
+            None,
+            &crate::model_fetch::vad_artifact_digest(),
+        )?;
         let selection = select(&candidates)?;
         Ok(Self {
             schema_version: PROFILE_SCHEMA_VERSION,
@@ -231,7 +236,12 @@ impl TuningProfile {
         if tuning.selection != select_window(&tuning.evidence)? {
             bail!("window selection does not match its evidence");
         }
-        self.cache_key = profile_cache_key(&self.hardware, &self.artifact_digest, Some(&tuning))?;
+        self.cache_key = profile_cache_key(
+            &self.hardware,
+            &self.artifact_digest,
+            Some(&tuning),
+            &crate::model_fetch::vad_artifact_digest(),
+        )?;
         self.window_tuning = Some(tuning);
         Ok(())
     }
@@ -293,7 +303,12 @@ impl TuningProfile {
             bail!("tuning profile hardware or macOS fingerprint is stale");
         }
         if self.cache_key
-            != profile_cache_key(hardware, artifact_digest, self.window_tuning.as_ref())?
+            != profile_cache_key(
+                hardware,
+                artifact_digest,
+                self.window_tuning.as_ref(),
+                &crate::model_fetch::vad_artifact_digest(),
+            )?
         {
             bail!("tuning profile cache key does not match its contents");
         }
@@ -315,22 +330,29 @@ impl TuningProfile {
 }
 
 pub fn cache_key(hardware: &HardwareFingerprint, artifact_digest: &str) -> Result<String> {
-    profile_cache_key(hardware, artifact_digest, None)
+    profile_cache_key(
+        hardware,
+        artifact_digest,
+        None,
+        &crate::model_fetch::vad_artifact_digest(),
+    )
 }
 
 /// The key adds the window choice only when the profile makes one, and then
-/// only the chosen buckets' archive digests and the chosen Hold window. A
+/// the chosen buckets' archive digests, Hold window, and VAD manifest. A
 /// profile without window tuning keeps the key it was written with, and one
 /// that chose 5 s alone does not go stale when the 8 s bucket is re-released.
 fn profile_cache_key(
     hardware: &HardwareFingerprint,
     artifact_digest: &str,
     window_tuning: Option<&WindowTuning>,
+    vad_artifact_digest: &str,
 ) -> Result<String> {
     #[derive(Serialize)]
     struct WindowKey<'a> {
         encoder_buckets: Vec<(u32, Option<&'a str>)>,
         hold_window_seconds: f32,
+        vad_artifact_digest: &'a str,
     }
     #[derive(Serialize)]
     struct Key<'a> {
@@ -357,6 +379,7 @@ fn profile_cache_key(
             })
             .collect(),
         hold_window_seconds: tuning.selection.hold_window_seconds,
+        vad_artifact_digest,
     });
     let bytes = serde_json::to_vec(&Key {
         hardware,
@@ -1650,8 +1673,13 @@ pub(crate) mod tests {
             .find(|cost| cost.window_seconds == 5)
             .unwrap();
         five.archive_sha256 = Some(CHANGED_SHA.into());
-        stale.cache_key =
-            profile_cache_key(&stale.hardware, "artifact", stale.window_tuning.as_ref()).unwrap();
+        stale.cache_key = profile_cache_key(
+            &stale.hardware,
+            "artifact",
+            stale.window_tuning.as_ref(),
+            &crate::model_fetch::vad_artifact_digest(),
+        )
+        .unwrap();
         stale.validate_for(&hardware(), "artifact").unwrap();
         assert!(stale.window_selection_for(manifest).is_err());
         assert_eq!(
@@ -1668,6 +1696,55 @@ pub(crate) mod tests {
             .selection
             .hold_window_seconds = 5.0;
         assert!(edited.validate_for(&hardware(), "artifact").is_err());
+    }
+
+    #[test]
+    fn a_window_profile_gated_with_the_retired_vad_is_rejected() {
+        let mut profile = tuned_profile(hardware(), "artifact");
+        let mut evidence = window_evidence(600_000_000);
+        gate_everything(&mut evidence, |buckets, hold| {
+            if buckets == [5] && hold == 6.0 {
+                BASELINE_SHA
+            } else {
+                CHANGED_SHA
+            }
+        });
+        profile
+            .set_window_tuning(WindowTuning::new(evidence).unwrap())
+            .unwrap();
+        profile.validate_for(&hardware(), "artifact").unwrap();
+        // Captured from this configuration before VAD identity joined its key.
+        profile.cache_key =
+            "267e27609649b3b3a5d70ea8b2562990207afe880e2e4f50233e1771d7184076".into();
+        let error = profile.validate_for(&hardware(), "artifact").unwrap_err();
+        assert!(error.to_string().contains("cache key"), "{error}");
+    }
+
+    #[test]
+    fn vad_identity_invalidates_window_profiles_but_not_compute_only_profiles() {
+        let mut profile = tuned_profile(hardware(), "artifact");
+        let current_vad = crate::model_fetch::vad_artifact_digest();
+        let key = profile_cache_key(
+            &profile.hardware,
+            "artifact",
+            profile.window_tuning.as_ref(),
+            &current_vad,
+        )
+        .unwrap();
+        assert_eq!(profile.cache_key, key);
+        profile.validate_for(&hardware(), "artifact").unwrap();
+        profile.cache_key = profile_cache_key(
+            &profile.hardware,
+            "artifact",
+            profile.window_tuning.as_ref(),
+            "different-vad",
+        )
+        .unwrap();
+        assert!(profile.validate_for(&hardware(), "artifact").is_err());
+        assert_eq!(
+            profile_cache_key(&hardware(), "artifact", None, &current_vad).unwrap(),
+            profile_cache_key(&hardware(), "artifact", None, "different-vad").unwrap(),
+        );
     }
 
     #[test]

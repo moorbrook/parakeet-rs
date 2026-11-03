@@ -2,14 +2,8 @@ import Foundation
 
 /// Shallow-fusion contextual biasing over the native joint's output.
 ///
-/// The user's custom vocabulary used to force the whole app onto the
-/// sherpa-onnx fallback, because that backend owned the only contextual-biasing
-/// implementation (ADR-0020, ADR-0022). Sherpa's `modified_beam_search`
-/// hotword path builds an Aho-Corasick context graph over the hotwords'
-/// token ids and adds the graph's score delta to each hypothesis before the
-/// beam is pruned. This is the same graph, applied to the greedy loop's joint
-/// logits before the argmax, so the biased path keeps the int8 encoder on the
-/// Neural Engine.
+/// An Aho-Corasick context graph applies sparse score deltas before greedy
+/// selection, keeping the int8 encoder on the Neural Engine.
 ///
 /// ## What the numbers mean
 ///
@@ -40,15 +34,8 @@ import Foundation
 /// [`ContextGraph.delta(from:token:)`] returns the unshifted value, which is
 /// negative on a mismatch and is what the retraction tests assert on.
 ///
-/// ## Where it differs from sherpa
-///
-/// Sherpa keeps a completed entry's `nodeScore` at risk until `Finalize` and
-/// compensates with a separate `output_score` bonus. That is invisible in a
-/// beam, where the two cancel along every complete path, but a greedy decoder
-/// takes one step at a time: an uncompensated `+nodeScore` sitting on blank
-/// after a completed entry would suppress the word that follows it. Folding the
-/// banked part into `endScore` gives a state at a completed entry an `atRisk`
-/// of zero, so finishing an entry costs the next word nothing.
+/// Completed entries bank their earned score in `endScore`. Their boost is
+/// no longer at risk, so a later blank cannot suppress the following word.
 final class ContextGraph {
     /// One trie node. Children are owned; `fail` is a back edge into the same
     /// trie and must not retain.
@@ -86,8 +73,7 @@ final class ContextGraph {
 
     /// Build the graph over already-tokenized entries.
     ///
-    /// `score` is the per-token boost, the same knob as sherpa's
-    /// `hotwords_score`. It is uniform across entries: a per-entry score would
+    /// `score` is the per-token boost. It is uniform across entries; a per-entry score would
     /// need every descendant's `nodeScore` recomputed when a shared prefix's
     /// edge score rises, and nothing in the product sets one.
     init(entries: [[Int]], score: Float, blankIndex: Int) {

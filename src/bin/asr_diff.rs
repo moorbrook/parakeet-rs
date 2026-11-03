@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
-use parakeet_dictation::asr::{Asr, AsrBackendMetadata, AsrConfig, Decoded};
+use parakeet_dictation::asr::{Asr, AsrBackendMetadata, Decoded};
 use parakeet_dictation::asr_eval::{
     self, DecodeMetadata, GoldManifest, QualityReport, RunMetadata,
 };
@@ -69,7 +69,6 @@ struct Args {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Backend {
-    Sherpa,
     CoreMlUnified,
     /// The TDT 0.6B v3 challenger, through the same worker (kata f0zg).
     CoreMlTdtV3,
@@ -78,18 +77,16 @@ enum Backend {
 impl Backend {
     fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
-            "sherpa" => Ok(Self::Sherpa),
             "coreml-unified" => Ok(Self::CoreMlUnified),
             "coreml-tdt-v3" => Ok(Self::CoreMlTdtV3),
-            _ => anyhow::bail!(
-                "unknown backend {value:?}; expected sherpa, coreml-unified, or coreml-tdt-v3"
-            ),
+            _ => {
+                anyhow::bail!("unknown backend {value:?}; expected coreml-unified or coreml-tdt-v3")
+            }
         }
     }
 
     fn model_variant(self) -> Option<CoreMlModelVariant> {
         match self {
-            Self::Sherpa => None,
             Self::CoreMlUnified => Some(CoreMlModelVariant::Unified),
             Self::CoreMlTdtV3 => Some(CoreMlModelVariant::TdtV3),
         }
@@ -106,7 +103,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut json_out = PathBuf::from(DEFAULT_QUALITY_REPORT);
     let mut vocabulary = None;
     let mut hotword_score = 2.0_f32;
-    let mut backend = Backend::Sherpa;
+    let mut backend = Backend::CoreMlUnified;
     let mut worker = None;
     let mut rnnt_engine = CoreMlRnntEngine::default();
     let mut model_dir = None;
@@ -240,7 +237,7 @@ fn print_usage() {
     eprintln!(
         "usage: asr_diff [--record | --gold JSON] [--audio-dir DIR]\n\
         \x20               [--baseline JSON] [--json-out JSON]\n\
-        \x20               [--backend sherpa|coreml-unified|coreml-tdt-v3]\n\
+        \x20               [--backend coreml-unified|coreml-tdt-v3]\n\
         \x20               [--worker PATH] [--model-dir DIR]\n\
         \x20               [--rnnt-engine native|coreml]\n\
         \x20               [--repetitions N]\n\
@@ -281,80 +278,17 @@ fn main() -> ExitCode {
     }
 }
 
-/// Deletes its path on drop. The generated hotwords file is a
-/// tokenised copy of the user's vocabulary; leaving it in `/tmp` after
-/// the run is both litter and a small disclosure.
-struct TempFileGuard(PathBuf);
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
 /// Returns `Ok(false)` when transcripts differed from the baseline.
 fn run(args: &Args) -> anyhow::Result<bool> {
     let gold = args.gold.as_deref().map(read_gold_manifest).transpose()?;
     let store = SettingsStore::new()?;
-    if args.backend == Backend::Sherpa && !store.model_present() {
-        anyhow::bail!(
-            "ASR model not present at {}. Launch Parakeet.app once so it can \
-             download the first-run model bundle.",
-            store.encoder_path().display()
-        );
-    }
-    // Translate the vocabulary the same way the app does, into a temp
-    // file — the point of this harness is to measure the *shipping*
-    // encoding, so it must not reimplement it.
-    // Per-process filename: a fixed one let two concurrent runs
-    // overwrite each other's hotwords while their recognisers loaded,
-    // and left a tokenised copy of the user's vocabulary lying around
-    // in the temp dir afterwards.
-    let generated = std::env::temp_dir().join(format!(
-        "parakeet-asr-diff-hotwords.{}.txt",
-        std::process::id()
-    ));
-    // The generated hotwords file is the sherpa fallback's format. The Core ML
-    // worker tokenizes the terms itself against the model bundle's inventory,
-    // so that path sends the terms and never writes a file.
-    let hotwords = match (&args.vocabulary, args.backend) {
-        (Some(v), Backend::Sherpa) => {
-            vocabulary::prepare(v, &generated, Some(&store.tokens_path()))?
-        }
-        _ => None,
-    };
     let terms = match &args.vocabulary {
         Some(path) => vocabulary::terms(path)?,
         None => Vec::new(),
     };
-    // Removed on every exit path below via this guard.
-    let _cleanup = TempFileGuard(generated.clone());
-    match &hotwords {
-        Some(p) => eprintln!(
-            "biasing ON (score {}) from {}",
-            args.hotword_score,
-            p.display()
-        ),
-        None if !terms.is_empty() => eprintln!(
-            "biasing ON (score {}): {} terms sent to the Core ML worker",
-            args.hotword_score,
-            terms.len()
-        ),
-        None => eprintln!("biasing OFF (greedy decoding)"),
-    }
-
     let run_started = Instant::now();
     let model_load_started = Instant::now();
     let asr = match args.backend {
-        Backend::Sherpa => Asr::load(&AsrConfig {
-            encoder: &store.encoder_path(),
-            decoder: &store.decoder_path(),
-            joiner: &store.joiner_path(),
-            tokens: &store.tokens_path(),
-            num_threads: performance::performance_core_count(),
-            hotwords: hotwords.as_deref(),
-            hotwords_score: args.hotword_score,
-        })?,
         Backend::CoreMlUnified | Backend::CoreMlTdtV3 => {
             let variant = args
                 .backend
@@ -375,7 +309,7 @@ fn run(args: &Args) -> anyhow::Result<bool> {
             asr
         }
     };
-    let decoding = decoding_metadata(args, hotwords.as_deref(), asr.contextual_vocabulary())?;
+    let decoding = decoding_metadata(args, asr.contextual_vocabulary())?;
     if let Some(status) = asr.contextual_vocabulary() {
         eprintln!(
             "Core ML worker accepted {} of {} vocabulary terms",
@@ -387,9 +321,6 @@ fn run(args: &Args) -> anyhow::Result<bool> {
     let mut peak_resident_bytes = process_tree_resident_bytes(&asr)?;
 
     let warmup_started = Instant::now();
-    if args.backend == Backend::Sherpa {
-        warmup::page_touch(&store.encoder_path())?;
-    }
     warmup::dummy_decode(&asr)?;
     let warmup_seconds = warmup_started.elapsed().as_secs_f64();
     peak_resident_bytes = peak_resident_bytes.max(process_tree_resident_bytes(&asr)?);
@@ -415,7 +346,7 @@ fn run(args: &Args) -> anyhow::Result<bool> {
             let (fixture, fixture_rate) = read_wav_mono(wav)?;
             // Both backends see what production hands `Asr::recognize`: 16 kHz
             // mono, converted by the project's own resampler. The corpus is
-            // stored at 48 kHz, so without this the sherpa arm would be gated
+            // stored at 48 kHz, so without this the decoder would be gated
             // on audio no user path produces any more. ADR-0030.
             let samples = to_target_rate(&fixture, fixture_rate)?.into_owned();
             let name = wav.file_name().map_or_else(
@@ -685,14 +616,10 @@ fn run_metadata(
 
 fn decoding_metadata(
     args: &Args,
-    hotwords: Option<&Path>,
     worker_vocabulary: Option<parakeet_dictation::asr::VocabularyStatus>,
 ) -> anyhow::Result<DecodeMetadata> {
-    // Two implementations of the same feature: sherpa's hotwords file, and the
-    // worker's own context trie. `active` is true when either is in force, so a
-    // report cannot claim biasing that nothing is doing.
     let worker_active = worker_vocabulary.is_some_and(|status| status.accepted > 0);
-    let active = hotwords.is_some() || worker_active;
+    let active = worker_active;
     let vocabulary_requested = args.vocabulary.is_some();
     let vocabulary_raw = args.vocabulary.as_deref().map(std::fs::read).transpose()?;
     let vocabulary_terms_requested = vocabulary_raw
@@ -700,9 +627,7 @@ fn decoding_metadata(
         .map(|raw| String::from_utf8_lossy(raw))
         .map_or(0, |raw| vocabulary::parse_terms(&raw).len());
     Ok(DecodeMetadata {
-        method: if hotwords.is_some() {
-            "modified_beam_search".to_string()
-        } else if args.backend == Backend::CoreMlUnified {
+        method: if args.backend == Backend::CoreMlUnified {
             if worker_active {
                 "coreml_unified_greedy_biased".to_string()
             } else {
@@ -716,12 +641,7 @@ fn decoding_metadata(
         hotword_score: active.then_some(args.hotword_score),
         vocabulary_terms_requested,
         vocabulary_sha256: vocabulary_raw.as_deref().map(sha256_bytes),
-        generated_hotwords_sha256: hotwords.map(sha256_file).transpose()?,
     })
-}
-
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
-    Ok(sha256_bytes(&std::fs::read(path)?))
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {

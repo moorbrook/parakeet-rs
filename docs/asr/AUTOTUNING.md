@@ -51,6 +51,10 @@ the actual model files, then accepts the profile only if its cache key,
 fingerprint, baseline, and selection recomputed from the saved evidence all
 match. Missing, unreadable, stale, or invalid profiles use CPU+ANE.
 
+Profiles that select encoder buckets and Hold windows also bind the pinned VAD
+manifest digest. A VAD model change invalidates that window-quality verdict.
+Compute-only profile keys do not depend on VAD.
+
 `PARAKEET_ASR_TUNING=off` bypasses a valid profile for diagnosis without
 deleting it. Unset it or use `auto` to restore automatic selection.
 

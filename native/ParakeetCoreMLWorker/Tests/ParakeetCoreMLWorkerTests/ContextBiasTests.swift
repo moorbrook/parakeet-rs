@@ -98,7 +98,7 @@ struct ContextBiasTests {
 
     @Test("a completed entry is never taken back")
     func completedEntryIsBanked() {
-        // The difference from sherpa's beam bookkeeping. After a full match,
+        // Completed entries bank their earned score. After a full match,
         // moving on must cost nothing: an uncompensated retraction sitting on
         // blank would suppress whatever word follows the matched term.
         let graph = self.graph([[1, 2]])
@@ -206,7 +206,7 @@ struct PieceVocabularyTests {
     @Test("a term with no piece for some part of it is rejected, not truncated")
     func unrepresentableTermIsRejected() {
         // A silently dropped term boosts nothing and the user is never told —
-        // the exact failure the sherpa path's token validation exists to catch.
+        // a term absent from the token inventory.
         #expect(pieces.encode("Zzz") == nil)
         #expect(pieces.encode("Newz") == nil)
     }

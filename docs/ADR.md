@@ -9,29 +9,14 @@ below should be re-evaluated against it.
 
 ---
 
-## Current state vs target snapshot
+## Current state
 
-This section tracks the gap between what the code does **today** and what the
-ADRs target. Update whenever the code lands or a measurement is taken.
-
-| Dimension | Today (measured / asserted) | Target (ADR-0007) | Blocker to close the gap |
-|---|---|---|---|
-| End-of-speech → text appears | Resident Parakeet Unified Core ML recognition starts speculatively behind an unchanged Silero stop authority. Tap Fast measured **182.0 ms p50 / 203.0 ms p95** on the representative 5 s production-path replay; pause-friendly Tap measured **637.0 ms p50 / 658.1 ms p95** on the 14.225 s endpoint fixture. | **<1 s p50** with the representative-speech quality gate intact | none — ADR-0022, ADR-0023, and ADR-0025 shipped and measured |
-| Recognition acceleration | A resident native Swift worker owns the int8 Parakeet Unified Core ML graph on CPU+ANE. The sherpa CoreML backend remains the automatic load-failure fallback. An explicit per-chip tuner keeps CPU+ANE unless another bounded plan clears quality, memory, and ≥5% performance gates. | Native Apple Silicon execution with evidence-backed placement | none — ADR-0022 + ADR-0026 shipped; current M5 Pro evidence correctly retains CPU+ANE |
-| Resident set | ~800 MB (640 MB mmap'd ASR model + ORT arenas + audio buffers); ~50 MB bundled dylibs | ≤1.2 GB steady state | none — ADR-0016 + ADR-0022 shipped |
-| Settings window | Native `NSWindow` opened from menubar "Settings…" (`src/settings_ui.rs`); `orderFrontRegardless` so it surfaces above other apps | native, on-demand | none — shipped |
-| Menubar UX | SF Symbols (`mic` / `mic.fill` / `arrow.down.circle`) via `objc2_app_kit::NSImage`; state-reflective menu labels | HIG-conformant template image with state | none — shipped |
-| Paste path | `CGEventKeyboardSetUnicodeString` synthetic keystroke at `AnnotatedSession` tap layer (`src/ax_paste.rs`) | no clipboard mutation; works in terminals, browsers, native, Electron, IDEs | none — [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) shipped, supersedes ADR-0011 |
-| Smart formatting | Optional rewrite through an already-running OpenCode service (`src/rewrite.rs`), off by default; an absent service, an error, an empty answer, or the 5 s deadline pastes the local transcript unchanged | optional formatting pass that never withholds the local transcript | none — [ADR-0036](#0036--optional-transcript-rewrite-through-the-running-opencode-service) shipped |
-| Custom vocabulary | A plain-text vocabulary is tokenized with the model's own pieces and biased over the native joint output; the sherpa hotword path survives only as the fallback's implementation | explicit specialization without silently changing the generic model | none — ADR-0033 removed the fallback cliff; ADR-0028's bound on a global score change stands |
-| macOS permissions | Contextual Input Monitoring onboarding, just-in-time Microphone/Accessibility requests, a permanent dashboard, settings recovery links, activation-time revocation detection, and a stable self-signed local signing identity so grants survive rebuilds (ADR-0035) | explain before requesting and remain usable when a grant is absent | implementation shipped in ADR-0029; destructive revocation confirmation remains issue #23 |
-
-**Primary acceleration path complete.** ADR-0012 and ADR-0015 first proved the
-sherpa fallback's CoreML execution. ADR-0022 then moved the default path to a
-resident native Parakeet Unified worker, ADR-0023 overlapped recognition with
-endpoint confirmation, ADR-0026 added safe per-chip runtime selection without
-changing model weights, and ADR-0033 brought the custom vocabulary onto that
-path so no user setting drops back to the fallback.
+Apple Silicon and macOS 14+ are required. Native Core ML workers own ASR and
+Silero VAD. Rust owns capture, pause policy, speculative and Hold window
+coordination, optional OpenCode rewrite, and Unicode text injection. Custom
+vocabulary stays on the native recognition path. Load failures are explicit
+setup errors. Runtime placement and short-window choices require the gold
+quality and performance gates.
 
 ---
 
@@ -39,7 +24,7 @@ path so no user setting drops back to the fallback.
 
 **Status:** **Superseded.** The Tauri shell was dropped in favour of
 a single native AppKit binary (`objc2` + per-class `objc2-app-kit`
-features) — see [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation)
+features) — see [ADR-0016](#0016--native-appkit-shell)
 for the spike-was-revisited-and-flipped trail. ADR-0001's text below
 records the original Electron → Tauri decision; the codebase no
 longer ships any Tauri / WebView code.
@@ -80,7 +65,7 @@ for other OSes, no cross-platform abstractions.
 
 **Alternatives.**
 - *Cross-platform via tauri-cross-platform-shortcut-y libs*: works, but every
-  optimization in [ADR-0006](#0006--apple-silicon-optimization-plan-ds4-playbook-applied) becomes
+  optimization in [ADR-0006](#0006--apple-silicon-execution-policy) becomes
   conditional, which doubles the maintenance burden for no user gain on day
   one.
 - *Intel mac support*: M-series is now ubiquitous in our user base.
@@ -123,119 +108,27 @@ cloud competitor including Wispr Flow.
 
 ---
 
-## 0004 — Parakeet TDT 0.6B v3 as the model
+## 0004 — Parakeet Unified EN 0.6B as the model
 
-**Status:** **Accepted as fallback; superseded as the default backend by
-[ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend).**
+**Status:** Accepted
 
-**Context.** Candidates considered, with English WER on LibriSpeech-clean and
-deployability on M5 Pro:
-
-| Model | WER (clean) | Size | sherpa-onnx export | Punctuation | License |
-|---|---|---|---|---|---|
-| Canary-Qwen 2.5B | **1.6%** (#1 leaderboard) | ~2.5 GB | ONNX exists, sherpa-onnx not yet | yes | CC-BY-NC |
-| **Parakeet TDT 0.6B v3** | **1.93%** | **640 MB int8** | **yes (`csukuangfj/...-v3-int8`)** | **yes** | CC-BY-4.0 |
-| IBM Granite Speech 3.3 8B | ~2.0% | ~8 GB | no | yes | Apache 2.0 |
-| Whisper Large v3 | ~2.0% | ~1.5 GB | yes | post-process | MIT |
-| Omnilingual ASR 1B int8 | not benched on English-only | 1.0 GB | yes | no, raw chars | Apache 2.0 |
-
-**Decision.** Parakeet TDT 0.6B v3 int8. Win across the four axes that
-matter for press-to-talk dictation: WER within 0.3% of leaderboard top,
-smallest size, native sherpa-onnx support, **native punctuation + capitalization
-output** (saves a post-process pass and ~50 ms latency).
-
-**Alternatives explicitly rejected.**
-- *Canary-Qwen 2.5B*: best WER but 4× larger and sherpa-onnx doesn't have the
-  SALM (FastConformer + Qwen3 LLM) config yet.
-- *Omnilingual ASR 1B int8* (our previous choice): higher quality on
-  multilingual but outputs raw character sequences, no punctuation, ~60%
-  larger, no English-specific leaderboard data.
-- *NVIDIA Nemotron Speech*: NVIDIA-only, Linux preferred, no CPU/Apple
-  Silicon path. Ruled out before the swap.
-
-**Consequences.** Multilingual coverage drops from 1,600 langs (Omni) to 25
-European langs (Parakeet v3). English/EU dictation users gain; speakers of
-non-European languages lose. Acceptable for our user base.
+The production recognizer uses the immutable int8 Parakeet Unified EN 0.6B Core ML bundle. The tokenizer, frontend, and greedy decode contract are pinned in `docs/asr/COREML_MODEL.md`. A replacement must clear the human-speech gold gate, preserve punctuation, and fit the local Apple Silicon runtime.
 
 ---
 
-## 0005 — sherpa-onnx as the inference binding
+## 0005 — Native Core ML inference
 
-**Status:** **Accepted as the fallback/contextual-vocabulary binding; superseded
-as the default empty-vocabulary path by [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend).**
-The body below records the original binding decision and the static-library
-risk that ADR-0012 later resolved for the fallback.
+**Status:** Accepted
 
-**Context.** Three Rust paths to running ONNX/ML models on Apple Silicon:
-
-1. *sherpa-onnx Rust crate* (v1.13.2): wraps the sherpa-onnx C++ runtime, which
-   in turn wraps ONNX Runtime + audio frontend + CTC/RNN-T decoders. Build
-   script auto-downloads a prebuilt static lib. Ready-made `OfflineTransducer`
-   and `OfflineOmnilingualAsrCtc` configs.
-2. *`ort` (ONNX Runtime Rust bindings)*: closer to the metal but requires us
-   to implement mel-spectrogram, FastConformer encoder loop, RNN-T/CTC
-   decoder, hotword/language-bias logic ourselves — multi-week project.
-3. *Candle Metal backend, pure Rust*: aspirational. We'd port FastConformer +
-   transducer head to Candle's API by hand. Multi-month project, no existing
-   community implementation of Parakeet TDT in Candle.
-4. *MLX from Rust*: no Rust binding crate exists on crates.io. Would require
-   subprocess-call to the MLX Python tool, which erases the gains.
-
-**Decision.** sherpa-onnx Rust crate. Provider set to `"coreml"` so ONNX
-Runtime's CoreML Execution Provider routes ops to ANE / Metal / CPU per-op.
-
-**Alternatives** above, rejected for scope.
-
-**Consequences.** We inherit sherpa-onnx's release cadence, build process,
-and limitations. The static lib in the upstream prebuilt may or may not
-include the CoreML EP — see [ADR-0006](#0006--apple-silicon-optimization-plan-ds4-playbook-applied) for
-the verification path. We do not own the inference code, so we cannot easily
-add custom kernels.
-
-**Historical risk — realised, then resolved.** The static upstream prebuilt did
-not include the CoreML EP. This was verified 2026-05-15 by running
-`nm -gU target/sherpa-onnx-prebuilt/sherpa-onnx-v1.13.2-osx-arm64-static-lib/lib/libonnxruntime.a | grep -i coreml`
-which returned zero matches; available providers were CPU / CUDA / DML / Dnnl /
-MIGraphX / Nnapi / OpenVINO / ROCM / TensorRT / VitisAI / CANN. Setting
-`provider="coreml"` against that artifact was a silent no-op. ADR-0012 switched
-the fallback to shared linkage with a CoreML-capable ONNX Runtime dylib, and
-ADR-0015 added build/runtime verification.
+Recognition and Silero VAD run in native worker processes. Rust owns capture, endpoint policy, transcript delivery, and bounded IPC. The app has one production ASR backend; a worker load failure is a setup error. See ADR-0040.
 
 ---
 
-## 0006 — Apple Silicon optimization plan (ds4 playbook applied)
+## 0006 — Apple Silicon execution policy
 
-**Status:** **Accepted for the CPU-side baseline; accelerator selection is
-superseded by [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend)
-and [ADR-0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans).** The
-P-core scheduling, thread count, page-touch warmup, mmap'd weights, and
-long-lived runtime object remain in the fallback path.
+**Status:** Accepted
 
-**Context.** [antirez/ds4](https://github.com/antirez/ds4) is a from-scratch
-DeepSeek V4 inference engine for Apple Silicon. Its kernel set is
-model-specific (RoPE / MoE / FP8 KV cache) and doesn't transfer to a
-FastConformer + transducer stack. But its *systems-level* moves do.
-
-**Decision.** Apply these ds4 principles around the sherpa-onnx call:
-
-| ds4 idea | Implementation |
-|---|---|
-| Metal-first execution | CoreML EP via `provider="coreml"` |
-| `kernel_touch_u8_stride` page warmup | `warmup::page_touch` walks mmap'd encoder at 16 KiB stride at startup |
-| Pre-compiled compute pipelines | `warmup::dummy_decode` runs one 0.5 s silent recognition to bake the CoreML graph cache |
-| Unified memory, no host↔device copies | Apple Silicon native; cpal f32 → sherpa directly, no temp WAV |
-| Long-lived runtime objects | `OfflineRecognizer` lives in `AppState`, reused every press |
-| P-core scheduling hint | `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE)` on capture + recognition threads |
-| `num_threads` = physical P-cores | `sysctlbyname("hw.perflevel0.logicalcpu")` (M5 Pro = 10) |
-
-**Alternatives.**
-- *Hand-write Metal kernels for FastConformer*: multi-month.
-- *Skip optimizations, rely on sherpa-onnx defaults*: leaves ~50–250 ms on
-  the table on the cold path; first dictation feels slow.
-
-**Consequences.** Cold first-decode is amortized into startup. Hot path
-shouldn't have surprise pauses. We accept that we can't outdo the underlying
-ONNX Runtime kernels.
+Models stay resident between dictations. Startup warms the ASR graphs. Capture converts audio to 16 kHz once using the local Kaldi resampler. CPU topology and thread QoS remain application concerns; model placement is selected by the evidence-gated tuner in ADR-0026.
 
 ---
 
@@ -272,7 +165,7 @@ never confuse aspiration with engineering:
   which is arithmetically impossible (the model alone is 640 MB on disk and
   some of those pages will be resident under any access pattern). Corrected.
 - The <200 ms p50 latency target was **retired** after the
-  [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)
+  [ADR-0009](#0009--silero-endpointing-with-offline-recognition)
   streaming-model survey: no streaming Parakeet TDT 0.6B v3 ONNX exists,
   the realistic substitutes (NeMo FastConformer-streaming-large at 114 M
   params, Kroko Streaming Zipformer at ~50 M) all regress WER on test-other
@@ -294,7 +187,7 @@ ADR-0021, ADR-0023, ADR-0025, and ADR-0026.
 
 **Status:** **Both halves superseded.** Press-twice was replaced by
 hotkey-press → talk → VAD-auto-stop per
-[ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected). Clipboard +
+[ADR-0009](#0009--silero-endpointing-with-offline-recognition). Clipboard +
 ⌘V was replaced by `CGEventKeyboardSetUnicodeString` synthetic
 keystrokes per [ADR-0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession).
 Original v0.1 framing preserved below.
@@ -309,101 +202,17 @@ tolerable in exchange for breadth of app compatibility. AX injection
 deferred to v2.
 
 The press-twice UX was replaced by hotkey-press → talk →
-VAD-auto-stop in [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)
+VAD-auto-stop in [ADR-0009](#0009--silero-endpointing-with-offline-recognition)
 because press-twice adds a user-input delay on top of inference
 latency.
 
 ---
 
-## 0009 — Silero-VAD auto-stop, offline encoder (Accepted) — streaming model SWAP REJECTED
+## 0009 — Silero endpointing with offline recognition
 
-**Status:** **Accepted in current form (press-once + Silero VAD + offline
-Parakeet); streaming model swap rejected after measurement.**
+**Status:** Accepted
 
-Replaces [ADR-0008](#0008--hotkey-press-to-toggle--clipboard-paste) on the
-press-twice toggle; supersedes the originally proposed
-`OfflineRecognizer` → `OnlineRecognizer` switch.
-
-**Context.** With the current offline recognizer, the encoder doesn't run
-until the user stops talking. For a 5-second utterance on M5 Pro with CoreML
-EP engaged (measured 7.8x RTFx in [ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage))
-that's ~640 ms after end-of-speech.
-
-The original proposal — switch the recognizer to `OnlineRecognizer` with a
-streaming Parakeet variant — would in principle move encoder work inside
-the recording window so the finalize cost drops to one chunk + decoder pass.
-
-**Why streaming model swap was rejected.** Three hard constraints:
-
-1. **No streaming Parakeet TDT 0.6B v3 ONNX exists in the sherpa-onnx ecosystem.**
-   Issue [k2-fsa/sherpa-onnx#2918](https://github.com/k2-fsa/sherpa-onnx/issues/2918)
-   is open and unresolved. The full-attention FastConformer encoder in v2/v3
-   cannot be reconfigured for cache-aware streaming without retraining.
-2. **The realistic substitutes are smaller, less accurate models.** Concrete
-   WER comparison done at swap-time:
-
-   | Model | Params | LibriSpeech test-clean | test-other | Punctuation |
-   |---|---|---|---|---|
-   | **Parakeet TDT 0.6B v3 (current, offline)** | 600 M | **1.93%** | ~4.5% | **native** |
-   | NVIDIA `stt_en_fastconformer_hybrid_large_streaming_multi` @ 480 ms (best converted streaming option for sherpa-onnx) | 114 M | not reported | **5.7%** | no |
-   | Kroko Streaming Zipformer 2025-08-06 | ~50 M | not published | not published | no |
-
-   The streaming candidates are 5.4×–12× smaller and either don't publish
-   test-clean numbers (a known smell) or land ~25–50% relative-worse on
-   test-other. The Parakeet WER difference between 1.9% and ~3% is one extra
-   error per 100 words on long-form text — noticeable.
-3. **Native punctuation/capitalization is part of Parakeet TDT v3's value.**
-   Losing it means a post-processing pass would have to ship before v1,
-   adding latency that would more than erase the streaming latency savings.
-
-NVIDIA's flagship `nvidia/nemotron-speech-streaming-en-0.6b` (2.32% test-clean
-at 1.12s chunk, native punctuation, comparable parameter count) is the *only*
-streaming model that would be a fair substitute — but it is **NVIDIA-GPU
-only** (Ampere/Hopper/Blackwell), explicitly does not run on Apple Silicon
-or CoreML, killing it for this project.
-
-Building a streaming Parakeet ourselves was considered: it requires either
-(a) retraining v3 with cache-aware attention masks (weeks of training time,
-needs the original training corpus we don't have) or (b) wrapping the
-existing FastConformer encoder in a chunked-offline simulated streaming
-loop, which scales superlinearly with utterance length (chunks recompute
-overlapping context) and *increases* total compute. Both rejected.
-
-**Decision.** Keep `OfflineRecognizer` + Parakeet TDT 0.6B v3. Press-once UX
-+ Silero VAD auto-stop remains (already shipped, see `streamer.rs` +
-`vad.rs`). End-of-speech-to-text latency: VAD hangover (150 ms) + offline
-encoder over the full utterance + decoder finalize. On a 5 s utterance with
-the measured 7.8x RTFx that's `150 ms + 640 ms + ~50 ms ≈ 840 ms` —
-**slower than Wispr Flow's ~500 ms cloud latency, but with the WER and
-punctuation advantages of a bigger offline model.**
-
-**Revised target.** [ADR-0007](#0007--performance-targets-beat-wispr-flow) "<200 ms p50 felt
-latency" target is **provisionally retired** — it is not reachable with an
-offline 600 M-param encoder regardless of CoreML acceleration. Replaced by:
-**end-of-speech-to-text under 1 s p50 on M5 Pro, with WER ≤ 2% on
-LibriSpeech test-clean.** Re-open if a no-WER-loss streaming Parakeet
-becomes available upstream.
-
-**Alternatives reconsidered and rejected**
-
-- *Switch to Kroko Streaming Zipformer (71 MB):* loses native punctuation,
-  no published WER — too much unknown for a primary recognizer.
-- *Switch to streaming NeMo FastConformer 480 ms (136 MB, converted):*
-  measurable WER regression on a smaller model; no test-clean number
-  reported.
-- *Chunked-offline pseudo-streaming with the current Parakeet:* compute
-  grows superlinearly with utterance length; ends up slower than the
-  current single-shot path. Rejected after sketch.
-- *Hybrid (streaming partials + offline finalize):* doubles the model
-  weight on disk (~770 MB), complicates the indicator UX we just deleted,
-  and the finalize-time latency doesn't change vs. today.
-
-**Consequences.** [ADR-0009] is now narrower than originally drafted:
-it covers the VAD auto-stop UX (shipped) but explicitly does NOT cover a
-recognizer swap. [ADR-0007]'s original sub-200 ms p50 target was
-retired in favour of a more honest sub-1 s target. The 150 ms endpoint remains
-available through explicit Tap Fast mode; normal Tap uses ADR-0025's
-pause-friendly policy.
+Silero is the sole Tap endpoint authority. Speculative recognition can overlap a pause but cannot stop capture. Hold ends on hotkey release and can decode bounded windows during capture. The 32 ms Core ML VAD graph keeps the capture cadence. See ADR-0023, ADR-0025, ADR-0031, ADR-0032, and ADR-0040.
 
 ---
 
@@ -428,7 +237,7 @@ than the ~150-line estimate: `kAXValueAttribute` replaces the entire field,
 implementation needs a per-app-class fallback table plus user-permission UX.
 Realistic scope is ~300 lines plus ongoing per-app-bug maintenance. The
 incremental latency win (~15-50 ms) is not worth taking on that maintenance
-surface in v1, especially since [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)
+surface in v1, especially since [ADR-0009](#0009--silero-endpointing-with-offline-recognition)
 delivers larger latency gains for less code.
 
 Kept in the ADR for the v2 conversation. Not on the v1 critical path.
@@ -444,178 +253,33 @@ Kept in the ADR for the v2 conversation. Not on the v1 critical path.
 
 ---
 
-## 0012 — sherpa-onnx prebuilt with CoreML EP (shared linkage)
-
-**Status:** **Accepted — shipped.** Spike per [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation)
-revealed that a **5-minute Cargo feature change** gets us a CoreML-enabled
-libonnxruntime, with no submodule, no cmake build, no maintenance tax. The
-4-hour vendored-self-build plan documented below as "originally drafted" has
-been superseded.
-
-**Context.** The sherpa-onnx Rust crate's build script downloads a prebuilt
-osx-arm64 library from GitHub releases. Two paths exist upstream:
-
-| Path | Archive | onnxruntime origin | CoreML EP |
-|---|---|---|---|
-| `static` (Cargo `default-features`) | `sherpa-onnx-v1.13.2-osx-arm64-static-lib.tar.bz2` | `csukuangfj/onnxruntime-libs` CPU-only static build | **No** — sherpa-onnx hardcodes `add_definitions(-DSHERPA_ONNX_DISABLE_COREML)` in `cmake/onnxruntime-osx-arm64-static.cmake:64` for this path |
-| `shared` | `sherpa-onnx-v1.13.2-osx-arm64-shared-lib.tar.bz2` | Microsoft's official `onnxruntime-osx-arm64-1.24.4.tgz` dylib | **Yes** — verified by `nm -gU libonnxruntime.1.24.4.dylib \| grep _OrtSessionOptionsAppendExecutionProvider_CoreML` returns one symbol at offset `0x13eff4` |
-
-Switching from `static` to `shared` therefore replaces a CPU-only static lib
-with a CoreML-capable dylib at the cost of shipping ~30 MB of dylibs in the
-`.app` bundle.
-
-**Decision.** Use the `shared` feature on `sherpa-onnx-sys`:
-
-```toml
-# src-tauri/Cargo.toml
-sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"] }
-```
-
-Bundle the dylibs into the `.app` via `tauri.conf.json`:
-
-```json
-"bundle": {
-  "macOS": {
-    "frameworks": [
-      "target/release/libsherpa-onnx-c-api.dylib",
-      "target/release/libsherpa-onnx-cxx-api.dylib",
-      "target/release/libonnxruntime.dylib",
-      "target/release/libonnxruntime.1.24.4.dylib"
-    ]
-  }
-}
-```
-
-`sherpa-onnx-sys` already emits `cargo:rustc-link-arg=-Wl,-rpath,…` so the
-binary loads the dylibs from the bundle's `Contents/Frameworks/` at runtime.
-
-**Verification.** All three [ADR-0015](#0015--coreml-ep-verification-protocol)
-layers are green, with **empirical numbers measured on this machine**:
-
-- **Layer 1 (build-time symbol check):** `build.rs::check_coreml_ep` runs
-  `nm -gU` over the linked `libonnxruntime.1.24.4.dylib`, finds
-  `OrtSessionOptionsAppendExecutionProvider_CoreML` (at offset `0x13eff4`),
-  sets `--cfg parakeet_coreml_ep_present`. No `cargo:warning=` line.
-- **Layer 2 (recognizer init log):** `asr.rs:64` logs
-  `"ASR provider requested: coreml (EP symbol present in libonnxruntime.a)"`
-  at startup.
-- **Layer 3 (per-utterance RTFx probe):** `asr.rs::recognize_with_timing`
-  reports `ASR decoded 2.00s in 0.258s (7.8x real time)` on the warmup pass.
-  That's well above the 2x CoreML floor — CPU-only int8 transducer inference
-  on this encoder size sits at ~1.0–1.5x; 7.8x is the signal that CoreML is
-  partitioning ops to ANE / GPU and not silently falling back. Two corollary
-  observations from the runtime log:
-  - The first warmup pass (0.5 s of silence) hits ~0.85x; that's pure
-    CoreML graph-compile cost, not a steady-state measurement. The warmup
-    in `warmup.rs::dummy_decode` now uses a throwaway-then-measured
-    two-pass structure so the user-visible log line is always the
-    steady-state number, and `recognize_with_timing(warmup: true)`
-    suppresses the spurious warn.
-  - The macOS console emits ~13 `"Context leak detected, CoreAnalytics
-    returned false"` lines on the first decode. That's an Apple-framework
-    teardown log from `CoreAnalyticsCenter` and confirms CoreML is
-    initialising; it does not appear on subsequent decodes.
-
-**Alternatives considered then rejected.**
-
-- *Vendor sherpa-onnx + ONNX Runtime as submodules and `cmake --build` with
-  `SHERPA_ONNX_ENABLE_COREML=ON`* — the original ADR plan. Costs: 1–2 h
-  initial build, ongoing tag-bump tax, owning ORT regressions. Only worth
-  doing if we needed something the prebuilt shared dylib lacks; it doesn't.
-- *Keep upstream `static` prebuilt* — CPU-only, kills the [ADR-0007]
-  (#0007--performance-targets-beat-wispr-flow) latency story. Rejected.
-- *Different inference binding* — see
-  [ADR-0005](#0005--sherpa-onnx-as-the-inference-binding); already rejected.
-
-**Consequences.**
-- Bundle size grows by ~30 MB (mostly `libonnxruntime`'s 25 MB).
-- Code-signing / notarization must handle bundled dylibs. Standard for
-  third-party-dylib-shipping macOS apps; Tauri's bundler handles the rpath.
-- We don't own the ORT build; if Microsoft's CoreML EP regresses, we wait
-  for a new release rather than bisect ourselves. Acceptable for v1.
-- If ANE coverage on the Parakeet encoder turns out to be poor (large
-  fraction of ops fall back to CPU), the *only* lever left is a from-source
-  ONNX Runtime build with a tuned CoreML EP — at which point the original
-  vendor-build plan returns. We'll know after the first RTFx measurement.
-
-**Historical record (pre-spike plan, kept for context).** The earlier draft
-called for a vendored cmake build. That plan is superseded by this one, but
-the cmake flags it specified — `SHERPA_ONNX_ENABLE_COREML=ON`,
-`SHERPA_ONNX_ENABLE_TTS=OFF`, etc. — remain the right invocation if we ever
-do need to fall back to a self-build.
-
----
-
-## 0015 — CoreML EP verification protocol
+## 0012 — Native runtime linkage
 
 **Status:** Accepted
 
-**Context.** After [ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage)
-lands, we need an automated, repeatable way to **prove** the CoreML EP is
-actually present and being used — not just hope that `provider="coreml"`
-silently fell back to CPU again.
-
-**Decision.** Three layers of verification, all gated in CI before any
-ADR-0007 latency claim is asserted:
-
-**Layer 1 — Build-time symbol check.** As part of the post-build step:
-
-```bash
-LIB="$SHERPA_ONNX_LIB_DIR/libonnxruntime.a"
-if ! nm -gU "$LIB" 2>/dev/null | grep -q "_OrtSessionOptionsAppendExecutionProvider_CoreML\|CoreMLExecutionProvider"; then
-  echo "FAIL: CoreML EP symbol absent from $LIB"
-  exit 1
-fi
-```
-
-Fails the build if the EP isn't linked in. No silent CPU-only fallback ever
-reaches production.
-
-**Layer 2 — Runtime provider availability log.** sherpa-onnx logs the
-selected EP at recognizer-create time. We will parse for the line containing
-"CoreMLExecutionProvider" and panic in debug builds if it's absent. In
-release builds, log a warning and emit a telemetry event so we know.
-
-**Layer 3 — Per-utterance latency probe.** Wrap `recognizer.decode(&stream)`
-with `Instant::now()` and emit p50 / p95 / p99 to a local rolling histogram
-(written to `~/Library/Application Support/com.parakeet.rs/latency.jsonl`,
-local-only, no telemetry). If end-to-end p50 climbs above 250 ms, surface a
-warning in the settings UI: "ANE acceleration may be inactive — re-run
-verification".
-
-**Alternatives.**
-- *Just trust the EP string*: known to fail silently — that's how we got
-  here.
-- *Compare CPU vs CoreML A/B benchmarks*: nice but expensive at startup.
-  Layer 3 catches this implicitly via the latency histogram.
-
-**Consequences.** ~80 lines of Rust (symbol check is one shell line in the
-post-build, runtime log parse is ~30 lines, latency probe is ~50 lines).
-Replaces "I hope it works" with "we know it works."
+The app links its local Kaldi resampler statically. The native worker links the pinned FluidAudio package. The bundle contains the Rust executable, the native worker, and license resources; model weights download separately. No ONNX runtime is linked or bundled.
 
 ---
 
-## 0013 — Hotword / custom dictionary support
+## 0015 — Core ML execution verification
 
-**Status:** **Superseded by [ADR-0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list),
-which shipped a plain-text vocabulary and measured decoder policy.**
+**Status:** Accepted
 
-**Context.** Domain vocabulary (engineering terms, names, product names) gets
-mistranscribed by general ASR. sherpa-onnx supports an external
-`hotwords_file` that boosts specific n-grams during decoding.
+Core ML stage reports identify execution placement and distinguish native RNNT work from graph dispatch. A runtime plan is accepted only against the quality, memory, and performance gates in ADR-0026. A load failure is surfaced to the user; a low observed RTFx is a performance diagnostic rather than proof of placement.
 
-**Decision.** Settings UI gains a "Custom vocabulary" textarea. Each line is
-a hotword + optional boost score (`tauri 30.0\nshergaonnx 25.0`). Wired to
-`OfflineRecognizerConfig.hotwords_file` (or its online equivalent).
+---
 
-**Consequences.** Minor decoder latency cost (negligible). Big accuracy win
-on dictation about the user's actual work.
+## 0013 — Custom dictionary support
+
+**Status:** Accepted
+
+Vocabulary is an editable plain-text list. Parsing removes comments and blank lines. The native worker tokenizes terms with its own inventory and reports accepted and rejected terms. See ADR-0033.
 
 ---
 
 ## 0014 — Tray-only headless UX
 
-**Status:** **Superseded in implementation by [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation).**
+**Status:** **Superseded in implementation by [ADR-0016](#0016--native-appkit-shell).**
 The intended tray-only outcome shipped in native AppKit without Tauri/WebKit;
 the body below preserves the original Tauri-era proposal.
 
@@ -633,160 +297,19 @@ the user asks for it. Matches OpenWhispr's `LSUIElement` mode.
 
 ---
 
-## 0016 — Tauri + Rust shell vs SwiftUI native (re-evaluation)
+## 0016 — Native AppKit shell
 
-**Status:** **Superseded — outcome reversed.** The spike landed
-"stay on Tauri+Rust", but during the subsequent code-architecture +
-adversarial review rounds we dropped the Tauri shell entirely and
-moved to a single native AppKit binary via `objc2` + per-class
-`objc2-app-kit` features. Reason: with Tauri out, the WebView /
-WebKit / `tauri-conf.json` / `bun`-frontend surface contributed no
-value (Settings UI fits in native `NSWindow` + `NSTextField` +
-`NSPopUpButton` cleanly), and removing it cut ~200 MB resident, the
-entire frontend toolchain, and a class of focus-stealing bugs.
-ADR-0019 (CGEvent paste) and the streaming HUD bar work depended on
-direct AppKit access anyway. Original spike rationale preserved
-below.
+**Status:** Accepted
 
-**Context.** ADR-0001 chose Tauri to escape Electron. Two of the implicit
-motivations for *Tauri specifically* over *native Cocoa / SwiftUI* were:
-(a) cross-platform optionality and (b) avoiding Swift learning curve. (a)
-was retired when ADR-0002 made the project mac-only. Codex's review then
-exposed that getting CoreML EP through sherpa-onnx requires vendoring the
-upstream lib, building it ourselves, and maintaining the build going
-forward — which is real, recurring work that a native SwiftUI app would
-avoid entirely (Core ML is just the runtime in Swift, not a separate EP to
-enable). So the original ADR-0001 reasoning has weakened.
-
-A SwiftUI rewrite would substitute:
-- **Whisper Large v3 turbo via WhisperKit** (Argmax's CoreML-native port,
-  ANE on by default, no symbol-check theatrics) for Parakeet TDT v3 via
-  sherpa-onnx.
-- **AVAudioEngine** for cpal.
-- **AXUIElement APIs** for objc2-accessibility glue (un-defers
-  [ADR-0011](#0011--direct-accessibility-text-injection-deferred)).
-- **NSStatusBar + SwiftUI settings view** for Tauri tray + WebView settings.
-- **Apple Foundation Model API** (macOS 26+) for an LLM post-pass.
-
-Cost: a Swift rewrite is ~1,000 lines thrown away, several weeks of Swift
-fluency development, and lock-in to a single OS forever.
-
-Benefit: every layer becomes Apple-native, the CoreML / ANE story stops
-being a vendor-and-pray exercise, smaller binary, and faster cold start.
-
-**Decision (spike-resolved).** **Stay on Tauri+Rust.** The
-[ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage)
-spike took **5 minutes, not 4 hours**: the upstream sherpa-onnx prebuilt
-already ships a CoreML-enabled `libonnxruntime.dylib` in its `shared`
-release archive, behind a single Cargo feature flag flip. No submodule,
-no cmake build, no ongoing vendor maintenance — the "real cost" of
-ADR-0012 collapsed to "add `default-features = false, features = ["shared"]`
-to one line of Cargo.toml plus four entries in `tauri.conf.json` to bundle
-the dylibs."
-
-**Continuation triggers (assessed after spike):**
-- ✅ Spike succeeded within budget (5 min vs 4 h)
-- ⏳ ADR-0015 latency probe will confirm ANE engagement at first end-to-end
-  run with a live mic. **Not yet measured.** Layer-1 build-time symbol
-  check is green; layer-2 init log will say "EP symbol present"; layer-3
-  RTFx probe needs a real recording.
-- ✅ Build reproduces cleanly on a fresh checkout — `cargo build` just
-  downloads the right prebuilt archive
-
-**Pivot triggers — still active, archived as future safeguards.** The
-spike succeeded for layer 1 (linking). If layer 3 (runtime RTFx) comes
-back below 2x real-time, the pivot triggers re-arm:
-- Build works but ANE is not actually engaged (per [ADR-0015] latency
-  probe showing CPU-equivalent timings) → pivot to SwiftUI + WhisperKit
-- Upstream sherpa-onnx / ONNX Runtime breaks the CoreML build in a way
-  that takes more than a day to diagnose → same pivot
-
-**Pivot cost (re-baseline after Tauri+Rust scaffold landed).** Roughly
-1.5–2 weeks of clean Swift rewrite, reusing all design decisions
-(Parakeet/Whisper choice, hotkey UX, settings model, paste path,
-performance targets) and throwing away ~1,500 lines of Rust + TypeScript.
-
-**Alternatives reconsidered.**
-- *Pivot to SwiftUI now anyway, on principle*: rejected — the original
-  motivation for the pivot was the ADR-0012 maintenance tax, which has
-  evaporated. SwiftUI's other advantages (Foundation Model API for an
-  LLM post-pass, AXUIElement for direct injection) remain real but are
-  not load-bearing for v1.
-
-**Consequences.** Tauri+Rust scaffold stays. The remaining ADRs proceed
-on the original critical path. The dormant SwiftUI pivot path is kept in
-the ADR record so we know what to do if a future ONNX Runtime regression
-makes CoreML EP unreliable.
+The menu bar, HUD, settings, permissions, hotkey, and text injection use native macOS APIs through Rust. A separate Swift worker owns Core ML inference. Keeping model execution behind IPC isolates failures and gives the app and benchmarks the same recognition contract.
 
 ---
 
-## 0017 — CoreML `ModelCacheDirectory` blocked at the sherpa-onnx Rust binding
+## 0017 — Core ML model cache ownership
 
-**Status:** **Superseded as the primary optimization path by
-[ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend).** The
-sherpa binding limitation remains true for the fallback backend.
+**Status:** Accepted
 
-**Context.** [docs/latency-plan.md](./latency-plan.md) §2 wants us to set
-ONNX Runtime's CoreML EP `ModelCacheDirectory` provider option to
-`~/Library/Caches/parakeet-rs/coreml/`. ORT 1.20+ supports it; we link
-`libonnxruntime.1.24.4.dylib`, so the underlying EP can consume it.
-Expected win: seconds off **first-dictation-after-launch** cold start
-(does not move warm p50, per the plan).
-
-**Investigation.** Surveyed sherpa-onnx 1.13.2 (current crates.io latest):
-
-- `OfflineModelConfig` exposes a single `provider: Option<String>` field
-  (just `"coreml"`). No `provider_config`, no `coreml_*` sub-struct,
-  no key/value map for arbitrary EP options.
-  ( `~/.cargo/registry/.../sherpa-onnx-1.13.2/src/offline_asr.rs:475` )
-- The sys binding mirrors the upstream C struct exactly — also a single
-  `*const c_char`. ( `sherpa-onnx-sys-1.13.2/src/offline_asr.rs:178` )
-- Upstream `SherpaOnnxOfflineRecognizerConfig` (k2-fsa/sherpa-onnx C
-  API) does NOT carry a `provider_config` field. Only the *online*
-  recognizer's `SherpaOnnxOnlineModelConfig` has one — and even there
-  the CoreML sub-struct only surfaces `coreml_provider`, not
-  `model_cache_directory`.
-- `rg -i 'coreml|provider_config|model_cache'` across both crates
-  returns zero matches outside the provider-name string itself.
-
-**Decision.** Defer §2 until we can pass arbitrary CoreML EP options
-through to `OrtSessionOptionsAppendExecutionProvider_CoreML_V2`.
-Paths forward, in increasing cost:
-
-1. **Wait for sherpa-onnx upstream.** File an issue requesting the
-   offline path's `OfflineModelConfig` gain a `provider_config` field
-   matching the online path. Low effort to file; weeks–months to land.
-2. **Vendored fork of sherpa-onnx-sys.** Patch the C struct +
-   `to_sys` bridge locally; rebuild the sys crate against our fork.
-   Adds a maintenance liability — every sherpa-onnx upgrade has to
-   re-apply the patch.
-3. **Drop sherpa-onnx for the ASR path.** Switch to direct ORT
-   bindings (`ort` crate) and feed the `.onnx` files ourselves. Big
-   refactor; would absorb the encoder/decoder/joiner glue sherpa
-   currently provides for the NeMo transducer family.
-
-**Why deferring is OK.** The §1 baseline (bench/baseline.csv,
-2026-05-16, M5 Pro 24 GB) puts the 5 s ASR-only p50 at **362 ms**.
-Adding the latency plan's 150 ms VAD hangover + 50 ms paste finalize
-≈ 562 ms total post-endpoint — already inside the latency plan's
-acceptance criterion of ≤ 700 ms p50. The §2 optimization helps
-*first-launch* cold start only (where the user feels CoreML's MLProgram
-graph compile cost). That's a real win to grab eventually, but it's
-not gating the plan's acceptance numbers.
-
-**Open question.** Empirically verify whether CoreML's own framework-level
-cache at `~/Library/Caches/com.apple.MLModelCompiler/` already short-
-circuits enough of the recompile cost that the ORT-layer cache is
-marginal. If it does, this ADR closes as "no work needed"; if it doesn't,
-path 2 (vendored fork) becomes the right move.
-
-**Consequences.**
-- `src/asr.rs:72` left unchanged.
-- Latency plan §2 acceptance criterion ("CoreML model cache directory
-  is configured…") reads "Deferred — see ADR-0017" in the final
-  rollup.
-- Bench harness from §1 is already in place to measure the win when
-  the binding option lands.
+The native Core ML runtime owns compiled model caching. Rust verifies each downloaded model file before loading and retains a metadata-bound verification cache. App code does not configure an ONNX execution-provider cache.
 
 ---
 
@@ -896,112 +419,11 @@ exactly as they had it.
 
 ---
 
-## 0020 — Vocabulary: sherpa contextual biasing, generated from a plain-text list
+## 0020 — Vocabulary file ownership
 
-**Status:** **Accepted — shipped.**
+**Status:** Accepted
 
-**Context.** Dictation fails predictably on the same class of words:
-proper nouns, product names, trade jargon, colleagues' surnames. The
-recognizer is fixed and small; nothing in the pipeline let a user tell
-it "this word exists". sherpa-onnx supports contextual biasing
-(hotwords) for offline transducers, so the capability was already in
-the tree — but three properties of it had to be measured against
-`parakeet-tdt-0.6b-v3-int8` before it could be exposed, because getting
-any of them wrong produces a feature that silently does nothing.
-
-**Measurements** (M5 Pro, `bench/audio/5s.wav`, int8 + CoreML):
-
-1. **Greedy decoding rejects a hotwords file outright.**
-   `OfflineRecognizer::create` returns `None` with
-   `Please use --decoding-method=modified_beam_search if you provide
-   --hotwords-file`. Biasing therefore forces beam search — it is not
-   an opt-in refinement on top of the existing decode path.
-
-2. **Beam search costs ~13%.** 396 ms → 448 ms per 5 s decode
-   (greedy vs `modified_beam_search`, `max_active_paths=4`). Real but
-   affordable, and only paid when the user has terms.
-
-3. **A plain word does nothing — silently.** The model ships no
-   `bpe.model` (the HF repo contains only the three ONNX files and
-   `tokens.txt`), so sherpa falls back to `modeling_unit="cjkchar"` and
-   looks up each whitespace-separated piece as a single token.
-   `Kubernetes` is not a token, so it fails to encode and the decode is
-   unchanged **even at `hotwords_score=50`**. This is the trap: the
-   naive implementation ships, appears to work, and does nothing.
-
-   The tokens are SentencePiece pieces, so the correct encoding is
-   per-character with `▁` (U+2581) marking word-initial position:
-
-   | vocabulary.txt | encoded | decode at score 50 |
-   |---|---|---|
-   | `Kubernetes` | `Kubernetes` | *(unchanged — no effect)* |
-   | `Kubernetes` | `K u b e r n e t e s` | `KubernetesKubernetes…` (glued) |
-   | `Kubernetes` | `▁K u b e r n e t e s` | `Kubernetes Kubernetes …` ✓ |
-   | `New York` | `▁N e w ▁Y o r k` | `New York New York …` ✓ |
-
-4. **Safe boost range.** With a realistic 3-term vocabulary, scores
-   1.0–6.0 left all five bench fixtures byte-identical to the greedy
-   baseline. 10.0 began injecting hotwords into audio that did not
-   contain them; 50.0 replaced the transcript with them entirely.
-   **Default: 2.0.**
-
-**Decision.**
-
-- The user edits `vocabulary.txt` — one term or phrase per line, `#`
-  comments, written naturally. `crate::vocabulary` owns the translation
-  into sherpa's format. The raw format is not exposed; measurement 3 is
-  precisely why asking a user to write it themselves would be a bug
-  farm.
-- **Every encoded piece is validated against `tokens.txt` before the
-  hotwords file is written.** Measurement 3's failure mode is not
-  limited to whole words: any character with no token (emoji, `Ω`, a
-  decomposed `é`, smart punctuation) makes sherpa drop that hotword
-  with a stderr log the bundled app discards. Validating up front turns
-  "your term silently does nothing" into a named warning identifying
-  the term and the offending piece. If validation rejects everything,
-  we fall back to greedy rather than paying beam-search cost for an
-  empty context graph.
-- A plain file opened via `NSWorkspace`, not an in-window text view.
-  This is a list people paste into, sort, and keep in dotfiles;
-  `NSTextView` would be a worse editor than the one they already have.
-- Greedy stays the default. `AsrConfig.hotwords: Option<&Path>` selects
-  the decoding method, so an empty or absent vocabulary costs nothing —
-  no beam search, no behaviour change, byte-identical transcripts.
-- Biasing is baked in at recognizer construction, so a vocabulary edit
-  requires a rebuild. Settings-Save rebuilds in the background via
-  `DictationFsm::claim_model_reload_or_defer`, which atomically takes the
-  app out of `Idle` so a hotkey press can't start a session against a
-  recognizer that is about to be dropped. The previous recognizer is
-  replaced only on success — a malformed vocabulary costs the user
-  their custom terms, never their ability to dictate.
-
-**Staleness tracking (`App::loaded_inputs`).** Three bugs here were
-caught in adversarial review, and all three share one root cause:
-comparing against *what settings said* rather than *what was loaded*.
-
-  1. Comparing `prev` vs `new` settings meant a **failed** rebuild
-     never retried — the second Save saw `prev == new` and did nothing,
-     leaving a recognizer that didn't match the config indefinitely.
-  2. Fingerprinting the vocabulary file *after* the build recorded a
-     newer file than was actually read if the user edited mid-build.
-     That erased the very mismatch that would have triggered the retry,
-     so it was permanent.
-  3. A rebuild requested while the app was busy printed "applies after
-     the current dictation" and was then dropped — nothing drained it.
-
-The fix is one type, `BuildInputs { vocab: Option<(len, mtime)>, score,
-encoder_buckets }`, sampled **before** the build, returned by
-`load_asr_blocking`, and stored only on success. Staleness is
-`loaded != BuildInputs::sample(...)`.
-Failure leaves the old value, so the mismatch persists and the retry
-happens; a mid-build edit compares unequal to the pre-build sample and
-gets picked up by the re-check the worker runs on completion; and a
-busy app records the request inside the FSM claim's own lock, taken at
-the next return to `Idle` whatever ended the session.
-
-**Consequences.** Verified by `asr_diff` (ADR-0021): the default
-vocabulary + score is transparent on all five fixtures, and the
-harness catches the drift at score 20 with 100% divergence.
+The app owns `vocabulary.txt`, containing one natural-language term or phrase per line. It sends active terms directly to the native worker. No intermediate token file is generated. Vocabulary edits reload the resident recognizer after the current dictation. See ADR-0033.
 
 ---
 
@@ -1067,86 +489,9 @@ runtime.
 
 ## 0022 — Resident native Core ML Parakeet Unified backend
 
-**Status:** **Accepted — implemented and measured.**
+**Status:** Accepted
 
-**Context.** The sherpa-onnx/CoreML path was already usable at roughly
-13–14× real time, but its ONNX execution and decoder path left a large gap to
-hardware-specialized Parakeet runtimes. The target for this change was not an
-external benchmark number: it was at least **3× the frozen previous backend**
-under the same local harness, while preserving the gold-reference WER/CER
-gate. The implementation also needed to keep Python out of the shipping app
-and retain the existing custom-vocabulary behavior.
-
-**Decision.** Prefer FluidAudio's int8 Parakeet Unified EN 0.6B offline model
-through a resident Swift worker. Rust remains the application and policy
-layer; `AsrBackend` is the stable seam. Rust owns the pinned download and
-integrity gate. The worker owns model load, native mel extraction, Core ML
-CPU+ANE execution, and greedy RNNT decode, then accepts framed little-endian
-Float32 audio over stdin and returns framed JSON over stdout. It is pinned to
-FluidAudio commit `00a9aa771900ea09c485659663be31019e293e47`, taken since
-[ADR-0038](#0038--fluidaudio-from-a-revision-pinned-moorbrook-fork) from the
-moorbrook fork commit that adds the window and decode-loop change to it.
-
-- Model load and ANE plan compilation happen once per worker, not once per
-  utterance.
-- The worker is built as a 15 MB arm64 helper, copied into
-  `Contents/MacOS/`, signed before the main executable, and verified with the
-  complete app bundle.
-- A non-empty custom vocabulary deliberately selects sherpa, whose modified
-  beam-search hotword graph preserves ADR-0020. Empty vocabulary selects the
-  optimized backend. **Amended 2026-09-04:** the vocabulary condition is removed
-  by [ADR-0033](#0033--contextual-biasing-on-the-native-core-ml-path), which
-  biases inside the worker; sherpa is now the load-failure fallback only.
-- Specialized model download/load failure falls back to sherpa. The fallback
-  remains downloaded on first launch so the app does not become unusable when
-  a hardware-specific plan cannot load.
-- The Core ML weights are a separate ~595 MB on-demand artifact governed by
-  the NVIDIA Open Model License Agreement, as a derivative of
-  `nvidia/parakeet-unified-en-0.6b`; the conversion's own CC-BY-4.0 label
-  does not change that. FluidAudio is Apache-2.0. Attribution and the NVIDIA
-  notice are shipped in `THIRD_PARTY_NOTICES.md`.
-
-**Evidence.** M5 Pro, 24 GB, macOS 26.5.1, release builds, identical 48 kHz
-fixtures, three warmups, 30 measured repetitions per bucket. Both rows include
-Rust↔worker IPC and resampling because the outer timer wraps
-`Asr::recognize()`.
-
-| bucket | sherpa p50 | unified p50 | speedup | sherpa p95 | unified p95 | speedup |
-|---|---:|---:|---:|---:|---:|---:|
-| 1 s | 112.0 ms | 35.0 ms | **3.20×** | 116.5 ms | 36.5 ms | **3.19×** |
-| 3 s | 226.0 ms | 50.0 ms | **4.52×** | 239.6 ms | 51.0 ms | **4.70×** |
-| 5 s | 361.5 ms | 66.0 ms | **5.48×** | 384.3 ms | 67.0 ms | **5.74×** |
-| 10 s | 580.0 ms | 90.0 ms | **6.44×** | 597.8 ms | 91.5 ms | **6.53×** |
-| 20 s | 1195.0 ms | 188.0 ms | **6.36×** | 1245.3 ms | 192.6 ms | **6.47×** |
-
-The versioned five-fixture smoke gate passed at **2.38% WER / 2.22% CER**
-against 4% / 3% limits, with punctuation/capitalization retained. This corpus
-is macOS `say` output and proves regression-harness compatibility, not
-production WER; representative recorded speech remains a release gate.
-
-**Consequences.** The 3× target holds at p50 and p95 in every measured bucket,
-including one-second audio where fixed IPC cost dominates. Optimized model
-cold load measured about 10 seconds on first Core ML plan creation and about
-0.12 seconds from a warm compiled cache; startup warmup keeps both off the
-dictation path. The helper requires macOS 14; older supported systems fail the
-specialized spawn/load and use sherpa.
-
-The later real-speech gold gate measured 5.43% WER / 3.57% CER with zero
-ten-repeat spread. Against sherpa greedy it was 6.21× faster at corpus-decode
-p50 and 6.39× at p95; model load was 0.130 s versus 3.647 s, first result
-0.278 s versus 4.582 s, and observed full-process-tree RSS 0.10 GiB versus
-4.25 GiB. Production now verifies the complete 15-file Core ML bundle from
-model revision `4252711f6f060f9a2f91e5f081a806d7f45eebd8` through the Rust
-integrity gate before the worker may load it. `PARAKEET_ASR_BACKEND=sherpa`
-keeps the fallback one setting away. The exact graph, tokenizer, decoder,
-license, compatibility, and conversion limitation are recorded in
-[`docs/asr/COREML_MODEL.md`](asr/COREML_MODEL.md).
-
-Paired outer/internal instrumentation also prices the worker boundary rather
-than inferring it from bucket scaling. At 30 repetitions the boundary was
-0.128 ms p50 / 0.143 ms p95 for one-second audio and 1.111 ms / 1.209 ms for
-20-second audio. The 35 ms short-utterance floor is model-side work, so shared
-memory or an in-process rewrite is not justified by current measurements.
+The native worker owns the int8 Parakeet Unified model and stays resident across hotkey presses. Rust supplies 16 kHz mono Float32 through a bounded framed protocol. Native RNNT decode and the encoder run against the same pinned graph pack. Vocabulary is applied inside native greedy selection. Model or worker load errors are user-visible setup errors. The app requires Apple Silicon and macOS 14+.
 
 ---
 
@@ -1193,7 +538,6 @@ on every repetition:
 
 | pipeline | mean | p50 | p95 | p99 |
 |---|---:|---:|---:|---:|
-| frozen sherpa + serial ASR | 613.6 ms | 613.0 ms | 652.5 ms | 657.3 ms |
 | Core ML + speculative ASR | 189.7 ms | 182.0 ms | 203.0 ms | 203.0 ms |
 | speedup | **3.23×** | **3.37×** | **3.21×** | **3.24×** |
 
@@ -1218,56 +562,9 @@ so its before/after comparison stays like-for-like.
 
 ## 0024 — Immutable identities for Rust-managed model artifacts
 
-**Status:** **Accepted — implemented.**
+**Status:** Accepted
 
-**Context.** The first-run downloader previously treated an existing path as a
-valid model. New downloads were checked against the response's optional
-`Content-Length`, but that length was supplied by the same server as the bytes.
-A truncated response without the header, a wrong upstream object of the same
-length, or a locally changed file could therefore reach an inference runtime.
-
-**Decision.** Give every artifact fetched by `model_fetch.rs` a code-reviewed
-identity: an immutable Hugging Face revision where available, a published byte
-length, and a SHA-256 digest. Hash each response while streaming it to a
-same-directory `.part` file, flush it, and rename it only after the pinned
-digest and length match. `Content-Length` is not an integrity input. A mismatch
-deletes the partial or existing artifact and the normal first-use path fetches
-it again.
-
-Existing artifacts are hashed before their first use by this version. A JSON
-sidecar beside each model records the expected digest plus the file's size,
-mtime, ctime, device, and inode. Later launches may skip the full hash
-only when all cached identity fields still match. Malformed/unreadable cache
-data is a cache miss, never proof of integrity; cache writes use fsync plus an
-atomic same-directory rename.
-
-| Artifact | Immutable revision / release | Bytes | SHA-256 |
-|---|---|---:|---|
-| `tokens.txt` | sherpa `2bda32e` | 93,939 | `d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d` |
-| `decoder.int8.onnx` | sherpa `2bda32e` | 11,845,275 | `179e50c43d1a9de79c8a24149a2f9bac6eb5981823f2a2ed88d655b24248db4e` |
-| `joiner.int8.onnx` | sherpa `2bda32e` | 6,355,277 | `3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3` |
-| `encoder.int8.onnx` | sherpa `2bda32e` | 652,184,281 | `acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247` |
-| `silero_vad.onnx` | sherpa-onnx `asr-models` release asset | 643,854 | `9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6` |
-
-The sherpa revision is the upstream repository commit
-[`2bda32ec70b097a55adaa07d9a7173915b43cc78`](https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/commit/2bda32ec70b097a55adaa07d9a7173915b43cc78).
-Silero's mutable release URL is made byte-immutable by the pinned digest.
-
-**Scope.** This ADR's table covers five artifacts. ADR-0022 now adds
-the separately reviewed 15-file Core ML truth pack and reuses this verifier,
-cache, and atomic-publish path before the Swift worker may load it. Its exact
-manifest is maintained in `model_fetch.rs` and
-[`docs/asr/COREML_MODEL.md`](asr/COREML_MODEL.md).
-
-**Consequences.** A first launch after upgrading reads and hashes each existing
-Rust-managed model once. On later launches the integrity gate is a handful of
-metadata reads and small sidecar reads. Changing a model now requires an
-intentional code review of revision, size, and digest together.
-
-Measured on the M5 Pro release bundle against the installed artifacts, the
-one-time SHA-256 pass took 1.291 s for the 671 MB sherpa/VAD set. The next
-launch's metadata-cache checks took 0.738 ms. This is a launch/first-use gate, not part of
-recording, endpointing, or inference.
+ASR graphs, short-window encoder archives, and the Silero Core ML VAD graph have immutable revisions, byte lengths, and SHA-256 digests in `model_fetch.rs`. Downloads stream into temporary files and publish only after verification. Existing files are hashed once, then a metadata-bound cache avoids unnecessary hashing. The Swift worker loads only the verified directory supplied by Rust.
 
 ---
 
@@ -1381,109 +678,17 @@ run again.
 
 ## 0027 — Qwen3-ASR q8 Apple Silicon challenger
 
-**Status:** **Rejected — measured no-go; no production code added.**
+**Status:** Accepted
 
-**Context.** Qwen3-ASR 0.6B offers multilingual offline/streaming recognition
-and quantized MLX conversions. Its q8 artifact could improve offline lexical
-quality while applying the same fixed-model/hardware-specialization thesis as
-ADR-0026, but the shipping app cannot add Python and no reviewed native Rust or
-Core ML implementation exists.
-
-**Decision.** Retain native Core ML Parakeet Unified as the default and
-sherpa-onnx as the contextual-vocabulary/load-failure fallback. Treat q8 as the
-only default Qwen quantization candidate; reject q4 unless it wins quality as
-well as memory/latency. Do not fund a native Qwen port, package its weights, or
-expose it through the backend selector until a maintained native runtime passes
-the same per-category, real-boundary streaming, process-cold startup, latency,
-memory, immutable-artifact, signing, and fallback gates.
-
-**Evidence.** On M5 Pro, the pinned q8 MLX oracle measured 4.35% WER / 3.15%
-CER offline, 0.840 s corpus p50, 40.5× RTFx, 1.12 GiB peak RSS, and a 960 MiB
-weight artifact. It improved aggregate offline quality but was 1.86× slower and
-about 11.0× larger in resident memory than shipping Parakeet, while regressing
-the `noisy` and `numbers` category rows. q4 added only 17.2% throughput over q8
-and regressed WER to 6.52%; fp16 was 3.52× slower than q8.
-
-At actual 2-second model boundaries, q8 measured 23.91% WER / 21.01% CER under
-exact, unpaced 100 ms segmented, and jittered transport writes. The 14.225 s
-fixture was exact offline and 41.86% WER streaming. A native `mlx-rs` 0.25.3
-release spike bound
-the needed primitive ops but failed before linking because Xcode's separately
-downloaded Metal Toolchain was absent; the crate also raises the MSRV from 1.77
-to 1.82 and still requires a several-thousand-line architecture/tokenizer/
-cache/streaming port plus a separately packaged `mlx.metallib`.
-
-**Consequences.** No Qwen, MLX, Candle, Python, model download, runtime switch,
-or MSRV change enters the app. The PEP 723 oracle and losing measurements stay
-checked in for future comparison. Multilingual evaluation is deferred because
-the English product, streaming, latency, memory, and native-build gates already
-fail. Full evidence and the reopen conditions are in
-[`docs/asr/QWEN3_ASR_EVALUATION.md`](asr/QWEN3_ASR_EVALUATION.md).
+Qwen3-ASR is not a production dependency. The native Parakeet Unified backend remains the shipping recognizer. The evaluation, provenance, and requirements for reconsideration are in `docs/asr/QWEN3_ASR_EVALUATION.md`.
 
 ---
 
-## 0028 — Generic ASR base with evidence-gated domain and user adaptation
+## 0028 — Generic ASR with evidence-gated adaptation
 
-**Status:** **Accepted architecture; training rejected on current evidence.**
+**Status:** Accepted
 
-**Context.** A generic model can be specialized along two independent axes:
-semantic behavior for a domain or speaker, and deployment/runtime behavior for
-hardware. Calling both “fine-tuning for the Mac” risks training on too little
-user data, binding personal identity to a chip artifact, or using QAT to solve a
-vocabulary problem. The product already has the cheapest semantic mechanism:
-sherpa contextual vocabulary with a configurable score.
-
-The frozen shipping Core ML baseline has one repeated lexical class in this
-seven-fixture corpus: three word edits across two custom-vocabulary fixtures.
-The other lexical failure is a single spoken-number-form example. That is
-enough to test the existing vocabulary mechanism, not enough to estimate a
-trainable error distribution.
-
-**Decision.** Retain the immutable generic int8 Parakeet Unified Core ML model
-and its CPU+ANE default. Do not collect training data, train an adapter,
-distill, run QAT, or raise the global hotword score from current evidence.
-Before learned weights, attempt a constrained native vocabulary/lexical-
-rescoring layer when newly separated data proves a repeated target class.
-
-Keep specialization layers distinct:
-
-- a domain adapter is global/organization-specific and portable across Macs;
-- a personal adapter is user-specific, local, removable, and also portable;
-- a QAT/distilled export may target an Apple hardware family but never encodes
-  user ownership;
-- the existing runtime profile remains keyed to exact chip, OS, model digest,
-  and workload, with CPU+ANE fallback.
-
-Any future collection must preregister consent/retention, speaker- or session-
-disjoint train/development/blind-test splits, category thresholds, and artifact
-identity. The current seven fixtures were used to locate vocabulary-score
-transitions, so they are diagnostic rather than a fresh blind test for future
-adaptation and remain prohibited from training/calibration/QAT/distillation.
-
-**Evidence.** A 27-point score exploration from 0 through 50 was narrowed to
-six ten-repeat boundary rows on M5 Pro. Score 0 and the default score 2 were
-transcript-identical to greedy while costing 13.2% and 13.9% p50. The first
-effect at 2.75 improved custom-vocabulary WER from 54.55% to 27.27%, but changed
-noisy `Amy` to `80`, worsened CER from 5.46% to 6.09%, regressed noisy and
-numbers categories, and cost 14.2% p50. Score 4.5 began producing `Olly` while
-injecting `IBM` into unrelated audio. Score 6 reached 42.39% WER; scores 8–50
-measured 96.74–119.57% WER. All repeated outputs were deterministic, and no
-sherpa row cleared the frozen shipping Core ML overall/per-category gate.
-
-Report schema v3 now embeds decoder method, requested/active vocabulary state,
-score, term count, source vocabulary digest, and generated-hotword digest. The
-raw reports, compact summary, and PEP 723/`uv` verifier live under
-`bench/domain-adaptation/`.
-
-**Consequences.** The architecture supports the requested generic-base-plus-
-specialization design without manufacturing a training project. A future
-adapter has explicit ownership, deletion, blind-test, accuracy, repeatability,
-latency, memory, and fallback gates before collection begins. Any QAT or
-distillation result must report compiled artifact bytes, process-tree RSS,
-load/first-result/p50/p95 latency, and overall/per-category quality, and must
-reduce a targeted deployment resource by at least 10% without quality loss.
-Full thresholds and reopen conditions are in
-[`docs/asr/DOMAIN_ADAPTATION.md`](asr/DOMAIN_ADAPTATION.md).
+Keep the immutable generic Core ML model. Contextual vocabulary runs in the native worker at score 2.0. Training, distillation, and quantization-aware training require a repeated error class, consented data, separated development and blind-test sets, and the per-category gates in `docs/asr/DOMAIN_ADAPTATION.md`. Hardware runtime plans have a separate identity from semantic adapters.
 
 ---
 
@@ -1545,137 +750,11 @@ map are maintained in [`docs/macos-permissions.md`](macos-permissions.md).
 
 ---
 
-## 0030 — One 16 kHz resampler in Rust, run during capture
+## 0030 — One 16 kHz resampler during capture
 
-**Status:** **Accepted — implemented.**
+**Status:** Accepted
 
-**Context.** The [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend)
-worker received audio at the capture device's native rate and handed it to
-FluidAudio's `AudioConverter`, which builds a fresh `AVAudioConverter` per call.
-The g38m stage profiler priced that conversion at a linear 4.6 ms per second of
-48 kHz input: 22.7 ms of the 66.5 ms a 5 s utterance spent inside the worker,
-more than the entire RNNT decode loop at every measured length, and all of it
-after the endpoint. The Rust side was already converting the same audio to
-16 kHz for Silero VAD with a separate resampler, so the work happened twice and
-the copy that mattered was the one nobody could overlap.
-
-**Rejected: capture at 16 kHz from Core Audio.** Zero conversion would be
-cheapest, and the loopback device advertises 16 kHz. The built-in microphone
-does not. Its `supported_input_configs` list is 44100, 48000, 88200, and 96000
-at one channel; `Microsoft Teams Audio` offers only 48000. Requesting a rate a
-device does not list makes cpal's Core Audio host write
-`kAudioDevicePropertyNominalSampleRate`, which is a system-wide change other
-applications and Audio MIDI Setup observe. The option fails on the hardware
-before the side effect is even argued.
-
-**Decision.** Convert once, in `src/resample.rs`, and do it inside the cpal
-capture callback. `AudioCapture` folds each callback to mono, pushes it through
-a streaming resampler, and both accumulates and taps the 16 kHz result, so
-`Recording` and the VAD tap carry model-rate audio and `Recording.channels` is
-gone. `streamer.rs` no longer owns a resampler; the tap it already reads is what
-the recognizer receives. `CoreMlWorkerBackend::transcribe` converts anything
-that still arrives at another rate — the gold corpus is stored at 48 kHz — and
-always frames the request at 16 kHz, which is the rate FluidAudio's
-`AudioConverter.resample` returns untouched. `Worker.swift` is unchanged.
-
-**The filter.** sherpa-onnx's `LinearResampler` is Kaldi's `LinearResample`,
-verified in `sherpa-onnx/csrc/resample.cc`: `FilterFunc` is a sinc multiplied by
-a raised-cosine window, and the binding constructs it with the cutoff at 99% of
-the lower rate's Nyquist frequency and `num_zeros = 6`. The name describes the
-linear interpolation of the filter table, not of the signal. This is the same
-kernel sherpa's own feature front-end uses, so the decision is to reuse a
-bandlimited resampler already linked into the binary rather than add rubato.
-
-Three properties are tested directly rather than inferred. Filtering the signal
-in arbitrary chunk sizes returns exactly the samples one batch call returns,
-which is what makes per-callback conversion safe. A 12 kHz tone at 48 kHz,
-which would fold to 4 kHz under naive decimation, comes back below 5% of its
-input RMS. A 1 kHz tone keeps its amplitude within 2% and its sample count
-within one of the ratio. `audio.rs` repeats the first property through the
-callback path, covering the mono fold and the short-chunk case where the filter
-returns nothing.
-
-**Consequences.** The worker's resample stage is a rate comparison. The
-conversion cost that remains is spread across capture callbacks, and since a
-cpal callback that overruns its buffer period drops audio, that cost is measured
-rather than assumed: `AudioCapture` keeps a lock-free duration histogram and
-logs `capture_callback` when capture stops. On the 48 kHz loopback, 461
-callbacks over 4.917 s of audio measured a mean of 9.8 µs, a p99 of 30 µs, and a
-maximum of 103 µs against the 10.67 ms period of a 512-frame chunk — 0.09%,
-0.28%, and 0.97% of the budget. The maximum is a single-sample tail and varied
-between runs (35 µs and 103 µs across two), so it is the figure to watch if the
-callback grows again.
-
-That is 0.92 ms of callback wall time per audio-second, and it covers the whole
-callback — mono fold, level meter, filter, buffer append, and channel send — not
-the filter alone, which the histogram cannot separate. It replaces an earlier
-draft's asserted 0.1 ms, which was an order of magnitude low. The number that
-matters is unchanged either way: all of it runs during capture and none of it at
-the endpoint.
-
-`bench_asr` converts its fixture once at load, outside the measured loop,
-because that is now what production hands `Asr::recognize`; timing it inside the
-loop would measure a step the endpoint path no longer has.
-
-The sherpa fallback backend changed with it. In production it now receives
-16 kHz from capture instead of device-rate audio, so its own internal Kaldi
-resample became a no-op — the same filter, applied once instead of twice, with
-no expected quality change. `asr_diff` converts the 48 kHz gold corpus through
-`to_target_rate` before either backend sees it, so both arms are gated on the
-audio production actually produces rather than on a rate no user path emits.
-
-The quality risk is real and is gated where it can be seen: the gold corpus is
-48 kHz, so `scripts/bench-gold.sh` runs every fixture through this resampler and
-compares WER and CER against limits set when `AVAudioConverter` did the work.
-`scripts/bench-end-to-end.sh` covers the capture path with the same audio and
-requires an exact lexical match on every repetition.
-
-**Measured.** M5 Pro 24 GB, 2026-09-04, release build, 30 measured repetitions
-per bucket after 3 warmups, the same five 48 kHz fixtures for both arms, both
-arms run back to back in one session. "Before" is commit `9857547`, this branch's
-parent.
-
-| audio | resample before | resample after | ASR p50 before | ASR p50 after | change |
-|---|---:|---:|---:|---:|---:|
-| 0.816 s | 3.87 ms | 0.001 ms | 36.0 ms | 32.0 ms | −4.0 ms |
-| 2.828 s | 13.04 ms | 0.001 ms | 51.0 ms | 38.0 ms | −13.0 ms |
-| 4.854 s | 22.37 ms | 0.001 ms | 67.0 ms | 44.5 ms | −22.5 ms |
-| 8.062 s | 36.98 ms | 0.001 ms | 91.0 ms | 52.5 ms | −38.5 ms |
-| 16.513 s | 76.50 ms | 0.001 ms | 190.5 ms | 111.5 ms | −79.0 ms |
-
-The p50 change is the retired resample plus a smaller second term: the pipe now
-carries 16 kHz floats instead of 48 kHz, so measured IPC falls from 0.42 to
-0.21 ms at 5 s and from 1.14 to 0.47 ms at 20 s. At 5 s, 22.37 + 0.21 accounts
-for 22.6 of the 22.5 ms.
-
-Nothing else moved. Mel is 3.19 against 3.23 ms at 5 s, the encoder 25.97
-against 26.04, and the profiled transcribe interval 44.79 against 44.87. The
-Core ML dispatch counts are identical in both arms at every bucket — 7/17 at
-0.816 s through 119/349 at 16.513 s — so the Kaldi filter hands the encoder
-audio the model decodes into the same token stream AVAudioConverter's did.
-
-Gold at 10 repetitions passes with worst WER 5.43% and worst CER 3.57%, which
-are the manifest's baseline values under a zero-regression cap, with zero
-nondeterministic fixtures and zero changed transcripts.
-
-**Where the saving does and does not land.** Tap keeps its number. The
-end-to-end gate re-ran at 630.0 ms against 192.0 ms p50, a 3.28x ratio, and the
-`phase_timer` lines explain the flat result: the speculative decode ends about
-80 ms before the endpoint policy confirms, and post-endpoint work is 0 to 1 ms,
-so that path is bound by the confirmation window rather than by the decode.
-Removing 22 ms widens the margin instead of shortening the transcript. The
-saving is collected wherever the decode is not hidden — Hold, where the hotkey
-release is the endpoint and nothing overlaps it; the serial fallback; and any
-utterance long enough that its decode would otherwise outrun the window. It also
-stops the work from being done twice on every utterance in every mode.
-
-Hold shows it. Release-to-transcript p50 falls from 54.0 to 48.0 ms at the
-shortest bucket, 106.5 to 72.5 ms at 5 s, and 231.5 to 192.5 ms at the longest,
-though the two runs' captured durations differ by up to 0.8 s per bucket so this
-is a trend rather than a controlled comparison. Capture shutdown also rounds to
-0 ms now, against about 1 ms before: `finish_with_recording` no longer folds the
-recording to mono, since capture did that per callback, and only the resampler's
-tail flush remains after the stream is dropped.
+Every downstream consumer receives 16 kHz mono Float32. Capture owns one streaming Kaldi windowed-sinc resampler, now statically compiled from `native/resample`. The cutoff is 99% of the lower Nyquist rate, with six zero crossings. Target-rate input passes through. Chunked conversion preserves the filter carry; flush drains the tail. The local kernel retains source notices and preserves the released kernel's ordered 16-product loop and fused scalar tail.
 
 ---
 
@@ -1911,7 +990,7 @@ while the next session starts. The tail's wait behind an in-flight window is
 inherent and shows at p95 rather than p50.
 
 **Failure is always backwards.** Windowing turns itself off, with the reason
-logged, when the recognizer reports no word boundaries (sherpa), when the
+logged, when the recognizer reports no word boundaries, when the
 configuration is out of range, when Silero will not load, when the audio tap
 closes early, or when capture returns something other than 16 kHz. Any window
 decode error, and any merge that comes back empty on non-empty audio, abandons
@@ -1927,147 +1006,9 @@ so the seam merge is held to the same WER as the plain decode.
 
 ## 0033 — Contextual biasing on the native Core ML path
 
-**Status:** **Accepted — implemented and measured.**
+**Status:** Accepted
 
-**Context.** [ADR-0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list)
-put contextual biasing in sherpa-onnx because sherpa owned the only
-implementation of it, and [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend)
-therefore routed any non-empty custom vocabulary to that fallback. The cost of
-that route is the whole of ADR-0022: 132x real time drops to roughly 11x, and
-0.10 GiB of resident set becomes 4.25 GiB, for exactly the users who cared
-enough about accuracy to write a vocabulary file. The measured sweep in
-[`docs/asr/DOMAIN_ADAPTATION.md`](asr/DOMAIN_ADAPTATION.md) also found that
-sherpa's biasing bought nothing at the shipped score: 54.55% custom-vocabulary
-WER at score 2.0, identical to greedy, and no score improved one category
-without worsening another.
-
-**Decision.** Bias inside the native worker, over the joint logits the RNNT
-loop already computes, and remove the vocabulary condition from backend
-selection. sherpa remains reachable through Core ML load failure and
-`PARAKEET_ASR_BACKEND=sherpa`, and keeps its hotwords-file path for those.
-
-- The worker tokenizes each term with the model bundle's own `vocab.json`
-  (1024 SentencePiece pieces), longest-match from the left, with `▁` prefixed
-  to each word. The bundle ships the inventory but not the merge ranks a
-  faithful BPE encoder needs, so this approximates the model's own
-  segmentation. A disagreement costs biasing on that term rather than
-  correctness, but it is the failure mode with no alarm: a term with no piece
-  at all is reported rejected, while a term split the wrong way is reported
-  accepted and boosts a path the joint never walks. The worker therefore echoes
-  the pieces it chose for every accepted term, which Rust logs at info and
-  exposes through `Asr::contextual_vocabulary`. That is the whole mitigation —
-  the split is inspectable, not verified. Verifying it needs either the merge
-  ranks or a decode of audio containing the term.
-- The token sequences build an Aho-Corasick trie with failure arcs. Each node
-  carries `nodeScore` (the boost accumulated along its path), `endScore` (the
-  part a completed entry has banked, including through the output link when the
-  node's *suffix* is a complete entry) and `atRisk = nodeScore - endScore`.
-- A step's true shallow-fusion deltas are `0` for blank, which does not extend
-  the label sequence; `atRisk(n) + banked(s, n) - atRisk(s)` for a token
-  continuing or starting an entry; and `-atRisk(s)` for any other token, the
-  retraction. A greedy argmax compares outcomes only inside one step, so the
-  vector is shifted by `+atRisk(s)`, which puts the non-matching tokens at zero
-  and makes the boost sparse: blank plus the tokens reachable from the state or
-  its failure chain, a few dozen logits out of 1025.
-- Two departures from sherpa's `ContextGraph`, both because greedy takes one
-  step at a time where a beam scores whole paths. Blank is boosted by
-  `atRisk(s)` rather than left among the non-matching tokens, or continuing an
-  entry would be worth the whole accumulated boost over blank rather than one
-  token's score, and the loop would emit the rest of a hotword inside a single
-  frame until it hit the symbol cap. And a completed entry is banked into
-  `endScore` rather than compensated by a separate `output_score` that
-  `Finalize` settles, or an uncompensated retraction sitting on blank after a
-  match would suppress the word that follows it.
-- The terms reach the worker in one `PRKV` control frame at spawn, so the trie
-  is built once. The frame carries a distinct magic rather than a protocol
-  version bump, leaving the audio frame untouched. The worker replies with the
-  accepted count and the terms its inventory could not represent, which Rust
-  logs — the Core ML counterpart of ADR-0020's `tokens.txt` validation.
-- Biasing is refused, not ignored, under `--rnnt-engine coreml` and
-  `--model-variant tdt-v3`. Neither decode loop has the hook, and accepting the
-  terms there would claim biasing that nothing was doing.
-- The boost is removed from the logits again before the softmax, so the
-  confidence a biased emission reports is still the model's own.
-
-**Evidence.** M5 Pro, 24 GB, macOS 26.5.1, release worker and binaries built
-from this tree. Quality is the seven-fixture human gold corpus at ten
-repetitions with `bench/gold/vocabulary.txt` (IBM, Olly, Tactics), all three
-accepted by the tokenizer; every row produced one unique transcript per fixture
-across its ten runs.
-
-| backend | decoding | WER | CER | custom-vocabulary WER / CER | corpus p50 | RTFx p50 | peak RSS | load |
-|---|---|---:|---:|---:|---:|---:|---:|---:|
-| Core ML | greedy, no vocabulary | 5.43% | 3.57% | 27.27% / 8.93% | 0.245 s | 139.2× | 0.103 GiB | 0.150 s |
-| Core ML | greedy + biasing, score 2.0 | **3.26%** | **2.94%** | **9.09% / 3.57%** | 0.245 s | 139.1× | 0.103 GiB | 0.090 s |
-| sherpa | greedy | 10.87% | 5.46% | 54.55% / 12.50% | 3.045 s | 11.2× | 4.455 GiB | 4.216 s |
-| sherpa | `modified_beam_search` + hotwords, score 2.0 | 10.87% | 5.46% | 54.55% / 12.50% | 3.330 s | 10.2× | 4.678 GiB | 4.060 s |
-
-The bottom row is what a custom vocabulary used to cost: 13.6× the corpus
-decode time and 45× the resident set of the biased native path, for a
-custom-vocabulary WER six times worse. It reproduces ADR-0028's finding that
-sherpa's hotword graph has no lexical effect at the shipped score — beam search
-and greedy return the identical transcript set, the beam being 9.4% slower for
-nothing.
-
-Per-category against the unbiased Core ML baseline, negative better:
-
-| category | Δ WER points | Δ CER points |
-|---|---:|---:|
-| commands | -4.88 | -1.50 |
-| custom vocabulary | -18.18 | -5.36 |
-| general | 0.00 | 0.00 |
-| long | 0.00 | 0.00 |
-| noisy | 0.00 | 0.00 |
-| numbers | 0.00 | 0.00 |
-| proper nouns | -2.38 | -0.69 |
-| punctuation-tagged corpus | -2.17 | -0.63 |
-
-No category regresses, which is what the sherpa sweep could not achieve —
-`IBM` and `Olly` are both repaired while the noisy `Amy` fixture, which
-sherpa's first effective score turned into `80`, stays exact. The residual
-custom-vocabulary error is `from` → `for`, an acoustic substitution the
-vocabulary has no bearing on. Single runs at scores 3.0 and 4.0 changed only
-capitalization inside already-correct words, so the shipped `hotword_score`
-default of 2.0 is unchanged.
-
-Latency is `bench_asr` at 30 repetitions after 3 warmups per length, biased
-with the 50-entry `bench/gold/vocabulary-50.txt` at score 2.0. Wall p50 is
-identical to the millisecond at every length; the worker-internal p50, which
-resolves below that, is the honest column:
-
-| audio | no vocabulary p50 | 50-entry vocabulary p50 | Δ | p95 without / with |
-|---|---:|---:|---:|---:|
-| 1 s | 30.571 ms | 30.627 ms | +0.2% | 31.189 / 31.368 ms |
-| 3 s | 33.030 ms | 33.004 ms | -0.1% | 34.470 / 34.093 ms |
-| 5 s | 35.747 ms | 36.620 ms | **+2.4%** | 38.557 / 39.015 ms |
-| 10 s | 39.927 ms | 39.904 ms | -0.1% | 42.516 / 42.540 ms |
-| 20 s | 81.199 ms | 81.323 ms | +0.2% | 87.856 / 87.952 ms |
-
-The 15% budget holds with a factor of six to spare. The 5 s row is the only one
-that moves, and the stage breakdown says why it is not biasing overhead: the
-biased decode emitted 40 prediction steps and 101 joint evaluations where the
-unbiased one emitted 35 and 96, because the boost changed the transcript on
-that fixture. Five more steps at the measured ~0.18 ms each account for the
-whole 0.87 ms. The per-call cost is a few dozen adds and subtractions on a
-1025-wide logit vector, and it does not register.
-
-With an empty vocabulary the decode is unchanged by construction — the sparse
-boost loops are empty and the argmax is byte-for-byte the one ADR-0032 shipped
-— and the ten-repetition run reproduces the frozen baseline's aggregate and
-every per-category WER/CER to the full float:
-5.434782608695652% / 3.5714285714285716%, zero spread, zero nondeterministic
-outputs. The frozen baseline records no per-fixture transcripts, so that is
-agreement on every published number rather than a transcript diff.
-
-**Consequences.** ADR-0020's format and its silent-drop trap survive only on
-the sherpa fallback, which now needs an explicit environment variable or a load
-failure to reach. `crate::vocabulary::has_terms` is gone; backend selection no
-longer reads the vocabulary at all. A user who sets a vocabulary keeps the
-Neural Engine, the 0.10 GiB resident set, and the sub-100 ms decode, and gets
-biasing that measurably works rather than biasing that measurably did not.
-`bench-gold.sh` still defaults to the installed app's worker, so a gold run
-against a changed worker protocol needs `COREML_WORKER` set or it measures
-stale code.
+The native RNNT decoder applies an Aho-Corasick context trie before greedy selection. The worker tokenizes natural-language terms with the model's piece inventory, reports rejected terms and accepted segmentations, and keeps completed entries' earned score out of later retraction. Empty vocabulary leaves the unbiased path intact. Score 2.0 is the shipped setting; changes must clear the gold corpus with no category regression.
 
 ---
 
@@ -2248,7 +1189,7 @@ first-load plan compile is the only per-device step.
   windows that verified, never filename discovery, so an unverified bundle
   is never loaded. With no bucket the list is `none` and every utterance
   uses the 15 s encoder, as before. If Core ML refuses a verified bucket the
-  worker is reloaded without buckets rather than falling back to sherpa.
+  worker is reloaded without buckets while retaining the stock Core ML encoder.
 - Startup loads the 15 s encoder alone. Core ML's compiled-plan cache is
   keyed by the worker executable's name and the model directory's path, not
   by the binary's contents, so it is cold after a first install, a moved
@@ -2406,264 +1347,35 @@ to the 15 s encoder. Release to text in the app's primed Hold, 5+8 against the
 
 ---
 
-## Target status index
+## 0040 — Core ML ASR and frame-sized Silero VAD
 
-| ADR-0007 target | Owner ADR | Status | Blocked by |
-|---|---|---|---|
-| Accelerated Core ML path present | [0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage) + [0015](#0015--coreml-ep-verification-protocol) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped + measured** — native worker quality/latency gates pass; the sherpa fallback retains its CoreML symbol/runtime checks | exact per-op placement remains Apple-managed |
-| <1 s p50 felt latency (revised from <200 ms — see [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)) | [0009] + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) + [0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) + [0031](#0031--tap-fast-confirms-at-90-ms-punctuation-rejected-as-an-endpoint-signal) | **Shipped + measured** — Tap Fast is 148.5 ms p50 on the representative 5 s bucket, down 33.5 ms, and 46.0 ms faster on the 3.505 s human fixture (13.0 ms measured, offset low by that fixture's marker); pause-friendly Tap remains below 1 s on the endpoint corpus | nothing |
-| Live partial transcripts | [0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected) + [0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority) | **Out of scope** — no quality-preserving streaming model won; speculative final decode provides the measured latency win | a new candidate must beat the existing quality/latency/resource gates |
-| CPU+ANE requested and performance-gated | [0022](#0022--resident-native-core-ml-parakeet-unified-backend) + [0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans) | **Shipped** — explicit tuner retained CPU+ANE on the M5 Pro after all challengers failed the ≥5%/quality/memory gates | Core ML owns final per-op placement |
-| ≤1.2 GB resident set | [0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation) + [0022](#0022--resident-native-core-ml-parakeet-unified-backend) | **Shipped** — native tray shell and resident Core ML worker; ~800 MB asserted | nothing |
-| Optional smart formatting | [ADR-0036](#0036--optional-transcript-rewrite-through-the-running-opencode-service) | **Shipped** — optional rewrite through an already-running OpenCode service; any failure pastes the local transcript | nothing |
-| Clipboard not clobbered | [0019](#0019--paste-delivery-synthetic-unicode-keystroke-annotatedsession) | **Shipped** on the normal path; clipboard is rescue-only for observable delivery failure | `CGEventPost` has no delivery receipt |
-| Custom vocabulary | [0020](#0020--vocabulary-sherpa-contextual-biasing-generated-from-a-plain-text-list) + [0028](#0028--generic-asr-base-with-evidence-gated-domain-and-user-adaptation) + [0033](#0033--contextual-biasing-on-the-native-core-ml-path) | **Shipped + measured** — the native worker biases over its own joint output: 5.43% to 3.26% WER, custom-vocabulary 27.27% to 9.09%, no category regression, and 2.4% decode cost at five seconds with fifty terms | nothing |
+**Status:** Accepted
 
-**Completed path to the ADR-0007 latency claim:**
-1. [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend) — move
-   the generic default path to a pinned resident Parakeet Unified worker while
-   retaining sherpa for fallback and vocabulary.
-2. [ADR-0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans) — keep
-   hardware placement evidence-gated, quality-safe, and reversible.
-3. [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)
-   + [ADR-0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode) —
-   retain Silero endpoint authority with pause-friendly and explicit fast modes.
-4. [ADR-0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority)
-   — overlap recognition with confirmation and clear the matched 3× p50/p95 gate.
+The app uses one native Core ML recognition backend and requires macOS 14+.
+A missing worker, invalid model, or load failure produces a clear setup error.
+No backend-selection environment variable, generated hotword file, ONNX model
+download, or ONNX runtime library is part of the product. The ASR facade keeps
+shared metrics, warmup, token-span handling, and evaluation adapters.
 
-Anything not on this table is either accepted-and-done or out of scope.
+Silero VAD uses FluidInference's v6.0.0 32 ms Core ML graph at revision
+`b419383c55c110e2c9271fa6ee0ea83d03c70d96`. Each detector owns a dedicated
+worker with a fresh FluidAudio `VadState`. ASR work cannot block VAD IPC.
+The adapter supplies 512 new samples plus 64 context samples directly;
+FluidAudio's `VadManager` targets a fixed 4096-sample graph and cannot serve
+the frame-sized endpoint contract. Both probability thresholds, minimum speech
+duration, and candidate/confirming silence windows stay explicit in Rust.
+Window-tuning keys include the VAD manifest digest, so a quality verdict from
+another detector cannot select Hold windows. Compute-only keys stay independent
+of endpointing.
 
-## Change log
+The local Kaldi resampler is statically linked with its notices retained.
+Its ordered product accumulation preserves the distributed kernel's rounding.
+Packaging copies only the Rust executable, native worker, and notices.
 
-- **2026-11-01** — [ADR-0039](#0039--per-mac-choice-of-encoder-buckets-and-hold-window-on-the-gold-gate)
-  accepted and implemented. `tune_asr` measures each encoder bucket and the
-  cost of switching between them, then chooses the bucket set and Hold window
-  that the gold gate leaves byte-identical. The app installs only the chosen
-  buckets. On the M5 Pro: buckets 5 and 8 s at 6 s.
+---
 
-- **2026-11-01** — [ADR-0038](#0038--fluidaudio-from-a-revision-pinned-moorbrook-fork)
-  accepted and implemented. The worker takes FluidAudio from the moorbrook
-  fork at a pinned revision, upstream `00a9aa77` plus the window and
-  decode-loop change, so a clean checkout builds without a local override.
+## Target status
 
-- **2026-10-31** — [ADR-0037](#0037--short-window-encoder-buckets-258-s-as-verified-release-assets)
-  accepted and implemented. The app fetches 2, 5 and 8 s offline encoders
-  from release tag `encoder-buckets-v1`, verifies every file by SHA-256
-  before the worker may load it, compiles their Core ML plans in a
-  throwaway worker off the dictation path, and falls back to the 15 s
-  encoder when a bucket is absent. 1.77 GB of disk.
-
-- **2026-10-31** — [ADR-0036](#0036--optional-transcript-rewrite-through-the-running-opencode-service)
-  accepted and implemented. The optional formatting pass is a rewrite by the
-  OpenCode service already running on the Mac, bounded by a 5 s deadline,
-  with the local transcript pasted on any failure. Parakeet loads no
-  language model of its own.
-
-- **2026-09-04** — [ADR-0035](#0035--self-signed-local-identity-so-tcc-grants-survive-rebuilds)
-  accepted and implemented. Local builds now sign with the keychain's
-  self-signed `Parakeet Local Dev` identity by default instead of ad hoc,
-  so the TCC designated requirement is stable across rebuilds and stored
-  Input Monitoring / Microphone / Accessibility grants keep matching — the
-  root cause of the Input Monitoring Grant button silently doing nothing
-  on rebuilt installs. Ad-hoc remains as a loud-warned fallback when the
-  identity is absent. The Grant path additionally distinguishes a live
-  consent prompt from a suppressed one via a ~1.5 s main-thread re-check
-  (the alert takes focus; a suppressed request does not): a suppressed
-  request warns and opens the Input Monitoring settings pane, refreshing
-  the dashboard only when the pane fails to open — never a silent no-op.
-
-- **2026-09-04** — [ADR-0033](#0033--contextual-biasing-on-the-native-core-ml-path)
-  accepted and implemented. Contextual biasing moved onto the native Core ML
-  path as an Aho-Corasick shallow-fusion boost over the joint logits, and the
-  sherpa fallback stopped being what a custom vocabulary selects. On the human
-  gold corpus at ten repetitions the biased path measured 3.26% WER / 2.94%
-  CER against 5.43% / 3.57% unbiased, with custom-vocabulary WER 27.27% to
-  9.09%, no category regression, and no measurable decode cost — 2.4% at five
-  seconds with a fifty-term vocabulary, against 15% allowed. The sherpa row it
-  replaces measured 10.87% / 5.46% at 13.6× the corpus decode time and 45× the
-  resident set.
-
-- **2026-09-04** — [ADR-0031](#0031--tap-fast-confirms-at-90-ms-punctuation-rejected-as-an-endpoint-signal)
-  accepted and implemented. Tap Fast confirms after 90 ms of Silero silence
-  instead of 150 ms: 182.0 to 148.5 ms p50 on the synthesized 5 s fixture and
-  59.0 to 13.0 ms on the 3.505 s human fixture, whose absolutes sit low because
-  its acoustic-end marker survives into the room tone; 0/30 false cuts and both
-  existing gates unchanged. A punctuation-aware early commit was built and measured
-  alongside it and is rejected: the model emits a sentence-final period at the
-  endpoint corpus's 544 ms intra-utterance pause, so it cut that fixture 15/15,
-  and where it was safe it matched a plain 90 ms window. Its implementation and
-  benchmark rows are reachable at commit `b2cc586`.
-
-- **2026-09-04** — [ADR-0032](#0032--hold-decodes-6-s-windows-during-the-hold-joined-on-word-agreement)
-  accepted and implemented. Hold cuts the held recording into 6 s windows,
-  decodes them in the background while the key is still down, and joins them on
-  the words neighbouring windows agree on, so release-to-text is the tail window
-  rather than the whole recording: 180.5 ms to 65.0 ms p50 at a 16.6 s
-  utterance. Cutting at Silero-confirmed pauses instead was implemented,
-  measured, and rejected — it cost 1.09 points of gold WER by splitting short
-  utterances — so the pause path ships disabled. The recognizer is unchanged;
-  this is not the streaming-model swap ADR-0009 rejected.
-
-- **2026-09-04** — [ADR-0030](#0030--one-16-khz-resampler-in-rust-run-during-capture)
-  accepted and implemented. One Kaldi sinc resampler in `src/resample.rs`,
-  run per cpal callback, retires FluidAudio's per-call `AVAudioConverter`
-  from the endpoint path: resample falls from 22.4 to 0.001 ms at 5 s and
-  ASR p50 from 67.0 to 44.5 ms, with gold unchanged at its baseline WER
-  and CER. Capturing at 16 kHz was rejected — the built-in microphone does
-  not offer the rate, and requesting an unlisted one changes the device's
-  nominal rate system-wide.
-
-- **2026-08-11** — [ADR-0029](#0029--contextual-macos-permission-onboarding-and-recovery)
-  added: ZoomItForMac-inspired permission-state separation, contextual
-  request scopes, explicit denied/restricted/revoked recovery, targeted
-  settings links with fallback, activation refresh, and a signed manual QA
-  matrix without adding Screen Recording or Camera access.
-
-- **2026-08-11** — [ADR-0028](#0028--generic-asr-base-with-evidence-gated-domain-and-user-adaptation)
-  added: a 27-point vocabulary sweep with six repeated boundary reports, a
-  measured no-training decision, explicit global/domain/personal/hardware
-  ownership, pre-collection split/privacy gates, and report-schema-v3 decoding
-  provenance.
-
-- **2026-08-11** — [ADR-0027](#0027--qwen3-asr-q8-apple-silicon-challenger)
-  added: pinned q8/q4/fp16 offline evidence, actual mid-chunk streaming
-  measurements, `mlx-rs`/Candle/Core ML feasibility and packaging analysis,
-  and a measured no-go that leaves the production backend unchanged.
-
-- **2026-08-11** — [ADR-0026](#0026--evidence-gated-per-chip-core-ml-runtime-plans)
-  added: bounded Core ML candidate tuning, short/long regime selection,
-  hardware/OS/model/tuner cache invalidation, quality/category/memory gates,
-  an inspectable atomic profile, and measured M5 Pro negative evidence that
-  keeps CPU+ANE.
-
-- **2026-08-11** — [ADR-0025](#0025--pause-friendly-tap-with-an-explicit-low-latency-mode)
-  added: 750 ms pause-friendly Tap default, explicit 150 ms Tap Fast, and a
-  versioned real-speech gate coupling zero false stops with sub-second p95
-  final-pause latency.
-
-- **2026-08-10** — [ADR-0024](#0024--immutable-identities-for-rust-managed-model-artifacts)
-  added: immutable Hugging Face revisions, pinned length/SHA-256 identities,
-  streaming `.part` verification, corrupt-file refetch, and metadata-cached
-  first-use verification for all five Rust-managed model artifacts.
-
-- **2026-08-10** — [ADR-0023](#0023--speculative-decode-behind-an-unchanged-endpoint-authority)
-  added: dual-VAD speculative decode with the original confirmer retained as
-  stop authority, true acoustic-end timing, deterministic BlackHole replay,
-  and a passing 30-repetition 3.37× p50 / 3.21× p95 end-to-end gate.
-
-- **2026-08-10** — [ADR-0022](#0022--resident-native-core-ml-parakeet-unified-backend)
-  added: pinned resident FluidAudio worker, int8 Parakeet Unified CPU+ANE
-  backend, automatic sherpa fallback, vocabulary-aware backend selection,
-  matched 30-repetition evidence showing 3.20–6.44× p50 speedups, and a
-  passing 2.38% WER / 2.22% CER smoke gate.
-
-- **2026-05-15** — Codex challenge review (`/codex challenge docs/ADR.md`)
-  surfaced eight findings. Verified the most critical (no CoreML EP in
-  prebuilt static lib) via `nm -gU` symbol inspection. Material revisions:
-  - Added [Current state snapshot](#current-state-vs-target-snapshot) so the
-    code-vs-target gap is impossible to overlook.
-  - [ADR-0005](#0005--sherpa-onnx-as-the-inference-binding) updated to
-    record the realised CoreML EP risk with evidence.
-  - [ADR-0006](#0006--apple-silicon-optimization-plan-ds4-playbook-applied)
-    split: CPU optimizations Accepted, CoreML / ANE claims downgraded to
-    Proposed-gated-on-0012.
-  - [ADR-0007](#0007--performance-targets-beat-wispr-flow) latency table gained a "Today
-    (baseline)" column; the impossible "<400 MB resident set including
-    model" target replaced with the honest "≤1.2 GB" steady-state target.
-  - [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected) VAD silence
-    threshold tightened from 250 ms to 150 ms; latency budget made
-    explicit and shown to require ADR-0012 to hold.
-  - [ADR-0011](#0011--direct-accessibility-text-injection-deferred) **deferred to
-    v2** by user direction.
-  - [ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage) **promoted
-    from Proposed to Accepted**; vendor as submodule rather than env-var
-    redirection; explicit cmake flag list; honest maintenance cost.
-  - New [ADR-0015](#0015--coreml-ep-verification-protocol) added with a
-    three-layer verification protocol (build-time symbol check, runtime
-    provider log parse, per-utterance latency probe).
-  - New [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation)
-    re-opens the Tauri-vs-SwiftUI question now that we're mac-only and
-    ADR-0012 has revealed real maintenance costs. Decision time-boxed to a
-    ≤ 4 h sherpa-onnx-with-CoreML build spike; explicit pivot/continuation
-    triggers documented.
-
-- **2026-05-15** (later) — Implementation pass landed:
-  - [ADR-0014](#0014--tray-only-headless-ux) shipped: settings window
-    `visible: false` at launch; tray menu opens it on demand.
-  - [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected) shipped (offline
-    encoder variant): press-twice toggle deleted; new `streamer.rs` +
-    `vad.rs` modules drive Silero VAD over an audio tap channel; cancel-on-
-    second-press preserved. Streaming Parakeet still future work.
-  - [ADR-0015](#0015--coreml-ep-verification-protocol) implemented: layer 1
-    in `build.rs`, layer 2 in `asr.rs::Asr::load`, layer 3 in
-    `asr.rs::Asr::recognize_with_timing` with an RTFx-floor warn at 2x.
-  - HIG audit findings #1, #2, #3, #5, #9, #11, #12, #14, #15 addressed:
-    SF Symbols tray icon (via `objc2_app_kit`), state-reflective menu
-    labels, glyph-rendered hotkey field, determinate `<progress>` bar,
-    `-apple-system` typography, semantic dark-mode palette.
-  - **[ADR-0012](#0012--sherpa-onnx-prebuilt-with-coreml-ep-shared-linkage)
-    spike resolved unexpectedly fast** — switched `sherpa-onnx` to
-    `default-features = false, features = ["shared"]`, which pulls
-    Microsoft's official `libonnxruntime.dylib` (CoreML-enabled) instead
-    of the CPU-only static archive. Bundled the four resulting dylibs in
-    `tauri.conf.json` `bundle.macOS.frameworks`. Build-time `nm -gU`
-    confirms `OrtSessionOptionsAppendExecutionProvider_CoreML` is exported.
-    The originally drafted vendored-cmake plan is preserved at the bottom
-    of ADR-0012 as a future fallback if Microsoft's prebuilt regresses.
-  - [ADR-0016](#0016--tauri--rust-shell-vs-swiftui-native-re-evaluation)
-    closed in favour of staying on Tauri+Rust — the ADR-0012 maintenance
-    tax that triggered the re-evaluation no longer exists.
-
-- **2026-05-15** (even later, runtime confirmation pass):
-  - **ADR-0015 layer 3 measured and green** on this M5 Pro: the warmup's
-    2 s silent decode runs in **0.258 s (7.8x real time)**, well above the
-    2x CoreML floor. ANE/GPU is engaged. The "Context leak detected,
-    CoreAnalytics returned false" lines from the first decode were
-    misread as failure on the prior pass — they're a harmless lifecycle
-    log from `CoreAnalyticsCenter` that *confirms* CoreML is initialising.
-  - **Warmup refactored** to a throwaway-then-measured two-pass structure
-    (`warmup.rs:38-48`), so the user-visible RTFx log line is always the
-    steady-state number. The throwaway pass uses a new
-    `Asr::recognize_silent_warmup` that suppresses the spurious
-    "below CoreML floor" warn for the JIT-dominated first decode.
-  - **Warn threshold tightened**: `recognize_with_timing` now only warns
-    on samples ≥ 1.5 s of audio (was 0.5 s), since short utterances —
-    "yes", "no", single words — aren't reliable RTFx measurements.
-  - [ADR-0014] indicator webview **dropped entirely** — tray icon state
-    swap (mic / mic.fill via SF Symbols) is now the sole visual feedback
-    during dictation. Saves a webview at startup and aligns with the
-    "no niceties" steer. Files removed: `src/indicator.html`,
-    `src/indicator.ts`, `body.indicator` CSS rule; window definition
-    removed from `tauri.conf.json`; helpers `show_indicator` /
-    `hide_indicator` deleted from `lib.rs`.
-  - **Release profile tuned**: `[profile.release]` in Cargo.toml now sets
-    `lto = "fat"`, `codegen-units = 1`, `panic = "abort"`,
-    `strip = "symbols"`, `opt-level = 3`. **Release binary 16 MB → 8.6 MB**
-    (-46%), with no measurable cold-start regression.
-
-- **2026-05-15** (final pass) — **Streaming model swap considered and
-  rejected.** The "ADR-0009 phase 2" idea (`OfflineRecognizer` →
-  `OnlineRecognizer` with a streaming model) was investigated end-to-end:
-  - No streaming Parakeet TDT 0.6B v3 ONNX exists; sherpa-onnx issue
-    [k2-fsa/sherpa-onnx#2918](https://github.com/k2-fsa/sherpa-onnx/issues/2918)
-    is open and unresolved.
-  - The available substitutes — NeMo FastConformer streaming-multi @ 480 ms
-    (114 M params, 5.7% test-other, no test-clean published, no
-    punctuation) and Kroko Streaming Zipformer (~50 M, no published WER,
-    no punctuation) — both regress accuracy meaningfully and lose
-    Parakeet TDT v3's native punctuation/capitalization.
-  - NVIDIA's high-quality streaming option (`nemotron-speech-streaming-en-0.6b`)
-    is **NVIDIA-GPU only** by license and runtime; not deployable on
-    Apple Silicon. Rejected.
-  - Building our own streaming variant from the existing Parakeet
-    checkpoint would require retraining with cache-aware attention masks
-    — multi-week ML project, not justified by the ~640 ms latency saving.
-  - [ADR-0009](#0009--silero-vad-auto-stop-offline-encoder-accepted--streaming-model-swap-rejected)
-    re-titled and rewritten to record the reasoning, the WER trade-off
-    table, and the new accepted scope (Silero VAD auto-stop only, no
-    recognizer swap).
-  - [ADR-0007](#0007--performance-targets-beat-wispr-flow) latency table updated:
-    **<200 ms p50 target retired** in favour of **<1 s p50 with WER ≤ 2%**,
-    which the current shipped build already meets (~840 ms p50 on a 5 s
-    utterance: 150 ms VAD hangover + 640 ms offline encoder + ~50 ms
-    finalize).
+Production recognition, vocabulary, and endpointing use native Core ML.
+Latency and quality commands are in the README and `bench/README.md`.
+Historical evidence does not define a current latency guarantee.

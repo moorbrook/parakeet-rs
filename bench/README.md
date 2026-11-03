@@ -51,9 +51,8 @@ and does not affect the shipping dependency graph. Its immutable artifact
 summary and no-go evidence are under `bench/qwen3-asr/`; the full interpretation
 is in `docs/asr/QWEN3_ASR_EVALUATION.md`.
 
-The measured vocabulary-score sweep and no-training decision are under
-`bench/domain-adaptation/`; interpretation and future adapter/data gates are in
-`docs/asr/DOMAIN_ADAPTATION.md`.
+Native vocabulary evidence is under `bench/vocabulary-biasing/`; future
+adapter and data gates are in `docs/asr/DOMAIN_ADAPTATION.md`.
 
 ## Quick start
 
@@ -70,7 +69,7 @@ BACKEND=coreml-unified OUT_CSV=bench/coreml-unified.csv \
 
 # Production capture + VAD + ASR, frozen serial baseline vs optimized path.
 # Requires a duplex Core Audio loopback named "BlackHole 2ch".
-scripts/bench-end-to-end.sh
+scripts/bench-endpoint-policy.sh
 
 # Hold mode: release-to-transcript through the same production path.
 # Also requires the "BlackHole 2ch" loopback.
@@ -98,56 +97,12 @@ It **does not** exercise:
   (sub-ms per chord — see ADR-0019)
 
 So `scripts/bench-latency.sh` is **ASR-only**. Use
-`scripts/bench-end-to-end.sh` for the production capture, resampling, dual-VAD,
+`scripts/bench-endpoint-policy.sh` for the production capture, resampling, dual-VAD,
 endpoint, session-shutdown, and ASR path, and `scripts/bench-hold.sh` for the
 Hold path, where the hotkey release replaces the VAD endpoint. Both harnesses
 stop at transcript-ready rather than typing into the user's focused app; the
 only excluded production step is the synchronous synthetic-Unicode event post
 (sub-ms per chord; see ADR-0019).
-
-## End-to-end 3x result: M5 Pro 24 GB (2026-08-10)
-
-The end-to-end harness selects `BlackHole 2ch` directly for both input and
-output without changing macOS defaults. It trims only sub-threshold trailing
-fixture silence, uses Core Audio's predicted playback timestamp for the last
-non-silent sample, and feeds the production `cpal` capture and `streamer` path.
-Both variants receive the same measurement-only acoustic endpoint marker.
-
-The representative fixture is `5s_48000.wav` (4.854 s measured). Release
-builds used two warmups and 30 measured repetitions per variant. Every
-measured transcript had an exact lexical match to the reviewed reference.
-
-| pipeline | n | mean | p50 | p95 | p99 |
-|---|---:|---:|---:|---:|---:|---:|
-| sherpa + serial endpoint | 30 | 613.6 ms | 613.0 ms | 652.5 ms | 657.3 ms |
-| Core ML + speculative decode | 30 | 189.7 ms | 182.0 ms | 203.0 ms | 203.0 ms |
-| speedup | | **3.23×** | **3.37×** | **3.21×** | **3.24×** |
-
-The optimized path starts ASR from the early 32 ms detector, discards the
-provisional result whenever speech resumes, and lets an independent Silero
-state remain the sole stop authority. Re-run on 2026-09-04 after ADR-0030
-retired the resample stage, the gate reads 630.0 ms against 192.0 ms (3.28x
-p50) and 952.3 ms against 203.0 ms (4.69x p95), every transcript matching.
-
-Tap did not collect the resample saving, and the `phase_timer` lines said why:
-`t_asr_start=4966`, `t_asr_done=5013`, `t_vad_endpoint=5094`. The speculative
-decode finishes about 80 ms before the endpoint policy confirms, and
-`dur_post_endpoint_ms` is 0 to 1 ms, so this path is endpoint-bound rather than
-decode-bound. Taking 22 ms out of the decode widens that margin instead of
-shortening the result. The saving lands where the decode is not hidden: Hold,
-the serial fallback, and every utterance long enough that the decode would
-otherwise outrun the confirmation window. ADR-0031 acted on the endpoint side
-instead and moved Tap Fast to 90 ms; the window sweep is below.
-
-This frozen comparison pins `--confirmation-ms 150`, Tap Fast's original policy,
-so the historical 3× result stays like-for-like whatever the shipping window
-becomes. Re-run on 2026-09-04 it reads, baseline before optimized, 594.5 → 182.0 ms p50
-(3.27×) and 635.1 → 203.6 ms p95 (3.12×). The gate fails unless both p50 and p95 are at
-least 3.0× and every transcript matches:
-
-```bash
-REPS=30 WARMUP_REPS=2 scripts/bench-end-to-end.sh
-```
 
 ## Long-pause endpoint gate
 
@@ -205,16 +160,16 @@ REPS=15 WARMUP_REPS=2 scripts/bench-endpoint-sweep.sh
 
 Matched release runs used the same 48 kHz WAVs, resident recognizer, three
 warmups, 30 measured repetitions, outer `Asr::recognize()` timer, and CSV
-aggregator. `sherpa` is the frozen previous backend; `coreml-unified` is the
-resident FluidAudio worker with the int8 offline encoder on CPU+ANE.
+aggregator. The resident FluidAudio worker uses the int8 offline encoder on
+CPU+ANE.
 
-| bucket | sherpa p50 | unified p50 | p50 speedup | sherpa p95 | unified p95 | p95 speedup |
-|--------|-----------:|------------:|------------:|-----------:|------------:|------------:|
-| 1 s    | 112.0 ms   | 35.0 ms     | **3.20×**   | 116.5 ms   | 36.5 ms     | **3.19×**   |
-| 3 s    | 226.0 ms   | 50.0 ms     | **4.52×**   | 239.6 ms   | 51.0 ms     | **4.70×**   |
-| 5 s    | 361.5 ms   | 66.0 ms     | **5.48×**   | 384.3 ms   | 67.0 ms     | **5.74×**   |
-| 10 s   | 580.0 ms   | 90.0 ms     | **6.44×**   | 597.8 ms   | 91.5 ms     | **6.53×**   |
-| 20 s   | 1195.0 ms  | 188.0 ms    | **6.36×**   | 1245.3 ms  | 192.6 ms    | **6.47×**   |
+| bucket | p50 | p95 |
+|---|---:|---:|
+| 1 s | 35.0 ms | 36.5 ms |
+| 3 s | 50.0 ms | 51.0 ms |
+| 5 s | 66.0 ms | 67.0 ms |
+| 10 s | 90.0 ms | 91.5 ms |
+| 20 s | 188.0 ms | 192.6 ms |
 
 The companion gold run passed at **2.38% WER / 2.22% CER** against limits of
 4% / 3%, with 40% exact formatting and 74.4× aggregate model-reported RTFx.
@@ -971,11 +926,8 @@ does not have to be unset to run the challenger.
 
 ## Contextual vocabulary on the Core ML path: M5 Pro 24 GB (2026-09-04)
 
-A non-empty custom vocabulary used to route the whole app to the sherpa
-fallback, because sherpa owned the only contextual-biasing implementation. The
-native worker now builds an Aho-Corasick trie over the vocabulary's token ids
-and adds a shallow-fusion boost to the joint logits before the argmax
-(ADR-0033), so the vocabulary no longer costs the Neural Engine.
+The native worker builds an Aho-Corasick trie over vocabulary token IDs and
+applies shallow fusion to joint logits before greedy selection (ADR-0033).
 
 ```bash
 # quality, biased vs unbiased, on the human gold corpus
@@ -1007,14 +959,6 @@ across its ten runs, so the WER and CER spreads are zero.
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Core ML | greedy, no vocabulary | 5.43% | 3.57% | 27.27% / 8.93% | 28.57% | 0.245 s | 139.2× | 0.103 GiB | 0.150 s |
 | Core ML | greedy + biasing, score 2.0 | **3.26%** | **2.94%** | **9.09% / 3.57%** | 42.86% | 0.245 s | 139.1× | 0.103 GiB | 0.090 s |
-| sherpa | greedy | 10.87% | 5.46% | 54.55% / 12.50% | 28.57% | 3.045 s | 11.2× | 4.455 GiB | 4.216 s |
-| sherpa | `modified_beam_search` + hotwords, score 2.0 | 10.87% | 5.46% | 54.55% / 12.50% | 28.57% | 3.330 s | 10.2× | 4.678 GiB | 4.060 s |
-
-The last row is the configuration a custom vocabulary used to select. It costs
-13.6× the corpus decode time and 45× the resident set of the biased native
-path and returns the identical transcript set as sherpa greedy, so the beam is
-9.4% slower for no lexical effect at all — ADR-0028's finding, reproduced here
-against the row that replaces it.
 
 Single runs at scores 3.0 and 4.0 matched score 2.0 on every aggregate,
 changing only capitalization inside already-correct words, so the shipped
@@ -1035,7 +979,7 @@ Per-category delta against the unbiased Core ML row, negative better:
 
 `Is IPM up today?` becomes `Is IBM up today?` and `Hey Ollie` becomes
 `Hey Olly`. Nothing else in the corpus moves — including the noisy `Amy`
-fixture that sherpa's first effective score turned into `80`. The residual
+fixture. The residual
 custom-vocabulary error is `from` → `for`, which no vocabulary can reach.
 Scores 3.0 and 4.0 only change capitalization inside already-correct words, so
 the shipped `hotword_score` default of 2.0 stands.
@@ -1489,24 +1433,6 @@ of the cadence is higher by whatever the engine draws to stay awake.
 
 Results and the ship/no-ship decision are recorded in
 [`../docs/asr/PERF.md`](../docs/asr/PERF.md).
-
-## Baseline: M5 Pro 24 GB (2026-05-16, pre-§2 CoreML cache)
-
-| length | n  | mean ms | p50 ms | p95 ms | p99 ms |
-|--------|----|---------|--------|--------|--------|
-| 1 s    | 30 | 121     | 121    | 136    | 146    |
-| 3 s    | 30 | 229     | 227    | 237    | 263    |
-| 5 s    | 30 | 364     | **362**| 376    | 405    |
-| 10 s   | 30 | 573     | 572    | 589    | 591    |
-| 20 s   | 30 | 1120    | 1114   | 1162   | 1185   |
-
-**Steady-state RTFx** ≈ 13–14× real time on the 5 s bucket. This historical
-sherpa baseline is retained for comparison; the shipping native Core ML and
-end-to-end measurements above supersede it as the current performance record.
-
-**Implied total post-endpoint latency on 5 s (pre-cache):**
-362 ms ASR + 150 ms VAD ≈ **512 ms** — under the former 700 ms acceptance
-target before the native worker and speculative-decode work landed.
 
 ## Hex engine comparison: M5 Pro 24 GB (2026-10-31)
 

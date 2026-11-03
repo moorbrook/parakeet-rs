@@ -19,14 +19,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use parakeet_dictation::asr::{Asr, AsrConfig, StageReport};
+use parakeet_dictation::asr::{Asr, StageReport};
 use parakeet_dictation::coreml_worker::{
     load_coreml_worker, CoreMlComputeUnits, CoreMlModelVariant, CoreMlRnntEngine,
     CoreMlWorkerConfig,
 };
-use parakeet_dictation::performance::{self, next_session_id, PhaseTimer, PhaseTimerMode};
+use parakeet_dictation::performance::{next_session_id, PhaseTimer, PhaseTimerMode};
 use parakeet_dictation::resample::{to_target_rate, TARGET_SAMPLE_RATE};
-use parakeet_dictation::settings::SettingsStore;
 use parakeet_dictation::warmup;
 use parakeet_dictation::wav::read_wav_mono;
 
@@ -101,7 +100,6 @@ impl Arm {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Backend {
-    Sherpa,
     CoreMlUnified,
     /// The TDT 0.6B v3 challenger, through the same worker (kata f0zg).
     CoreMlTdtV3,
@@ -110,18 +108,16 @@ enum Backend {
 impl Backend {
     fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
-            "sherpa" => Ok(Self::Sherpa),
             "coreml-unified" => Ok(Self::CoreMlUnified),
             "coreml-tdt-v3" => Ok(Self::CoreMlTdtV3),
-            _ => anyhow::bail!(
-                "unknown backend {value:?}; expected sherpa, coreml-unified, or coreml-tdt-v3"
-            ),
+            _ => {
+                anyhow::bail!("unknown backend {value:?}; expected coreml-unified or coreml-tdt-v3")
+            }
         }
     }
 
     fn model_variant(self) -> Option<CoreMlModelVariant> {
         match self {
-            Self::Sherpa => None,
             Self::CoreMlUnified => Some(CoreMlModelVariant::Unified),
             Self::CoreMlTdtV3 => Some(CoreMlModelVariant::TdtV3),
         }
@@ -133,7 +129,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut wav: Option<PathBuf> = None;
     let mut reps: usize = DEFAULT_REPS;
     let mut warmup_reps: usize = DEFAULT_WARMUP_REPS;
-    let mut backend = Backend::Sherpa;
+    let mut backend = Backend::CoreMlUnified;
     let mut worker = None;
     let mut model_dir = None;
     let mut compute_units = CoreMlComputeUnits::default();
@@ -283,7 +279,7 @@ fn parse_args() -> anyhow::Result<Args> {
 fn print_usage() {
     eprintln!(
         "usage: bench_asr --wav PATH [--reps N] [--warmup-reps N]\n\
-         \x20                [--backend sherpa|coreml-unified|coreml-tdt-v3]\n\
+         \x20                [--backend coreml-unified|coreml-tdt-v3]\n\
         \x20                [--tdt-chunk-concurrency N]\n\
         \x20                [--tdt-decode-compute-units NAME]\n\
          \x20                [--worker PATH] [--model-dir DIR]\n\
@@ -382,15 +378,11 @@ fn run(args: &Args) -> anyhow::Result<()> {
     if args.arm == Arm::Cadence && args.keepalive_ms == 0 {
         anyhow::bail!("--arm cadence needs a nonzero --keepalive-ms");
     }
-    let store = SettingsStore::new()?;
-    let asr = Arc::new(load_backend(args, &store)?);
+    let asr = Arc::new(load_backend(args)?);
 
     // CoreML graph compile happens on first inference. The aggregator
     // ignores the warmup reps so steady-state numbers aren't contaminated.
     log::info!("warming recognizer (silent decode)");
-    if args.backend == Backend::Sherpa {
-        warmup::page_touch(&store.encoder_path())?;
-    }
     warmup::dummy_decode(&asr)?;
 
     let (fixture, fixture_rate) = read_wav_mono(&args.wav)?;
@@ -459,31 +451,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_backend(args: &Args, store: &SettingsStore) -> anyhow::Result<Asr> {
+fn load_backend(args: &Args) -> anyhow::Result<Asr> {
     match args.backend {
-        Backend::Sherpa => {
-            if !store.model_present() {
-                anyhow::bail!(
-                    "ASR model not present at {}. Launch Parakeet.app once so it can \
-                     download the first-run model bundle.",
-                    store.encoder_path().display()
-                );
-            }
-            let threads = performance::performance_core_count();
-            log::info!("loading sherpa Asr (threads={threads}, provider=coreml)");
-            // Latency bench: no contextual biasing, so the number stays
-            // comparable to every previously-recorded run. `asr_diff
-            // --vocabulary` is where the biased path gets exercised.
-            Asr::load(&AsrConfig {
-                encoder: &store.encoder_path(),
-                decoder: &store.decoder_path(),
-                joiner: &store.joiner_path(),
-                tokens: &store.tokens_path(),
-                num_threads: threads,
-                hotwords: None,
-                hotwords_score: 0.0,
-            })
-        }
         Backend::CoreMlUnified | Backend::CoreMlTdtV3 => {
             let variant = args
                 .backend

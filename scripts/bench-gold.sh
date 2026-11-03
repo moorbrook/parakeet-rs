@@ -60,13 +60,4 @@ fi
     --hotword-score "${HOTWORD_SCORE:-2.0}" \
     --json-out "$ROOT/bench/coreml-vocabulary-gold-quality.json" || true
 
-"$BINARY" "${common[@]}" \
-    --backend sherpa \
-    --json-out "$ROOT/bench/sherpa-gold-quality.json" || true
-
-"$BINARY" "${common[@]}" \
-    --backend sherpa \
-    --vocabulary "$VOCABULARY" \
-    --json-out "$ROOT/bench/sherpa-vocabulary-gold-quality.json" || true
-
 exit "$shipping_status"

@@ -23,7 +23,7 @@ independent, immutable identities:
   baseline, with an optional evidence-gated per-chip runtime profile described
   in [AUTOTUNING.md](AUTOTUNING.md)
 - Text contract: the model's punctuation and capitalization are retained
-- License: model CC-BY-4.0; FluidAudio Apache-2.0
+- License: NVIDIA Open Model License Agreement; FluidAudio Apache-2.0
 
 The Rust first-use path fetches every required file from the pinned model
 revision, streams it through SHA-256 verification, and atomically publishes it
@@ -76,17 +76,17 @@ retaining the slightly more accurate and roughly 4.2x higher-throughput batch
 graph. A streaming backend can be reconsidered when its user-visible latency,
 quality, and resource use beat that full production pipeline.
 
-## Compatibility and fallback
+## Runtime requirements
 
 The native worker requires Apple Silicon and macOS 14 or later. Worker spawn,
-model verification, Core ML load, or runtime failure returns to the existing
-sherpa-onnx backend. A custom vocabulary no longer forces that choice: the
-worker tokenizes the terms with this bundle's own `vocab.json` and biases the
-joint output toward them (ADR-0033). For diagnosis or emergency rollback, launch with
-`PARAKEET_ASR_BACKEND=sherpa`; unset it or use `auto` to restore normal policy.
-Unknown values are rejected instead of silently selecting a backend.
-Missing, stale, or invalid runtime-plan profiles use CPU+ANE;
-`PARAKEET_ASR_TUNING=off` bypasses a valid profile without deleting it.
+model verification, and Core ML load failures produce a setup error.
+Vocabulary uses this bundle's own `vocab.json` and native joint biasing
+(ADR-0033). Missing or invalid tuning profiles use CPU+ANE;
+`PARAKEET_ASR_TUNING=off` bypasses a valid profile.
+
+Silero endpointing uses FluidInference's 32 ms v6.0.0 Core ML graph, pinned
+separately in `model_fetch.rs`. Dedicated session-local worker processes keep
+its recurrent state separate from ASR and from previous dictations.
 
 Power is not reported as a one-shot benchmark. `powermetrics` requires elevated
 access, and its sampling interval is longer than these sub-second decodes, so

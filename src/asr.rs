@@ -1,31 +1,12 @@
-//! Stable local-ASR facade and the sherpa fallback backend.
-//!
-//! The app prefers the resident native Core ML Parakeet Unified worker and
-//! selects sherpa-onnx only when specialized model setup fails or the
-//! environment asks for it explicitly. Custom vocabulary no longer forces that
-//! choice: the worker biases natively. Each backend remains resident across
-//! hotkey presses so model loading and Core ML graph compilation stay off the
-//! dictation path.
-//!
-//! ADR-0015 layer 3: every `recognize` call records decode-time vs audio-time
-//! (RTFx). On this M5 Pro, CoreML-resident execution should sit comfortably
-//! above 5x real-time. A sustained drop below 2x is the signal that
-//! provider="coreml" silently fell back to CPU — surfaced as a `log::warn`.
+//! Resident Core ML recognition facade, timing, and token-span handling.
 
-use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
-
-use anyhow::{anyhow, Result};
-use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
-use sherpa_onnx::{
-    OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineTransducerModelConfig,
-};
 
 use crate::windows::{words_from_tokens, TokenSpan, Word};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
-/// Below this real-time factor we assume CoreML is not engaged.
+/// Below this real-time factor, report unexpectedly slow recognition.
 const RTFX_COREML_FLOOR: f32 = 2.0;
 
 /// Recognition engine used by [`Asr`].
@@ -71,9 +52,7 @@ pub trait AsrBackend: Send + Sync {
     }
 
     /// What the backend made of a custom vocabulary it was given, or `None`
-    /// when it was given none. The sherpa fallback returns `None` because its
-    /// hotword graph reports nothing back — its equivalent diagnostic is
-    /// `crate::vocabulary`'s token validation, which runs before the model.
+    /// when it was given none.
     fn contextual_vocabulary(&self) -> Option<VocabularyStatus> {
         None
     }
@@ -181,7 +160,7 @@ pub struct StageReport {
 ///
 /// Benchmark and quality reports read this from the backend rather than from
 /// CLI constants, so adding a challenger cannot accidentally label its results
-/// as the shipping sherpa model.
+/// as the shipping model.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct AsrBackendMetadata {
     pub backend: String,
@@ -192,9 +171,8 @@ pub struct AsrBackendMetadata {
 
 /// Stable recognition facade used by the app.
 ///
-/// The current default backend is sherpa-onnx. Keeping callers behind this
-/// facade lets native Core ML or MLX experiments use the same capture, warmup,
-/// timing, and transcript-handling path.
+/// Production and evaluation share capture, warmup, timing, and transcript
+/// handling through this facade.
 pub struct Asr {
     backend: Arc<dyn AsrBackend>,
 }
@@ -216,144 +194,10 @@ impl Decoded {
     }
 }
 
-/// Everything needed to construct the recogniser. A struct rather than
-/// a positional argument list because the biasing fields only make
-/// sense together, and `load(a, b, c, d, 8, None, 0.0)` at the call
-/// site says nothing about which `0.0` that is.
-pub struct AsrConfig<'a> {
-    pub encoder: &'a Path,
-    pub decoder: &'a Path,
-    pub joiner: &'a Path,
-    pub tokens: &'a Path,
-    pub num_threads: i32,
-    /// Generated sherpa hotwords file (see `crate::vocabulary`).
-    ///
-    /// `None` selects greedy decoding. `Some` selects modified beam
-    /// search, which is the **only** decoding method sherpa accepts
-    /// alongside a hotwords file — passing one with greedy makes
-    /// `OfflineRecognizer::create` fail outright — and which measured
-    /// ~13% slower on the 5 s bench fixture. See ADR-0020.
-    pub hotwords: Option<&'a Path>,
-    /// Boost applied to biased terms. Only read when `hotwords` is
-    /// `Some`. See [`crate::settings::Settings::hotword_score`] for the
-    /// measured safe range.
-    pub hotwords_score: f32,
-}
-
-struct SherpaBackend {
-    inner: Mutex<OfflineRecognizer>,
-    metadata: AsrBackendMetadata,
-}
-
-impl AsrBackend for SherpaBackend {
-    fn metadata(&self) -> &AsrBackendMetadata {
-        &self.metadata
-    }
-
-    fn transcribe(&self, samples: &[f32], sample_rate: u32) -> Result<Decoded> {
-        let recognizer = self.inner.lock();
-        let stream = recognizer.create_stream();
-        stream.accept_waveform(sample_rate as i32, samples);
-
-        let start = Instant::now();
-        recognizer.decode(&stream);
-        let decode_seconds = start.elapsed().as_secs_f32();
-
-        let result = stream
-            .get_result()
-            .ok_or_else(|| anyhow!("get_result returned None"))?;
-
-        Ok(Decoded {
-            text: result.text,
-            audio_seconds: samples.len() as f32 / sample_rate as f32,
-            decode_seconds,
-        })
-    }
-}
-
 impl Asr {
-    pub fn load(cfg: &AsrConfig<'_>) -> Result<Self> {
-        let AsrConfig {
-            encoder,
-            decoder,
-            joiner,
-            tokens,
-            num_threads,
-            hotwords,
-            hotwords_score,
-        } = *cfg;
-        for p in [encoder, decoder, joiner, tokens] {
-            if !p.exists() {
-                return Err(anyhow!("missing model file: {}", p.display()));
-            }
-        }
-
-        // Greedy unless the user actually has vocabulary terms — beam
-        // search is a real cost to pay for a feature nobody enabled.
-        let (decoding_method, hotwords_file, hotwords_score) = match hotwords {
-            Some(path) => {
-                log::info!(
-                    "ASR contextual biasing ON (score {hotwords_score}): {}",
-                    path.display()
-                );
-                (
-                    "modified_beam_search",
-                    Some(path.to_string_lossy().into_owned()),
-                    hotwords_score,
-                )
-            }
-            None => ("greedy_search", None, 0.0),
-        };
-
-        // ADR-0015 layer 2: log what we *asked* for and what build.rs
-        // (layer 1) detected in the static lib. sherpa-onnx's Rust surface
-        // doesn't expose the effective provider after creation, so the
-        // empirical signal lives in the per-utterance RTFx probe below.
-        if cfg!(parakeet_coreml_ep_present) {
-            log::info!("ASR provider requested: coreml (EP symbol present in libonnxruntime.a)");
-        } else {
-            log::warn!(
-                "ASR provider requested: coreml — but libonnxruntime.a has \
-                 no CoreML EP symbol (see build.rs warning). Expect CPU \
-                 fallback."
-            );
-        }
-
-        let config = OfflineRecognizerConfig {
-            model_config: OfflineModelConfig {
-                transducer: OfflineTransducerModelConfig {
-                    encoder: Some(encoder.to_string_lossy().into_owned()),
-                    decoder: Some(decoder.to_string_lossy().into_owned()),
-                    joiner: Some(joiner.to_string_lossy().into_owned()),
-                },
-                tokens: Some(tokens.to_string_lossy().into_owned()),
-                num_threads,
-                provider: Some("coreml".to_string()),
-                model_type: Some("nemo_transducer".to_string()),
-                ..Default::default()
-            },
-            decoding_method: Some(decoding_method.to_string()),
-            hotwords_file,
-            hotwords_score,
-            ..Default::default()
-        };
-
-        let recognizer = OfflineRecognizer::create(&config)
-            .ok_or_else(|| anyhow!("OfflineRecognizer::create returned None"))?;
-        Ok(Self::from_backend(Arc::new(SherpaBackend {
-            inner: Mutex::new(recognizer),
-            metadata: AsrBackendMetadata {
-                backend: "sherpa-onnx".to_string(),
-                model: "NVIDIA Parakeet TDT 0.6B v3".to_string(),
-                quantization: "int8".to_string(),
-                execution_provider: "coreml-requested".to_string(),
-            },
-        })))
-    }
-
     /// Construct the app-facing recognizer around an explicit backend.
     ///
-    /// Production startup uses [`Self::load`]. This constructor is the seam
+    /// This constructor is the seam
     /// for benchmark challengers and deterministic test doubles.
     pub fn from_backend(backend: Arc<dyn AsrBackend>) -> Self {
         Self { backend }
@@ -448,8 +292,7 @@ impl Asr {
             if decoded.audio_seconds >= 1.5 && rtfx < RTFX_COREML_FLOOR {
                 log::warn!(
                     "ASR RTFx {rtfx:.2}x on {:.2}s of audio is below the CoreML \
-                     floor of {RTFX_COREML_FLOOR:.1}x — provider=\"coreml\" is \
-                     almost certainly falling back to CPU. See ADR-0015.",
+                     floor of {RTFX_COREML_FLOOR:.1}x; inference is slower than expected.",
                     decoded.audio_seconds
                 );
             } else {

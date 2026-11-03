@@ -1,12 +1,12 @@
 //! The project's single sample-rate conversion path.
 //!
 //! Every consumer downstream of capture — Silero VAD, the native Core ML
-//! worker, and the sherpa fallback — wants 16 kHz mono Float32. Core Audio
+//! worker — wants 16 kHz mono Float32. Core Audio
 //! hands us the device rate instead, and the built-in microphone's supported
 //! rate list starts at 44.1 kHz (see ADR-0030), so a conversion is unavoidable
 //! somewhere. Doing it once, here, is what keeps it off the endpoint path.
 //!
-//! The kernel is sherpa-onnx's `LinearResampler`, which is Kaldi's
+//! The locally owned kernel in `native/resample` is Kaldi's
 //! `LinearResample`: a Hann-windowed sinc filter with the cutoff at 99% of the
 //! Nyquist frequency of the lower rate and `num_zeros = 6`. "Linear" names the
 //! linear interpolation of the filter table, not the interpolation of the
@@ -23,7 +23,58 @@
 use std::borrow::Cow;
 
 use anyhow::{anyhow, Result};
-use sherpa_onnx::LinearResampler;
+use std::ffi::c_void;
+use std::ptr::NonNull;
+
+extern "C" {
+    fn parakeet_resampler_new(rate: i32) -> *mut c_void;
+    fn parakeet_resampler_delete(ptr: *mut c_void);
+    fn parakeet_resampler_run(
+        ptr: *mut c_void,
+        input: *const f32,
+        count: i32,
+        flush: bool,
+        length: *mut usize,
+    ) -> *const f32;
+}
+
+struct LinearResampler(NonNull<c_void>);
+
+// SAFETY: The C++ object owns its buffers, has no thread affinity, and every
+// mutation requires exclusive access through resample(&mut self).
+unsafe impl Send for LinearResampler {}
+
+impl LinearResampler {
+    fn create(input: i32) -> Result<Self> {
+        // SAFETY: new receives a positive, validated sample rate.
+        NonNull::new(unsafe { parakeet_resampler_new(input) })
+            .map(Self)
+            .ok_or_else(|| anyhow!("could not allocate resampler"))
+    }
+
+    fn resample(&mut self, input: &[f32], flush: bool) -> Vec<f32> {
+        let mut length = 0;
+        let count = i32::try_from(input.len()).expect("capture chunk fits in i32");
+        // SAFETY: self uniquely owns a live C++ object; input and length remain
+        // valid throughout the call. The returned buffer belongs to this object.
+        let output = unsafe {
+            parakeet_resampler_run(self.0.as_ptr(), input.as_ptr(), count, flush, &mut length)
+        };
+        if length == 0 {
+            return Vec::new();
+        }
+        // SAFETY: the nonempty output contains length initialized floats and is
+        // copied before another call can mutate or destroy the C++ buffer.
+        unsafe { std::slice::from_raw_parts(output, length) }.to_vec()
+    }
+}
+
+impl Drop for LinearResampler {
+    fn drop(&mut self) {
+        // SAFETY: this is the unique owner, and the allocation is deleted once.
+        unsafe { parakeet_resampler_delete(self.0.as_ptr()) };
+    }
+}
 
 /// The rate every ASR backend and the Silero VAD expect.
 pub const TARGET_SAMPLE_RATE: u32 = 16_000;
@@ -36,10 +87,7 @@ pub const TARGET_SAMPLE_RATE: u32 = 16_000;
 pub struct Resampler {
     /// `None` when the input is already at the target rate.
     ///
-    /// The sherpa binding takes `&self` and declares `Sync`, but the underlying
-    /// Kaldi object mutates `input_remainder_` and two sample offsets on every
-    /// call. Owning it behind `&mut self` here is what actually makes the
-    /// aliasing claim true; never hand this type out by shared reference.
+    /// The filter's carry and offsets are mutated only through `&mut self`.
     inner: Option<LinearResampler>,
 }
 
@@ -56,11 +104,7 @@ impl Resampler {
                 "input sample rate must be positive; got {input_rate}"
             ));
         }
-        let target = i32::try_from(TARGET_SAMPLE_RATE)
-            .map_err(|_| anyhow!("target sample rate does not fit in i32"))?;
-        let inner = LinearResampler::create(input, target).ok_or_else(|| {
-            anyhow!("could not build a {input_rate} -> {TARGET_SAMPLE_RATE} Hz resampler")
-        })?;
+        let inner = LinearResampler::create(input)?;
         Ok(Self { inner: Some(inner) })
     }
 

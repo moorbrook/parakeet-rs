@@ -1,5 +1,5 @@
 //! First-run download and integrity verification for the Rust-managed model
-//! artifacts: Parakeet TDT 0.6B v3 int8, Parakeet Unified Core ML and Silero
+//! artifacts: Parakeet Unified Core ML and Silero Core ML
 //! VAD.
 //!
 //! Every artifact has an immutable upstream identity (revision where the host
@@ -21,17 +21,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-#[cfg(test)]
-const SHERPA_REVISION: &str = "2bda32ec70b097a55adaa07d9a7173915b43cc78";
-#[cfg(test)]
-const HF_REPO: &str = concat!(
-    "https://huggingface.co/csukuangfj/",
-    "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/",
-    "2bda32ec70b097a55adaa07d9a7173915b43cc78"
-);
-const SILERO_VAD_URL: &str =
-    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
-
 #[derive(Clone, Copy, Debug)]
 struct Artifact {
     label: &'static str,
@@ -40,55 +29,39 @@ struct Artifact {
     size: u64,
 }
 
-const ASR_ARTIFACTS: &[Artifact] = &[
+pub const VAD_MODEL_FOLDER: &str = "silero-vad-unified-v6.0.0.mlmodelc";
+const VAD_ARTIFACTS: &[Artifact] = &[
     Artifact {
-        label: "tokens.txt",
-        url: concat!(
-            "https://huggingface.co/csukuangfj/",
-            "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/",
-            "2bda32ec70b097a55adaa07d9a7173915b43cc78/tokens.txt"
-        ),
-        sha256: "d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d",
-        size: 93_939,
+        label: "silero-vad-unified-v6.0.0.mlmodelc/analytics/coremldata.bin",
+        url: "https://huggingface.co/FluidInference/silero-vad-coreml/resolve/b419383c55c110e2c9271fa6ee0ea83d03c70d96/silero-vad-unified-v6.0.0.mlmodelc/analytics/coremldata.bin",
+        sha256: "2141be60ea0adf7acb1232fbcfaffb2be308ae02e6672d3762aedf36611ea9fd",
+        size: 243,
     },
     Artifact {
-        label: "decoder.int8.onnx",
-        url: concat!(
-            "https://huggingface.co/csukuangfj/",
-            "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/",
-            "2bda32ec70b097a55adaa07d9a7173915b43cc78/decoder.int8.onnx"
-        ),
-        sha256: "179e50c43d1a9de79c8a24149a2f9bac6eb5981823f2a2ed88d655b24248db4e",
-        size: 11_845_275,
+        label: "silero-vad-unified-v6.0.0.mlmodelc/coremldata.bin",
+        url: "https://huggingface.co/FluidInference/silero-vad-coreml/resolve/b419383c55c110e2c9271fa6ee0ea83d03c70d96/silero-vad-unified-v6.0.0.mlmodelc/coremldata.bin",
+        sha256: "f460dcdf796b19c04bc38ab6e69601831f634e5e74d499487f0c8fe17ca12f0f",
+        size: 593,
     },
     Artifact {
-        label: "joiner.int8.onnx",
-        url: concat!(
-            "https://huggingface.co/csukuangfj/",
-            "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/",
-            "2bda32ec70b097a55adaa07d9a7173915b43cc78/joiner.int8.onnx"
-        ),
-        sha256: "3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3",
-        size: 6_355_277,
+        label: "silero-vad-unified-v6.0.0.mlmodelc/metadata.json",
+        url: "https://huggingface.co/FluidInference/silero-vad-coreml/resolve/b419383c55c110e2c9271fa6ee0ea83d03c70d96/silero-vad-unified-v6.0.0.mlmodelc/metadata.json",
+        sha256: "282b1b788b5d4d66d6a70d468464a7ada71d2469a8705526b741fd9ab841295a",
+        size: 3232,
     },
     Artifact {
-        label: "encoder.int8.onnx",
-        url: concat!(
-            "https://huggingface.co/csukuangfj/",
-            "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/",
-            "2bda32ec70b097a55adaa07d9a7173915b43cc78/encoder.int8.onnx"
-        ),
-        sha256: "acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247",
-        size: 652_184_281,
+        label: "silero-vad-unified-v6.0.0.mlmodelc/model.mil",
+        url: "https://huggingface.co/FluidInference/silero-vad-coreml/resolve/b419383c55c110e2c9271fa6ee0ea83d03c70d96/silero-vad-unified-v6.0.0.mlmodelc/model.mil",
+        sha256: "79eea23c368f3e7edf85af798a953f5b0910e4b08ff48e55fff8545dd05fd047",
+        size: 25126,
+    },
+    Artifact {
+        label: "silero-vad-unified-v6.0.0.mlmodelc/weights/weight.bin",
+        url: "https://huggingface.co/FluidInference/silero-vad-coreml/resolve/b419383c55c110e2c9271fa6ee0ea83d03c70d96/silero-vad-unified-v6.0.0.mlmodelc/weights/weight.bin",
+        sha256: "853cf34740d3f5061f977ebe2976f7c921b064261c9c4753b3a1196f2dba42b4",
+        size: 882304,
     },
 ];
-
-const SILERO_VAD: Artifact = Artifact {
-    label: "silero_vad.onnx",
-    url: SILERO_VAD_URL,
-    sha256: "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6",
-    size: 643_854,
-};
 
 pub const COREML_REVISION: &str = "4252711f6f060f9a2f91e5f081a806d7f45eebd8";
 
@@ -191,10 +164,19 @@ const COREML_ARTIFACTS: &[Artifact] = &[
 /// model on every launch. `ensure_coreml_model` verifies the corresponding
 /// bytes before a profile keyed by this identity can be used.
 pub fn coreml_artifact_digest() -> String {
+    artifact_digest(COREML_REVISION, COREML_ARTIFACTS)
+}
+
+/// Window quality depends on the VAD graph as well as the ASR encoder.
+pub fn vad_artifact_digest() -> String {
+    artifact_digest(VAD_MODEL_FOLDER, VAD_ARTIFACTS)
+}
+
+fn artifact_digest(revision: &str, artifacts: &[Artifact]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(COREML_REVISION.as_bytes());
+    hasher.update(revision.as_bytes());
     hasher.update(b"\n");
-    for artifact in COREML_ARTIFACTS {
+    for artifact in artifacts {
         hasher.update(artifact.label.as_bytes());
         hasher.update(b"\0");
         hasher.update(artifact.size.to_le_bytes());
@@ -382,18 +364,6 @@ pub enum BucketFetch {
     Download,
 }
 
-/// Parakeet TDT triplet + tokens, all relative to the per-model dir.
-/// `pub(crate)` so `settings.rs`'s tests can cross-check that this list
-/// stays in sync with the four files `SettingsStore::model_present()`
-/// gates startup on.
-#[cfg(test)]
-pub(crate) const ASR_FILES: &[&str] = &[
-    "tokens.txt",
-    "decoder.int8.onnx",
-    "joiner.int8.onnx",
-    "encoder.int8.onnx",
-];
-
 const CACHE_SCHEMA_VERSION: u8 = 1;
 static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -456,33 +426,11 @@ enum ExistingVerification {
     },
 }
 
-pub async fn ensure_model(
-    model_dir: &Path,
-    vad_path: &Path,
-    on_progress: ProgressFn,
-) -> Result<()> {
-    tokio::fs::create_dir_all(model_dir).await?;
-    if let Some(parent) = vad_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+/// Verify the Core ML VAD bundle before the worker loads it.
+pub async fn ensure_vad_model(models_dir: &Path, on_progress: ProgressFn) -> Result<()> {
+    for artifact in VAD_ARTIFACTS {
+        ensure_artifact(*artifact, &models_dir.join(artifact.label), &on_progress).await?;
     }
-
-    on_progress(Progress::Status("Checking model integrity…".to_string()));
-    let mut downloaded = false;
-    for artifact in ASR_ARTIFACTS {
-        downloaded |= ensure_artifact(*artifact, &model_dir.join(artifact.label), &on_progress)
-            .await
-            .with_context(|| format!("ensuring {}", artifact.label))?;
-    }
-    downloaded |= ensure_artifact(SILERO_VAD, vad_path, &on_progress)
-        .await
-        .context("ensuring silero_vad.onnx")?;
-
-    let status = if downloaded {
-        "Model downloaded and verified."
-    } else {
-        "Model verified."
-    };
-    on_progress(Progress::Status(status.to_string()));
     Ok(())
 }
 
@@ -1247,28 +1195,6 @@ mod tests {
     }
 
     #[test]
-    fn artifact_manifest_matches_public_file_list() {
-        let manifest: Vec<&str> = ASR_ARTIFACTS
-            .iter()
-            .map(|artifact| artifact.label)
-            .collect();
-        assert_eq!(manifest, ASR_FILES);
-        assert!(ASR_ARTIFACTS.iter().all(|artifact| {
-            artifact.url.starts_with(HF_REPO)
-                && artifact.url.contains(SHERPA_REVISION)
-                && artifact.sha256.len() == 64
-                && artifact.size > 0
-        }));
-    }
-
-    #[test]
-    fn silero_manifest_pins_published_release_digest() {
-        assert_eq!(SILERO_VAD.url, SILERO_VAD_URL);
-        assert_eq!(SILERO_VAD.sha256.len(), 64);
-        assert_eq!(SILERO_VAD.size, 643_854);
-    }
-
-    #[test]
     fn coreml_truth_pack_is_complete_revision_pinned_and_unique() {
         assert_eq!(COREML_ARTIFACTS.len(), 15);
         assert!(COREML_ARTIFACTS.iter().all(|artifact| {
@@ -1307,15 +1233,6 @@ mod tests {
         assert!(ensure_artifact(artifact, &dest, &progress).await.unwrap());
         server.join().unwrap();
         assert_eq!(fs::read(dest).unwrap(), b"abc");
-    }
-
-    #[test]
-    fn asr_files_list_has_no_duplicates() {
-        let mut copy: Vec<&&str> = ASR_FILES.iter().collect();
-        copy.sort();
-        let len_before = copy.len();
-        copy.dedup();
-        assert_eq!(len_before, copy.len(), "duplicate entry in ASR_FILES");
     }
 
     #[test]

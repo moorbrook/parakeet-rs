@@ -1,44 +1,12 @@
-//! Startup warmup, ds4-style.
-//!
-//! Two passes:
-//! 1. mmap the .onnx file and walk one byte per 16 KB page. The kernel populates
-//!    the page cache before the first recognition needs it, so the first decode
-//!    doesn't pay a cold-read tax (~hundreds of ms on a 1 GB model).
-//! 2. Run one tiny silent decode through the recognizer. CoreML compiles its
-//!    graph the first time it sees a shape; we eat that cost during startup so
-//!    the first user press feels instant.
+//! Warm Core ML graphs and prime the resident encoder.
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use memmap2::Mmap;
 
 use crate::asr::Asr;
-
-/// Walk the mmap'd model file, touching one byte every `STRIDE` bytes.
-pub fn page_touch(model_path: &Path) -> Result<u64> {
-    let file = std::fs::File::open(model_path)
-        .with_context(|| format!("opening {} for warmup", model_path.display()))?;
-    // SAFETY: model artifacts are immutable after verified installation, the
-    // file stays alive while the read-only map is created, and this function
-    // never writes through or aliases the mapping mutably.
-    let map = unsafe { Mmap::map(&file).context("mmap model file")? };
-
-    // 16 KiB matches macOS' default page size on Apple Silicon.
-    const STRIDE: usize = 16 * 1024;
-    let bytes = &map[..];
-    let mut acc: u64 = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        // `std::hint::black_box` keeps LLVM from optimising the read away.
-        acc = acc.wrapping_add(u64::from(std::hint::black_box(bytes[i])));
-        i += STRIDE;
-    }
-    Ok(acc)
-}
 
 /// Two-pass startup warmup against the recognizer:
 /// 1. **Throwaway pass.** 0.5 s of silence pays the CoreML graph-compile cost

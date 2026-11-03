@@ -51,10 +51,9 @@ LENGTHS=(1 3 5 10 20)
 WAV_DIR="bench/audio"
 RAW_LOG="bench/raw.log"
 OUT_CSV="${OUT_CSV:-bench/baseline.csv}"
-BACKEND="${BACKEND:-sherpa}"
+BACKEND="${BACKEND:-coreml-unified}"
 # The native worker can report where its decode time went (resample, mel,
-# encoder, RNNT loop) plus its Core ML dispatch counts. sherpa has no
-# equivalent seam, so the flag is only passed to the native backends.
+# encoder, RNNT loop) plus its Core ML dispatch counts.
 STAGE_TIMINGS="${STAGE_TIMINGS:-1}"
 # Model directory for the native backend. Unset means the worker's own default,
 # which holds only the 15 s encoder; point this at a directory carrying bucket
@@ -77,9 +76,9 @@ HOTWORD_SCORE="${HOTWORD_SCORE:-2.0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 case "$BACKEND" in
-    sherpa|coreml-unified|coreml-tdt-v3) ;;
+    coreml-unified|coreml-tdt-v3) ;;
     *)
-        echo "unknown BACKEND=$BACKEND (expected sherpa, coreml-unified, or coreml-tdt-v3)" >&2
+        echo "unknown BACKEND=$BACKEND (expected coreml-unified or coreml-tdt-v3)" >&2
         exit 2
         ;;
 esac
@@ -121,7 +120,7 @@ for len in "${LENGTHS[@]}"; do
 done
 
 # Step 2 — release build (debug numbers are useless for latency comparison).
-if [[ "$BACKEND" != "sherpa" ]]; then
+if [[ "$BACKEND" == "coreml-unified" || "$BACKEND" == "coreml-tdt-v3" ]]; then
     echo "Building native Core ML worker…"
     scripts/build-coreml-worker.sh
 fi
@@ -174,7 +173,7 @@ echo
 echo "Wrote $BOUNDARY_CSV"
 cat "$BOUNDARY_CSV"
 
-if [[ "$BACKEND" != "sherpa" && "$STAGE_TIMINGS" != "0" ]]; then
+if [[ "$STAGE_TIMINGS" != "0" ]]; then
     STAGES_CSV="${OUT_CSV%.csv}-stages.csv"
     uv run --quiet scripts/bench-stages.py --log "$RAW_LOG" --out "$STAGES_CSV"
     echo
