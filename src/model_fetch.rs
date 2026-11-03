@@ -10,7 +10,8 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, Read, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -462,6 +463,35 @@ pub async fn ensure_coreml_model(model_dir: &Path, on_progress: ProgressFn) -> R
 /// one rename after every file in it has matched the manifest.
 const BUCKET_STAGING_DIR: &str = ".encoder-buckets-staging";
 
+// Never unlink this file: every provisioner must lock the same inode, even
+// after an interrupted run. Closing the file releases the kernel lock.
+const BUCKET_LOCK_FILE: &str = ".encoder-buckets.lock";
+
+fn try_lock_buckets(model_dir: &Path) -> Result<Option<File>> {
+    fs::create_dir_all(model_dir)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(model_dir.join(BUCKET_LOCK_FILE))
+        .context("opening encoder bucket lock")?;
+    loop {
+        // SAFETY: file owns a valid open descriptor for this entire call.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(file));
+        }
+        let error = std::io::Error::last_os_error();
+        match error.kind() {
+            std::io::ErrorKind::WouldBlock => return Ok(None),
+            std::io::ErrorKind::Interrupted => continue,
+            _ => return Err(error).context("locking encoder buckets"),
+        }
+    }
+}
+
 /// Verify every encoder bucket and, with [`BucketFetch::Download`], fetch the
 /// missing or corrupt ones. Returns the windows whose bundle is intact,
 /// ascending.
@@ -470,6 +500,8 @@ const BUCKET_STAGING_DIR: &str = ".encoder-buckets-staging";
 /// the worker sends those utterances to the stock 15 s encoder. After the
 /// first failed download no further bucket is fetched in the same call, so an
 /// unreachable host costs one request rather than one per bucket.
+/// A competing provisioner skips the busy model directory and returns no
+/// buckets; a later call verifies the completed installation.
 pub async fn ensure_encoder_buckets(
     model_dir: &Path,
     windows: &[u32],
@@ -516,6 +548,39 @@ pub async fn remove_encoder_buckets_except(model_dir: &Path, keep: &[u32]) {
 }
 
 async fn ensure_buckets(
+    buckets: &[EncoderBucket],
+    model_dir: &Path,
+    fetch: BucketFetch,
+    on_progress: &ProgressFn,
+) -> Vec<u32> {
+    let buckets = buckets.to_vec();
+    let model_dir = model_dir.to_path_buf();
+    let on_progress = Arc::clone(on_progress);
+    // The task retains the lock if its caller is cancelled while a blocking
+    // verifier or unpacker is still touching staging.
+    tokio::spawn(async move {
+        let lock_dir = model_dir.clone();
+        let _lock = match tokio::task::spawn_blocking(move || try_lock_buckets(&lock_dir)).await {
+            Ok(Ok(Some(lock))) => lock,
+            Ok(Ok(None)) => {
+                log::info!("encoder bucket provisioning already in progress; skipping");
+                return Vec::new();
+            }
+            error => {
+                log::warn!("cannot acquire encoder bucket lock: {error:?}");
+                return Vec::new();
+            }
+        };
+        ensure_buckets_locked(&buckets, &model_dir, fetch, &on_progress).await
+    })
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!("encoder bucket provisioner failed: {error}");
+        Vec::new()
+    })
+}
+
+async fn ensure_buckets_locked(
     buckets: &[EncoderBucket],
     model_dir: &Path,
     fetch: BucketFetch,
@@ -1374,6 +1439,136 @@ mod tests {
 
     fn no_progress() -> ProgressFn {
         Arc::new(|_| {})
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_bucket_provisioners_leave_one_complete_bundle() {
+        let archive = tar_of(BUNDLE_FILES);
+        let (base, requested) = serve(vec![("/2.tar".to_string(), archive.clone())]);
+        let bucket = test_bucket(2, &base, &archive, BUNDLE_FILES);
+        let dir = tempfile::tempdir().unwrap();
+        let (unpacking_tx, unpacking_rx) = tokio::sync::oneshot::channel();
+        let unpacking_tx = parking_lot::Mutex::new(Some(unpacking_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        let progress: ProgressFn = Arc::new(move |event| {
+            if matches!(event, Progress::Status(ref text) if text.starts_with("Unpacking")) {
+                unpacking_tx.lock().take().unwrap().send(()).unwrap();
+                release_rx.lock().recv().unwrap();
+            }
+        });
+        let model_dir = dir.path().to_path_buf();
+        let first = tokio::spawn(async move {
+            ensure_buckets(&[bucket], &model_dir, BucketFetch::Download, &progress).await
+        });
+        unpacking_rx.await.unwrap();
+        let second =
+            ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
+        release_tx.send(()).unwrap();
+        let first = first.await.unwrap();
+
+        assert!(
+            second.is_empty(),
+            "a competing provisioner must skip the busy directory"
+        );
+        assert_eq!(first, [2]);
+        assert!(verify_bundle(bucket, &dir.path().join(BUNDLE)).await);
+        assert_eq!(requested.lock().as_slice(), ["/2.tar"]);
+        let retry =
+            ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
+        assert_eq!(retry, [2]);
+    }
+
+    #[tokio::test]
+    async fn interrupted_bucket_staging_is_restarted_and_verified() {
+        let archive = tar_of(BUNDLE_FILES);
+        let (base, requested) = serve(vec![("/2.tar".to_string(), archive.clone())]);
+        let bucket = test_bucket(2, &base, &archive, BUNDLE_FILES);
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join(BUCKET_STAGING_DIR);
+        let weight = staging.join(BUNDLE).join("weights/weight.bin");
+        fs::create_dir_all(weight.parent().unwrap()).unwrap();
+        fs::write(&weight, b"wei").unwrap();
+        fs::write(
+            part_path(&staging.join(bucket.archive.label)).unwrap(),
+            &archive[..100],
+        )
+        .unwrap();
+
+        let ready =
+            ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
+
+        assert_eq!(ready, [2]);
+        assert_eq!(
+            fs::read(dir.path().join(BUNDLE).join("weights/weight.bin")).unwrap(),
+            b"weights"
+        );
+        assert!(verify_bundle(bucket, &dir.path().join(BUNDLE)).await);
+        assert!(!staging.join(BUNDLE).exists());
+        assert!(!part_path(&staging.join(bucket.archive.label))
+            .unwrap()
+            .exists());
+        assert_eq!(requested.lock().as_slice(), ["/2.tar"]);
+    }
+
+    #[test]
+    fn bucket_lock_child() {
+        let Some(model_dir) = std::env::var_os("PARAKEET_TEST_BUCKET_LOCK_DIR") else {
+            return;
+        };
+        let _lock = try_lock_buckets(Path::new(&model_dir)).unwrap().unwrap();
+        println!("bucket lock held");
+        std::io::stdout().flush().unwrap();
+        let _ = std::io::stdin().read(&mut [0_u8]);
+    }
+
+    #[tokio::test]
+    async fn a_killed_process_releases_the_bucket_lock_for_relaunch() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "model_fetch::tests::bucket_lock_child",
+                "--nocapture",
+            ])
+            .env("PARAKEET_TEST_BUCKET_LOCK_DIR", dir.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "child exited before locking"
+            );
+            if line.contains("bucket lock held") {
+                break;
+            }
+            line.clear();
+        }
+        let competing = try_lock_buckets(dir.path()).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(competing.is_none(), "another process owns the lock");
+
+        let archive = tar_of(BUNDLE_FILES);
+        let (base, _) = serve(vec![("/2.tar".to_string(), archive.clone())]);
+        let bucket = test_bucket(2, &base, &archive, BUNDLE_FILES);
+        let staging = dir.path().join(BUCKET_STAGING_DIR);
+        let weight = staging.join(BUNDLE).join("weights/weight.bin");
+        fs::create_dir_all(weight.parent().unwrap()).unwrap();
+        fs::write(weight, b"wei").unwrap();
+
+        let ready =
+            ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
+        assert_eq!(ready, [2]);
+        assert!(verify_bundle(bucket, &dir.path().join(BUNDLE)).await);
     }
 
     #[tokio::test]
