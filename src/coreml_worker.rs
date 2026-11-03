@@ -720,10 +720,6 @@ impl WorkerProcess {
         let _ = self.child.wait();
     }
 
-    pub(crate) fn request_shutdown(&mut self) {
-        let _ = self.child.kill();
-    }
-
     pub(crate) fn read_ready(&mut self, deadline: Instant) -> Result<()> {
         self.read_response(deadline)?.require_success("ready")
     }

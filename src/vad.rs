@@ -122,9 +122,15 @@ impl Vad {
         self.state.detected
     }
 
-    /// Stop inference now; Drop reaps the process after the tail ASR completes.
-    pub(crate) fn request_shutdown(&mut self) {
-        self.process.request_shutdown();
+    /// Reap the idle helper without delaying delivery of a completed Hold decode.
+    pub(crate) fn cleanup_in_background(self) {
+        if let Err(error) = std::thread::Builder::new()
+            .name("vad-cleanup".into())
+            .spawn(move || drop(self))
+        {
+            // A failed spawn drops its closure and uses the normal cleanup path.
+            log::warn!("could not start VAD cleanup thread; cleaned up inline: {error}");
+        }
     }
 }
 
