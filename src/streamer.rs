@@ -787,7 +787,7 @@ fn finish_manual(
     timer.mark_capture_end(audio_s);
 
     let Some(HoldWindowing {
-        vad,
+        mut vad,
         planner,
         decoder,
     }) = windowing
@@ -799,6 +799,9 @@ fn finish_manual(
             timer,
         };
     };
+
+    // Reap after ASR instead of blocking release-to-text on process exit.
+    vad.request_shutdown();
 
     // The planner counts on the VAD's 16 kHz timeline. Since ADR-0030 capture
     // delivers exactly that, but check rather than slice on an assumption.
@@ -825,7 +828,6 @@ fn finish_manual(
     );
     let summary = decoder.finish();
     timer.mark_asr_done();
-    vad.cleanup_in_background();
 
     let early_transcript = match summary.error {
         Some(error) => {
