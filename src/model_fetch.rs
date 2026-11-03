@@ -529,6 +529,18 @@ pub fn all_encoder_bucket_windows() -> Vec<u32> {
 /// tuning profile's disk budget holds on disk. A symlinked bundle loses only
 /// its link. Never fails: a bundle that cannot be removed is logged and left.
 pub async fn remove_encoder_buckets_except(model_dir: &Path, keep: &[u32]) {
+    let lock_dir = model_dir.to_path_buf();
+    let _lock = match tokio::task::spawn_blocking(move || try_lock_buckets(&lock_dir)).await {
+        Ok(Ok(Some(lock))) => lock,
+        Ok(Ok(None)) => {
+            log::info!("encoder bucket provisioning in progress; keeping unchosen buckets for now");
+            return;
+        }
+        error => {
+            log::warn!("cannot acquire encoder bucket lock: {error:?}");
+            return;
+        }
+    };
     for bucket in ENCODER_BUCKETS {
         if keep.contains(&bucket.seconds) {
             continue;
@@ -1569,6 +1581,29 @@ mod tests {
             ensure_buckets(&[bucket], dir.path(), BucketFetch::Download, &no_progress()).await;
         assert_eq!(ready, [2]);
         assert!(verify_bundle(bucket, &dir.path().join(BUNDLE)).await);
+    }
+
+    #[tokio::test]
+    async fn removing_unchosen_buckets_waits_for_a_running_provisioner() {
+        let dir = tempfile::tempdir().unwrap();
+        let unchosen = ENCODER_BUCKETS[0];
+        let bundle = dir.path().join(unchosen.bundle);
+        fs::create_dir_all(&bundle).unwrap();
+        fs::write(bundle.join("weight.bin"), b"weights").unwrap();
+
+        let provisioner = try_lock_buckets(dir.path()).unwrap().unwrap();
+        remove_encoder_buckets_except(dir.path(), &[]).await;
+        assert!(
+            bundle.exists(),
+            "removal ran while a provisioner held the directory"
+        );
+
+        drop(provisioner);
+        remove_encoder_buckets_except(dir.path(), &[]).await;
+        assert!(
+            !bundle.exists(),
+            "an unchosen bucket stays after the provisioner finished"
+        );
     }
 
     #[tokio::test]
